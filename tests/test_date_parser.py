@@ -21,9 +21,15 @@ DAY = timezone(timedelta(hours=8))
 NOW = datetime(2026, 3, 14, 10, 0, tzinfo=DAY)
 
 
-def parse_at(text: str, now: datetime = NOW, day_end: str = "24:00"):
-    """默认在 2026-03-14（周六）10:00、``day_end = "24:00"`` 下解析。"""
+def parse_at(text: str, now: datetime = NOW, day_end: str = "00:00"):
+    """默认在 2026-03-14（周六）10:00、``day_end = "00:00"``（不偏移）下解析。"""
     return parse(text, now=now, day_end=day_end)
+
+
+def test_the_two_spellings_of_no_offset_agree():
+    """ADR-0003 的规范形式是 ``"00:00"``；配置层会把 ``"24:00"`` 折成它，解析器两者都认。"""
+    assert parse_at("明天", day_end="00:00") == parse_at("明天", day_end="24:00")
+    assert parse("明天", now=NOW) == parse_at("明天")  # 省略 day_end 就是「不偏移」
 
 
 def test_today_means_the_current_logical_day():

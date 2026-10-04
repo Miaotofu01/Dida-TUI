@@ -5,7 +5,7 @@
 
 公开接口：
 
-- :func:`parse` —— ``parse(text, now, day_end="24:00") -> ParsedTask``。
+- :func:`parse` —— ``parse(text, now, day_end="00:00") -> ParsedTask``。
   「现在」与 ``day_end`` 都是参数：本模块不看表、不读配置。
 - :class:`ParsedTask` —— 标题、截止时刻、是否全天、优先级、标签、诊断。
 - :class:`ParseDiagnostic` —— 一段没被识别的东西（``token`` / ``code`` / ``message``）。
@@ -157,11 +157,14 @@ class _Mark:
     """解析结果；``None`` = 看着像日期/时刻，但解析失败。"""
 
 
-def parse(text: str, now: datetime, day_end: str = "24:00") -> ParsedTask:
+def parse(text: str, now: datetime, day_end: str = "00:00") -> ParsedTask:
     """把一行输入解析成 :class:`ParsedTask`。
 
     相对日期从 ``now`` 所在的**逻辑日**算起（``logical_day(now, day_end)``），
-    不是从自然日算起。纯函数：同样的入参永远给出同样的结果。
+    不是从自然日算起。``day_end`` 的默认值是配置的规范形式（ADR-0003 把「不偏移」
+    写成 ``"00:00"``；``"24:00"`` 在配置层就折成它了，两者等价）。
+
+    纯函数：同样的入参永远给出同样的结果。
     """
     day = logical_day(now, day_end)
     marks = _scan(text, day.label)
