@@ -13,11 +13,24 @@ from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.widgets import Footer
 
-from dida.sync.engine import Engine
-from dida.tui.panes import DetailPane, ListPane, StatusBar, TaskPane, format_status
+from dida.sync.engine import Engine, UnknownTaskError
+from dida.tui.panes import (
+    DetailPane,
+    ListPane,
+    RescheduleInput,
+    StatusBar,
+    TaskPane,
+    format_status,
+)
 
 FLASH_SECONDS = 0.45
 """完成后那一行高亮多久：够看清这一下生效了，又不至于拖住下一次分诊。"""
+
+NO_DATE_MESSAGE = "没写日期：改期要说清改到哪一天，可以写「明天」或「3-15」"
+"""改期输入框里一个日期都没写时的话。新建可以没有日期，改期不行——那等于什么都没改。"""
+
+UNKNOWN_TASK_MESSAGE = "没有改成：这条任务已经不在本地缓存里了，刷新之后再试一次"
+"""引擎拒绝写入（本地没有这条任务的底稿，工单 #25）时的话：如实说没改成。"""
 
 
 class DidaApp(App[None]):
@@ -32,6 +45,7 @@ class DidaApp(App[None]):
         Binding("x", "complete", "完成"),
         Binding("g", "defer", "顺延"),
         Binding("G", "defer_week", "顺延一周"),
+        Binding("e", "reschedule", "改期"),
     ]
     CSS = """
     #panes {
@@ -65,6 +79,8 @@ class DidaApp(App[None]):
             yield ListPane(id="list-pane")
             yield TaskPane(id="task-pane")
             yield DetailPane(id="detail-pane")
+        # 改期输入框：默认收起，按 e 才出现（新建输入框归 t15，在顶部）
+        yield RescheduleInput(id="reschedule-input")
         yield Footer()
         yield StatusBar(id="status-bar")
 
@@ -122,4 +138,50 @@ class DidaApp(App[None]):
         if task_id is None:
             return
         self.engine.defer(task_id, days=days)
+        self.refresh_view()
+
+    # ---------------------------------------------------------------- 改期（t14）
+
+    def action_reschedule(self) -> None:
+        """``e``：打开改期输入框（工单 #14）。
+
+        光标下没有任务就什么都不做——空屏上按键不该报错（与 ``x``/``g`` 同一条口径）。
+        瞄准的是**按下 e 那一刻**光标下那条任务：输入框拿到焦点之后 j/k 都成了文本，
+        不再移动光标，所以这一次改期永远落在那一条上。
+        """
+        task_id = self.query_one(TaskPane).selected_task_id
+        if task_id is None:
+            return
+        self.query_one(RescheduleInput).open(task_id)
+
+    def on_reschedule_input_submitted(self, event: RescheduleInput.Submitted) -> None:
+        """改期输入框按了 ``Enter``：先解析，再决定提不提交（工单 #14）。
+
+        三条规矩：
+
+        - **非空 ``diagnostics`` 一律提示、绝不提交**。不按 code 名单挑着报：``invalid_date``
+          与 #23 的 ``duplicate_priority`` 一样重要——「13-45」被当成标题的一部分静默吞掉，
+          用户三天后才发现任务没有日期，正是「如实呈现」要消灭的那类安静错误。
+        - 一个日期都没写（``due is None``）也拒绝：改期不写日期等于什么都没改。新建可以没有
+          日期，改期不行。
+        - 引擎拒绝写入（本地已经没有这条任务的底稿，#25）时如实说一句「没有改成」，不崩、
+          也不拿一个猜来的清单 id 硬发。
+
+        被拒绝时输入框留在原地、原文一个字不删——用户改一改再按 Enter 就行。
+        """
+        box = self.query_one(RescheduleInput)
+        parsed = self.engine.plan(event.text)
+        if parsed.diagnostics:
+            box.show_message("；".join(item.message for item in parsed.diagnostics))
+            return
+        if parsed.due is None:
+            box.show_message(NO_DATE_MESSAGE)
+            return
+        try:
+            self.engine.reschedule(event.task_id, due=parsed.due, all_day=parsed.all_day)
+        except UnknownTaskError:
+            box.show_message(UNKNOWN_TASK_MESSAGE)
+            return
+        box.close()
+        self.query_one(TaskPane).focus()
         self.refresh_view()
