@@ -20,6 +20,7 @@ from typing import Any
 import httpx
 
 from dida.clock import Clock
+from dida.storage.store import RefreshReport
 from dida.sync.engine import SyncEngine, SyncStatus
 from dida.sync.view import ListSnapshot, SyncState, TaskSnapshot, TodayView
 
@@ -157,6 +158,14 @@ class FakeBackend:
 
         self._engine = SyncEngine(clock=clock, day_end=day_end, source=self.source)
 
+    async def refresh(self) -> RefreshReport:
+        """真引擎的 ``refresh()`` 是 async 的（网络等待不阻塞界面），假后端跟着它。
+
+        什么都不写：假后端没有网络也没有库，返回一份空报告就是实话。
+        """
+        self.refreshes += 1
+        return RefreshReport()
+
     def add_list(self, name: str, *, id: str | None = None) -> ListSnapshot:
         return self.source.add_list(name, id=id)
 
@@ -171,9 +180,6 @@ class FakeBackend:
 
     def status(self) -> SyncStatus:
         return self._engine.status()
-
-    def refresh(self) -> None:
-        self.refreshes += 1
 
     def complete(self, task_id: str) -> None:
         self.completed.append(task_id)
