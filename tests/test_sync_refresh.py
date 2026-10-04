@@ -210,11 +210,6 @@ async def test_a_payload_of_the_wrong_shape_is_a_structured_error(store):
     assert store.tasks() == ()
 
 
-@pytest.mark.xfail(
-    strict=True,
-    reason="t07 的客户端对非对象载荷（200 + `[]`）在 client.py:112 抛裸 AttributeError；"
-    "工单 #9 不许改 src/dida/api/*。这条留给 t07 的后续工单：客户端承诺结构化错误。",
-)
 async def test_a_non_object_project_payload_is_translated_by_the_client(store):
     transport = FakeTransport()
     transport.enqueue(httpx.Response(200, json=[project()]))

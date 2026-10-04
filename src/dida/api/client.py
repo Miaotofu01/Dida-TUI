@@ -70,12 +70,12 @@ class DidaApiClient:
         if limit is not None:
             params["limit"] = limit
         response = await self._send(self._request("GET", "/open/v1/project", params=params))
-        return self._payload(response)
+        return self._payload_array(response, endpoint="清单索引", item_keys=("id",))
 
     async def list_tags(self) -> list[dict[str, Any]]:
         """GET /open/v1/tag —— 全部标签（``OpenTag``：name / label / sortOrder / color / type）。"""
         response = await self._send(self._request("GET", "/open/v1/tag"))
-        return self._payload(response)
+        return self._payload_array(response, endpoint="标签列表", item_keys=("name",))
 
     async def list_completed(
         self,
@@ -99,7 +99,7 @@ class DidaApiClient:
         response = await self._send(
             self._request("POST", "/open/v1/task/completed", body=normalize_dates(body))
         )
-        return self._payload(response)
+        return self._payload_array(response, endpoint="已完成流", item_keys=("id",))
 
     async def get_project_data(self, project_id: str) -> dict[str, Any]:
         """GET /open/v1/project/{id}/data —— 该清单的未完成任务全量，无分页。
@@ -108,8 +108,19 @@ class DidaApiClient:
         ``_snapshots``：刷新完就能安全地写回，不用先把任务再拉一遍。
         """
         response = await self._send(self._request("GET", f"/open/v1/project/{project_id}/data"))
-        payload = self._payload(response)
-        for task in payload.get("tasks") or []:
+        payload = self._payload_object(response, endpoint=f"清单 {project_id} 的 data")
+        # ``project`` / ``tasks`` 缺席（或 ``null``）是合法数据：这个清单就是空的。给错形状
+        # 才是错误——被安静地当成空清单，用户看到的是「我的任务不见了」。
+        project = payload.get("project")
+        if project is not None and not isinstance(project, Mapping):
+            raise self._malformed(response, f"清单 {project_id} 的 project", "一个对象", project)
+        tasks_endpoint = f"清单 {project_id} 的 tasks"
+        tasks = payload.get("tasks")
+        if tasks is not None:
+            if not isinstance(tasks, list):
+                raise self._malformed(response, tasks_endpoint, "一个数组", tasks)
+            self._require_items(response, tasks, endpoint=tasks_endpoint, item_keys=("id",))
+        for task in tasks or []:
             self._remember(task)
         return payload
 
@@ -118,7 +129,9 @@ class DidaApiClient:
         response = await self._send(
             self._request("GET", f"/open/v1/project/{project_id}/task/{task_id}")
         )
-        return self._remember(self._payload(response))
+        return self._remember(
+            self._payload_object(response, endpoint=f"任务 {task_id} 的原文", required=("id",))
+        )
 
     async def create_task(self, body: Mapping[str, Any]) -> dict[str, Any]:
         """POST /open/v1/task —— 请求体透传，但先过本地守卫（日期、重复规则、不可写字段）。"""
@@ -126,7 +139,7 @@ class DidaApiClient:
         response = await self._send(
             self._request("POST", "/open/v1/task", body=prepare_write_body(body))
         )
-        return self._remember(self._payload(response))
+        return self._remember(self._payload_object(response, endpoint="新建任务的响应"))
 
     async def update_task(
         self,
@@ -153,7 +166,9 @@ class DidaApiClient:
         response = await self._send(
             self._request("POST", f"/open/v1/task/{task_id}", body=prepare_write_body(body))
         )
-        return self._remember(self._payload(response))
+        return self._remember(
+            self._payload_object(response, endpoint=f"更新任务 {task_id} 的响应")
+        )
 
     async def complete_task(self, project_id: str, task_id: str) -> None:
         """POST .../task/{taskId}/complete —— 无请求体、无响应体。"""
@@ -174,6 +189,74 @@ class DidaApiClient:
                 f"服务端返回 HTTP {response.status_code}，但响应体不是 JSON",
                 status_code=response.status_code,
             ) from exc
+
+    def _payload_object(
+        self, response: httpx.Response, *, endpoint: str, required: Sequence[str] = ()
+    ) -> Any:
+        """2xx 的载荷必须是**对象**，且带上必需字段，否则结构化报错。
+
+        取字段（``payload["tasks"]``、``payload.get(...)``）之前先在这里把形状钉死：
+        服务端给个数组时，裸着往下走漏出来的是 ``AttributeError``，绕过整个 ``DidaError``
+        族（工单 #24）。
+        """
+        payload = self._payload(response)
+        if not isinstance(payload, Mapping):
+            raise self._malformed(response, endpoint, "一个对象", payload)
+        self._require(response, endpoint, payload, required)
+        return payload
+
+    def _payload_array(
+        self, response: httpx.Response, *, endpoint: str, item_keys: Sequence[str] = ()
+    ) -> Any:
+        """2xx 的载荷必须是**数组**，且每一项都是带必需字段的对象。
+
+        空数组是合法数据（就是没有清单 / 没有标签 / 这个窗口没完成过任务），不是错误；
+        给个对象才是——``{}`` 被当成空数组，用户看到的是「我的清单不见了」而且不报错。
+        """
+        payload = self._payload(response)
+        if not isinstance(payload, list):
+            raise self._malformed(response, endpoint, "一个数组", payload)
+        self._require_items(response, payload, endpoint=endpoint, item_keys=item_keys)
+        return payload
+
+    def _require_items(
+        self,
+        response: httpx.Response,
+        items: Sequence[Any],
+        *,
+        endpoint: str,
+        item_keys: Sequence[str] = (),
+    ) -> None:
+        """数组的每一项都必须是带必需字段的对象；第几项不对要能一眼看出来。"""
+        for index, item in enumerate(items):
+            where = f"{endpoint}[{index}]"
+            if not isinstance(item, Mapping):
+                raise self._malformed(response, where, "一个对象", item)
+            self._require(response, where, item, item_keys)
+
+    def _require(
+        self,
+        response: httpx.Response,
+        endpoint: str,
+        payload: Mapping[str, Any],
+        required: Sequence[str],
+    ) -> None:
+        """必需字段缺席（或为空）＝形状不对：结构化报错，别留给调用方一个裸 ``KeyError``。"""
+        missing = [key for key in required if not payload.get(key)]
+        if missing:
+            raise MalformedResponseError(
+                f"{endpoint} 的响应缺字段：{'、'.join(missing)}",
+                status_code=response.status_code,
+            )
+
+    def _malformed(
+        self, response: httpx.Response, endpoint: str, expected: str, payload: Any
+    ) -> MalformedResponseError:
+        """形状不对时的结构化错误：带上端点与**实际**收到的东西，方便查。"""
+        return MalformedResponseError(
+            f"{endpoint} 期望{expected}，收到 {type(payload).__name__}",
+            status_code=response.status_code,
+        )
 
     def _remember(self, task: Any) -> Any:
         """记下服务端给的一份任务原文（写回时的合并底稿），并原样返回。"""
