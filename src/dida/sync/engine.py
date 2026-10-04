@@ -36,7 +36,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_checkable
 from uuid import uuid4
 
-from dida.api.errors import DidaError, MalformedResponseError
+from dida.api.errors import AuthError, DidaError, MalformedResponseError
 from dida.api.guards import api_date
 from dida.clock import Clock
 from dida.date_parser import ParsedTask, parse
@@ -81,6 +81,7 @@ if TYPE_CHECKING:  # 只为了标注：storage 反过来 import dida.sync.view�
 __all__ = [
     "INBOX_ID",
     "NO_DUE_TEXT",
+    "AuthError",
     "CompletedItem",
     "CompletedReader",
     "CompletedReport",
@@ -204,6 +205,18 @@ class Engine(Protocol):
 
     async def refresh(self) -> RefreshReport:
         """写：全量刷新。**要 await**：它不是一次纯本地操作。"""
+        ...
+
+    async def push_pending(self) -> int:
+        """写：推一轮待推送改动（到期的才推），返回推成功的条数。
+
+        手动同步（``r``）与周期泵（t21）都从这里过；等待与定时都不在引擎里，
+        引擎只负责说清楚「现在哪些能推」。
+        """
+        ...
+
+    async def refresh_completed(self) -> CompletedReport:
+        """写：拉一次已完成流（按完成时间游标拉窗口）。**要 await**。"""
         ...
 
     def complete(self, task_id: str) -> None:
@@ -403,12 +416,17 @@ class SyncEngine:
         source: ViewSource | None = None,
         client: ProjectReader | TaskWriter | CompletedReader | None = None,
         completed_window_hours: int = DEFAULT_COMPLETED_WINDOW_HOURS,
+        push_on_change: bool = True,
     ) -> None:
         self._clock = clock
         self._day_end = day_end
         self._source = source
         self._client = client
         self._completed_window_hours = completed_window_hours
+        # 「界面上的改动立即推送」（配置键 push_on_change，spec 的配置 schema）。关掉它只是
+        # 不排那一轮**立刻**的推送：改动照样入队、照样在本地生效，等下一次 push_pending
+        # （手动同步 r，或 t21 的周期泵）再出去。默认开着，ADR-0002 要的就是立刻推。
+        self._push_on_change = push_on_change
         # 推送串行化：一次写会顺手排一轮推送，别让同一批改动被两个协程同时推两遍
         # （完成与删除不是幂等的）。锁本身不绑事件循环，第一次 acquire 时才绑。
         self._push_lock = asyncio.Lock()
@@ -548,7 +566,9 @@ class SyncEngine:
 
         ADR-0002 的口径：一次按键的手感比可撤销性值钱，所以本地先动，服务端随后到。
         改动进 :class:`~dida.storage.store.PendingChange` 队列后，会立刻在事件循环上
-        推一次；推不动就留在队列里按注入的钟退避重试，绝不让这一屏等网络。
+        推一次（``push_on_change=False`` 时不排这一轮，改动留在队列里等下一次
+        :meth:`push_pending`：手动同步 ``r``，或 t21 那个周期泵）；推不动就留在队列里按
+        注入的钟退避重试，绝不让这一屏等网络。
 
         ``changes`` 是这次要盖上去的字段（本地与请求体同一份，未知字段的底稿由存储层
         拼好交给 :meth:`~dida.api.client.DidaApiClient.update_task` 的 ``snapshot=``）。
@@ -570,7 +590,7 @@ class SyncEngine:
             payload=self._local_effect(kind, changes),
             now=self._clock.now(),
         )
-        self._schedule_push()
+        self._push_now()
 
     async def push_pending(self) -> int:
         """推一轮：把**到期**的待推送改动依次推给服务端，返回推成功的条数。
@@ -616,6 +636,16 @@ class SyncEngine:
             await asyncio.gather(*tuple(self._inflight))
 
     # ---------------------------------------------------------------- 内部
+
+    def _push_now(self) -> None:
+        """写完之后要不要**立刻**排一轮推送（配置键 ``push_on_change`` 的落点）。
+
+        关掉它（``push_on_change=False``）时改动只入队：本地照旧当场生效，出队交给下一次
+        :meth:`push_pending`——手动同步（``r``）或 t21 那个周期泵。默认是开的：
+        ADR-0002 的「写操作立即推送」。
+        """
+        if self._push_on_change:
+            self._schedule_push()
 
     def _schedule_push(self) -> None:
         """把「立刻推一轮」排到事件循环上（ADR-0002：写操作立即推送）。
@@ -886,7 +916,7 @@ class SyncEngine:
             now=self._clock.now(),
             list_id=INBOX_ID,
         )
-        self._schedule_push()
+        self._push_now()
         return local_id
     # ---------------------------------------------------------------- 优先级（t17）
 
