@@ -4,7 +4,7 @@
 
 技术栈：Python 3.12 + Textual。安装后以 `dida` 命令启动。
 
-当前状态：**spec 阶段**，还没有代码。v1 spec 发布在 GitHub issue 上（见下）。
+当前状态：**spec 阶段**，还没有代码。v1 spec 在 [issue #1](https://github.com/Miaotofu01/Dida-TUI/issues/1)。
 
 ## Agent skills
 
