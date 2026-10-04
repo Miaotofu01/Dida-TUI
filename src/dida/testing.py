@@ -20,6 +20,7 @@ from typing import Any
 import httpx
 
 from dida.clock import Clock
+from dida.date_parser import ParsedTask
 from dida.storage.store import RefreshReport
 from dida.sync.engine import SyncEngine, SyncStatus
 from dida.sync.view import ListSnapshot, SyncState, TaskSnapshot, TodayView
@@ -164,6 +165,18 @@ class FakeBackend:
         self.deferred_days: list[int] = []
         """每次顺延前进了几个逻辑日（``g`` 是 1、``G`` 是 7），与 ``deferred`` 一一对应。"""
 
+        self.rescheduled: list[str] = []
+        """``reschedule(task_id, due=, all_day=)`` 收到的任务 id，按调用顺序（t14 的改期）。"""
+
+        self.rescheduled_due: list[datetime] = []
+        """每次改期改到的截止时刻，与 ``rescheduled`` 一一对应。"""
+
+        self.rescheduled_all_day: list[bool] = []
+        """每次改期是不是全天，与 ``rescheduled`` 一一对应。"""
+
+        self.reschedule_error: Exception | None = None
+        """摆一个异常进去，``reschedule`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。"""
+
         self._engine = SyncEngine(clock=clock, day_end=day_end, source=self.source)
 
     async def refresh(self) -> RefreshReport:
@@ -195,3 +208,19 @@ class FakeBackend:
     def defer(self, task_id: str, *, days: int = 1) -> None:
         self.deferred.append(task_id)
         self.deferred_days.append(days)
+
+    def plan(self, text: str) -> ParsedTask:
+        """读：委托给真引擎——「现在」、日界、语法都是生产那一份，替身不自己编一套。"""
+        return self._engine.plan(text)
+
+    def reschedule(self, task_id: str, *, due: datetime, all_day: bool = False) -> None:
+        """写：只记录（与 ``complete`` / ``defer`` 一样，替身不动缓存）。
+
+        摆了 ``reschedule_error`` 就记完这一笔再抛：模拟引擎当场拒绝（#25 的
+        ``UnknownTaskError``），好试 TUI 拿到结构化错误时的反应。
+        """
+        self.rescheduled.append(task_id)
+        self.rescheduled_due.append(due)
+        self.rescheduled_all_day.append(all_day)
+        if self.reschedule_error is not None:
+            raise self.reschedule_error

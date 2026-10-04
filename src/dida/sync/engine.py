@@ -38,6 +38,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_chec
 from dida.api.errors import DidaError, MalformedResponseError
 from dida.api.guards import api_date
 from dida.clock import Clock
+from dida.date_parser import ParsedTask, parse
 from dida.logical_day import LogicalDay, logical_day
 from dida.sync.view import (
     INBOX_ID,
@@ -168,7 +169,7 @@ class WriteKind(Enum):
 
 @runtime_checkable
 class Engine(Protocol):
-    """TUI 眼里的引擎：它只用得到这五个。t11/t13 的实现必须仍然满足它。"""
+    """TUI 眼里的引擎：它只用得到这几个。t11/t13/t14 的实现必须仍然满足它。"""
 
     def status(self) -> SyncStatus:
         """读：状态栏要的全部信息。"""
@@ -188,6 +189,14 @@ class Engine(Protocol):
 
     def defer(self, task_id: str, *, days: int = 1) -> None:
         """写：顺延 ``days`` 个逻辑日（``g`` 是 1 天、``G`` 是 7 天）。"""
+        ...
+
+    def plan(self, text: str) -> ParsedTask:
+        """读：用注入的钟与日界把一行输入解析成计划（新建与改期共用同一套语法）。"""
+        ...
+
+    def reschedule(self, task_id: str, *, due: datetime, all_day: bool) -> None:
+        """写：改期（``e``）——把截止时间换成 ``due``，只动 ``dueDate`` 与 ``isAllDay``。"""
         ...
 
 
@@ -684,6 +693,18 @@ class SyncEngine:
         return self._client
 
     # ---------------------------------------------------------------- 改期（t14）
+
+    def plan(self, text: str) -> ParsedTask:
+        """读：把一行输入解析成计划（``ParsedTask``）——新建与改期共用同一套语法。
+
+        「现在」取注入的钟、日界取注入的 ``day_end``，逻辑日由
+        :func:`dida.date_parser.parse` 自己问纯函数：TUI 不看表、也不算日界。
+
+        诊断随结果一起回来，提不提交由调用方定：这里的职责只是「用同一个时钟、同一套语法
+        翻译一行输入」，一个判断都不做。``diagnostics`` 非空 = 用户写了没人认得的东西，
+        调用方必须提示、不许静默提交（见 ``date_parser`` 的约定）。
+        """
+        return parse(text, self._clock.now(), self._day_end)
 
     def reschedule(self, task_id: str, *, due: datetime, all_day: bool) -> None:
         """写：改期（``e``）——把截止时间换成解析出来的那一刻，只动 ``dueDate`` 与 ``isAllDay``。
