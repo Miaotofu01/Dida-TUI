@@ -385,6 +385,118 @@ def test_every_digit_outside_the_three_tiers_is_reported_not_swallowed():
         assert parsed.title == "交报告"
 
 
+def test_the_last_priority_marker_wins_and_the_earlier_one_is_reported():
+    """issue #1：同一行里优先级记号重复出现时取**最后一个**，并进诊断告知。
+
+    以前只认第一个而且不出声：``交报告 !低 !高`` 会得到「低」，用户写的「高」被丢掉。
+    """
+    parsed = parse_at("交报告 !低 !高")
+
+    assert parsed.priority == 5
+    assert parsed.title == "交报告"
+    assert [d.code for d in parsed.diagnostics] == ["duplicate_priority"]
+    assert parsed.diagnostics[0].token == "!低"
+
+
+def test_the_duplicate_priority_diagnostic_says_which_one_was_ignored_word_for_word():
+    """诊断要自成一句、带上被忽略的记号原文，并点明认下的是哪一个——改文案先改这条。"""
+    parsed = parse_at("交报告 !低 !高")
+
+    assert parsed.diagnostics[0].message == (
+        "「!低」被忽略了：同一行里写了多个优先级记号时，只认最后一个「!高」"
+    )
+
+
+def test_a_line_with_a_single_priority_marker_has_no_diagnostic():
+    """负例：只写一个优先级记号是正常路径，不该有任何诊断——不管写的是字还是数字。"""
+    for token, expected in (("!高", 5), ("!低", 1), ("!3", 5), ("!1", 1)):
+        parsed = parse_at(f"交报告 {token}")
+
+        assert parsed.diagnostics == (), token
+        assert parsed.priority == expected, token
+        assert parsed.title == "交报告", token
+
+
+def test_a_word_marker_and_a_digit_marker_follow_the_same_last_one_wins_rule():
+    """``!高 !2`` 就是「优先级写了两遍」：取最后的 ``!2``（档位 2 = 中），``!高`` 进诊断。"""
+    parsed = parse_at("交报告 !高 !2")
+
+    assert parsed.priority == 3
+    assert parsed.title == "交报告"
+    assert [(d.token, d.code) for d in parsed.diagnostics] == [("!高", "duplicate_priority")]
+
+
+def test_a_duplicate_next_to_an_out_of_range_digit_still_reports_the_invalid_one():
+    """出界数字不被新规则吞掉：``!0``/``!4``/``!5``/``!9`` 照旧只报 ``invalid_priority``。
+
+    它不算「重复的优先级记号」（它根本认不出来），所以也不会去顶掉前面写对的那个。
+    """
+    for token in ("!0", "!4", "!5", "!9"):
+        parsed = parse_at(f"交报告 !低 {token}")
+
+        assert [d.code for d in parsed.diagnostics] == ["invalid_priority"], token
+        assert parsed.diagnostics[0].token == token, token
+        assert parsed.priority == 1, token
+
+
+def test_a_trailing_out_of_range_digit_does_not_take_the_valid_marker_down_with_it():
+    """``!高 !5``：``!5`` 认不出来，但 ``!高`` 不是「被忽略的重复」——它仍然生效。"""
+    parsed = parse_at("交报告 !高 !5")
+
+    assert parsed.priority == 5
+    assert [(d.token, d.code) for d in parsed.diagnostics] == [("!5", "invalid_priority")]
+
+
+def test_an_unrecognised_marker_does_not_count_as_the_last_one():
+    """``!高 !5 !2``：认不出来的 ``!5`` 不算数，「最后一个」是 ``!2`` → 中。
+
+    两条诊断按在输入里出现的顺序排：先 ``!高`` 的重复，再 ``!5`` 的认不出来。
+    """
+    parsed = parse_at("交报告 !高 !5 !2")
+
+    assert parsed.priority == 3
+    assert [(d.token, d.code) for d in parsed.diagnostics] == [
+        ("!高", "duplicate_priority"),
+        ("!5", "invalid_priority"),
+    ]
+
+
+def test_every_ignored_marker_gets_its_own_diagnostic_in_written_order():
+    """``!低 !中 !高``：只留 ``!高``，前面两个各报一条，按写的顺序，各点各的名。"""
+    parsed = parse_at("交报告 !低 !中 !高")
+
+    assert parsed.priority == 5
+    assert [(d.token, d.code) for d in parsed.diagnostics] == [
+        ("!低", "duplicate_priority"),
+        ("!中", "duplicate_priority"),
+    ]
+    assert parsed.diagnostics[1].message == (
+        "「!中」被忽略了：同一行里写了多个优先级记号时，只认最后一个「!高」"
+    )
+
+
+def test_two_identical_markers_are_a_duplicate_too():
+    """写了两遍同一个记号也算重复：``!中 !中`` 取中，前一个进诊断。"""
+    parsed = parse_at("交报告 !中 !中")
+
+    assert parsed.priority == 3
+    assert [(d.token, d.code) for d in parsed.diagnostics] == [("!中", "duplicate_priority")]
+
+
+def test_the_duplicate_diagnostic_takes_its_place_among_the_other_failures():
+    """诊断整体按在输入里出现的顺序排，重复的优先级不例外。"""
+    parsed = parse_at("!低 13-45 交报告 !高 25:00")
+
+    assert [d.token for d in parsed.diagnostics] == ["!低", "13-45", "25:00"]
+    assert [d.code for d in parsed.diagnostics] == [
+        "duplicate_priority",
+        "invalid_date",
+        "invalid_time",
+    ]
+    assert parsed.priority == 5
+    assert parsed.title == "交报告"
+
+
 def test_the_priority_diagnostic_spells_out_the_legal_shorthands():
     """诊断要自成一句，把合法写法列全——改这句文案就得先改这条测试。"""
     parsed = parse_at("交报告 !5")
