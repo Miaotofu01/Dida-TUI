@@ -22,16 +22,21 @@
   时 3/15 00:00 属于逻辑日 3/14，按逻辑日区间判定会把全天任务放错分区。
 - 只写时刻（``all_day=False``、没有日期）时，已过去的时刻落到**下一个逻辑日**；
   写明了日期（哪怕「今天」）就照写的那天算，不顺延。
-- ``diagnostics`` 空 = 没写日期，正常；非空 = 写了疑似日期/时刻但没解析出来，
-  消费方**必须**提示用户，不许静默提交。
+- ``diagnostics`` 空 = 没写日期，正常；非空 = 有事情要告诉用户（疑似日期/时刻没解析出来、
+  优先级记号写了多个而只认了最后一个），消费方**必须**提示用户，不许静默提交。
 
 语法表没写到的地方，本工单定稿：
 
 - 标签：``#`` 到空白、下一个 ``#`` 或句读为止。``#a#b`` 是**两个**标签；光秃秃的
   ``#`` 留在标题里（不是诊断——它本来就不是日期）；重复的标签只留一次。
-- 优先级数字按 api-contracts.md 第 3 条解释：服务端只有 0/1/3/5（无/低/中/高），
-  所以「中」是 ``3`` 而不是 ``2``，``!2`` 与 ``!3`` 都落到「中」，高写 ``!高``（或 ``!5``）。
-  认不出的数字（``!9``）报诊断，不留在标题里。
+- 优先级：``!高``/``!中``/``!低``，或者**档位序号** ``!1``/``!2``/``!3``（1=低、2=中、3=高）。
+  数字是档位，不是 API 取值——服务端 ``priority`` 的线上编码 0/1/3/5 只在 dida/api 边界出现，
+  所以 ``!3`` 解析出来是 ``5``（高），而 ``!5`` **不是**「高」，``!0`` 也**不是**清除语法
+  （清除优先级是 ``p`` 键的事）：1/2/3 以外的数字一律报诊断，不留在标题里。
+  同一行里写了多个时取**最后一个**（issue #1 的边界规则），被丢下的那些各报一条
+  ``duplicate_priority``，并说清认下的是哪一个。只有**能解析出来**的记号才算数：
+  认不出来的（``!5``）已经进了 ``invalid_priority``，不参与「谁是最后一个」，
+  也不会把前面写对的那个顶掉——与日期/时刻「取第一个能解析出来的」同一套办法。
 - 时刻只认 ``14:00`` 和带时段的 ``下午3点``。不带时段的「9点」不收：分不清上午晚上，
   而且「点」在中文里还表示条目（「第3点建议」），误判会把标题吃出洞来。它留在标题里，
   用户看得见。
@@ -55,12 +60,18 @@ _KIND_TIME = "time"
 _KIND_TAG = "tag"
 _KIND_PRIORITY = "priority"
 
+#: 一行里写了多个优先级记号时只认最后一个，被丢下的那些报这条 code。
+_DUPLICATE_PRIORITY = "duplicate_priority"
+
 #: 相对日期的词表：值是从当前**逻辑日**起算的天数。
 _RELATIVE_DAYS = {"今天": 0, "今日": 0, "明天": 1, "明日": 1, "后天": 2}
 
-#: 优先级：「高/中/低」加数字。数字按 api-contracts.md 第 3 条的档位解释——
-#: 服务端只有 0/1/3/5（无/低/中/高），「中」落到 3 而不是 2，所以 ``!2`` 与 ``!3`` 都是「中」。
-_PRIORITIES = {"高": 5, "中": 3, "低": 1, "0": 0, "1": 1, "2": 3, "3": 3, "5": 5}
+#: 优先级：``高/中/低`` 或**档位序号** ``1/2/3``。数字是档位（1=低、2=中、3=高），
+#: 与 ``!低``/``!中``/``!高`` 一一对应，也与 ``p`` 键的循环顺序（无→低→中→高）一致。
+#: 它不是 API 取值——服务端 ``priority`` 的线上编码 0/1/3/5（无/低/中/高）只出现在
+#: dida/api 边界上。所以 ``!3`` → 5，而 ``!5`` 不在表里 → 诊断（``!5`` 不是「高」）。
+#: 表里没有的写法（``!0``/``!4``/``!5``/``!9``…）一律报诊断，不静默当标题文本。
+_PRIORITIES = {"高": 5, "中": 3, "低": 1, "1": 1, "2": 3, "3": 5}
 
 #: 星期几的字面量 → ``date.weekday()``（周一 = 0）。
 _WEEKDAYS = {"一": 0, "二": 1, "三": 2, "四": 3, "五": 4, "六": 5, "日": 6, "天": 6}
@@ -105,19 +116,26 @@ _PRIORITY_RE = re.compile(r"!(?P<priority>高|中|低|\d+)")
 _MESSAGES = {
     _KIND_DATE: "「{token}」不是一个能认出来的日期，可以写「明天」或「3-15」",
     _KIND_TIME: "「{token}」不是一个能认出来的时刻，可以写「15:00」或「下午3点」",
-    _KIND_PRIORITY: "「{token}」不是一个能认出来的优先级，可以写「!高」或「!1」",
+    _KIND_PRIORITY: (
+        "「{token}」不是一个能认出来的优先级："
+        "优先级只支持「!1」/「!2」/「!3」或「!高」/「!中」/「!低」"
+    ),
 }
+
+#: 优先级记号重复时，被丢下的那些怎么跟用户说：点名原文，也点名认下的是哪一个。
+_IGNORED_PRIORITY = "「{token}」被忽略了：同一行里写了多个优先级记号时，只认最后一个「{kept}」"
 
 
 @dataclass(frozen=True)
 class ParseDiagnostic:
-    """一小段输入没被解析出来。"""
+    """一小段输入要提醒用户的地方：没解析出来的，或者被忽略掉的重复优先级。"""
 
     token: str
     """输入里的原文，例如 ``"13-45"``（UI 可以据此高亮）。"""
 
     code: str
-    """机器可判定的原因：``"invalid_date"`` / ``"invalid_time"`` / ``"invalid_priority"``。"""
+    """机器可判定的原因：``"invalid_date"`` / ``"invalid_time"`` / ``"invalid_priority"`` /
+    ``"duplicate_priority"``（优先级记号不止一个，只认了最后一个，这条说的是被忽略的那个）。"""
 
     message: str
     """给用户看的一句话，自带 token。"""
@@ -137,13 +155,14 @@ class ParsedTask:
     """``True`` = 只写了日期没写时刻，按全天处理，只看 ``due.date()``。"""
 
     priority: int | None = None
-    """服务端优先级取值：低 ``1`` / 中 ``3`` / 高 ``5``；``None`` = 没写。"""
+    """服务端优先级取值：低 ``1`` / 中 ``3`` / 高 ``5``；``None`` = 没写。
+    一行里写了多个优先级记号时，这里是**最后一个能解析出来**的那个。"""
 
     tags: tuple[str, ...] = ()
     """``#标签`` 解析出来的标签，按出现顺序去重。"""
 
     diagnostics: tuple[ParseDiagnostic, ...] = ()
-    """没解析出来的部分；空 = 一切正常（没写日期也是正常的）。"""
+    """要提醒用户的地方；空 = 一切正常（没写日期也是正常的）。"""
 
 
 @dataclass(frozen=True)
@@ -171,30 +190,46 @@ def parse(text: str, now: datetime, day_end: str = "00:00") -> ParsedTask:
 
     dates = [m.value for m in marks if m.kind == _KIND_DATE and isinstance(m.value, date)]
     clocks = [m.value for m in marks if m.kind == _KIND_TIME and isinstance(m.value, time)]
-    priorities = [m.value for m in marks if m.kind == _KIND_PRIORITY and isinstance(m.value, int)]
+    priorities = [m for m in marks if m.kind == _KIND_PRIORITY and isinstance(m.value, int)]
     due, all_day = _when(day, dates[0] if dates else None, clocks[0] if clocks else None, now)
+    priority = priorities[-1] if priorities else None
 
     return ParsedTask(
         title=_title_of(text, marks),
         due=due,
         all_day=all_day,
-        priority=priorities[0] if priorities else None,
+        priority=priority.value if priority is not None else None,
         tags=tuple(dict.fromkeys(m.value for m in marks if m.kind == _KIND_TAG)),
-        diagnostics=_diagnostics_of(text, marks),
+        diagnostics=_diagnostics_of(text, marks, priority),
     )
 
 
-def _diagnostics_of(text: str, marks: list[_Mark]) -> tuple[ParseDiagnostic, ...]:
-    """没解析出来的片段，按在输入里出现的顺序各报一条。
+def _diagnostics_of(
+    text: str, marks: list[_Mark], priority: _Mark | None
+) -> tuple[ParseDiagnostic, ...]:
+    """要提醒用户的地方，按在输入里出现的顺序各报一条。
 
-    空元组 = 这行没写日期/时刻/优先级，属于正常；有内容 = 用户写了却没人认得，
-    消费方必须提示，不许静默提交。
+    两类：没解析出来的片段，和重复的优先级记号里被丢下的那些（``priority`` 是认下的那一个，
+    剩下的都算被忽略）。空元组 = 这行没写日期/时刻/优先级，属于正常；有内容 = 用户写了
+    却没人认得、或者写了多个只认了一个，消费方必须提示，不许静默提交。
     """
     reported: list[ParseDiagnostic] = []
     for mark in marks:
+        token = _text_of(text, mark)
+        if mark.kind == _KIND_PRIORITY and isinstance(mark.value, int):
+            if mark is not priority:
+                reported.append(
+                    ParseDiagnostic(
+                        token=token,
+                        code=_DUPLICATE_PRIORITY,
+                        message=_IGNORED_PRIORITY.format(
+                            token=token, kept=_text_of(text, priority)
+                        ),
+                    )
+                )
+            continue
         if mark.value is not None:
             continue
-        token = text[mark.start : mark.end]
         reported.append(
             ParseDiagnostic(
                 token=token,
@@ -203,6 +238,11 @@ def _diagnostics_of(text: str, marks: list[_Mark]) -> tuple[ParseDiagnostic, ...
             )
         )
     return tuple(reported)
+
+
+def _text_of(text: str, mark: _Mark | None) -> str:
+    """一个记号在输入里的原文；``None`` = 没有那个记号，就是空串。"""
+    return "" if mark is None else text[mark.start : mark.end]
 
 
 def _scan(text: str, label: date) -> list[_Mark]:
