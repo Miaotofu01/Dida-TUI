@@ -8,12 +8,15 @@ TUI 只通过 :class:`~dida.sync.engine.Engine` 读写；分组、排序、逾�
 
 from __future__ import annotations
 
+from typing import Callable
+
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.widgets import Footer
 
 from dida.sync.engine import Engine, UnknownTaskError, filter_groups
+from dida.tui.escape import open_in_browser, task_url
 from dida.tui.panes import (
     ConfirmScreen,
     DetailPane,
@@ -46,6 +49,25 @@ UNKNOWN_DELETE_MESSAGE = "没有删：这条任务已经不在本地缓存里了
 """
 
 
+NO_BROWSER_PREFIX = "打不开浏览器：把这条链接自己粘到浏览器里 "
+"""没有浏览器可用时那句话的开头（工单 #19）。
+
+与 :func:`no_browser_message` 分开写：测试要断的是「出声了没有」，而那句话后面还挂着
+一条随时会变的 URL。措辞里**不假装**有桌面客户端可以切——ADR-0002 已核实官方客户端
+不接受任务深链，所以这里只有浏览器这一条路。
+"""
+
+
+def no_browser_message(url: str) -> str:
+    """没有浏览器可用时状态栏里的话：说清楚打不开，并把 URL 原样给人抄（工单 #19）。
+
+    这里**绝不能**静默：完成在服务端不可逆（ADR-0002），``o`` 是它的补偿，按下去什么都
+    没发生比吵一句坏得多。也不说「重试一下就好」——``webbrowser`` 找不到浏览器时重试
+    还是找不到，用户该做的是自己把这条链接粘走。
+    """
+    return f"{NO_BROWSER_PREFIX}{url}"
+
+
 def delete_prompt(title: str) -> str:
     """删除确认浮层上的那句话（工单 #16）。
 
@@ -76,6 +98,9 @@ class DidaApp(App[None]):
         Binding("d", "delete", "删除"),
         Binding("p", "priority", "优先级"),
         Binding("/", "filter", "过滤"),
+        # 逃生舱（t19）：把光标下那一条交给系统浏览器。完成在服务端不可逆（ADR-0002），
+        # 官方客户端又不接受任务深链，所以按错之后唯一能走的路就是这个键。
+        Binding("o", "open", "浏览器"),
     ]
     CSS = """
     #panes {
@@ -100,9 +125,16 @@ class DidaApp(App[None]):
     }
     """
 
-    def __init__(self, engine: Engine) -> None:
+    def __init__(self, engine: Engine, *, open_url: Callable[[str], bool] = open_in_browser) -> None:
+        """``open_url`` 是**注入**的浏览器开手（工单 #19）。
+
+        生产默认值 :func:`~dida.tui.escape.open_in_browser` 会真的叫起系统浏览器；测试
+        塞一个假的进来，于是「交给浏览器的是哪条 URL」能当场断言，而没有一个标签页被
+        打开。它回 ``False`` 或抛异常都表示这台机器上开不了浏览器。
+        """
         super().__init__()
         self.engine = engine
+        self._open_url = open_url
         self._query = ""
         """当前生效的过滤词（空串 = 不过滤）。框里的原文由 :class:`FilterInput` 拿着。"""
 
@@ -347,3 +379,35 @@ class DidaApp(App[None]):
     def on_task_pane_selection_changed(self, event: TaskPane.SelectionChanged) -> None:
         """光标换了一条任务：右栏跟着换（过滤期间因此不会指着一个被筛掉的任务）。"""
         self.query_one(DetailPane).show(event.item)
+
+    # ---------------------------------------------------------------- 逃生舱（t19）
+
+    def action_open(self) -> None:
+        """``o``：把光标下那条任务交给系统浏览器（工单 #19）。
+
+        **只有浏览器这一条路。** ADR-0002 的「逃生舱的确切形态（已核实）」记着：官方
+        桌面客户端不接受任务深链（``dida365://`` 不存在、Linux 的 ``.desktop`` 没注册
+        协议处理器、主进程也不处理 argv），能做出来的就是厂商自己在「复制任务链接」里
+        生成的那条网页版路由。所以这里不试任何 ``xxx://``，也不假装能切到桌面 App。
+
+        URL 由 :func:`~dida.tui.escape.task_url` 拼（纯函数，含收集箱那条字面量替换），
+        清单 id 取**光标下那一条**的：TUI 不做判断，只把视图模型里已经有的事实交出去。
+
+        光标下没有任务就什么都不做——空屏上按键不该报错（与 ``x``/``g``/``e`` 同一条口径）。
+
+        交不出去时**必须出声**：完成在服务端不可逆，这个键是它的补偿，静默失败比吵一句
+        坏得多。两种失败都报同一句话（状态栏），并且把 URL 原样给人抄——``webbrowser``
+        找不到浏览器时抛 ``webbrowser.Error``，``open()`` 回 ``False`` 也是一种失败。
+        """
+        item = self.query_one(TaskPane).selected_item
+        if item is None:
+            return
+        url = task_url(item.list_id, item.task_id)
+        try:
+            opened = self._open_url(url)
+        except Exception:
+            # 开手当场抛（``webbrowser.Error`` 就是这一种）：按上面那条规矩如实说，
+            # 不让一个找不到浏览器的机器把整个界面带走。
+            opened = False
+        if not opened:
+            self.query_one(StatusBar).update(no_browser_message(url))
