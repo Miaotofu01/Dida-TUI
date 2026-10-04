@@ -22,7 +22,11 @@ class DidaApp(App[None]):
 
     ENABLE_COMMAND_PALETTE = False  # 命令面板会抢键；键位帮助归 t18
     # 非 priority：焦点在输入框里时 q 应当是普通字符（t15/t17 的输入框）
-    BINDINGS = [Binding("q", "quit", "退出")]
+    BINDINGS = [
+        Binding("q", "quit", "退出"),
+        Binding("g", "defer", "顺延"),
+        Binding("G", "defer_week", "顺延一周"),
+    ]
     CSS = """
     #panes {
         height: 1fr;
@@ -72,3 +76,23 @@ class DidaApp(App[None]):
     def update_status(self) -> None:
         """把引擎的状态刷进状态栏。t05/t09/t21 在数据变化后调用。"""
         self.query_one(StatusBar).update(format_status(self.engine.status()))
+
+    def action_defer(self) -> None:
+        """``g``：把光标下那条任务顺延到下一个逻辑日。"""
+        self._defer(days=1)
+
+    def action_defer_week(self) -> None:
+        """``G``：顺延到下周同一天（同一个星期几）。"""
+        self._defer(days=7)
+
+    def _defer(self, *, days: int) -> None:
+        """顺延光标下那条任务，然后重画。
+
+        落点由引擎按逻辑日算（TUI 不碰日界）；光标下没有任务就什么都不做——空屏上按键
+        不该报错。``days`` 是逻辑日数：``g`` 1 天、``G`` 7 天。
+        """
+        task_id = self.query_one(TaskPane).selected_task_id
+        if task_id is None:
+            return
+        self.engine.defer(task_id, days=days)
+        self.refresh_view()
