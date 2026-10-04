@@ -1,7 +1,9 @@
 """今日执行台的三栏外壳。
 
-TUI 只通过 :class:`~dida.sync.engine.SyncEngine` 读写；分组、排序、逾期判定
-全部留在引擎里，这里不做任何业务判断。内容由 t05/t18 替换。
+TUI 只通过 :class:`~dida.sync.engine.Engine` 读写；分组、排序、逾期判定、截止时间
+读法全部留在引擎里，这里只把视图模型画出来，不做任何业务判断。
+
+一启动就读本地缓存渲染（:meth:`DidaApp.refresh_view`）——网络不是这一屏的前置条件。
 """
 
 from __future__ import annotations
@@ -11,7 +13,7 @@ from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.widgets import Footer
 
-from dida.sync.engine import SyncEngine
+from dida.sync.engine import Engine
 from dida.tui.panes import DetailPane, ListPane, StatusBar, TaskPane, format_status
 
 
@@ -38,16 +40,13 @@ class DidaApp(App[None]):
     #detail-pane {
         width: 34;
     }
-    .pane-placeholder {
-        color: ansi_bright_black;
-    }
     #status-bar {
         height: 1;
         color: ansi_cyan;
     }
     """
 
-    def __init__(self, engine: SyncEngine) -> None:
+    def __init__(self, engine: Engine) -> None:
         super().__init__()
         self.engine = engine
 
@@ -60,6 +59,14 @@ class DidaApp(App[None]):
         yield StatusBar(id="status-bar")
 
     def on_mount(self) -> None:
+        self.refresh_view()
+        self.query_one(TaskPane).focus()  # 一进来 j/k 就能过任务；Tab 换到左栏
+
+    def refresh_view(self) -> None:
+        """读引擎的视图模型，重画三栏与状态栏。t09/t10/t11 在数据变化后调用。"""
+        view = self.engine.view()
+        self.query_one(ListPane).render_lists(view.lists)
+        self.query_one(TaskPane).render_groups(view.groups)
         self.update_status()
 
     def update_status(self) -> None:

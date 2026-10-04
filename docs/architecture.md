@@ -10,7 +10,7 @@
 | 1 | 配置与凭据 | `dida/config.py` | `Config`（`token` / `day_end` / `refresh_on_start` / `push_on_change` / `completed_window_hours`）、`config_path()`、`load_config()`、`save_config()`、`needs_token()`、`Credentials(transport=, path=).verify_and_store(token)`；失败是 `ConfigError` / `CredentialsError` | t03 已实现 |
 | 2 | 滴答 API 客户端 | `dida/api/` | `DidaApiClient(token=, transport=, base_url=)`：`list_projects(offset=, limit=)`、`get_project_data(project_id)`、`get_task(project_id, task_id)`、`list_tags()`、`list_completed(project_ids=, start_date=, end_date=)`、`create_task(body)`、`update_task(project_id, task_id, changes, snapshot=)`、`complete_task(project_id, task_id)`、`delete_task(project_id, task_id)`；失败一律是 `dida.api.errors.DidaError` 的子类（`NetworkError` / `AuthError` / `ServerRejectionError` / `FieldIgnoredError`，守卫另有 `InvalidDateError` / `DatelessRepeatError` / `MalformedResponseError`） | t07 已实现 |
 | 3 | 本地存储 | `dida/storage/store.py` | `Store`：清单、任务快照、待推送改动、同步状态；签名由 t08 定稿 | t08 |
-| 4 | 同步引擎 | `dida/sync/engine.py` | `SyncEngine(clock=)`、`status() -> SyncStatus`、`view()`（t05）、`refresh()`（t09）、`complete(task_id)`（t11）、`defer(task_id)`（t13） | t09/t10 实现 |
+| 4 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` | `SyncEngine(clock=, day_end=, source=)`、`status() -> SyncStatus`、`view() -> TodayView`、`refresh()`（t09）、`complete(task_id)`（t11）、`defer(task_id)`（t13）；视图模型与分组纯函数在 `dida/sync/view.py` | t05 定读路径、t09/t10 填数据 |
 | 5 | 逻辑日 | `dida/logical_day.py` | `logical_day(now, day_end) -> date` | t04 |
 | 6 | 日期解析器 | `dida/date_parser.py` | `parse(text) -> ParsedTask` | t06 |
 | 7 | TUI | `dida/tui/` | `DidaApp(engine)`；栏位 `#list-pane` / `#task-pane` / `#detail-pane` / `#status-bar`、`update_status()` | t05/t18 填内容 |
@@ -62,6 +62,41 @@ assert transport.last_json == {"title": "写周报"}      # 请求体字段
 另外两件事不走报错，走**原样回写**：时区与未知字段一律逐字节带回——写路径把服务端给的
 快照与本次改动合并后再发（`update_task(..., snapshot=)`），所以调用方递进来的那份快照
 越新越好。
+
+## 读路径：视图模型与内存假后端（t05 定稿）
+
+一启动就读本地缓存渲染，网络不是这一屏的前置条件。`view()` 的数据来源是注入的
+`dida.sync.view.ViewSource`（t08 的 `Store` 是生产实现，测试用 `dida.testing.InMemorySource`），
+类型分两组：
+
+```python
+# 输入（缓存 → 引擎），只有事实，没有判断
+ListSnapshot(id, name)                       # 一条清单
+TaskSnapshot(id, title, list_id, due, all_day, priority, completed)
+SyncState(last_refresh_at, pending_count)
+
+# 输出（引擎 → TUI），字段都是可以直接画的成品
+TodayView(lists: tuple[ListSummary, ...], groups: tuple[TaskGroup, ...])
+ListSummary(id, name, unfinished)            # 左栏的未完成条数徽标
+TaskGroup(kind: GroupKind, items)            # kind 是 OVERDUE / TODAY；title 与 count 由 kind 推出
+TaskItem(task_id, title, list_id, list_name, priority, priority_mark, due, all_day, due_text)
+```
+
+分组、排序、逾期判定、截止时间读法（「今天 18:00」「昨天 09:00」「3 天前」「—」）全在
+`dida.sync.view` 的纯函数里，TUI 只画字符串。两个已经踩过的坑：
+
+- 全天任务的 `due` 是**日期标记**（当天 00:00），不是时刻：`due_day()` 对它按日期算，
+  否则 `day_end = "04:00"` 时一个「今天」的全天任务会被算成昨天。
+- 没有截止时间的任务留在「今日」区（读作「—」），收集箱无日期区还没落地。
+
+接缝一的假后端在 `dida.testing.FakeBackend`：读委托给真引擎（分组行为跟生产同一份实现），
+写操作只记录（`refreshes` / `completed` / `deferred`）。TUI 测试一律这样搭：
+
+```python
+backend = FakeBackend(clock=ManualClock(T0), day_end="04:00")
+backend.add_task("写周报", list_name="工作", due=T0.replace(hour=18))
+app = DidaApp(backend)
+```
 
 ## 屏幕文本怎么断言
 
