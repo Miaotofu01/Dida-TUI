@@ -32,7 +32,7 @@ from dida.api.errors import (
 from dida.api.guards import (
     guard_writable,
     merge_snapshot,
-    normalize_dates,
+    prepare_completed_window_body,
     prepare_write_body,
 )
 from dida.api.transport import Transport
@@ -88,6 +88,8 @@ class DidaApiClient:
 
         日期窗口**只允许**用在这里（ADR 0001）：未完成任务永远是逐清单全量拉。
         三个字段都是可选的，没给就不写进请求体。服务端一次最多回 200 条。
+        窗口**两端**都过本地日期守卫，规则一致：合法字符串原样回写、带时区的
+        ``datetime`` 按自己的 offset 序列化、其余形式结构化报错（工单 #26）。
         """
         body: dict[str, Any] = {}
         if project_ids is not None:
@@ -97,7 +99,11 @@ class DidaApiClient:
         if end_date is not None:
             body["endDate"] = end_date
         response = await self._send(
-            self._request("POST", "/open/v1/task/completed", body=normalize_dates(body))
+            self._request(
+                "POST",
+                "/open/v1/task/completed",
+                body=prepare_completed_window_body(body),
+            )
         )
         return self._payload_array(response, endpoint="已完成流", item_keys=("id",))
 
