@@ -15,7 +15,7 @@ from __future__ import annotations
 
 import re
 from datetime import datetime
-from typing import Any, Mapping
+from typing import Any, Mapping, Sequence
 
 from dida.api.errors import DatelessRepeatError, FieldIgnoredError, InvalidDateError
 
@@ -26,11 +26,23 @@ _API_DATE_RE = re.compile(
     r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[+-]\d{2}:?\d{2}|Z)$"
 )
 
-#: 任务上的日期字段。``completedTime`` 也收：服务端给的、我们原样带回的值必须是合法的。
-DATE_FIELDS = ("startDate", "dueDate", "completedTime")
+#: 每一类请求体各自的日期字段清单。守卫按清单逐个校验，所以清单与请求体对不上时，
+#: 漏掉的那个字段就会带着 ``datetime`` 直奔 json 编码器（裸 ``TypeError``），或者带着
+#: 服务端会静默忽略的字符串发出去——工单 #26 就是 ``endDate`` 不在任何清单里。
 
-#: 子任务（``ChecklistItem``）上的日期字段。字段名照样是 ``startDate``，含义不同而已。
-ITEM_DATE_FIELDS = ("startDate",)
+#: 任务（``Task``）请求体上的日期字段。``completedTime`` 也收：服务端给的、我们原样带回的值必须是合法的。
+TASK_DATE_FIELDS = ("startDate", "dueDate", "completedTime")
+
+#: 旧名，保留兼容。
+DATE_FIELDS = TASK_DATE_FIELDS
+
+#: 子任务（``ChecklistItem``）请求体上的日期字段。字段名照样是 ``startDate``，含义不同而已；
+#: ``completedTime`` 与任务上的那个一样，是服务端给的、我们要原样带回的值。
+ITEM_DATE_FIELDS = ("startDate", "completedTime")
+
+#: 已完成流（``POST /open/v1/task/completed``）窗口的两端。两端与任务日期走同一套守卫，
+#: 只是清单不同：``endDate`` 不在任务字段里，曾经因此漏成裸 ``TypeError``（工单 #26）。
+COMPLETED_WINDOW_DATE_FIELDS = ("startDate", "endDate")
 
 #: 文档说 create / update **都不接受**的字段（api-contracts.md 第 5 条）。
 #: 写它们等于什么都没写：服务端静默忽略，用户以为完成了，其实没有（ADR 0002）。
@@ -83,20 +95,30 @@ def _fraction(value: datetime) -> str:
     return f".{value.microsecond // 1000:03d}"
 
 
-def normalize_dates(body: Mapping[str, Any]) -> dict[str, Any]:
+def normalize_dates(
+    body: Mapping[str, Any], *, fields: Sequence[str] = TASK_DATE_FIELDS
+) -> dict[str, Any]:
     """校验请求体里的日期字段；返回真正要发出去的那一份。
 
-    覆盖任务自己的日期字段（含 ``completedTime``：服务端给的、我们要原样带回的值）
-    和子任务（``items[]``）的 ``startDate`` —— 子任务的日期被静默丢掉是同一类 bug。
+    ``fields`` 是**这类请求体**上的日期字段清单（任务 / 子任务 / 已完成流窗口）：
+    调用方声明自己发的是哪一类，守卫就不会因为清单缺一个字段而放它过去。
+
+    任务请求体还会覆盖子任务（``items[]``）的日期字段 —— 子任务的日期被静默丢掉
+    是同一类 bug。
     """
     normalized = dict(body)
-    for field in DATE_FIELDS:
+    for field in fields:
         if normalized.get(field) is not None:
             normalized[field] = api_date(normalized[field], field=field)
     items = normalized.get("items")
     if isinstance(items, list):
         normalized["items"] = [_normalize_item(index, item) for index, item in enumerate(items)]
     return normalized
+
+
+def prepare_completed_window_body(body: Mapping[str, Any]) -> dict[str, Any]:
+    """已完成流窗口的守卫：``startDate`` / ``endDate`` 两端同一套规则（工单 #26）。"""
+    return normalize_dates(body, fields=COMPLETED_WINDOW_DATE_FIELDS)
 
 
 def _normalize_item(index: int, item: Any) -> Any:
