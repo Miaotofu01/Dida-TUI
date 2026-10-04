@@ -7,8 +7,8 @@
 
 | # | 模块 | 路径 | 公开接口 | 归属 |
 |---|---|---|---|---|
-| 1 | 配置与凭据 | `dida/config.py` | `Config`（`token` / `day_end` / `refresh_on_start` / `push_on_change` / `completed_window_hours`）、`config_path()`、`load_config()`、`save_config()` | t03 实现 |
-| 2 | 滴答 API 客户端 | `dida/api/` | `DidaApiClient(token=, transport=, base_url=)`、`await get_project_data(project_id)`、`await create_task(body)`；失败一律是 `dida.api.errors.DidaError` 的子类 | t07 补端点与守卫 |
+| 1 | 配置与凭据 | `dida/config.py` | `Config`（`token` / `day_end` / `refresh_on_start` / `push_on_change` / `completed_window_hours`）、`config_path()`、`load_config()`、`save_config()`、`needs_token()`、`Credentials(transport=, path=).verify_and_store(token)`；失败是 `ConfigError` / `CredentialsError` | t03 已实现 |
+| 2 | 滴答 API 客户端 | `dida/api/` | `DidaApiClient(token=, transport=, base_url=)`、`await list_projects()`、`await get_project_data(project_id)`、`await create_task(body)`；失败一律是 `dida.api.errors.DidaError` 的子类 | t07 补端点与守卫 |
 | 3 | 本地存储 | `dida/storage/store.py` | `Store`：清单、任务快照、待推送改动、同步状态；签名由 t08 定稿 | t08 |
 | 4 | 同步引擎 | `dida/sync/engine.py` | `SyncEngine(clock=)`、`status() -> SyncStatus`、`view()`（t05）、`refresh()`（t09）、`complete(task_id)`（t11）、`defer(task_id)`（t13） | t09/t10 实现 |
 | 5 | 逻辑日 | `dida/logical_day.py` | `logical_day(now, day_end) -> date` | t04 |
@@ -23,6 +23,7 @@
 ```
 bootstrap ─► tui ─► sync.engine ─► storage / api.client ─► api.transport ─► httpx
                     └─► clock（谁要「现在」就注入它）
+bootstrap ─► config ─► api.client（「列清单」验证凭据；失败一律结构化）
 ```
 
 - TUI 只许 import `dida.sync.engine` 和自己的 `dida.tui.*`；不许碰存储与 API 客户端，

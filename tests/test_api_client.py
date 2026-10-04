@@ -76,3 +76,16 @@ async def test_server_rejection_keeps_the_status_code():
         await client.create_task({"title": "写周报"})
 
     assert caught.value.status_code == 500
+
+
+async def test_list_projects_pins_method_url_and_auth_header():
+    transport = FakeTransport(json=[{"id": "inbox", "name": "收集箱"}])
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    projects = await client.list_projects()
+
+    request = transport.last_request
+    assert request.method == "GET"
+    assert str(request.url) == "https://api.dida365.com/open/v1/project"
+    assert request.headers["Authorization"] == "Bearer tok-123"
+    assert projects == [{"id": "inbox", "name": "收集箱"}]
