@@ -8,6 +8,7 @@ from dida.api.client import DidaApiClient
 from dida.api.errors import (
     AuthError,
     DatelessRepeatError,
+    DidaError,
     FieldIgnoredError,
     InvalidDateError,
     MalformedResponseError,
@@ -16,6 +17,7 @@ from dida.api.errors import (
 )
 from dida.testing import FakeTransport
 from datetime import datetime, timedelta, timezone
+from typing import Any
 import httpx
 import pytest
 
@@ -532,3 +534,191 @@ async def test_a_naive_datetime_is_rejected_rather_than_given_an_offset():
 
     assert caught.value.field == "dueDate"
     assert transport.requests == []
+
+
+# --- 2xx 但形状不对：一律结构化错误 -----------------------------------------
+#
+# 「2xx」只说明服务端没报错，不说明载荷是文档说的那个形状。清单被删、代理插了个数组、
+# 服务端改版漏字段——裸着往下走，调用方取字段时漏出的就是 AttributeError / KeyError /
+# TypeError，绕过整个 DidaError 族（工单 #24）。每个端点在这里声明自己期望的形状。
+
+
+async def test_a_non_object_project_data_payload_is_a_structured_error():
+    """``GET .../data`` 回了 ``200`` + ``[]``：结构化错误，不是取字段时的裸 AttributeError。"""
+    transport = FakeTransport(json=[])
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError) as caught:
+        await client.get_project_data("inbox")
+
+    assert caught.value.status_code == 200
+
+
+async def test_get_task_that_gets_an_array_is_a_structured_error():
+    transport = FakeTransport(json=[{"id": "t-1"}])
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError) as caught:
+        await client.get_task("inbox", "t-1")
+
+    assert caught.value.status_code == 200
+
+
+async def test_create_task_that_gets_an_array_is_a_structured_error():
+    transport = FakeTransport(json=[{"id": "t-1"}])
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError):
+        await client.create_task({"title": "写周报", "projectId": "inbox"})
+
+
+async def test_update_task_that_gets_an_array_is_a_structured_error():
+    transport = FakeTransport(json=[{"id": "t-1"}])
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError):
+        await client.update_task("inbox", "t-1", {"title": "写月报"})
+
+
+async def test_a_task_payload_without_an_id_is_a_structured_error():
+    """任务原文缺 ``id``：认不出是哪条任务，别让它在存储层变成裸 ``KeyError``。"""
+    transport = FakeTransport(json={"title": "写周报"})
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError):
+        await client.get_task("inbox", "t-1")
+
+
+async def test_project_data_whose_tasks_is_not_an_array_is_a_structured_error():
+    transport = FakeTransport(json={"project": {"id": "inbox"}, "tasks": {"t1": "写周报"}})
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError):
+        await client.get_project_data("inbox")
+
+
+async def test_a_task_inside_project_data_without_an_id_is_a_structured_error():
+    transport = FakeTransport(json={"project": {"id": "inbox"}, "tasks": [{"title": "写周报"}]})
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError):
+        await client.get_project_data("inbox")
+
+
+async def test_project_data_whose_project_is_not_an_object_is_a_structured_error():
+    transport = FakeTransport(json={"project": [{"id": "inbox"}], "tasks": []})
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError):
+        await client.get_project_data("inbox")
+
+
+async def test_project_data_may_leave_project_and_tasks_out():
+    """``project`` / ``tasks`` 缺席是合法数据（这个清单就是空的），不是形状错误。"""
+    transport = FakeTransport(json={"columns": []})
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    payload = await client.get_project_data("inbox")
+
+    assert payload == {"columns": []}
+
+
+async def test_no_endpoint_ever_leaks_a_bare_exception_on_a_wrong_shape():
+    """把契约按类钉死：2xx + 形状不对 ⇒ ``DidaError``，绝不漏裸异常给调用方。
+
+    逐个端点的例子在上面；这一条是横着扫一遍——任何端点、任何非预期载荷，
+    漏出来的都不许是 ``AttributeError`` / ``KeyError`` / ``TypeError``。
+    """
+    payloads: list[Any] = [
+        [],
+        {},
+        None,
+        "ok",
+        7,
+        {"project": [], "tasks": {}},
+        [{"name": "没有 id"}],
+    ]
+    calls = [
+        ("list_projects", lambda client: client.list_projects()),
+        ("list_tags", lambda client: client.list_tags()),
+        ("list_completed", lambda client: client.list_completed()),
+        ("get_project_data", lambda client: client.get_project_data("inbox")),
+        ("get_task", lambda client: client.get_task("inbox", "t-1")),
+        (
+            "create_task",
+            lambda client: client.create_task({"title": "写周报", "projectId": "inbox"}),
+        ),
+        ("update_task", lambda client: client.update_task("inbox", "t-1", {"title": "写月报"})),
+    ]
+
+    for payload in payloads:
+        for name, call in calls:
+            transport = FakeTransport(json=payload)
+            client = DidaApiClient(token="tok-123", transport=transport)
+            try:
+                await call(client)
+            except DidaError:
+                pass
+            except Exception as exc:  # 裸异常就是这条工单要挡的东西
+                pytest.fail(
+                    f"{name} 收到 {payload!r} 时漏出了裸 {type(exc).__name__}：{exc}"
+                )
+
+
+async def test_list_projects_that_gets_an_object_is_a_structured_error():
+    """清单索引本该是数组：一个 ``{}`` 被当成「没有清单」，用户看到的是整屏空，且不报错。"""
+    transport = FakeTransport(json={"id": "inbox", "name": "收集箱"})
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError) as caught:
+        await client.list_projects()
+
+    assert caught.value.status_code == 200
+
+
+async def test_a_project_entry_that_is_not_an_object_is_a_structured_error():
+    transport = FakeTransport(json=["inbox"])
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError):
+        await client.list_projects()
+
+
+async def test_a_project_without_an_id_is_a_structured_error():
+    transport = FakeTransport(json=[{"name": "收集箱"}])
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError):
+        await client.list_projects()
+
+
+async def test_list_tags_that_gets_an_object_is_a_structured_error():
+    transport = FakeTransport(json={"name": "工作"})
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError):
+        await client.list_tags()
+
+
+async def test_a_tag_without_a_name_is_a_structured_error():
+    transport = FakeTransport(json=[{"label": "工作", "sortOrder": 1}])
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError):
+        await client.list_tags()
+
+
+async def test_list_completed_that_gets_an_object_is_a_structured_error():
+    transport = FakeTransport(json={"tasks": []})
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError):
+        await client.list_completed()
+
+
+async def test_a_completed_task_without_an_id_is_a_structured_error():
+    transport = FakeTransport(json=[{"title": "写周报", "status": 2}])
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError):
+        await client.list_completed()

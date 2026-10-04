@@ -62,8 +62,9 @@ class DatelessRepeatError(FieldIgnoredError):
 
 
 class MalformedResponseError(DidaError):
-    """服务端回了 2xx，但响应体不是 JSON。
+    """服务端回了 2xx，但响应体不是文档说的那个形状。
 
-    代理的登录页、被截断的响应都会长这样。同样不把 ``json.JSONDecodeError``
-    这种裸异常抛给 UI。
+    两种都算：不是 JSON（代理的登录页、被截断的响应），或者是 JSON 但形状不对——
+    该是对象的地方给了数组、该是数组的地方给了对象、缺必需字段。``json.JSONDecodeError``
+    / ``AttributeError`` / ``KeyError`` 这种裸异常一个都不许抛给 UI。
     """
