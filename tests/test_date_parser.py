@@ -266,13 +266,18 @@ def test_priority_words_map_onto_the_server_scale():
     assert parse_at("交报告 !低").priority == 1
 
 
-def test_priority_digits_map_onto_the_server_scale():
-    """api-contracts.md 第 3 条：档位是 0/1/3/5，中 = 3 而不是 2，``!3`` 就是中。"""
-    assert parse_at("交报告 !1").priority == 1
-    assert parse_at("交报告 !2").priority == 3
-    assert parse_at("交报告 !3").priority == 3
-    assert parse_at("交报告 !5").priority == 5
-    assert parse_at("交报告 !0").priority == 0
+def test_priority_digits_are_tier_indices_not_server_values():
+    """issue #1：数字是**档位序号**——1=低、2=中、3=高，与 ``!低``/``!中``/``!高`` 一一对应。
+
+    服务端 ``priority`` 的线上编码 0/1/3/5 是另一套东西，只在 dida/api 边界出现：
+    所以 ``!3`` 解析出来是 5（高），不是 3。
+    """
+    for token, expected in (("!1", 1), ("!2", 3), ("!3", 5)):
+        parsed = parse_at(f"交报告 {token}")
+
+        assert parsed.priority == expected, token
+        assert parsed.title == "交报告"
+        assert parsed.diagnostics == ()
 
 
 def test_priority_is_taken_out_of_the_title():
@@ -282,12 +287,17 @@ def test_priority_is_taken_out_of_the_title():
     assert parsed.tags == ()
 
 
-def test_a_lone_bang_is_not_a_priority_attempt():
-    parsed = parse_at("好! 交报告")
+def test_a_bang_before_anything_else_is_ordinary_text():
+    """``!`` 后面既不是 高/中/低 也不是数字时，按普通文本处理。
 
-    assert parsed.priority is None
-    assert parsed.title == "好! 交报告"
-    assert parsed.diagnostics == ()
+    v1 不发明 ``!high`` 这类写法：认不出来就别装作认出来了，留在标题里用户看得见。
+    """
+    for text in ("好! 交报告", "!high 交报告", "交报告!"):
+        parsed = parse_at(text)
+
+        assert parsed.priority is None, text
+        assert parsed.diagnostics == (), text
+        assert parsed.title == text
 
 
 def test_tags_are_collected_in_order_and_glued_to_chinese_text():
@@ -358,6 +368,31 @@ def test_an_unknown_priority_is_reported():
     assert parsed.diagnostics[0].token == "!9"
     assert parsed.priority is None
     assert parsed.title == "交报告"
+
+
+def test_every_digit_outside_the_three_tiers_is_reported_not_swallowed():
+    """``!`` 后面是数字就一定是优先级记号，1/2/3 以外（含 ``0``、``4``、``5``）一律进诊断。
+
+    ``!5`` 不是「高」：5 是 API 的线上取值，不是用户能写的档位序号。也**没有**清除语法——
+    ``!0`` 同样只是没写成的记号，清除优先级是 ``p`` 键的事。
+    """
+    for token in ("!0", "!4", "!5", "!9", "!12"):
+        parsed = parse_at(f"交报告 {token}")
+
+        assert [d.code for d in parsed.diagnostics] == ["invalid_priority"], token
+        assert parsed.diagnostics[0].token == token
+        assert parsed.priority is None
+        assert parsed.title == "交报告"
+
+
+def test_the_priority_diagnostic_spells_out_the_legal_shorthands():
+    """诊断要自成一句，把合法写法列全——改这句文案就得先改这条测试。"""
+    parsed = parse_at("交报告 !5")
+
+    assert parsed.diagnostics[0].message == (
+        "「!5」不是一个能认出来的优先级："
+        "优先级只支持「!1」/「!2」/「!3」或「!高」/「!中」/「!低」"
+    )
 
 
 def test_every_failure_is_reported_in_the_order_it_was_written():
