@@ -114,10 +114,15 @@ class InMemorySource:
         completed: bool = False,
         id: str | None = None,
         completed_at: datetime | None = None,
+        desc: str = "",
+        content: str = "",
+        tags: tuple[str, ...] = (),
     ) -> TaskSnapshot:
         """加一条任务快照；``id`` 默认 ``t1``、``t2``……（按加入顺序）。
 
         ``completed_at`` 是服务端的完成时刻：已完成区（t12）按它决定谁在窗口里。
+        ``desc`` / ``content`` / ``tags`` 是右栏常驻显示的那三样（工单 #20）：替身照
+        ``Store`` 的口径把它们摆进快照，读路径因此与生产那一份走同一条。
         """
         self._seq += 1
         snapshot = TaskSnapshot(
@@ -129,6 +134,9 @@ class InMemorySource:
             priority=priority,
             completed=completed,
             completed_at=completed_at,
+            desc=desc,
+            content=content,
+            tags=tags,
         )
         self._lists.setdefault(snapshot.list_id, ListSnapshot(id=snapshot.list_id, name=list_name))
         self._tasks[snapshot.id] = snapshot

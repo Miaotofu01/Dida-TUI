@@ -75,6 +75,19 @@ class TaskSnapshot:
     completed_at: datetime | None = None
     """完成时刻（服务端的 ``completedTime``）；本地刚完成、服务端还没认过的那些是 ``None``。"""
 
+    desc: str = ""
+    """服务端的 ``desc``：这条任务的**描述**（工单 #20 的右栏要常驻显示它）。"""
+
+    content: str = ""
+    """服务端的 ``content``：这条任务的**备注/正文**。
+
+    ``api-contracts.md`` 的 ``Task`` 字段表里 ``desc`` 与 ``content`` 是两个字面不同的字段：
+    描述归描述、备注归备注，这里不合并、也不互相兜底——详情栏两行各画各的。
+    """
+
+    tags: tuple[str, ...] = ()
+    """服务端的 ``tags``：标签名，按服务端给的顺序。"""
+
 
 @dataclass(frozen=True)
 class SyncState:
@@ -122,6 +135,18 @@ class TaskItem:
     due: datetime | None
     all_day: bool
     due_text: str
+
+    desc: str = ""
+    """描述，原样来自快照（TUI 不解析它）。"""
+
+    content: str = ""
+    """备注/正文，原样来自快照。"""
+
+    tags_text: str = ""
+    """标签的成品读法（``#工作 #季度``，见 :func:`format_tags`）。
+
+    没有标签就是空串——「这一行要不要画」由这个空串回答，详情栏不自己判断有没有标签。
+    """
 
 
 @dataclass(frozen=True)
@@ -208,6 +233,15 @@ def list_names(lists: Sequence[ListSnapshot]) -> dict[str, str]:
     return names
 
 
+def format_tags(tags: Sequence[str]) -> str:
+    """标签的人类读法：``#工作 #季度``；没有标签就是空串。
+
+    ``#`` 是用户在日期解析器里写标签时用的那个记号（``交报告 #工作``），所以详情栏照它
+    画——引擎把读法算好（与 ``due_text`` / ``priority_mark`` 同一个口径），TUI 只画。
+    """
+    return " ".join(f"#{tag}" for tag in tags)
+
+
 def task_item(snapshot: TaskSnapshot, names: dict[str, str], *, now: datetime, day_end: str) -> TaskItem:
     """一条任务快照 → 一行成品。"""
     return TaskItem(
@@ -220,6 +254,9 @@ def task_item(snapshot: TaskSnapshot, names: dict[str, str], *, now: datetime, d
         due=snapshot.due,
         all_day=snapshot.all_day,
         due_text=format_due(snapshot.due, all_day=snapshot.all_day, now=now, day_end=day_end),
+        desc=snapshot.desc,
+        content=snapshot.content,
+        tags_text=format_tags(snapshot.tags),
     )
 
 

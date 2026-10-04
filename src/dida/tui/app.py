@@ -202,6 +202,11 @@ class DidaApp(App[None]):
         # 完成在服务端不可逆（ADR-0002）：x 在主键区下面那一行，与 j/k 隔着整行。防误按
         # 是这个动作唯一的补偿；footer 上带标签显示，看得见才按得准。
         Binding("x", "complete", "完成"),
+        # 键位表这一格是两个键：``x`` / ``Space``，做的是同一个「完成」。防误按的理由与 x
+        # 一字不差：它不在栏位的光标键位组里（j/k/↑/↓），也**不是** priority 绑定——焦点
+        # 在输入框里时空格仍然是空格（t15/t17 的新建、改期、过滤输入）。footer 上不重复
+        # 出现第二次：一个动作一行，两个键的说明都在键位帮助表里。
+        Binding("space", "complete", "完成", show=False),
         Binding("g", "defer", "顺延"),
         Binding("G", "defer_week", "顺延一周"),
         Binding("e", "reschedule", "改期"),
