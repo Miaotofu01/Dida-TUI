@@ -24,7 +24,8 @@ async def test_shell_renders_three_panes_and_the_status_bar():
     assert "清单" in text
     assert "今日" in text
     assert "详情" in text
-    assert "已同步 — · 待推送 0 · 逻辑日 —" in text
+    # 逻辑日由引擎按注入的时钟与 day_end 算出来：t5 起状态栏不再是「—」
+    assert "已同步 — · 待推送 0 · 逻辑日 03-14" in text
 
 
 async def test_q_quits_the_app():
