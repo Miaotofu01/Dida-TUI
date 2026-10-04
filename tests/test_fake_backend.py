@@ -17,10 +17,10 @@ def test_fake_backend_satisfies_the_engine_interface():
     assert isinstance(FakeBackend(clock=ManualClock(T0)), Engine)
 
 
-def test_fake_backend_records_the_write_calls_later_tickets_assert_on():
+async def test_fake_backend_records_the_write_calls_later_tickets_assert_on():
     backend = FakeBackend(clock=ManualClock(T0))
 
-    backend.refresh()
+    await backend.refresh()
     backend.complete("t1")
     backend.defer("t2")
 

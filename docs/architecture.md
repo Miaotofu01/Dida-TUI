@@ -10,7 +10,7 @@
 | 1 | 配置与凭据 | `dida/config.py` | `Config`（`token` / `day_end` / `refresh_on_start` / `push_on_change` / `completed_window_hours`）、`config_path()`、`load_config()`、`save_config()`、`needs_token()`、`Credentials(transport=, path=).verify_and_store(token)`；失败是 `ConfigError` / `CredentialsError` | t03 已实现 |
 | 2 | 滴答 API 客户端 | `dida/api/` | `DidaApiClient(token=, transport=, base_url=)`：`list_projects(offset=, limit=)`、`get_project_data(project_id)`、`get_task(project_id, task_id)`、`list_tags()`、`list_completed(project_ids=, start_date=, end_date=)`、`create_task(body)`、`update_task(project_id, task_id, changes, snapshot=)`、`complete_task(project_id, task_id)`、`delete_task(project_id, task_id)`；失败一律是 `dida.api.errors.DidaError` 的子类（`NetworkError` / `AuthError` / `ServerRejectionError` / `FieldIgnoredError`，守卫另有 `InvalidDateError` / `DatelessRepeatError` / `MalformedResponseError`） | t07 已实现 |
 | 3 | 本地存储 | `dida/storage/store.py` | `Store`：清单、任务快照、待推送改动、同步状态；签名由 t08 定稿 | t08 |
-| 4 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` | `SyncEngine(clock=, day_end=, source=)`、`status() -> SyncStatus`、`view() -> TodayView`、`refresh()`（t09）、`complete(task_id)`（t11）、`defer(task_id)`（t13）；视图模型与分组纯函数在 `dida/sync/view.py` | t05 定读路径、t09/t10 填数据 |
+| 4 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` | `SyncEngine(clock=, day_end=, source=, client=)`、`status() -> SyncStatus`、`view() -> TodayView`、`refresh() -> RefreshReport`（**async**，t09）、`complete(task_id)`（t11）、`defer(task_id)`（t13）；视图模型与分组纯函数在 `dida/sync/view.py` | t05 定读路径、t09/t10 填数据 |
 | 5 | 逻辑日 | `dida/logical_day.py` | `logical_day(now, day_end) -> date` | t04 |
 | 6 | 日期解析器 | `dida/date_parser.py` | `parse(text) -> ParsedTask` | t06 |
 | 7 | TUI | `dida/tui/` | `DidaApp(engine)`；栏位 `#list-pane` / `#task-pane` / `#detail-pane` / `#status-bar`、`update_status()` | t05/t18 填内容 |
@@ -97,6 +97,19 @@ backend = FakeBackend(clock=ManualClock(T0), day_end="04:00")
 backend.add_task("写周报", list_name="工作", due=T0.replace(hour=18))
 app = DidaApp(backend)
 ```
+
+## 写路径：全量刷新（t09，ADR-0001）
+
+`await engine.refresh() -> RefreshReport`：先 `GET /open/v1/project` 拿清单索引（服务端说了算），
+再逐个清单 `GET /open/v1/project/{id}/data`——**未完成任务只能这样拉**，日期窗口会静默漏掉
+「日期在很久以后、但刚被改过」的任务（ADR-0001）。全部取回之后才 `apply_refresh` 落库，所以中途
+失败不会留下半份刷新；返回的 `RefreshReport` 里 `written_lists` / `written_tasks` 是这次真正写了
+几行，同一份数据拉第二次时两个都是 0（界面不闪、光标不丢），`overwritten` / `suppressed` 是
+服务端权威盖掉了什么、哪些被待推送改动挡回去了。
+
+它是 **async** 的：网络等待不能阻塞界面，而 t08 的 `Store` 用的是普通 sqlite 连接（线程亲和），
+写必须发生在创建连接的那个线程上。异步协程跑在事件循环同一个线程里，两条同时满足——**不许**
+把刷新丢进 `threading.Thread` 工人（t08 故意没开 `check_same_thread=False`，也没加锁）。
 
 ## 屏幕文本怎么断言
 
