@@ -1,0 +1,317 @@
+"""同步引擎的写路径（t10）：乐观写 → 待推送改动 → 指数退避重试。
+
+接缝是 ``SyncEngine`` 的两个公开入口：``write()``（写）与 ``push_pending()``（推），
+接真的 ``Store``（t08）与真的 ``DidaApiClient``（t07）。网络钉在**接缝二**（传输层可注入）上，
+所以这里断言的是「引擎发了哪些请求、请求体长什么样」与「本地库、视图、状态栏看到什么」，
+不碰任何私有方法，也不 mock 我们自己的模块。
+
+钉死的规矩（ADR-0002 + CONTEXT）：
+
+- 写先在本地生效并**立即返回**，网络结果不是它的前置条件；
+- 推失败留在队列里，按**注入的时钟**指数退避重试——没有 ``time.sleep``、没有真时钟、
+  也没有测试管不住的线程；
+- 待推送数量是状态栏常驻的那一个数，它从 0 变 1，推成功后再变回 0。
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timedelta, timezone
+
+import httpx
+import pytest
+
+from dida.api.client import DidaApiClient
+from dida.api.errors import NetworkError
+from dida.storage.store import ChangeKind, Store
+from dida.sync.engine import SyncEngine, WriteKind, backoff_delay
+from dida.testing import FakeTransport, InMemorySource, ManualClock
+
+TZ = timezone(timedelta(hours=8))
+
+
+def at(day: int, hour: int = 0, minute: int = 0) -> datetime:
+    """2026-03 里的一个时刻（带时区）。"""
+    return datetime(2026, 3, day, hour, minute, tzinfo=TZ)
+
+
+T0 = at(14, 12, 3)
+
+
+@pytest.fixture
+def store(tmp_path):
+    """指向临时文件的库；关掉时不留句柄。"""
+    opened = Store(tmp_path / "dida.sqlite3")
+    yield opened
+    opened.close()
+
+
+def project(id: str = "work", name: str = "工作") -> dict:
+    """一份 ``GET /open/v1/project`` 那样的清单原文。"""
+    return {"id": id, "name": name, "sortOrder": 1}
+
+
+def task(id: str = "t1", title: str = "写周报", project_id: str = "work", **extra: object) -> dict:
+    """一份 ``GET /open/v1/project/{id}/data`` 那样的任务原文。"""
+    return {"id": id, "projectId": project_id, "title": title, "status": 0, **extra}
+
+
+def inbox() -> dict:
+    """收集箱：API 里用字面量 ``"inbox"`` 这个 projectId。"""
+    return {"id": "inbox", "name": "收集箱", "sortOrder": 0}
+
+
+def seed(store: Store, *tasks: dict, lists: list[dict] | None = None) -> None:
+    """直接把一份缓存摆进库里（写路径的测试不必先跑一遍刷新）。"""
+    store.apply_refresh(
+        lists=lists if lists is not None else [inbox(), project()],
+        tasks=list(tasks),
+    )
+
+
+def make_engine(
+    store: Store,
+    transport: FakeTransport | None = None,
+    *,
+    now: datetime = T0,
+    clock: ManualClock | None = None,
+) -> SyncEngine:
+    """接上真存储；给了传输就同时接上真客户端。"""
+    return SyncEngine(
+        clock=clock if clock is not None else ManualClock(now),
+        source=store,
+        client=None if transport is None else DidaApiClient(token="tok", transport=transport),
+    )
+
+
+def titles(engine: SyncEngine) -> list[str]:
+    """视图里看得见的任务标题（用户真正看到的那一份）。"""
+    return [item.title for group in engine.view().groups for item in group.items]
+
+
+def test_a_write_lands_locally_and_queues_immediately(store):
+    """乐观写：本地当场生效、改动入队、``created_at`` 来自注入的钟。
+
+    这一条是同步的（没有事件循环）：写路径里**没有**任何东西需要等网络。
+    """
+    seed(store, task(id="t1", title="写周报", project_id="work"))
+    engine = make_engine(store)
+
+    engine.write("t1", changes={"title": "写周报（我改的）"})
+
+    assert titles(engine) == ["写周报（我改的）"]
+    assert store.task_payload("t1")["title"] == "写周报（我改的）"
+    assert engine.status().pending_count == 1, "状态栏常驻的那个数必须已经变了"
+    queued = store.pending()
+    assert [(change.task_id, change.list_id, change.kind) for change in queued] == [
+        ("t1", "work", ChangeKind.UPDATE)
+    ]
+    assert queued[0].payload == {"title": "写周报（我改的）"}
+    assert queued[0].created_at == T0, "入队时刻来自注入的钟，不是 datetime.now()"
+
+
+def test_a_write_without_a_cache_fails_loudly(store):
+    """没接本地库的引擎不许假装写成功了（与刷新路径同一条口径）。"""
+    engine = SyncEngine(clock=ManualClock(T0), source=InMemorySource())
+
+    with pytest.raises(RuntimeError, match="本地存储"):
+        engine.write("t1", changes={"title": "写周报"})
+
+
+async def test_the_queued_update_is_pushed_with_the_unknown_fields_still_on_it(store):
+    """队列里的改动真的发得出去，且**原样回写不认识的服务端字段**。
+
+    请求形状按 ``api-contracts.md`` 钉：更新是 ``POST /open/v1/task/{taskId}``（没有 PATCH），
+    请求体至少要有 ``id`` 与 ``projectId``。``kind`` / ``reminders`` 这种 t07 不认识的字段
+    必须跟着底稿一起回去（CONTEXT 的 trap 第 4 条：不认识的字段丢了，手机端设置的东西就没了）。
+    """
+    transport = FakeTransport()
+    transport.enqueue(httpx.Response(200, json={}))
+    seed(
+        store,
+        task(
+            id="t1",
+            title="写周报",
+            project_id="work",
+            kind="TEXT",
+            reminders=["TRIGGER:P0DT9H0M0S"],
+        ),
+    )
+    engine = make_engine(store, transport)
+
+    engine.write("t1", changes={"title": "写周报（我改的）"})
+    await engine.wait_for_pushes()
+
+    request = transport.last_request
+    assert request.method == "POST"
+    assert str(request.url) == "https://api.dida365.com/open/v1/task/t1"
+    assert request.headers["Authorization"] == "Bearer tok"
+    body = transport.last_json
+    assert body["id"] == "t1"
+    assert body["projectId"] == "work"
+    assert body["title"] == "写周报（我改的）"
+    assert body["kind"] == "TEXT", "不认识的服务端字段必须原样回写"
+    assert body["reminders"] == ["TRIGGER:P0DT9H0M0S"]
+    assert "status" not in body, "status 不是新建/更新接受的字段（api-contracts 第 5 条）"
+
+    assert len(transport.requests) == 1, "队列里的那条改动推了一次"
+    assert store.pending() == (), "推成功就出队"
+    assert engine.status().pending_count == 0, "状态栏那个数回到 0"
+
+
+async def test_a_write_schedules_the_push_without_making_the_caller_wait(store):
+    """ADR-0002 的「立即推送」：写的人不等网络，但推送确实被排上了。
+
+    ``write()`` 返回时一个请求都还没发出去——网络不是这次写的前置条件；推送排在事件循环
+    那根线程上（不是新线程：t08 的连接有线程亲和）。测试用确定性入口 ``wait_for_pushes()``
+    等它跑完，生产路径上没有人 await 它。
+    """
+    transport = FakeTransport()
+    transport.enqueue(httpx.Response(200, json={}))
+    seed(store, task(id="t1", title="写周报"))
+    engine = make_engine(store, transport)
+
+    engine.write("t1", changes={"title": "写周报（我改的）"})
+
+    assert transport.requests == [], "写返回的那一刻还没碰网络"
+    assert engine.status().pending_count == 1
+
+    await engine.wait_for_pushes()
+
+    assert len(transport.requests) == 1, "推送被排上了，只是不等它"
+    assert engine.status().pending_count == 0
+
+
+async def test_a_failed_push_stays_queued_until_the_clock_reaches_the_backoff(store):
+    """推失败：改动留在队列里、错误与下次重试时刻都记下，状态栏那个数不归零。
+
+    「等多久」按失败次数指数增长（2s、4s…），全部由注入的钟判定：钟没走到点一次都不许
+    再发，走到了才发。没有 ``time.sleep``、没有真时钟、也没有测试管不住的线程。
+    """
+    transport = FakeTransport()
+    transport.enqueue(NetworkError("连不上"))
+    transport.enqueue(NetworkError("还是连不上"))
+    transport.enqueue(httpx.Response(200, json={}))
+    seed(store, task(id="t1", title="写周报"))
+    clock = ManualClock(T0)
+    engine = make_engine(store, transport, clock=clock)
+
+    engine.write("t1", changes={"title": "写周报（我改的）"})
+    await engine.wait_for_pushes()
+
+    queued = store.pending()
+    assert len(queued) == 1, "推不动就留在队列里，不许悄悄丢掉"
+    assert queued[0].attempts == 1
+    assert queued[0].next_retry_at == T0 + timedelta(seconds=2), "第一次失败等 2 秒"
+    assert "连不上" in (queued[0].last_error or "")
+    assert engine.status().pending_count == 1, "本地比服务端新，这个数就是给用户看的"
+    assert titles(engine) == ["写周报（我改的）"], "推失败不许撤销用户刚做的操作"
+
+    assert await engine.push_pending() == 0, "还没到点：一次都不许再发"
+    assert len(transport.requests) == 1
+
+    clock.advance(timedelta(seconds=2))
+    assert await engine.push_pending() == 0, "到点重试了，但这次还是失败"
+
+    queued = store.pending()
+    assert len(transport.requests) == 2, "到点才重试，而且只重试一次"
+    assert queued[0].attempts == 2
+    assert queued[0].next_retry_at == T0 + timedelta(seconds=2 + 4), "第二次失败等 4 秒"
+
+    clock.advance(timedelta(seconds=4))
+
+    assert await engine.push_pending() == 1, "钟走到点，第三次才成功"
+    assert len(transport.requests) == 3
+    assert store.pending() == ()
+    assert engine.status().pending_count == 0, "重试成功后这个数才回到 0"
+
+
+def test_backoff_doubles_each_attempt_and_stops_at_the_cap():
+    """退避的节奏是纯函数，直接钉住：2s、4s、8s…最多 5 分钟。
+
+    期望值来自策略本身（写在这里的字面量），不是照代码再算一遍。
+    """
+    assert [backoff_delay(n).total_seconds() for n in range(5)] == [2, 4, 8, 16, 32]
+    assert backoff_delay(20) == timedelta(minutes=5), "封顶，不许涨到天上去"
+    assert backoff_delay(0) == timedelta(seconds=2)
+
+
+async def test_completing_through_the_write_path_uses_the_complete_endpoint(store):
+    """完成：本地**当场**标记完成（从今日视图里消失），推送走无请求体的 complete 端点。
+
+    ADR-0002：完成在服务端不可逆，所以本地先动、状态栏那个数顶上；``status`` 是
+    ``2`` 而不是 ``1``（api-contracts.md 第 2 条），且它不会进任何请求体（同第 5 条）。
+    """
+    transport = FakeTransport()
+    transport.enqueue(httpx.Response(200))
+    seed(store, task(id="t1", title="写周报"))
+    engine = make_engine(store, transport)
+
+    engine.write("t1", kind=WriteKind.COMPLETE)
+
+    assert titles(engine) == [], "本地当场就不再是未完成"
+    assert store.task_payload("t1")["status"] == 2
+    assert engine.status().pending_count == 1
+
+    await engine.wait_for_pushes()
+
+    request = transport.last_request
+    assert request.method == "POST"
+    assert str(request.url) == "https://api.dida365.com/open/v1/project/work/task/t1/complete"
+    assert request.content == b"", "完成端点没有请求体"
+    assert engine.status().pending_count == 0
+
+
+async def test_deleting_through_the_write_path_uses_the_delete_verb(store):
+    """删除：本地当场摘掉快照，推送是 ``DELETE /open/v1/project/{id}/task/{taskId}``。
+
+    没推成功的删除整条豁免于服务端权威（t08 的 ``_exempt_fields`` 返回 ``None``），
+    否则下一次刷新会让用户删掉的任务复活。
+    """
+    transport = FakeTransport()
+    transport.enqueue(httpx.Response(200, json={}))
+    seed(store, task(id="t1", title="写周报"))
+    engine = make_engine(store, transport)
+
+    engine.write("t1", kind=WriteKind.DELETE)
+
+    assert titles(engine) == []
+    assert store.task_payload("t1") is None
+
+    await engine.wait_for_pushes()
+
+    request = transport.last_request
+    assert request.method == "DELETE"
+    assert str(request.url) == "https://api.dida365.com/open/v1/project/work/task/t1"
+    assert engine.status().pending_count == 0
+
+
+async def test_one_failed_change_does_not_block_the_next_one(store):
+    """队列按发生顺序走完：一条推不动，后面的照推。
+
+    失败的那条自己留在队列里等退避（ADR-0002），不该把用户后面做的操作一起拖住。
+    """
+    transport = FakeTransport()
+    transport.enqueue(NetworkError("连不上"))
+    transport.enqueue(httpx.Response(200, json={}))
+    seed(store, task(id="t1", title="写周报"), task(id="t2", title="买牛奶"))
+    engine = make_engine(store, transport)
+
+    engine.write("t1", changes={"title": "写周报（我改的）"})
+    engine.write("t2", changes={"title": "买牛奶（我改的）"})
+    await engine.wait_for_pushes()
+
+    assert [str(request.url) for request in transport.requests] == [
+        "https://api.dida365.com/open/v1/task/t1",
+        "https://api.dida365.com/open/v1/task/t2",
+    ]
+    assert [change.task_id for change in store.pending()] == ["t1"], "只有失败的那条留在队列里"
+    assert engine.status().pending_count == 1
+    assert set(titles(engine)) == {"写周报（我改的）", "买牛奶（我改的）"}, "两条本地都生效了"
+
+
+async def test_pushing_without_a_client_fails_loudly(store):
+    """没接客户端的引擎不许假装推过了。"""
+    engine = SyncEngine(clock=ManualClock(T0), source=store)
+
+    with pytest.raises(RuntimeError, match="API 客户端"):
+        await engine.push_pending()

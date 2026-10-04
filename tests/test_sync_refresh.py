@@ -15,7 +15,7 @@ import httpx
 import pytest
 
 from dida.api.client import DidaApiClient
-from dida.api.errors import MalformedResponseError, ServerRejectionError
+from dida.api.errors import MalformedResponseError, NetworkError, ServerRejectionError
 from dida.storage.store import ChangeKind, RefreshReport, Store
 from dida.sync.engine import SyncEngine
 from dida.testing import FakeTransport, InMemorySource, ManualClock
@@ -59,10 +59,17 @@ def store(tmp_path):
     opened.close()
 
 
-def make_engine(store, transport, *, now: datetime = T0, day_end: str = "24:00") -> SyncEngine:
-    """接上真存储与真客户端（网络走假传输）。"""
+def make_engine(
+    store,
+    transport,
+    *,
+    now: datetime = T0,
+    day_end: str = "24:00",
+    clock: ManualClock | None = None,
+) -> SyncEngine:
+    """接上真存储与真客户端（网络走假传输）。``clock`` 传进来就能摆布「现在」。"""
     return SyncEngine(
-        clock=ManualClock(now),
+        clock=clock if clock is not None else ManualClock(now),
         day_end=day_end,
         source=store,
         client=DidaApiClient(token="tok", transport=transport),
@@ -329,6 +336,49 @@ async def test_a_pending_change_survives_a_full_refresh(store):
     assert [(item.task_id, item.field, item.local, item.server) for item in report.suppressed] == [
         ("t1", "title", "写周报（我改的）", "写周报")
     ]
+
+
+async def test_a_failed_push_survives_a_full_refresh_and_then_succeeds(store):
+    """写路径与刷新路径的闭环（t10 + ADR-0002）：一次推失败 + 一次全量刷新之后，
+    队列、本地值、状态栏那个数**一样都不能少**；钟走到点，重试成功才归零。
+
+    t08 的豁免是逐字段的，这里把它变成用户看得见的行为：视图里还是本地那份，
+    覆盖（``suppressed``）在报告里留痕——服务端权威被挡回去了，这件事不静默。
+    """
+    clock = ManualClock(T0)
+    transport = FakeTransport()
+    index = [inbox(), project()]
+    payload = [
+        data(inbox()),
+        data(project(), [task(title="写周报", dueDate="2026-03-14T18:00:00+0800")]),
+    ]
+    serve(transport, index=index, data=payload)
+    engine = make_engine(store, transport, clock=clock)
+    await engine.refresh()
+
+    transport.enqueue(NetworkError("连不上"))
+    engine.write("t1", changes={"title": "写周报（我改的）"})
+    await engine.wait_for_pushes()
+    assert engine.status().pending_count == 1
+
+    serve(transport, index=index, data=payload)  # 服务端还是旧值
+    report = await engine.refresh()
+
+    assert engine.status().pending_count == 1, "刷新不许把还没推成功的改动弄丢"
+    assert [item.title for group in engine.view().groups for item in group.items] == ["写周报（我改的）"]
+    assert store.task_payload("t1")["title"] == "写周报（我改的）"
+    assert [(item.task_id, item.field, item.local, item.server) for item in report.suppressed] == [
+        ("t1", "title", "写周报（我改的）", "写周报")
+    ]
+
+    transport.enqueue(httpx.Response(200, json={}))
+    clock.advance(timedelta(seconds=2))
+
+    assert await engine.push_pending() == 1
+
+    assert transport.last_json["title"] == "写周报（我改的）"
+    assert store.pending() == ()
+    assert engine.status().pending_count == 0, "推成功了才回到 0"
 
 
 async def test_the_inbox_is_fetched_even_when_the_project_index_omits_it(store):
