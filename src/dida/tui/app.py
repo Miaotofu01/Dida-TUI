@@ -13,6 +13,7 @@ from typing import Callable
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Horizontal
+from textual.events import Resize
 from textual.widgets import Footer
 
 from dida.sync.engine import Engine, UnknownTaskError, filter_groups
@@ -20,13 +21,19 @@ from dida.tui.escape import open_in_browser, task_url
 from dida.tui.panes import (
     ConfirmScreen,
     DetailPane,
+    DetailScreen,
     FilterInput,
+    HelpScreen,
     ListPane,
+    ListsScreen,
     QuickAddInput,
     RescheduleInput,
     StatusBar,
     TaskPane,
+    detail_body,
     format_status,
+    key_help_body,
+    lists_body,
 )
 
 FLASH_SECONDS = 0.45
@@ -79,10 +86,35 @@ def delete_prompt(title: str) -> str:
     return f"删除「{title}」？\n删掉就找不回来了，滴答清单没有回收站。\n\ny 确认删除 · n / Esc 取消"
 
 
+WIDE_MIN_WIDTH = 110
+"""三栏常驻的最小列数（工单 #18）。"""
+
+MEDIUM_MIN_WIDTH = 80
+"""收掉左栏的最小列数：比这更窄就连清单也进浮层。"""
+
+
+def pane_tier(width: int) -> str:
+    """按终端列数分档（工单 #18）：``wide`` / ``medium`` / ``narrow``。
+
+    - ``wide``（≥110）：三栏常驻。
+    - ``medium``（80–109）：收起右栏，``Enter`` 以浮层打开详情。
+    - ``narrow``（<80）：再收起左栏，清单也进浮层。
+
+    纯函数：宽度进来、档位出去。分档是布局的事，跟终端里有什么数据无关，所以它在这里
+    而不是在引擎里——也不需要在测试里开一个 app 才能问「95 列算哪一档」。
+    """
+    if width >= WIDE_MIN_WIDTH:
+        return "wide"
+    if width >= MEDIUM_MIN_WIDTH:
+        return "medium"
+    return "narrow"
+
+
 class DidaApp(App[None]):
     """三栏 + 状态栏。"""
 
     ENABLE_COMMAND_PALETTE = False  # 命令面板会抢键；键位帮助归 t18
+
     # 非 priority：焦点在输入框里时 q 应当是普通字符（t15/t17 的输入框）
     BINDINGS = [
         Binding("q", "quit", "退出"),
@@ -101,7 +133,23 @@ class DidaApp(App[None]):
         # 逃生舱（t19）：把光标下那一条交给系统浏览器。完成在服务端不可逆（ADR-0002），
         # 官方客户端又不接受任务深链，所以按错之后唯一能走的路就是这个键。
         Binding("o", "open", "浏览器"),
+        # 右栏详情的开合（t18）。三档语义一致：右栏在屏上就收放它，收起了就弹浮层。
+        # 不抢输入框：焦点在 Input 里时 Enter 归 Input（提交），到不了这里。
+        Binding("enter", "toggle_detail", "详情"),
+        # 清单浮层（t18）。窄档（<80 列）左栏不在屏上，清单只能从这里看；
+        # 更宽的两档左栏本来就在，这个键照样能开——同一个键在哪里都做同一件事。
+        Binding("l", "lists", "清单"),
+        # 键位帮助（t18）。footer 只显示得下头几个键，这张表才是找键的地方。
+        Binding("question_mark", "help", "帮助"),
     ]
+
+    _tier = "wide"
+    """当前宽度档位（工单 #18）：``wide`` / ``medium`` / ``narrow``。``on_mount`` 与
+    ``on_resize`` 各算一次。"""
+
+    _detail_open = True
+    """右栏详情是不是开着。``Enter`` 开合它（工单 #18）：宽档下它决定右栏在不在屏上，
+    更窄的两档里它不参与布局——那两档的详情走浮层。尺寸变化后保留这个姿势，不重置。"""
     CSS = """
     #panes {
         height: 1fr;
@@ -154,8 +202,33 @@ class DidaApp(App[None]):
         yield StatusBar(id="status-bar")
 
     def on_mount(self) -> None:
+        self._apply_tier(self.size.width)
         self.refresh_view()
         self.query_one(TaskPane).focus()  # 一进来 j/k 就能过任务；Tab 换到左栏
+
+    # ---------------------------------------------------------------- 窄屏降级（t18）
+
+    def on_resize(self, event: Resize) -> None:
+        """窗口换了大小就重新分档（验收标准 #7：不用重启）。
+
+        拖动窗口、切分屏、Rotate 手机终端都会走到这里。分档只看宽度，所以重新分一次
+        是幂等的——档位没变时 :meth:`_apply_tier` 也不动屏幕上的东西。
+
+        宽度取 ``event.size`` 而**不是** ``self.size``：事件派发到这儿的时候 app 自己的
+        尺寸还没更新，读 ``self.size`` 拿到的是上一档的宽度，于是拖窄之后一直停在旧档位。
+        """
+        self._apply_tier(event.size.width)
+
+    def _apply_tier(self, width: int) -> None:
+        """按 ``width`` 列把三栏收放到位（工单 #18）。
+
+        右栏在 ``wide`` 档由 :attr:`_detail_open` 决定（``Enter`` 开合）；在更窄的两档
+        一律收起来，``Enter`` 改成弹浮层——所以窄档下这里显示的是 ``False``，浮层归
+        :meth:`action_toggle_detail` 管。
+        """
+        self._tier = pane_tier(width)
+        self.query_one("#list-pane").display = self._tier != "narrow"
+        self.query_one("#detail-pane").display = self._tier == "wide" and self._detail_open
 
     def action_complete(self) -> None:
         """完成光标下的任务并立即推送（`x`）。
@@ -411,3 +484,47 @@ class DidaApp(App[None]):
             opened = False
         if not opened:
             self.query_one(StatusBar).update(no_browser_message(url))
+
+    # ---------------------------------------------------------------- 详情开合（t18）
+
+    def action_toggle_detail(self) -> None:
+        """``Enter``：开合右栏详情（工单 #18，验收标准 #4）。
+
+        三档一个语义、两种落地：
+
+        - 右栏**在屏上**（≥110 列）：就地收起 / 显示。收起是用户自己按的，是一时的姿势，
+          所以尺寸变化不重置它（与已完成区的展开同一条口径）。
+        - 右栏**不在屏上**（<110 列）：把当前任务的详情作为浮层弹出来；再按一次 ``Enter``
+          由 :class:`~dida.tui.panes.DetailScreen` 自己收起来（``Esc`` 也一样）。
+
+        浮层里的内容是**按下那一刻**光标下那条的详情：浮层是模态的，j/k 到不了任务列，
+        所以它不会在开着的时候偷偷换成别的任务。
+        """
+        if isinstance(self.screen, DetailScreen):
+            self.screen.dismiss(None)
+            return
+        if self._tier == "wide":
+            self._detail_open = not self._detail_open
+            self.query_one("#detail-pane").display = self._detail_open
+            return
+        item = self.query_one(TaskPane).selected_item
+        self.push_screen(DetailScreen(detail_body(item)))
+
+    def action_lists(self) -> None:
+        """``l``：把清单作为浮层打开（工单 #18，验收标准 #3）。
+
+        窄档（<80 列）左栏不在屏上，清单只能从这里看；更宽的两档左栏本来就在，按 ``l``
+        也开同一个浮层——一个键到哪里都做同一件事，不必记两套。
+
+        内容取引擎的清单摘要（与左栏同一份 ``view().lists``）：左栏这会儿可能正被收起，
+        但数据一直在引擎里，浮层不是第二份缓存。
+        """
+        self.push_screen(ListsScreen(lists_body(self.engine.view().lists)))
+
+    def action_help(self) -> None:
+        """``?``：打开键位帮助浮层（工单 #18，验收标准 #6）。
+
+        表在 :data:`~dida.tui.panes.KEY_HELP`：帮助里少了哪个键，是那张表少了一行，
+        不是这里少了一段布局。``Esc`` 与 ``Enter`` 都能关掉它（浮层自己的绑定）。
+        """
+        self.push_screen(HelpScreen(key_help_body()))
