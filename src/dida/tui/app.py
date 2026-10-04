@@ -15,6 +15,7 @@ from textual.widgets import Footer
 
 from dida.sync.engine import Engine, UnknownTaskError
 from dida.tui.panes import (
+    ConfirmScreen,
     DetailPane,
     ListPane,
     RescheduleInput,
@@ -32,6 +33,24 @@ NO_DATE_MESSAGE = "没写日期：改期要说清改到哪一天，可以写「�
 UNKNOWN_TASK_MESSAGE = "没有改成：这条任务已经不在本地缓存里了，刷新之后再试一次"
 """引擎拒绝写入（本地没有这条任务的底稿，工单 #25）时的话：如实说没改成。"""
 
+UNKNOWN_DELETE_MESSAGE = "没有删：这条任务已经不在本地缓存里了"
+"""删除没有底稿时的话（工单 #16）。
+
+与改期那句分开写：这里**不能**说「刷新之后再试一次」——刷新会把它拉回来，看着像删掉了
+其实没有；而删除这条路径上「本来就没这条」与「删掉了」必须一眼分得清。
+"""
+
+
+def delete_prompt(title: str) -> str:
+    """删除确认浮层上的那句话（工单 #16）。
+
+    措辞是这一屏最要紧的一行字：**不许暗示还能找回来**。滴答清单 Open API 里没有
+    undelete、没有回收站、没有「已删除」列表（``api-contracts.md``），所以这里只说删了
+    就没有了，绝不说「可恢复」「稍后可找回」「已移入回收站」——那种话会让用户在按 ``y``
+    的时候以为还有退路，而实际上没有。
+    """
+    return f"删除「{title}」？\n删掉就找不回来了，滴答清单没有回收站。\n\ny 确认删除 · n / Esc 取消"
+
 
 class DidaApp(App[None]):
     """三栏 + 状态栏。"""
@@ -46,6 +65,9 @@ class DidaApp(App[None]):
         Binding("g", "defer", "顺延"),
         Binding("G", "defer_week", "顺延一周"),
         Binding("e", "reschedule", "改期"),
+        # 删除是这一屏唯一不可挽回的动作：服务端没有 undelete、没有回收站（api-contracts.md），
+        # 所以 `d` 不直接删，先弹一次确认（t16）。
+        Binding("d", "delete", "删除"),
     ]
     CSS = """
     #panes {
@@ -184,4 +206,40 @@ class DidaApp(App[None]):
             return
         box.close()
         self.query_one(TaskPane).focus()
+        self.refresh_view()
+
+    # ---------------------------------------------------------------- 删除（t16）
+
+    def action_delete(self) -> None:
+        """``d``：先问一句，确认了才删（工单 #16）。
+
+        光标下没有任务就什么都不做——空屏上按键不该报错（与 ``x``/``g``/``e`` 同一条口径）。
+
+        **确认是这里唯一的防线**：滴答清单的 Open API 里没有 undelete、没有回收站、也没有
+        「已删除」列表，删掉就是删掉了。所以瞄准的是按下 ``d`` 那一刻光标下那条任务，
+        提示语里点名是哪一条（``title``），而删除动作只发生在浮层回来 ``True`` 的时候。
+        """
+        pane = self.query_one(TaskPane)
+        task_id = pane.selected_task_id
+        if task_id is None:
+            return
+        self.push_screen(
+            ConfirmScreen(delete_prompt(pane.selected_title or task_id)),
+            lambda confirmed: self._finish_delete(task_id, confirmed),
+        )
+
+    def _finish_delete(self, task_id: str, confirmed: bool | None) -> None:
+        """浮层关掉了：只有 ``True`` 才写。
+
+        ``False``（``n``/``Esc``）与 ``None`` 都什么都不做——取消必须一点痕迹都不留：
+        没有待推送改动、本地快照照旧、没有请求发出去。引擎拒绝写入（本地已经没有这条任务
+        的底稿，#25）时如实说一句，不崩，也不拿一个猜来的清单 id 硬发。
+        """
+        if not confirmed:
+            return
+        try:
+            self.engine.delete(task_id)
+        except UnknownTaskError:
+            self.query_one(StatusBar).update(UNKNOWN_DELETE_MESSAGE)
+            return
         self.refresh_view()

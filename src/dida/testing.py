@@ -177,6 +177,12 @@ class FakeBackend:
         self.reschedule_error: Exception | None = None
         """摆一个异常进去，``reschedule`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。"""
 
+        self.deleted: list[str] = []
+        """``delete(task_id)`` 收到的任务 id，按调用顺序（t16 的删除）。"""
+
+        self.delete_error: Exception | None = None
+        """摆一个异常进去，``delete`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。"""
+
         self._engine = SyncEngine(clock=clock, day_end=day_end, source=self.source)
 
     async def refresh(self) -> RefreshReport:
@@ -224,3 +230,13 @@ class FakeBackend:
         self.rescheduled_all_day.append(all_day)
         if self.reschedule_error is not None:
             raise self.reschedule_error
+
+    def delete(self, task_id: str) -> None:
+        """写：只记录（t16 的 ``d``；替身不动缓存，与 ``complete`` / ``defer`` 一样）。
+
+        摆了 ``delete_error`` 就记完这一笔再抛：模拟引擎当场拒绝（#25 的
+        ``UnknownTaskError``），好试 TUI 拿到结构化错误时的反应。
+        """
+        self.deleted.append(task_id)
+        if self.delete_error is not None:
+            raise self.delete_error
