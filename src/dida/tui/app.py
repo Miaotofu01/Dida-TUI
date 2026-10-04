@@ -16,7 +16,7 @@ from textual.containers import Horizontal
 from textual.events import Resize
 from textual.widgets import Footer
 
-from dida.sync.engine import DidaError, Engine, TaskItem, UnknownTaskError, filter_groups
+from dida.sync.engine import AuthError, DidaError, Engine, TaskItem, UnknownTaskError, filter_groups
 from dida.tui.escape import open_in_browser, task_url
 from dida.tui.panes import (
     ConfirmScreen,
@@ -76,6 +76,65 @@ SUBTASK_READ_FAILED_MESSAGE = "没勾成：读不到服务端，待会儿再试�
 重读失败就没有「写回」可言，所以这一句必须说出来，而不是静默什么都不做：用户按了
 ``t``，屏幕上却什么都没发生，他会以为勾上了。"""
 
+
+SYNCING_MESSAGE = "同步中…"
+"""按下 ``r`` 之后、同步落地之前状态栏里的话（工单 #21）。
+
+只给**手动**同步用：用户主动按了键，得先有个「它动了」的信号；启动时那次后台刷新不写它，
+否则每次开屏都会闪一下这句。"""
+
+PUSH_TICK_SECONDS = 1.0
+"""周期泵的间隔（工单 #21）：每秒问一次「有没有到点该重试的待推送改动」。
+
+这是 t10 明确留给这一层的那件事——退避算得再准，也得有人**定期**来问一句。间隔只决定
+「什么时候看一眼」，到没到点依然由引擎那口注入的钟判定（见
+:meth:`~dida.tui.app.DidaApp.push_tick`）。1 秒的粒度对「按完 x 断网了、网络回来自动补上」
+这个体验足够，而每秒一次本地队列查询是免费的。"""
+
+SYNC_GROUP = "sync"
+"""同步 worker 的组名：``exclusive=True`` 靠它保证同时只有一轮同步在跑。"""
+
+
+def overwritten_message(count: int) -> str:
+    """服务端盖掉本地改动时的话（工单 #21，用户故事 59）。
+
+    ADR-0002 的规矩：服务端权威可以覆盖本地，但**覆盖必须被用户看见**。这一句就是那个
+    「看见」——不说的话，用户刚做过的改动会在这一屏上悄悄变回服务端那一份。
+    被待推送改动豁免挡回去的那些不算：用户的改动还在，没有任何东西被盖掉。
+    """
+    return f"{count} 处本地改动被覆盖"
+
+
+def refresh_failed_message(error: DidaError) -> str:
+    """同步失败时状态栏里的话：凭据失效与其它失败分开说（工单 #21，用户故事 6）。
+
+    「凭据失效」必须直接引导重新粘贴 token：说成笼统的网络失败，用户会去查网络，
+    而问题在他那把过期或被吊销的 token 上（t03 的 ``Credentials`` 提供了那条重新粘贴的路）。
+    """
+    if isinstance(error, AuthError):
+        return f"凭据失效，请重新粘贴 token：{error}"
+    return f"同步失败：{error}"
+
+
+def completed_failed_message(error: DidaError) -> str:
+    """已完成流没拉到，但全量刷新与推送已经落地时的话（工单 #21）。
+
+    这里**不能**说成整次同步都失败了：未完成任务那一份是新的，只有「已完成 N 项」还是旧的。
+    """
+    return f"已完成流没拉到：{error}"
+
+
+def quit_prompt(pending: int) -> str:
+    """待推送改动还在时退出的话（工单 #21，用户故事 58）。
+
+    必须说出**有几处**：只说「还有改动没推」用户不知道是刚按的那一下，还是攒了一整天的十几笔。
+    也必须明说退出会丢掉它们——待推送改动只存在于本地（ADR-0002 的豁免代价），进程一结束就没了。
+    """
+    return (
+        f"还有 {pending} 处改动没推上去。\n"
+        "现在退出，它们就丢了——本地改动不会在下次启动时补推。\n\n"
+        "y 仍然退出 · n / Esc 留下"
+    )
 
 
 NO_BROWSER_PREFIX = "打不开浏览器：把这条链接自己粘到浏览器里 "
@@ -155,6 +214,9 @@ class DidaApp(App[None]):
         # 逃生舱（t19）：把光标下那一条交给系统浏览器。完成在服务端不可逆（ADR-0002），
         # 官方客户端又不接受任务深链，所以按错之后唯一能走的路就是这个键。
         Binding("o", "open", "浏览器"),
+        # 手动同步（t21）：全量刷新 + 推待推送改动 + 拉已完成流，一次做完。断网时它只是
+        # 如实报一句，缓存照旧读、改动照旧排队——这一屏不因为没网就不能用。
+        Binding("r", "refresh", "同步"),
         # 子任务（t20）：s 把焦点移到右栏那份子任务列表上，t 在那里勾选。
         Binding("s", "subtasks", "子任务"),
         # 右栏详情的开合（t18）。三档语义一致：右栏在屏上就收放它，收起了就弹浮层。
@@ -197,16 +259,30 @@ class DidaApp(App[None]):
     }
     """
 
-    def __init__(self, engine: Engine, *, open_url: Callable[[str], bool] = open_in_browser) -> None:
+    def __init__(
+        self,
+        engine: Engine,
+        *,
+        open_url: Callable[[str], bool] = open_in_browser,
+        refresh_on_start: bool = False,
+        push_tick_seconds: float | None = None,
+    ) -> None:
         """``open_url`` 是**注入**的浏览器开手（工单 #19）。
 
         生产默认值 :func:`~dida.tui.escape.open_in_browser` 会真的叫起系统浏览器；测试
         塞一个假的进来，于是「交给浏览器的是哪条 URL」能当场断言，而没有一个标签页被
         打开。它回 ``False`` 或抛异常都表示这台机器上开不了浏览器。
+
+        ``refresh_on_start`` 与 ``push_tick_seconds`` 是**策略**，默认都不开（工单 #21）：
+        产品行为由组合根按 ``config.toml`` 决定（``dida.bootstrap`` 传 ``refresh_on_start=``
+        与 ``PUSH_TICK_SECONDS``）。这里不写死默认值，是为了让「直接 new 一个 app」的测试
+        不必先接上客户端与存储——后台同步需要一个真引擎才跑得起来。
         """
         super().__init__()
         self.engine = engine
         self._open_url = open_url
+        self._refresh_on_start = refresh_on_start
+        self._push_tick_seconds = push_tick_seconds
         self._query = ""
         """当前生效的过滤词（空串 = 不过滤）。框里的原文由 :class:`FilterInput` 拿着。"""
 
@@ -229,6 +305,96 @@ class DidaApp(App[None]):
         self._apply_tier(self.size.width)
         self.refresh_view()
         self.query_one(TaskPane).focus()  # 一进来 j/k 就能过任务；Tab 换到左栏
+        # 本地缓存**先**上屏，网络从来不挡第一屏（用户故事 3）：刷新排在事件循环上，
+        # 它回来之前 j/k 已经在动了。
+        if self._refresh_on_start:
+            self.start_sync()
+        if self._push_tick_seconds is not None:
+            # 重试队列的泵（t21）：写失败时改动留在队列里，退避到点了得有谁来推它。
+            self.set_interval(self._push_tick_seconds, self.push_tick)
+
+    # ---------------------------------------------------------------- 同步（t21）
+
+    def action_refresh(self) -> None:
+        """``r``：手动同步——全量刷新 + 推待推送改动 + 拉已完成流（用户故事 53）。
+
+        先写「同步中…」再排 worker：用户按了键，得有个「它动了」的信号；真正的活儿在
+        事件循环上跑，界面不因为等网络而卡住（引擎那条 ``refresh()`` 是 async 的就是为这个）。
+        """
+        self.query_one(StatusBar).update(SYNCING_MESSAGE)
+        self.start_sync()
+
+    def start_sync(self) -> None:
+        """把一轮同步排到事件循环上（不等它）。``r`` 与启动刷新都走这里。
+
+        ``exclusive=True``：连按 ``r`` 不会让两轮同步叠在一起（同一份缓存被两个协程交替
+        写）。协程 worker 跑在事件循环**同一根线程**上，t08 的 sqlite 连接有线程亲和，
+        所以这里不能改成 ``thread=True``。
+        """
+        self.run_worker(self._sync(), group=SYNC_GROUP, exclusive=True, description="同步")
+
+    async def _sync(self) -> None:
+        """一轮同步：全量刷新 → 推待推送改动 → 拉已完成流。
+
+        三件事各报各的失败，而且**不假装做过**：全量刷新失败（断网、凭据失效）时后面两件
+        不做——同一个网络问题会让它们一起失败，白跑两趟；已完成流失败时前两件已经落地，
+        照旧重画，只是把「没拉到」说出来。缓存从头到尾都在：这一屏不因为没网就不能用
+        （用户故事 62）。
+        """
+        try:
+            report = await self.engine.refresh()
+        except DidaError as exc:
+            self.query_one(StatusBar).update(refresh_failed_message(exc))
+            return
+        # 队列里那些到点的改动顺手推一轮：`r` 是用户能按的那个「现在再试一次」。
+        await self.engine.push_pending()
+        try:
+            await self.engine.refresh_completed()
+        except DidaError as exc:
+            completed_failed: DidaError | None = exc
+        else:
+            completed_failed = None
+        self.refresh_view()
+        # 覆盖告知排在最后：服务端真的盖掉了用户的东西，这句话比什么都该留在屏幕上
+        # （ADR-0002）。被待推送改动挡回去的不算——那些改动还在，没有被盖掉。
+        if report.overwritten:
+            self.query_one(StatusBar).update(overwritten_message(len(report.overwritten)))
+        elif completed_failed is not None:
+            self.query_one(StatusBar).update(completed_failed_message(completed_failed))
+
+    async def push_tick(self) -> None:
+        """推一轮**到点**的待推送改动（工单 #21 的周期泵；也是测试的确定性入口）。
+
+        t10 把退避、``next_retry_at`` 都做好了，缺的是「谁来定期问一句到点了没有」——
+        就是这里。间隔只决定**什么时候看一眼**，到没到点依然由引擎那口注入的钟判定：
+        所以测试可以把钟摆到任意一刻，再直接 ``await app.push_tick()``，不必等真实时间。
+        网络等待跑在事件循环的同一根线程上（t08 的线程亲和）。
+        """
+        await self.engine.push_pending()
+        self.update_status()
+
+    async def action_quit(self) -> None:
+        """``q``：还有待推送改动时先拦一下（工单 #21，用户故事 58）。
+
+        用户按 ``q`` 的意图通常是「我干完了」，而屏幕底下那个数可能是「我按了 ``x``，但网断了」
+        ——待推送改动只存在于本地（ADR-0002 的豁免代价），进程一结束就没了，而服务端并不知道
+        用户做过什么。所以这里**多问一句**，并且把「有几处」写在浮层上。
+
+        浮层已经开着时什么都不做：连按 ``q`` 不该叠出一摞确认框。没有待推送改动就照旧直接退
+        （``q`` 即结束，spec 的单进程规矩）。
+        """
+        pending = self.engine.status().pending_count
+        if not pending:
+            self.exit()
+            return
+        if isinstance(self.screen, ConfirmScreen):
+            return
+        self.push_screen(ConfirmScreen(quit_prompt(pending)), self._finish_quit)
+
+    def _finish_quit(self, confirmed: bool | None) -> None:
+        """退出浮层关掉了：只有 ``True`` 才真的退（``n`` / ``Esc`` 与 ``None`` 都留下）。"""
+        if confirmed:
+            self.exit()
 
     # ---------------------------------------------------------------- 窄屏降级（t18）
 

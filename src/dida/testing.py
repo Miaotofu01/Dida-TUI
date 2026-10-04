@@ -23,7 +23,7 @@ import httpx
 from dida.clock import Clock
 from dida.date_parser import ParsedTask
 from dida.storage.store import RefreshReport
-from dida.sync.engine import SubtaskWrite, SyncEngine, SyncStatus
+from dida.sync.engine import CompletedReport, SubtaskWrite, SyncEngine, SyncStatus
 from dida.sync.view import (
     INBOX_NAME,
     ListSnapshot,
@@ -164,6 +164,12 @@ class FakeBackend:
         self.refreshes = 0
         """``refresh()`` 被调用的次数。"""
 
+        self.pushes = 0
+        """``push_pending()`` 被调用的次数（t21 的周期泵与手动同步）。"""
+
+        self.completed_pulls = 0
+        """``refresh_completed()`` 被调用的次数（t21 的 ``r``）。"""
+
         self.completed: list[str] = []
         """``complete(task_id)`` 收到的任务 id，按调用顺序。"""
 
@@ -232,6 +238,25 @@ class FakeBackend:
         """
         self.refreshes += 1
         return RefreshReport()
+
+    async def push_pending(self) -> int:
+        """推一轮待推送改动（t21 的周期泵会调它）。
+
+        假后端没有队列，也没有网络，所以推出去 0 条——但调用本身要记下来，好让「泵真的在泵」
+        这件事在接缝一上看得见。
+        """
+        self.pushes += 1
+        return 0
+
+    async def refresh_completed(self) -> CompletedReport:
+        """拉一次已完成流（``r`` 的第三件事）。
+
+        同样什么都不写：已完成区的内容由 :meth:`set_sync_state` 与内存缓存摆布，
+        这里只记下「拉过几次」。
+        """
+        self.completed_pulls += 1
+        now = self.clock.now()
+        return CompletedReport(start=now, end=now)
 
     def add_list(self, name: str, *, id: str | None = None) -> ListSnapshot:
         return self.source.add_list(name, id=id)

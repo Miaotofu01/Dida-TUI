@@ -275,7 +275,12 @@ class TaskPane(Pane):
         *,
         empty: str | None = None,
     ) -> None:
-        """接住引擎给的分区与已完成区，光标回到第一行。
+        """接住引擎给的分区与已完成区，光标留在原来那条任务上。
+
+        重画不该动光标（工单 #21「只写变化」那一面）：全量刷新拉回来的是同一批任务，每次都把
+        光标推回第一行，等于每刷一次就打断一次分诊。原来那条**不在**新行表里了（完成了、
+        删了、被过滤词筛掉了）才回到第一行——这也正是下面那条「光标不许停在看不见的任务上」
+        的落点。
 
         展开与否**不**在这里重置：那是用户的看的姿势，不是数据；刷新之后把人家摊开的
         那一区又收回去，正是「刷新让屏幕闪」的另一副面孔。
@@ -288,13 +293,21 @@ class TaskPane(Pane):
         ``DidaApp`` 换成 :data:`NO_MATCH_TEXT`——屏上明明有任务却写「今天没有未完成的任务」
         是在骗人。
         """
+        selected = self.selected_task_id
         self._groups = tuple(groups)
         self._completed = completed
         self._empty_text = empty if empty is not None else self.EMPTY_TEXT
         self._rows = tuple(item for group in self._groups for item in group.items)
-        self._cursor = 0
+        self._cursor = self._index_of(selected)
         self._redraw()
         self._announce_selection()
+
+    def _index_of(self, task_id: str | None) -> int:
+        """``task_id`` 在新行表里的位置；它不在（或本来就没有光标）就回第一行。"""
+        for index, item in enumerate(self._rows):
+            if item.task_id == task_id:
+                return index
+        return 0
 
     def _move_cursor(self, step: int) -> None:
         """光标上下移：移完告诉外面现在指着谁（右栏据此跟着走）。"""
@@ -1027,6 +1040,7 @@ KEY_HELP: tuple[tuple[str, str], ...] = (
     ("/", "过滤"),
     ("c", "已完成区展开/收起"),
     ("o", "在浏览器打开"),
+    ("r", "同步（刷新 + 推送 + 已完成流）"),
     ("l", "清单浮层"),
     ("?", "这份帮助"),
     ("Esc", "关闭浮层"),
