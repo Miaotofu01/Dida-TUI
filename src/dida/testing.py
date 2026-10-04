@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 from collections import deque
+from dataclasses import replace
 from datetime import datetime, timedelta
 from typing import Any, Sequence
 
@@ -22,8 +23,15 @@ import httpx
 from dida.clock import Clock
 from dida.date_parser import ParsedTask
 from dida.storage.store import RefreshReport
-from dida.sync.engine import SyncEngine, SyncStatus
-from dida.sync.view import INBOX_NAME, ListSnapshot, SyncState, TaskSnapshot, TodayView
+from dida.sync.engine import SubtaskWrite, SyncEngine, SyncStatus
+from dida.sync.view import (
+    INBOX_NAME,
+    ListSnapshot,
+    SubtaskItem,
+    SyncState,
+    TaskSnapshot,
+    TodayView,
+)
 
 
 class ManualClock:
@@ -200,6 +208,21 @@ class FakeBackend:
         self.cycled: list[str] = []
         """``cycle_priority(task_id)`` 收到的任务 id，按调用顺序（t17 的 ``p``）。"""
 
+        self._subtasks: dict[str, tuple[SubtaskItem, ...]] = {}
+        """摆进来的子任务，按任务 id 索引（t20）；:meth:`set_subtasks` 摆，读路径照给。"""
+
+        self.toggled_subtasks: list[tuple[str, str]] = []
+        """``toggle_subtask(task_id, subtask_id)`` 收到的调用，按顺序（t20）。"""
+
+        self.subtask_changed_elsewhere: bool = False
+        """摆 ``True``，下一次勾选就报「重读发现任务在别处被改过」。"""
+
+        self.subtask_written: bool = True
+        """摆 ``False``，下一次勾选就报「服务端已经没有这个子任务了」。"""
+
+        self.subtask_error: Exception | None = None
+        """摆一个异常进去，``toggle_subtask`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。"""
+
         self._engine = SyncEngine(clock=clock, day_end=day_end, source=self.source)
 
     async def refresh(self) -> RefreshReport:
@@ -292,3 +315,39 @@ class FakeBackend:
         替身不自己再抄一份——抄了就会跟真货说不一样的话。
         """
         self.cycled.append(task_id)
+
+    def set_subtasks(self, task_id: str, *items: SubtaskItem) -> None:
+        """摆一条任务的子任务（t20）：右栏渲染与勾选测试的输入。
+
+        ``SubtaskItem`` 是引擎给的成品行（标题、完成状态、截止读法），替身照收不误——
+        「怎么从 ``items`` 数组读出这一行」是引擎的判断（``dida.sync.view.subtask_items``），
+        替身不自己再抄一份。
+        """
+        self._subtasks[task_id] = tuple(items)
+
+    def subtasks(self, task_id: str) -> tuple[SubtaskItem, ...]:
+        """读：摆进去的那一份（t20）；没摆过就是没有子任务。"""
+        return self._subtasks.get(task_id, ())
+
+    async def toggle_subtask(self, task_id: str, subtask_id: str) -> SubtaskWrite:
+        """写：记下这一笔，并把摆进去的那一份翻过来（t20）。
+
+        「写前重读、只合并这一次改动」是引擎的判断（``SyncEngine.toggle_subtask``），替身
+        不自己再抄一份；它只把结果摆成调用方看得见的样子：右栏要重画，状态栏要说清服务端
+        有没有说出别的事。真要断言「重读保护了别处的修改」，走接缝二那份测试。
+        """
+        self.toggled_subtasks.append((task_id, subtask_id))
+        if self.subtask_error is not None:
+            raise self.subtask_error
+        rows = tuple(
+            replace(row, completed=not row.completed) if row.subtask_id == subtask_id else row
+            for row in self._subtasks.get(task_id, ())
+        )
+        self._subtasks[task_id] = rows
+        return SubtaskWrite(
+            task_id=task_id,
+            subtask_id=subtask_id,
+            items=rows,
+            written=self.subtask_written and any(row.subtask_id == subtask_id for row in rows),
+            changed_elsewhere=self.subtask_changed_elsewhere,
+        )

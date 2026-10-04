@@ -25,7 +25,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from enum import Enum
-from typing import Protocol, Sequence
+from typing import Any, Mapping, Protocol, Sequence
 
 from dida.logical_day import logical_day
 
@@ -384,3 +384,89 @@ def completed_section(
     return CompletedSection(
         items=tuple(sorted(rows, key=lambda row: (row.completed_at, row.title), reverse=True))
     )
+
+
+# ------------------------------------------------------------------ 子任务（t20）
+
+SUBTASK_NORMAL_STATUS = 0
+SUBTASK_COMPLETED_STATUS = 1
+"""子任务的完成状态是**另一对**取值（``api-contracts.md``）：Normal ``0`` / Completed ``1``。
+
+不是任务级那一对 ``-1/0/2``：拿 ``status == 1`` 判任务完成是错的，拿 ``status == 2``
+判子任务完成同样是错的。两对取值只在这里相接，别处一律用这两个常量。
+"""
+
+
+@dataclass(frozen=True)
+class SubtaskItem:
+    """右栏一行子任务：字段都已经是可以直接画的成品。"""
+
+    subtask_id: str
+    title: str
+    completed: bool
+    due_text: str = NO_DUE_TEXT
+    """子任务 ``startDate`` 的人类读法；没有日期就是 :data:`NO_DUE_TEXT`。
+
+    没有日期**不影响这一行存在**：``startDate`` 是可选的，标题与完成状态才是子任务必有
+    的两样（工单 #20 的验收标准 #1）。
+    """
+
+
+def subtask_items(
+    payload: Mapping[str, Any] | None, *, now: datetime, day_end: str
+) -> tuple[SubtaskItem, ...]:
+    """一条任务的原文 → 右栏的子任务行。
+
+    只认服务端给的那一份 ``items``（``ChecklistItem``）：``status`` 是 0/1 那一对，日期
+    字段叫 ``startDate``（与任务上的 ``dueDate`` 不是同一个名字，见 ``guards``）。
+
+    没有 ``items``、``items`` 不是数组、某一条没有可用的 ``id``——都当作「没有这一行」
+    跳过而不是报错：右栏是只读的展示，一条脏数据不该让整个详情栏空掉，也不该拦住
+    其它子任务的勾选（勾选要的是 ``id``）。
+    """
+    if not isinstance(payload, Mapping):
+        return ()
+    raw = payload.get("items")
+    if not isinstance(raw, list):
+        return ()
+    rows: list[SubtaskItem] = []
+    for entry in raw:
+        if not isinstance(entry, Mapping) or not isinstance(entry.get("id"), str) or not entry["id"]:
+            continue
+        due = _subtask_moment(entry.get("startDate"))
+        rows.append(
+            SubtaskItem(
+                subtask_id=entry["id"],
+                title=str(entry.get("title") or ""),
+                completed=subtask_completed(entry.get("status")),
+                due_text=format_due(
+                    due, all_day=bool(entry.get("isAllDay")), now=now, day_end=day_end
+                ),
+            )
+        )
+    return tuple(rows)
+
+
+def subtask_completed(status: Any) -> bool:
+    """``status`` → 「勾上了没有」。认不出来的一律当作没勾上（与 ``priority`` 同一口径）。
+
+    子任务那一对取值是 0/1（``SUBTASK_COMPLETED_STATUS``），别拿任务级的 2 来比。
+    """
+    try:
+        return int(status or 0) == SUBTASK_COMPLETED_STATUS
+    except (TypeError, ValueError):
+        return False
+
+
+def _subtask_moment(value: Any) -> datetime | None:
+    """子任务的 ``startDate`` → 时刻；吃不下、或者没有时区偏移就当没有日期。
+
+    没有时区就不猜（那正是「时区写错静默位移」那个 trap），宁可这一行不显示日期。
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        moment = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    return moment if moment.tzinfo is not None else None
