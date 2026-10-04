@@ -429,3 +429,90 @@ class RescheduleInput(Vertical):
         event.stop()
         if self._task_id is not None:
             self.post_message(self.Submitted(self._task_id, event.value))
+
+
+# ------------------------------------------------------------------ 新建输入框（t15）
+
+QUICK_ADD_PLACEHOLDER = "新建：明天下午3点交季度报告 !高 #工作"
+"""新建输入框的占位文案：把一行能装下的四样东西（标题、日期、优先级、标签）示范一遍。"""
+
+
+class QuickAddInput(Vertical):
+    """新建输入框（``a``）：一行提示语 + 一行输入；``Enter`` 提交、``Esc`` 取消。
+
+    与 :class:`RescheduleInput` 是同一副骨架，差别只有位置与含义：这个在**三栏上面**
+    （不瞄准任何一条任务），那个在下面（改光标下那一条）。
+
+    这一层只做两件事：把用户写的**原文**原样交出去，把引擎回来的那句话显示出来。一个字都
+    不解析——语法归 :mod:`dida.date_parser`（与改期共用同一套），「现在」与逻辑日归引擎。
+    控件不认识任务、也不认识日期，只发一条 :class:`QuickAddInput.Submitted`。
+
+    默认收起（``display: none``）：没按 ``a`` 时不占一行，也不进布局。
+    """
+
+    DEFAULT_CSS = """
+    QuickAddInput {
+        display: none;
+        height: auto;
+        border: round ansi_cyan;
+        padding: 0 1;
+    }
+    QuickAddInput #quick-add-message {
+        color: yellow;
+        height: auto;
+    }
+    """
+    # 焦点落在里面那个 Input 上。Esc 由这一层收：t17 的过滤与 t18 的浮层各有各的
+    # Esc 语义，所以不往 app 上挂一个全局绑定去抢。``show=True`` 是为了让状态栏那一行
+    # 在输入框开着的时候显示「取消」——Textual 的 Footer 只列焦点链上的绑定，
+    # 输入框一拿到焦点，app 那些键位提示就都不显示了。
+    can_focus = False
+    BINDINGS = [Binding("escape", "cancel", "取消")]
+
+    class Submitted(Message):
+        """用户按了 ``Enter``：他写的那一行原文。"""
+
+        def __init__(self, text: str) -> None:
+            self.text = text
+            super().__init__()
+
+    def compose(self) -> ComposeResult:
+        yield Static("", id="quick-add-message")
+        yield Input(placeholder=QUICK_ADD_PLACEHOLDER)
+
+    def open(self) -> None:
+        """打开输入框并聚焦。
+
+        每次打开都从空的开始：上一次写了一半的那一行留着，下一次按 ``a`` 就得先删掉它。
+        """
+        self.show_message("")
+        self.query_one(Input).value = ""
+        self.display = True
+        self.query_one(Input).focus()
+
+    def close(self) -> None:
+        """收起输入框（提交成功或取消）。"""
+        self.display = False
+
+    @property
+    def text(self) -> str:
+        """输入框里的原文。"""
+        return self.query_one(Input).value
+
+    def show_message(self, text: str) -> None:
+        """显示一句要告诉用户的话；空串 = 收起那一行。
+
+        提交被拒绝时**不改**输入框里的原文：用户写的东西不能因为我们看不懂就吞掉。
+        """
+        message = self.query_one(Static)
+        message.update(text)
+        message.display = bool(text)
+
+    def action_cancel(self) -> None:
+        """``Esc``：取消这次新建，什么都不提交。"""
+        self.close()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """内层输入框按了 ``Enter``：转成本控件自己的提交消息（原文照递）。"""
+        event.stop()
+        self.post_message(self.Submitted(event.value))
