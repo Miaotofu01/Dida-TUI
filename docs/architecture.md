@@ -8,7 +8,7 @@
 | # | 模块 | 路径 | 公开接口 | 归属 |
 |---|---|---|---|---|
 | 1 | 配置与凭据 | `dida/config.py` | `Config`（`token` / `day_end` / `refresh_on_start` / `push_on_change` / `completed_window_hours`）、`config_path()`、`load_config()`、`save_config()`、`needs_token()`、`Credentials(transport=, path=).verify_and_store(token)`；失败是 `ConfigError` / `CredentialsError` | t03 已实现 |
-| 2 | 滴答 API 客户端 | `dida/api/` | `DidaApiClient(token=, transport=, base_url=)`、`await list_projects()`、`await get_project_data(project_id)`、`await create_task(body)`；失败一律是 `dida.api.errors.DidaError` 的子类 | t07 补端点与守卫 |
+| 2 | 滴答 API 客户端 | `dida/api/` | `DidaApiClient(token=, transport=, base_url=)`：`list_projects(offset=, limit=)`、`get_project_data(project_id)`、`get_task(project_id, task_id)`、`list_tags()`、`list_completed(project_ids=, start_date=, end_date=)`、`create_task(body)`、`update_task(project_id, task_id, changes, snapshot=)`、`complete_task(project_id, task_id)`、`delete_task(project_id, task_id)`；失败一律是 `dida.api.errors.DidaError` 的子类（`NetworkError` / `AuthError` / `ServerRejectionError` / `FieldIgnoredError`，守卫另有 `InvalidDateError` / `DatelessRepeatError` / `MalformedResponseError`） | t07 已实现 |
 | 3 | 本地存储 | `dida/storage/store.py` | `Store`：清单、任务快照、待推送改动、同步状态；签名由 t08 定稿 | t08 |
 | 4 | 同步引擎 | `dida/sync/engine.py` | `SyncEngine(clock=)`、`status() -> SyncStatus`、`view()`（t05）、`refresh()`（t09）、`complete(task_id)`（t11）、`defer(task_id)`（t13） | t09/t10 实现 |
 | 5 | 逻辑日 | `dida/logical_day.py` | `logical_day(now, day_end) -> date` | t04 |
@@ -55,7 +55,13 @@ assert transport.last_json == {"title": "写周报"}      # 请求体字段
 
 生产用 `HttpxTransport`。传输层失败必须抛 `httpx.TransportError`，客户端把它翻成
 `NetworkError`；401/403 → `AuthError`，其它 ≥400 → `ServerRejectionError`（都带 `status_code`）。
-`FieldIgnoredError` 留给 t07 的本地守卫：服务端会静默忽略的字段，发送前就拦下。
+失败按**状态码**分类，不解析错误载荷：文档里 401/403/404 都可能没有响应体。
+
+`FieldIgnoredError` 是四个本地守卫（`dida/api/guards.py`）在发送前抛的：非法日期
+（`InvalidDateError`）、无日期任务上的重复规则（`DatelessRepeatError`）、不可写的 `status`。
+另外两件事不走报错，走**原样回写**：时区与未知字段一律逐字节带回——写路径把服务端给的
+快照与本次改动合并后再发（`update_task(..., snapshot=)`），所以调用方递进来的那份快照
+越新越好。
 
 ## 屏幕文本怎么断言
 
