@@ -60,8 +60,8 @@ FLASH_STYLE = "bold green"
 
 EMPTY_STYLE = "dim"
 
-PLACEHOLDER = "（未接入）"
-"""详情栏的占位：内容归 t18。"""
+DETAIL_EMPTY_TEXT = "（没有选中任务）"
+"""详情栏没指着任何任务时的话。光标停在哪一条都没有（空屏、或不剩一条）时用它。"""
 
 
 def group_header(group: TaskGroup) -> Text:
@@ -110,6 +110,43 @@ def pane_body(lines: Sequence[Text], *, empty: str) -> Text:
             body.append("\n")
         body.append_text(line)
     return body
+
+
+def detail_body(item: TaskItem | None) -> Text:
+    """详情栏的内容：标题 + 清单 / 优先级 / 截止（工单 #18）。
+
+    四样字段全部取视图模型里的**成品**：``list_name``、``priority_mark``、``due_text``
+    都是引擎算好的读法（人类可读的截止时间、优先级的标记符号），这里一个都不重算——
+    分组、排序、逾期判定、截止读法都在 :mod:`dida.sync.engine` 那边（TUI 不做业务判断）。
+
+    优先级只画那个标记符号、不翻译成「高/中/低」：中栏那一列画的就是这个符号，两处
+    必须长得一样，而「哪个符号算高」是引擎的事实，不该在这里再写一份。
+    """
+    if item is None:
+        return Text(DETAIL_EMPTY_TEXT, style=EMPTY_STYLE)
+    body = Text()
+    body.append(item.title, style="bold")
+    body.append("\n\n")
+    body.append("清单  ", style=EMPTY_STYLE)
+    body.append(f"{item.list_name}\n")
+    body.append("优先级  ", style=EMPTY_STYLE)
+    body.append(item.priority_mark, style=PRIORITY_STYLES.get(item.priority_mark, ""))
+    body.append("\n")
+    body.append("截止  ", style=EMPTY_STYLE)
+    body.append(item.due_text, style=EMPTY_STYLE if item.due is None else "")
+    return body
+
+
+def lists_body(summaries: Sequence[ListSummary]) -> Text:
+    """清单浮层的内容：与左栏同一份清单行（工单 #18）。
+
+    行由 :func:`list_line` 画——与左栏逐字同一份写法（名字 + 未完成条数），所以浮层里看到的
+    「工作 2」与左栏那一行是一个意思。没有清单时给左栏那一句空状态。
+    """
+    return pane_body(
+        [list_line(item, selected=False) for item in summaries],
+        empty=ListPane.EMPTY_TEXT,
+    )
 
 
 class Pane(VerticalScroll):
@@ -347,7 +384,7 @@ class DetailPane(Pane):
     """
 
     BORDER_TITLE = "详情"
-    EMPTY_TEXT = PLACEHOLDER
+    EMPTY_TEXT = DETAIL_EMPTY_TEXT
     can_focus = False  # Tab 只在左栏与中栏之间切换
 
     def __init__(self, *, id: str | None = None) -> None:
@@ -368,8 +405,8 @@ class DetailPane(Pane):
         if self._item is None:
             self.set_body(Text(self.EMPTY_TEXT, style=EMPTY_STYLE))
             return
-        # 复用任务行那一个渲染器：优先级标记与截止读法都不在这里重写一份
-        self.set_body(pane_body([task_line(self._item, selected=False)], empty=self.EMPTY_TEXT))
+        # 字段铺开在 :func:`detail_body` 里，浮层形态（窄屏）复用同一份内容
+        self.set_body(detail_body(self._item))
 
 
 class StatusBar(Static):
@@ -717,3 +754,122 @@ class ConfirmScreen(ModalScreen[bool]):
     def action_cancel(self) -> None:
         """``n`` / ``Esc``：取消，什么都不做（``False``）。"""
         self.dismiss(False)
+
+# ------------------------------------------------------------------ 窄屏浮层（t18）
+
+
+class OverlayBox(ModalScreen[None]):
+    """一个居中的浮层盒子：边框标题 + 一块正文（工单 #18 的浮层共用）。
+
+    正文由调用方拼好（:func:`detail_body` / :func:`lists_body` / :func:`key_help_body`）
+    原样交给这里，所以浮层与它对应的常驻栏位画的是同一份内容——窄屏不是另一个界面，
+    只是同一块内容换了地方摆。控件不认识任务、不认识引擎，换一个场景不必动它
+    （与 :class:`ConfirmScreen` 同一条口径）。
+
+    ``Esc`` 与 ``Enter`` 都收起来：``Enter`` 就是开合右栏详情的那一个键（验收标准 #4），
+    在浮层里再按一次当然是「收起」。浮层是模态的，所以它开着的时候 j/k 到不了任务列。
+    """
+
+    TITLE = ""
+    """盒子边框上的标题。"""
+
+    DEFAULT_CSS = """
+    OverlayBox {
+        align: center middle;
+    }
+    OverlayBox .overlay-box {
+        width: 80%;
+        max-width: 60;
+        height: auto;
+        max-height: 80%;
+        border: round ansi_cyan;
+        padding: 1 2;
+        background: $surface;
+    }
+    OverlayBox .overlay-body {
+        width: auto;
+        height: auto;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "关闭", show=False),
+        Binding("enter", "close", "关闭"),
+    ]
+
+    def __init__(self, body: Text) -> None:
+        super().__init__()
+        self.body = body
+        """浮层正文，原样显示。"""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(classes="overlay-box") as box:
+            box.border_title = self.TITLE
+            yield Static(self.body, classes="overlay-body")
+
+    def action_close(self) -> None:
+        """``Esc`` / ``Enter``：收起浮层，回到下面那一屏。"""
+        self.dismiss(None)
+
+
+class DetailScreen(OverlayBox):
+    """窄屏下右栏的浮层形态：``Enter`` 把当前任务的详情弹出来（工单 #18）。"""
+
+    TITLE = "详情"
+
+
+class ListsScreen(OverlayBox):
+    """窄屏下左栏的浮层形态：``l`` 把清单弹出来（工单 #18，验收标准 #3）。
+
+    窄档（<80 列）左栏不在屏上，清单只能从这里看——「清单通过浮层切换」就是这一条。
+    """
+    TITLE = "清单"
+
+
+KEY_HELP: tuple[tuple[str, str], ...] = (
+    ("j / k", "上下移动光标"),
+    ("Enter", "开合右栏详情（窄屏：浮层）"),
+    ("q", "退出"),
+    ("x", "完成这条"),
+    ("g", "顺延一天"),
+    ("G", "顺延一周"),
+    ("e", "改期"),
+    ("a", "新建"),
+    ("d", "删除"),
+    ("p", "优先级推进一档"),
+    ("/", "过滤"),
+    ("c", "已完成区展开/收起"),
+    ("o", "在浏览器打开"),
+    ("l", "清单浮层"),
+    ("?", "这份帮助"),
+    ("Esc", "关闭浮层"),
+)
+"""键位表：一个键一行，第二列是它干什么（工单 #18，验收标准 #6）。
+
+**新绑一个键就要往这里加一行。** 这张表是这些键唯一被写下来的地方：footer 只显示得下
+头几个，而且它只显示 :class:`~dida.tui.app.DidaApp` 自己绑的键——``c`` 是任务列绑的
+（:class:`~dida.tui.panes.TaskPane`），footer 根本不提它；``j``/``k`` 是栏位绑的，
+footer 也不提。漏一行的后果不是「少个说明」，是那个功能没人找得到。
+"""
+
+
+def key_help_body() -> Text:
+    """键位帮助浮层的内容（工单 #18）：键一列、说明一列，键加粗。"""
+    width = max(len(key) for key, _ in KEY_HELP)
+    body = Text()
+    for index, (key, what) in enumerate(KEY_HELP):
+        if index:
+            body.append("\n")
+        body.append(key.ljust(width), style="bold")
+        body.append(f"  {what}")
+    return body
+
+
+class HelpScreen(OverlayBox):
+    """键位帮助浮层：``?`` 打开、``Esc``（或 ``Enter``）关闭（工单 #18）。
+
+    表在 :data:`KEY_HELP` 里，这里只负责摆出来——所以「帮助里少了某个键」永远是一个
+    数据问题（表里没有那一行），不是一个布局问题。
+    """
+
+    TITLE = "键位"
