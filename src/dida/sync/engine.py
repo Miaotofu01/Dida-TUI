@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_checkable
+from uuid import uuid4
 
 from dida.api.errors import DidaError, MalformedResponseError
 from dida.api.guards import api_date
@@ -154,8 +155,13 @@ class WriteKind(Enum):
 
     引擎有自己的这一份词汇，是因为 TUI 只 import ``dida.sync.engine``，而 ``ChangeKind``
     住在存储层；至于为什么不在模块顶层直接 import 它，:func:`_storage_kind` 里写了。
-    新建（``create``）不在其中：这条写路径服务的是**已有任务**的改 / 完成 / 删。
+    :meth:`SyncEngine.write` 只服务**已有任务**的改 / 完成 / 删；新建走
+    :meth:`SyncEngine.create`，它的本地效果是「凭空多出一条任务」，与那三条盖字段的路径
+    不是一回事。
     """
+
+    CREATE = "create"
+    """新建：本地先造一条（临时 id），推送走 ``POST /open/v1/task``（t15）。"""
 
     UPDATE = "update"
     """改字段：把 ``changes`` 推给 ``POST /open/v1/task/{taskId}``。"""
@@ -199,6 +205,18 @@ class Engine(Protocol):
         """写：改期（``e``）——把截止时间换成 ``due``，只动 ``dueDate`` 与 ``isAllDay``。"""
         ...
 
+    def create(
+        self,
+        title: str,
+        *,
+        due: datetime | None = None,
+        all_day: bool = False,
+        priority: int | None = None,
+        tags: Sequence[str] = (),
+    ) -> str:
+        """写：新建一条任务到收集箱（``a``），返回本地那条的 id（t15）。"""
+        ...
+
 
 class ProjectReader(Protocol):
     """全量刷新要的那两次网络调用；t07 的 ``DidaApiClient`` 满足它。
@@ -217,10 +235,14 @@ class ProjectReader(Protocol):
 
 @runtime_checkable
 class TaskWriter(Protocol):
-    """推送要的那三个写操作；t07 的 ``DidaApiClient`` 满足它。
+    """推送要的那几个写操作；t07 的 ``DidaApiClient`` 满足它。
 
     故意不认识领域概念：引擎给它清单 id、任务 id 与（更新时的）底稿，它只管按文档发。
     """
+
+    async def create_task(self, body: Mapping[str, Any]) -> dict[str, Any]:
+        """``POST /open/v1/task``：新建任务，返回服务端建好的那一条（t15）。"""
+        ...
 
     async def update_task(
         self,
@@ -315,6 +337,10 @@ class WriteTarget(ViewSource, Protocol):
 
     def resolve(self, change_id: int) -> None:
         """这条改动已经推到服务端了，出队。"""
+        ...
+
+    def adopt_created(self, local_id: str, payload: Mapping[str, Any]) -> None:
+        """新建推成功：把本地那条临时 id 的任务挪到服务端给的 id 上（t15）。"""
         ...
 
 
@@ -565,8 +591,40 @@ class SyncEngine:
             await writer.complete_task(change.list_id, change.task_id)
         elif change.kind is ChangeKind.DELETE:
             await writer.delete_task(change.list_id, change.task_id)
+        elif change.kind is ChangeKind.CREATE:
+            # 新建才知道服务端给的 id，所以这一条推成功之后要顺手认领它（t15）。
+            self._adopt_created(target, change, await writer.create_task(change.payload))
         else:
             raise NotImplementedError(f"推送还没有实现「{change.kind.value}」这一种改动")
+
+    def _adopt_created(
+        self, target: WriteTarget, change: PendingChange, created: Any
+    ) -> None:
+        """新建推成功：把本地那条临时 id 的任务挪到服务端给的 id 上（t15）。
+
+        不挪的后果不是「多一条看不见的行」：下一次全量刷新会把服务端那条（真 id）拉回来，
+        而临时 id 这条不会被清掉（``apply_refresh`` 不剪枝）——同一条任务在屏幕上出现两遍，
+        而且永远合不上。
+
+        是**合并**而不是替换：服务端给的字段盖上去，它没提的字段（用户刚写下的日期、
+        ``projectId``）留在本地。响应按文档就是那条建好的任务，但不拿这个赌——真正的
+        服务端权威裁决在全量刷新那条路上，那里每一笔覆盖都会如实记进报告（t08/t09），
+        而不是在这里悄悄少掉用户写的一个日期。
+
+        服务端没回一个带 id 的原文时**什么都不做**：这条改动已经推成功了，不能当失败重试
+        （新建不是幂等的，重试就是建两条）。宁可留着一条临时 id 的本地任务，也不建两条。
+        """
+        if not isinstance(created, Mapping) or not created.get("id"):
+            return
+        local = target.task_payload(change.task_id) or {}
+        target.adopt_created(
+            change.task_id,
+            {
+                **local,
+                **created,
+                "projectId": created.get("projectId") or change.list_id,
+            },
+        )
 
     def _writer(self) -> TaskWriter:
         """推送要的那个客户端。没接上就大声报错——绝不假装推过了。"""
@@ -724,6 +782,52 @@ class SyncEngine:
             task_id,
             changes={"dueDate": api_date(due, field="dueDate"), "isAllDay": all_day},
         )
+
+    # ---------------------------------------------------------------- 新建（t15）
+
+    def create(
+        self,
+        title: str,
+        *,
+        due: datetime | None = None,
+        all_day: bool = False,
+        priority: int | None = None,
+        tags: Sequence[str] = (),
+    ) -> str:
+        """写：新建一条任务，落在收集箱（``a`` 快速添加，t15）。
+
+        解析不在这一层：调用方拿 :meth:`plan` 的结果把标题、截止时间、优先级、标签交进来
+        ——新建与改期共用一套语法，用户只用学一次（与 :meth:`reschedule` 同一条口径）。
+
+        乐观写（ADR-0002）：先在本地造出这条任务（临时 id），**立即返回**；推送排到事件
+        循环上走 ``POST /open/v1/task``，推不动就留在重试队列里按注入的钟退避重试。
+        「新建的任务立刻出现在对应分区里」因此不依赖网络。
+
+        没有日期是**合法**的：只写标题就是一条「今天要做、但没说几点」的任务。要挡的是
+        「解析没成功还硬建」——那种任务在服务端还会被顺手清掉重复规则，是双重错误；
+        拦它的是调用方：``plan()`` 的 ``diagnostics`` 非空就不该走到这里（``date_parser``
+        的约定）。
+
+        返回本地那条任务的 id；推成功之后它会落到服务端给的 id 上。
+        """
+        target = self._write_target()
+        local_id = _local_task_id()
+        target.enqueue(
+            task_id=local_id,
+            kind=_storage_kind(WriteKind.CREATE),
+            payload=_create_payload(
+                title,
+                due=due,
+                all_day=all_day,
+                priority=priority,
+                tags=tags,
+                project_id=INBOX_ID,
+            ),
+            now=self._clock.now(),
+            list_id=INBOX_ID,
+        )
+        self._schedule_push()
+        return local_id
 
 
 def _is_due(change: PendingChange, now: datetime) -> bool:
@@ -913,6 +1017,47 @@ def _logical_day_after(day: LogicalDay, day_end: str, days: int) -> LogicalDay:
     for _ in range(days):
         day = logical_day(day.end, day_end)
     return day
+
+
+# ------------------------------------------------------------------ 新建（t15）
+
+
+def _local_task_id() -> str:
+    """新建时的本地临时 id（服务端还没给 id，本地这条任务当场就要能被选中）。
+
+    用 uuid 而不是计数器：计数器重启之后会从头开始，``local-1`` 会和上一次会话里那条
+    还没推成功的新建撞上——两条任务共用一个 id，本地那份原文就串了。
+    """
+    return f"local-{uuid4().hex}"
+
+
+def _create_payload(
+    title: str,
+    *,
+    due: datetime | None,
+    all_day: bool,
+    priority: int | None,
+    tags: Sequence[str],
+    project_id: str,
+) -> dict[str, Any]:
+    """新建任务的请求体（也是本地那份原文）。
+
+    只写用户真的写了的字段：没写日期就不带 ``dueDate``——凭空带一个日期字段正是
+    「服务端静默忽略」的入口。日期走 :func:`dida.api.guards.api_date`，按它自己的 offset
+    写成文档形式，不换时区（换时区就是静默位移那个 trap）。
+
+    ``isAllDay`` 只跟 ``dueDate`` 一起出现：没有截止时间时它没有意义。``priority`` 同理——
+    没写优先级就不写这个字段，服务端的默认值本来就是「无」。
+    """
+    payload: dict[str, Any] = {"title": title, "projectId": project_id}
+    if due is not None:
+        payload["dueDate"] = api_date(due, field="dueDate")
+        payload["isAllDay"] = all_day
+    if priority is not None:
+        payload["priority"] = priority
+    if tags:
+        payload["tags"] = list(tags)
+    return payload
 
 
 # ------------------------------------------------------------------ 写路径的守卫（t25）

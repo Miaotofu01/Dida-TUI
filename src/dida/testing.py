@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from collections import deque
 from datetime import datetime, timedelta
-from typing import Any
+from typing import Any, Sequence
 
 import httpx
 
@@ -23,7 +23,7 @@ from dida.clock import Clock
 from dida.date_parser import ParsedTask
 from dida.storage.store import RefreshReport
 from dida.sync.engine import SyncEngine, SyncStatus
-from dida.sync.view import ListSnapshot, SyncState, TaskSnapshot, TodayView
+from dida.sync.view import INBOX_NAME, ListSnapshot, SyncState, TaskSnapshot, TodayView
 
 
 class ManualClock:
@@ -177,6 +177,21 @@ class FakeBackend:
         self.reschedule_error: Exception | None = None
         """摆一个异常进去，``reschedule`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。"""
 
+        self.created: list[str] = []
+        """``create(title, ...)`` 收到的标题，按调用顺序（t15 的新建）。"""
+
+        self.created_due: list[datetime | None] = []
+        """每次新建写进去的截止时刻，与 ``created`` 一一对应。"""
+
+        self.created_all_day: list[bool] = []
+        """每次新建是不是全天，与 ``created`` 一一对应。"""
+
+        self.created_priority: list[int | None] = []
+        """每次新建写进去的优先级（API 取值 1/3/5；没写是 ``None``），与 ``created`` 一一对应。"""
+
+        self.created_tags: list[tuple[str, ...]] = []
+        """每次新建写进去的标签，与 ``created`` 一一对应。"""
+
         self._engine = SyncEngine(clock=clock, day_end=day_end, source=self.source)
 
     async def refresh(self) -> RefreshReport:
@@ -224,3 +239,31 @@ class FakeBackend:
         self.rescheduled_all_day.append(all_day)
         if self.reschedule_error is not None:
             raise self.reschedule_error
+
+    def create(
+        self,
+        title: str,
+        *,
+        due: datetime | None = None,
+        all_day: bool = False,
+        priority: int | None = None,
+        tags: Sequence[str] = (),
+    ) -> str:
+        """写：记下这一笔，**并且真的把它摆进内存缓存**（t15 的新建）。
+
+        与 ``complete`` / ``defer`` 那种「只记录」不一样：新建是凭空多出一条任务，而
+        「新建的任务立刻出现在对应分区里」正是工单 #15 的验收标准之一——只记录的话，
+        接缝一根本测不到这句话。落点与引擎同一口径：收集箱。
+        """
+        self.created.append(title)
+        self.created_due.append(due)
+        self.created_all_day.append(all_day)
+        self.created_priority.append(priority)
+        self.created_tags.append(tuple(tags))
+        return self.source.add_task(
+            title,
+            list_name=INBOX_NAME,
+            due=due,
+            all_day=all_day,
+            priority=priority or 0,
+        ).id

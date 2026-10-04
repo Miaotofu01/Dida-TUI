@@ -17,6 +17,7 @@ from dida.sync.engine import Engine, UnknownTaskError
 from dida.tui.panes import (
     DetailPane,
     ListPane,
+    QuickAddInput,
     RescheduleInput,
     StatusBar,
     TaskPane,
@@ -32,6 +33,9 @@ NO_DATE_MESSAGE = "没写日期：改期要说清改到哪一天，可以写「�
 UNKNOWN_TASK_MESSAGE = "没有改成：这条任务已经不在本地缓存里了，刷新之后再试一次"
 """引擎拒绝写入（本地没有这条任务的底稿，工单 #25）时的话：如实说没改成。"""
 
+NO_TITLE_MESSAGE = "没写标题：新建至少得有个标题，日期、优先级、标签都可以写在标题后面"
+"""新建输入框里只有日期/优先级/标签、一个字的标题都没有时的话。任务得有名字。"""
+
 
 class DidaApp(App[None]):
     """三栏 + 状态栏。"""
@@ -46,6 +50,7 @@ class DidaApp(App[None]):
         Binding("g", "defer", "顺延"),
         Binding("G", "defer_week", "顺延一周"),
         Binding("e", "reschedule", "改期"),
+        Binding("a", "quick_add", "新建"),
     ]
     CSS = """
     #panes {
@@ -75,6 +80,9 @@ class DidaApp(App[None]):
         self.engine = engine
 
     def compose(self) -> ComposeResult:
+        # 新建输入框：默认收起，按 a 才出现。它在三栏**上面**——它不瞄准任何一条任务，
+        # 而 e 的改期框在下面（改的是光标下那一条）。两者共用同一套语法。
+        yield QuickAddInput(id="quick-add-input")
         with Horizontal(id="panes"):
             yield ListPane(id="list-pane")
             yield TaskPane(id="task-pane")
@@ -182,6 +190,47 @@ class DidaApp(App[None]):
         except UnknownTaskError:
             box.show_message(UNKNOWN_TASK_MESSAGE)
             return
+        box.close()
+        self.query_one(TaskPane).focus()
+        self.refresh_view()
+
+    # ---------------------------------------------------------------- 新建（t15）
+
+    def action_quick_add(self) -> None:
+        """``a``：打开顶部新建输入框（工单 #15）。
+
+        不瞄准任何一条任务，所以光标在哪都无所谓——空屏上按 ``a`` 照样能建。
+        """
+        self.query_one(QuickAddInput).open()
+
+    def on_quick_add_input_submitted(self, event: QuickAddInput.Submitted) -> None:
+        """新建输入框按了 ``Enter``：先解析，再决定建不建（工单 #15）。
+
+        与改期同一条规矩：**非空 ``diagnostics`` 一律提示、绝不提交**，而且不按 code
+        名单挑着报——``invalid_date`` 与 #23 的 ``duplicate_priority`` 一样重要。新建这条
+        路上它更重：静默建出一个没有日期的任务，服务端还会顺手清掉重复规则，是双重错误，
+        用户三天后在手机上才发现这一条根本不是自己写的样子。
+
+        标题全是空的也不行（整行只写了「明天 !高」）：任务总得有个名字。
+
+        被拒绝时输入框留在原地、原文一个字不删——用户改一改再按 Enter 就行。
+        """
+        box = self.query_one(QuickAddInput)
+        parsed = self.engine.plan(event.text)
+        if parsed.diagnostics:
+            box.show_message("；".join(item.message for item in parsed.diagnostics))
+            return
+        if not parsed.title:
+            box.show_message(NO_TITLE_MESSAGE)
+            return
+        # 解析出来的四样东西原样交给引擎：TUI 不重算日期、不重排优先级、不动标签。
+        self.engine.create(
+            parsed.title,
+            due=parsed.due,
+            all_day=parsed.all_day,
+            priority=parsed.priority,
+            tags=parsed.tags,
+        )
         box.close()
         self.query_one(TaskPane).focus()
         self.refresh_view()

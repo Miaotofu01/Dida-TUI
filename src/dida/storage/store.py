@@ -331,6 +331,20 @@ class Store:
         assert change is not None
         return change
 
+    def adopt_created(self, local_id: str, payload: Mapping[str, Any]) -> None:
+        """新建推成功：把本地那条临时 id 的任务挪到服务端给的 id 上（t15）。
+
+        服务端建好之后才知道真 id。不挪的话，下一次全量刷新会把真 id 那条拉回来，而临时
+        id 这条不会被清掉（``apply_refresh`` 不剪枝，t08 的口径）——同一条任务在屏幕上
+        出现两遍，而且永远合不上。
+
+        ``payload`` 是服务端回的原文（含我们不认识的字段），原样存。两步在同一个事务里：
+        不会留下「两条都在」或者「一条都没有」的中间状态。
+        """
+        with self._db:
+            self._write_task(payload)
+            self._db.execute("DELETE FROM tasks WHERE id = ?", (local_id,))
+
     def pending(self) -> tuple[PendingChange, ...]:
         """还没推成功的改动，按发生顺序（t10 的重试队列按这个顺序挑）。
 
