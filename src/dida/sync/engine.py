@@ -88,6 +88,7 @@ __all__ = [
     "TaskItem",
     "TaskSnapshot",
     "TodayView",
+    "UnknownTaskError",
     "ViewSource",
     "WriteKind",
     "WriteTarget",
@@ -459,8 +460,15 @@ class SyncEngine:
         写失败（服务端说不行、网络断了）在 UI 上表现为状态栏那个待推送数量，而不是异常。
 
         t11 的完成、t13 的顺延都从这一个入口走；它俩只需要给 ``task_id`` 与 ``changes``。
+
+        本地缓存里没有这条任务（或者那份底稿没有 ``projectId``）时不入队，当场抛
+        :class:`UnknownTaskError`：请求的清单 id 只存在于底稿里，凭空入队只会留下一条
+        **永远推不出去**的改动，让状态栏那个数一直非零（工单 #25）。
         """
         target = self._write_target()
+        snapshot = target.task_payload(task_id)
+        if snapshot is None or not snapshot.get("projectId"):
+            raise UnknownTaskError(task_id)
         target.enqueue(
             task_id=task_id,
             kind=_storage_kind(kind),
@@ -884,3 +892,28 @@ def _logical_day_after(day: LogicalDay, day_end: str, days: int) -> LogicalDay:
     for _ in range(days):
         day = logical_day(day.end, day_end)
     return day
+
+
+# ------------------------------------------------------------------ 写路径的守卫（t25）
+
+
+class UnknownTaskError(DidaError):
+    """这条写推不出去，所以拒绝它：本地没有一条能拼出请求的底稿（工单 #25）。
+
+    三条写端点都要任务**真实的清单 id**：更新是 ``POST /open/v1/task/{taskId}``，请求体
+    要求 ``id`` + ``projectId``（api-contracts.md）；完成与删除把它写在路径里。这份清单
+    只存在于本地那份 ``task_payload`` 底稿里——**没有别处可查**，引擎手里只有 ``task_id``。
+
+    没有底稿还硬写下去的实测后果：存储层拿收集箱兜底（``Store._list_of``），凭空造出一行
+    没有 ``projectId`` 的快照，请求带着一个**猜来的**清单发出去，失败后那条改动永远留在
+    队列里。状态栏那个数一直非零，用户读到的是「等一下就好」，而它永远不会好——这正是
+    规范「如实呈现」要消灭的那类安静错误。所以宁可当场大声拒绝。
+    """
+
+    def __init__(self, task_id: str) -> None:
+        super().__init__(
+            f"本地缓存里没有任务 {task_id} 的可用底稿（写操作需要它的 projectId）："
+            "拒绝入队，因为这条改动永远推不出去"
+        )
+        self.task_id = task_id
+        """请求写入的那条任务 id，UI 可以直接显示出来。"""

@@ -273,6 +273,213 @@ async def test_the_completed_window_is_a_date_field_too():
     assert transport.requests == []
 
 
+async def test_a_datetime_end_date_is_rejected_as_a_structured_error_not_a_bare_type_error():
+    """窗口的另一端（``endDate``）和 ``startDate`` 是同一类字段（工单 #26）。
+
+    漏掉它的时候，``datetime`` 会一路走到 json 编码器，漏出裸 ``TypeError``——
+    spec 说这一层不把裸异常抛给 UI，所以这里断言的是**结构化**的那一个。
+    """
+    transport = FakeTransport(json=[])
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(InvalidDateError) as caught:
+        await client.list_completed(end_date=datetime(2026, 3, 5, 9, 30))
+
+    assert caught.value.field == "endDate"
+    assert transport.requests == []
+
+
+#: 已完成流窗口的两端：同一套守卫，两个不同的字段名（工单 #26）。
+COMPLETED_WINDOW_BOUNDS = [("start_date", "startDate"), ("end_date", "endDate")]
+
+
+@pytest.mark.parametrize(("bound", "field"), COMPLETED_WINDOW_BOUNDS)
+@pytest.mark.parametrize("rejected", [datetime(2026, 3, 5, 9, 30), "2026-03-05", "上周"])
+async def test_each_end_of_the_completed_window_rejects_the_same_illegal_forms(
+    bound, field, rejected
+):
+    """窗口两端行为一致：naive ``datetime``、裸日期、非日期字符串都不许发出去。
+
+    裸日期（``2026-03-05``）是最阴的一种：日期正则不认它，但它是**合法 JSON**，
+    漏过去服务端只会静默忽略这个窗口。
+    """
+    transport = FakeTransport(json=[])
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(InvalidDateError) as caught:
+        await client.list_completed(**{bound: rejected})
+
+    assert caught.value.field == field
+    assert transport.requests == []
+
+
+@pytest.mark.parametrize(("bound", "field"), COMPLETED_WINDOW_BOUNDS)
+async def test_each_end_of_the_completed_window_serializes_a_datetime_the_same_way(bound, field):
+    """合法输入照旧：字符串原样回写，带时区的 ``datetime`` 按自己的 offset 序列化。"""
+    transport = FakeTransport(json=[])
+    client = DidaApiClient(token="tok-123", transport=transport)
+    await client.list_completed(**{bound: "2026-03-05T09:00:00+0800"})
+    assert transport.last_json[field] == "2026-03-05T09:00:00+0800"  # 不是 +08:00
+
+    transport = FakeTransport(json=[])
+    client = DidaApiClient(token="tok-123", transport=transport)
+    await client.list_completed(
+        **{bound: datetime(2026, 3, 5, 9, 30, tzinfo=timezone(timedelta(hours=8)))}
+    )
+    assert transport.last_json[field] == "2026-03-05T09:30:00+0800"  # 不是 01:30:00+0000
+
+
+async def test_a_checklist_items_completed_time_is_a_guarded_date_field_too():
+    """子任务的 ``completedTime`` 与任务上那个同名同姓：也是服务端给的、原样带回的值。
+
+    漏掉它和漏掉 ``endDate`` 是同一类（``ChecklistItem`` 的字段表里就有它）：
+    ``datetime`` 会漏成裸 ``TypeError``，非法字符串会被静默丢掉。
+    """
+    transport = FakeTransport(json={"id": "t-1"})
+    client = DidaApiClient(token="tok-123", transport=transport)
+    await client.update_task(
+        "inbox",
+        "t-1",
+        {"items": [{"id": "i-1", "completedTime": "2026-03-05T09:00:00+0800"}]},
+    )
+    assert transport.last_json["items"][0]["completedTime"] == "2026-03-05T09:00:00+0800"
+
+    utc_noon = datetime(2026, 3, 5, 9, 30, tzinfo=timezone.utc)
+    transport = FakeTransport(json={"id": "t-1"})
+    client = DidaApiClient(token="tok-123", transport=transport)
+    await client.update_task(
+        "inbox",
+        "t-1",
+        {"items": [{"id": "i-1", "completedTime": utc_noon}]},
+    )
+    assert transport.last_json["items"][0]["completedTime"] == "2026-03-05T09:30:00+0000"
+
+    transport = FakeTransport(json={"id": "t-1"})
+    client = DidaApiClient(token="tok-123", transport=transport)
+    with pytest.raises(InvalidDateError) as caught:
+        await client.update_task(
+            "inbox", "t-1", {"items": [{"id": "i-1", "completedTime": "昨天"}]}
+        )
+    assert caught.value.field == "items[0].completedTime"
+    assert transport.requests == []
+
+
+def _body_field(body: Any, path: str) -> Any:
+    """按 ``items[0].completedTime`` 这种路径（api-contracts.md 的写法）从请求体里取值。"""
+    for part in path.split("."):
+        name, _, index = part.partition("[")
+        body = body[name]
+        if index:
+            body = body[int(index.rstrip("]"))]
+    return body
+
+
+#: 请求体里**所有**带日期的字段，一次列全：字段路径（与 api-contracts.md 的 ``Task`` /
+#: ``ChecklistItem`` 字段表一致）+ 怎么把一个值放进那次请求 + 那次调用的响应形状。
+#: 这张表是独立抄的，不从守卫的常量里生成——守卫漏字段时它才会红。
+DATE_FIELD_CASES = [
+    (
+        "create_task.startDate",
+        "startDate",
+        lambda client, value: client.create_task(
+            {"title": "写周报", "projectId": "inbox", "startDate": value}
+        ),
+        {"id": "t-1"},
+    ),
+    (
+        "create_task.dueDate",
+        "dueDate",
+        lambda client, value: client.create_task(
+            {"title": "写周报", "projectId": "inbox", "dueDate": value}
+        ),
+        {"id": "t-1"},
+    ),
+    (
+        "create_task.completedTime",
+        "completedTime",
+        lambda client, value: client.create_task(
+            {"title": "写周报", "projectId": "inbox", "completedTime": value}
+        ),
+        {"id": "t-1"},
+    ),
+    (
+        "update_task.startDate",
+        "startDate",
+        lambda client, value: client.update_task("inbox", "t-1", {"startDate": value}),
+        {"id": "t-1"},
+    ),
+    (
+        "update_task.dueDate",
+        "dueDate",
+        lambda client, value: client.update_task("inbox", "t-1", {"dueDate": value}),
+        {"id": "t-1"},
+    ),
+    (
+        "update_task.items[0].startDate",
+        "items[0].startDate",
+        lambda client, value: client.update_task(
+            "inbox", "t-1", {"items": [{"id": "i-1", "startDate": value}]}
+        ),
+        {"id": "t-1"},
+    ),
+    (
+        "update_task.items[0].completedTime",
+        "items[0].completedTime",
+        lambda client, value: client.update_task(
+            "inbox", "t-1", {"items": [{"id": "i-1", "completedTime": value}]}
+        ),
+        {"id": "t-1"},
+    ),
+    (
+        "list_completed.startDate",
+        "startDate",
+        lambda client, value: client.list_completed(start_date=value),
+        [],
+    ),
+    (
+        "list_completed.endDate",
+        "endDate",
+        lambda client, value: client.list_completed(end_date=value),
+        [],
+    ),
+]
+
+
+async def test_every_date_field_in_every_request_body_is_guarded_before_it_is_sent():
+    """横着扫一遍日期字段：**任何**一个字段收到非法值，都在发请求之前结构化报错。
+
+    ``endDate`` 曾经不在任何清单里（工单 #26）：拿它当字段名逐个端点数一遍，
+    才是「同类漏网还有没有」的答案，而不是只看被报告的那一个。
+    新端点带日期字段时，往 :data:`DATE_FIELD_CASES` 里加一行——表在，漏网就在。
+    """
+    rejected = "上周"  # 服务端会静默忽略的写法：请求成功、窗口没生效
+    for name, path, call, payload in DATE_FIELD_CASES:
+        transport = FakeTransport(json=payload)
+        client = DidaApiClient(token="tok-123", transport=transport)
+
+        with pytest.raises(InvalidDateError) as caught:
+            await call(client, rejected)
+
+        assert caught.value.field == path, f"{name} 报的字段名不对"
+        assert transport.requests == [], f"{name} 把非法日期发出去了"
+
+
+async def test_no_date_field_in_any_request_body_leaves_a_datetime_object_behind():
+    """另一半：合法输入必须是**字符串**才出门，否则 json 编码器会漏裸 ``TypeError``。
+
+    带时区的 ``datetime`` 是合法输入，所以这里断言它被序列化成了文档形式，
+    而不是「没抛异常就算过」——裸 ``TypeError`` 恰恰是工单 #26 报出来的那一个。
+    """
+    aware = datetime(2026, 3, 5, 9, 30, tzinfo=timezone(timedelta(hours=8)))
+    for name, path, call, payload in DATE_FIELD_CASES:
+        transport = FakeTransport(json=payload)
+        client = DidaApiClient(token="tok-123", transport=transport)
+
+        await call(client, aware)
+
+        assert _body_field(transport.last_json, path) == "2026-03-05T09:30:00+0800", name
+
+
 async def test_a_repeat_rule_on_a_dateless_task_never_leaves_the_client():
     transport = FakeTransport(json={"id": "t-1"})
     client = DidaApiClient(token="tok-123", transport=transport)
