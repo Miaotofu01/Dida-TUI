@@ -4,7 +4,9 @@
 
 技术栈：Python 3.12 + Textual。安装后以 `dida` 命令启动。
 
-当前状态：**spec 阶段**，还没有代码。v1 spec 在 [issue #1](https://github.com/Miaotofu01/Dida-TUI/issues/1)。
+当前状态：**骨架阶段**——`uv run pytest` 可跑，`uv run dida` 起三栏占位界面（`q` 退出）。
+模块边界、依赖方向与两个测试接缝见 [docs/architecture.md](docs/architecture.md)，
+v1 spec 在 [issue #1](https://github.com/Miaotofu01/Dida-TUI/issues/1)。
 
 ## Agent skills
 
