@@ -183,6 +183,24 @@ def priority_mark(priority: int) -> str:
     return {5: "!", 3: "~"}.get(priority, "·")
 
 
+PRIORITY_CYCLE: tuple[int, ...] = (0, 1, 3, 5)
+"""四个档位的**线上编码**，按 ``p`` 键的循环顺序：无 → 低 → 中 → 高。"""
+
+
+def next_priority(priority: int) -> int:
+    """``p`` 的下一档：无 → 低 → 中 → 高 → 无，值都是 API 的线上编码 ``0/1/3/5``。
+
+    稠密的 ``1/2/3`` 是**日期解析器的档位序号**（用户写的 ``!1``/``!2``/``!3``），不是要
+    发给服务端的取值：``!3`` 是「高」，对应线上的 ``5``。两套编码只在这一处相接，
+    ``!5`` 那种写法仍然是诊断（见 :mod:`dida.date_parser`）。
+
+    认不出来的取值（服务端给了表外的数）当作「无」：``priority_mark`` 本来就把它们读作
+    ``·``，从那儿往前推一档正好是「低」。
+    """
+    index = PRIORITY_CYCLE.index(priority) if priority in PRIORITY_CYCLE else -1
+    return PRIORITY_CYCLE[(index + 1) % len(PRIORITY_CYCLE)]
+
+
 def list_names(lists: Sequence[ListSnapshot]) -> dict[str, str]:
     """清单 id → 显示名；收集箱即使没有清单行也能叫出名字。"""
     names = {item.id: item.name for item in lists}
@@ -288,6 +306,40 @@ def _by_due(items: list[TaskItem]) -> list[TaskItem]:
     dated = sorted((item for item in items if item.due is not None), key=lambda item: (item.due, item.title))
     undated = sorted((item for item in items if item.due is None), key=lambda item: (item.title, item.task_id))
     return dated + undated
+
+
+# ------------------------------------------------------------------ 模糊过滤（t17）
+
+
+def fuzzy_match(query: str, title: str) -> bool:
+    """``query`` 是不是 ``title`` 的**有序子序列**（大小写不敏感）。
+
+    子序列而不是子串：中文标题里隔着字也认（``写报`` 命中 ``写周报``），这才是「模糊」；
+    顺序仍然算数（``报写`` 不命中）。空查询命中一切——那就是「没有过滤」。
+    """
+    if not query:
+        return True
+    rest = iter(title.casefold())
+    return all(char in rest for char in query.casefold())
+
+
+def filter_groups(groups: Sequence[TaskGroup], query: str) -> tuple[TaskGroup, ...]:
+    """按查询筛掉不命中的行；整组都不命中就整组不留。
+
+    只筛未完成任务的那两区（中栏）；底部的已完成区不在 ``groups`` 里，折叠着也不参与光标。
+    留下来的行保持引擎给的顺序——排序是引擎的事，这里只做筛。
+
+    组标题上的条数是 ``len(items)``（:class:`TaskGroup.count`），所以整组筛空必须整组丢掉：
+    留下一个「今日 · 3 项」的空标题，就是在骗人。空查询原样返回，``Esc`` 因此就是「恢复
+    完整列表」。
+    """
+    if not query:
+        return tuple(groups)
+    return tuple(
+        TaskGroup(kind=group.kind, items=kept)
+        for group in groups
+        if (kept := tuple(item for item in group.items if fuzzy_match(query, item.title)))
+    )
 
 
 # ------------------------------------------------------------------ 已完成流（t12）

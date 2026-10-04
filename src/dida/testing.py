@@ -177,6 +177,9 @@ class FakeBackend:
         self.reschedule_error: Exception | None = None
         """摆一个异常进去，``reschedule`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。"""
 
+        self.cycled: list[str] = []
+        """``cycle_priority(task_id)`` 收到的任务 id，按调用顺序（t17 的 ``p``）。"""
+
         self._engine = SyncEngine(clock=clock, day_end=day_end, source=self.source)
 
     async def refresh(self) -> RefreshReport:
@@ -224,3 +227,11 @@ class FakeBackend:
         self.rescheduled_all_day.append(all_day)
         if self.reschedule_error is not None:
             raise self.reschedule_error
+
+    def cycle_priority(self, task_id: str) -> None:
+        """写：只记录（与 ``complete`` / ``defer`` 一样，替身不动缓存）。
+
+        「下一档是哪个线上编码」是引擎的判断（``dida.sync.view.next_priority``，0/1/3/5），
+        替身不自己再抄一份——抄了就会跟真货说不一样的话。
+        """
+        self.cycled.append(task_id)
