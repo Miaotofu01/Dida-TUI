@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# 本地凭据兜底（正常配置在 ~/.config/dida-tui/config.toml，不进仓库）
+config.toml
+.env
+
+# 本地草稿与临时工作区
+.scratch/
