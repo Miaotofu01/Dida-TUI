@@ -538,6 +538,7 @@ def _snapshot(payload: Mapping[str, Any]) -> TaskSnapshot:
     这条属于今日还是逾期则完全不是这里的事。
     """
     due = payload.get("dueDate")
+    completed_at = payload.get("completedTime")
     return TaskSnapshot(
         id=str(payload["id"]),
         title=str(payload.get("title") or ""),
@@ -546,6 +547,7 @@ def _snapshot(payload: Mapping[str, Any]) -> TaskSnapshot:
         all_day=bool(payload.get("isAllDay")),
         priority=int(payload.get("priority") or 0),
         completed=payload.get("status") == COMPLETED_STATUS,
+        completed_at=_parse_time(completed_at) if isinstance(completed_at, str) else None,
     )
 
 

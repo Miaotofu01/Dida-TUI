@@ -95,7 +95,7 @@ class DidaApp(App[None]):
         """读引擎的视图模型，重画三栏与状态栏。t09/t10/t11 在数据变化后调用。"""
         view = self.engine.view()
         self.query_one(ListPane).render_lists(view.lists)
-        self.query_one(TaskPane).render_groups(view.groups)
+        self.query_one(TaskPane).render_groups(view.groups, view.completed)
         self.update_status()
 
     def update_status(self) -> None:
