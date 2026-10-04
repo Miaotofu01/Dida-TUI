@@ -675,6 +675,27 @@ class SyncEngine:
             )
         return self._client
 
+    # ---------------------------------------------------------------- 改期（t14）
+
+    def reschedule(self, task_id: str, *, due: datetime, all_day: bool) -> None:
+        """写：改期（``e``）——把截止时间换成解析出来的那一刻，只动 ``dueDate`` 与 ``isAllDay``。
+
+        「改成哪一天」由 :func:`dida.date_parser.parse` 定（与新建共用一套语法，入口是
+        :meth:`plan`）；这里只把那一份结果交给 :meth:`write`：本地当场生效、立即推送、
+        推不动留在队列里按注入的钟退避重试。
+
+        **截止时间原样写回，不做任何逻辑日加减。** ``all_day=True`` 时 ``due`` 是那一天的
+        00:00，是个**日期标记**：按 ``[start, end)`` 去把它挪进「当前逻辑日」，会让一个
+        「今天」的全天任务整天掉出今日区（``due_day()`` 对全天任务只看 ``due.date()``）。
+        时刻也不在这里顺延：只写时刻且已过去的那一次滚动，解析器已经算完了；写明了日期
+        （哪怕「今天」）的那一种本来就不该滚——再滚一次就是第二次顺延（``date_parser``
+        的两条约定）。
+        """
+        self.write(
+            task_id,
+            changes={"dueDate": api_date(due, field="dueDate"), "isAllDay": all_day},
+        )
+
 
 def _is_due(change: PendingChange, now: datetime) -> bool:
     """这条改动现在能不能推：没排过重试的立刻推，排过的要等到点。
