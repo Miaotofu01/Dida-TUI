@@ -104,8 +104,12 @@ class InMemorySource:
         priority: int = 0,
         completed: bool = False,
         id: str | None = None,
+        completed_at: datetime | None = None,
     ) -> TaskSnapshot:
-        """加一条任务快照；``id`` 默认 ``t1``、``t2``……（按加入顺序）。"""
+        """加一条任务快照；``id`` 默认 ``t1``、``t2``……（按加入顺序）。
+
+        ``completed_at`` 是服务端的完成时刻：已完成区（t12）按它决定谁在窗口里。
+        """
         self._seq += 1
         snapshot = TaskSnapshot(
             id=id if id is not None else f"t{self._seq}",
@@ -115,6 +119,7 @@ class InMemorySource:
             all_day=all_day,
             priority=priority,
             completed=completed,
+            completed_at=completed_at,
         )
         self._lists.setdefault(snapshot.list_id, ListSnapshot(id=snapshot.list_id, name=list_name))
         self._tasks[snapshot.id] = snapshot

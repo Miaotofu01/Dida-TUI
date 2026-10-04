@@ -23,7 +23,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import Protocol, Sequence
 
@@ -71,6 +71,9 @@ class TaskSnapshot:
     """``0`` / ``1`` / ``3`` / ``5``（无 / 低 / 中 / 高），与 API 一致。"""
 
     completed: bool = False
+
+    completed_at: datetime | None = None
+    """完成时刻（服务端的 ``completedTime``）；本地刚完成、服务端还没认过的那些是 ``None``。"""
 
 
 @dataclass(frozen=True)
@@ -140,11 +143,39 @@ class TaskGroup:
 
 
 @dataclass(frozen=True)
+class CompletedItem:
+    """已完成区一行：标题、清单名、完成时刻的人类读法（都已经是成品）。"""
+
+    task_id: str
+    title: str
+    list_name: str
+    completed_at: datetime | None
+    completed_text: str
+
+
+@dataclass(frozen=True)
+class CompletedSection:
+    """中栏底部的已完成区：条数与行。
+
+    折叠与否是 **TUI 的状态**（看点不看点是用户的事），所以这里没有 ``collapsed``；
+    引擎只管「窗口内完成的有哪些」，行已经排好序、写好读法了。
+    """
+
+    items: tuple[CompletedItem, ...] = ()
+
+    @property
+    def count(self) -> int:
+        """窗口内完成的条数，显示在「已完成 N 项」上。"""
+        return len(self.items)
+
+
+@dataclass(frozen=True)
 class TodayView:
-    """整屏要的数据：左栏清单与中栏分区。"""
+    """整屏要的数据：左栏清单与中栏分区（含底部的已完成区）。"""
 
     lists: tuple[ListSummary, ...]
     groups: tuple[TaskGroup, ...]
+    completed: CompletedSection = CompletedSection()
 
 
 def priority_mark(priority: int) -> str:
@@ -257,3 +288,47 @@ def _by_due(items: list[TaskItem]) -> list[TaskItem]:
     dated = sorted((item for item in items if item.due is not None), key=lambda item: (item.due, item.title))
     undated = sorted((item for item in items if item.due is None), key=lambda item: (item.title, item.task_id))
     return dated + undated
+
+
+# ------------------------------------------------------------------ 已完成流（t12）
+
+
+def completed_section(
+    tasks: Sequence[TaskSnapshot],
+    lists: Sequence[ListSnapshot],
+    *,
+    now: datetime,
+    day_end: str,
+    window_hours: int,
+) -> CompletedSection:
+    """已完成区：窗口 ``[now - window_hours, …]`` 内完成的任务，最近的排在最前。
+
+    「完成于何时」只认服务端的 ``completedTime``（``completed_at``），不认本地那条
+    ``status``：那是 ADR-0001 里唯一能被服务端过滤的变化时间戳，也是这条流唯一有意义的
+    排序与过滤依据。本地刚按了完成、服务端还没认过的任务因此不会出现在这里——它要等
+    下一次已完成流把它带着真正的完成时刻带回来。没有上界：服务端时钟快一点不该让用户
+    刚做完的任务消失。
+
+    纯函数：「现在」与窗口大小都从参数进来，这一层不读时钟（t12 的窗口由引擎按注入的
+    配置给）。
+    """
+    window_start = now - timedelta(hours=window_hours)
+    names = list_names(lists)
+    rows = [
+        CompletedItem(
+            task_id=snapshot.id,
+            title=snapshot.title,
+            list_name=names.get(snapshot.list_id, snapshot.list_id),
+            completed_at=snapshot.completed_at,
+            completed_text=format_due(
+                snapshot.completed_at, all_day=False, now=now, day_end=day_end
+            ),
+        )
+        for snapshot in tasks
+        if snapshot.completed
+        and snapshot.completed_at is not None
+        and snapshot.completed_at >= window_start
+    ]
+    return CompletedSection(
+        items=tuple(sorted(rows, key=lambda row: (row.completed_at, row.title), reverse=True))
+    )

@@ -6,6 +6,8 @@
 - 清单行：``❯ 清单名  未完成条数``。
 - 分区标题：``── 逾期 · 3 项``；逾期区标红，且排在最前（顺序由引擎给）。
 - 任务行：``❯ ! 标题  清单名  今天 18:00``，光标行反色。
+- 已完成区（底部，默认收起）：标题 ``▸ 已完成 N 项``，``c`` 展开/收起；展开后每行
+  ``标题  清单名  完成时间``，整行暗灰 + 删除线。已完成行不参与光标移动。
 - 颜色只用终端 16 色对应的名字（``red`` / ``yellow`` / ``dim``），不写死 hex；
   ``tests/test_app_view.py`` 扫源码守着这条。
 
@@ -23,7 +25,15 @@ from textual.binding import Binding
 from textual.containers import VerticalScroll
 from textual.widgets import Static
 
-from dida.sync.engine import GroupKind, ListSummary, SyncStatus, TaskGroup, TaskItem
+from dida.sync.engine import (
+    CompletedItem,
+    CompletedSection,
+    GroupKind,
+    ListSummary,
+    SyncStatus,
+    TaskGroup,
+    TaskItem,
+)
 
 CURSOR_MARK = "❯"
 """光标行的行首标记；光标行同时反色。"""
@@ -175,22 +185,44 @@ class ListPane(Pane):
 
 
 class TaskPane(Pane):
-    """任务列（中）：分组后的任务。"""
+    """任务列（中）：分组后的任务 + 底部的已完成区。"""
 
     BORDER_TITLE = "今日"
     EMPTY_TEXT = "（今天没有未完成的任务）"
+    # `c`（已完成）收放底部那一区；键位表里没派给别的工单，也不是输入用的字符
+    BINDINGS = [Binding("c", "toggle_completed", "已完成")]
 
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(id=id)
         self._groups: tuple[TaskGroup, ...] = ()
+        self._completed = CompletedSection()
+        self._completed_expanded = False
         self._line_of_row: tuple[int, ...] = ()
 
-    def render_groups(self, groups: Sequence[TaskGroup]) -> None:
-        """接住引擎给的分区，光标回到第一行。"""
+    def render_groups(
+        self, groups: Sequence[TaskGroup], completed: CompletedSection = CompletedSection()
+    ) -> None:
+        """接住引擎给的分区与已完成区，光标回到第一行。
+
+        展开与否**不**在这里重置：那是用户的看的姿势，不是数据；刷新之后把人家摊开的
+        那一区又收回去，正是「刷新让屏幕闪」的另一副面孔。
+        """
         self._groups = tuple(groups)
+        self._completed = completed
         self._rows = tuple(item for group in self._groups for item in group.items)
         self._cursor = 0
         self._redraw()
+
+    def toggle_completed(self) -> None:
+        """展开/收起已完成区；窗口里没有已完成的任务时什么都不做。"""
+        if not self._completed.count:
+            return
+        self._completed_expanded = not self._completed_expanded
+        self._redraw()
+
+    def action_toggle_completed(self) -> None:
+        """``c``：展开/收起已完成区。"""
+        self.toggle_completed()
 
     @property
     def selected_task_id(self) -> str | None:
@@ -208,6 +240,13 @@ class TaskPane(Pane):
             for item in group.items:
                 lines.append(task_line(item, selected=len(line_of_row) == self._cursor))
                 line_of_row.append(len(lines) - 1)
+        if not line_of_row and self._completed.count:
+            # 今天全做完了：空状态那句话不能因为底下的已完成区把内容撑起来，就不说了
+            lines.append(Text(self.EMPTY_TEXT, style=EMPTY_STYLE))
+        if self._completed.count:
+            lines.append(completed_header(self._completed, expanded=self._completed_expanded))
+            if self._completed_expanded:
+                lines.extend(completed_line(item) for item in self._completed.items)
         self._line_of_row = tuple(line_of_row)
         self.set_body(pane_body(lines, empty=self.EMPTY_TEXT))
 
@@ -229,3 +268,32 @@ def format_status(status: SyncStatus) -> str:
     logical_day = status.logical_day.strftime("%m-%d") if status.logical_day else "—"
     last_refresh = status.last_refresh_at.strftime("%H:%M") if status.last_refresh_at else "—"
     return f"已同步 {last_refresh} · 待推送 {status.pending_count} · 逻辑日 {logical_day}"
+
+
+FOLDED_MARK = "▸"
+UNFOLDED_MARK = "▾"
+"""已完成区标题前的折叠标记：收起 / 展开一眼可分。"""
+
+COMPLETED_STYLE = "dim strike"
+"""已完成行：暗灰 + 删除线。"""
+
+COMPLETED_HEADER_STYLE = "bold"
+
+
+def completed_header(section: CompletedSection, *, expanded: bool) -> Text:
+    """已完成区标题行：``▸ 已完成 N 项``；标记随展开状态变。"""
+    mark = UNFOLDED_MARK if expanded else FOLDED_MARK
+    return Text(f"{mark} 已完成 {section.count} 项", style=COMPLETED_HEADER_STYLE)
+
+
+def completed_line(item: CompletedItem) -> Text:
+    """已完成行：``标题  清单名  完成时间``，整行暗灰 + 删除线。
+
+    行首留一个空位与任务行对齐；已完成的行不参与光标移动，所以永远不是光标行。
+    """
+    text = Text(style=COMPLETED_STYLE)
+    text.append(f"{BLANK_MARK} {item.title}  ")
+    text.append(item.list_name)
+    text.append("  ")
+    text.append(item.completed_text)
+    return text
