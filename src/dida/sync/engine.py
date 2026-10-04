@@ -385,8 +385,13 @@ class SyncEngine:
         return report
 
     def complete(self, task_id: str) -> None:
-        """写：完成任务并立即推送（ADR 0002，服务端不可逆）。t11 实现。"""
-        raise NotImplementedError("完成由 t11 实现")
+        """写：完成任务并立即推送（ADR 0002，服务端不可逆）。
+
+        就是 :meth:`write` 的一个预置：本地当场标记完成（``status`` 由引擎补 ``2``），
+        推送走没有请求体的 ``complete`` 端点。没有「取消完成」这条路径——服务端没有
+        这个接口，本地自己造一个只会在下一次刷新时被服务端权威抹掉（ADR-0002）。
+        """
+        self.write(task_id, kind=WriteKind.COMPLETE)
 
     def defer(self, task_id: str) -> None:
         """写：顺延到下一个逻辑日。t13 实现。"""
