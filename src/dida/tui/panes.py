@@ -6,6 +6,7 @@
 - 清单行：``❯ 清单名  未完成条数``。
 - 分区标题：``── 逾期 · 3 项``；逾期区标红，且排在最前（顺序由引擎给）。
 - 任务行：``❯ ! 标题  清单名  今天 18:00``，光标行反色。
+- 刚完成的那一行再叠一层高亮（:data:`FLASH_STYLE`）：完成不可逆，这一下必须看得见。
 - 颜色只用终端 16 色对应的名字（``red`` / ``yellow`` / ``dim``），不写死 hex；
   ``tests/test_app_view.py`` 扫源码守着这条。
 
@@ -38,6 +39,13 @@ GROUP_HEADER_STYLE = "bold"
 GROUP_HEADER_OVERDUE_STYLE = "bold red"
 """逾期区标题标红——逾期置顶之外的另一半。"""
 
+FLASH_STYLE = "bold green"
+"""刚完成的那一行的高亮（几秒后由 ``TaskPane.flash(None)`` 收起）。
+
+完成在服务端不可逆（ADR-0002），所以这一下必须看得见：绿色是「做完了」，而光标的反色
+仍然是光标自己的那一层，两者叠在一起。终端 16 色里的名字，不写死 hex。
+"""
+
 EMPTY_STYLE = "dim"
 
 PLACEHOLDER = "（未接入）"
@@ -50,8 +58,12 @@ def group_header(group: TaskGroup) -> Text:
     return Text(f"── {group.title} · {group.count} 项", style=style)
 
 
-def task_line(item: TaskItem, *, selected: bool) -> Text:
-    """任务行：优先级标记 + 标题 + 清单名 + 人类可读的截止时间。"""
+def task_line(item: TaskItem, *, selected: bool, flash: bool = False) -> Text:
+    """任务行：优先级标记 + 标题 + 清单名 + 人类可读的截止时间。
+
+    ``flash`` 是「刚完成」的那一层额外高亮（见 :data:`FLASH_STYLE`），与 ``selected``
+    独立：完成的那一行通常正是光标行，两层要能叠。
+    """
     text = Text()
     text.append(f"{CURSOR_MARK if selected else BLANK_MARK} ")
     text.append(item.priority_mark, style=PRIORITY_STYLES.get(item.priority_mark, ""))
@@ -61,6 +73,8 @@ def task_line(item: TaskItem, *, selected: bool) -> Text:
     text.append(item.due_text, style=EMPTY_STYLE if item.due is None else "")
     if selected:
         text.stylize("reverse")
+    if flash:
+        text.stylize(FLASH_STYLE)
     return text
 
 
@@ -184,12 +198,22 @@ class TaskPane(Pane):
         super().__init__(id=id)
         self._groups: tuple[TaskGroup, ...] = ()
         self._line_of_row: tuple[int, ...] = ()
+        self._flashed: str | None = None
 
     def render_groups(self, groups: Sequence[TaskGroup]) -> None:
         """接住引擎给的分区，光标回到第一行。"""
         self._groups = tuple(groups)
         self._rows = tuple(item for group in self._groups for item in group.items)
         self._cursor = 0
+        self._redraw()
+
+    def flash(self, task_id: str | None) -> None:
+        """让刚完成的那一行高亮；``None`` 收起高亮。
+
+        只改「怎么画」，不改数据：高亮由 ``DidaApp`` 的定时器收起（ADR-0002 的补偿——
+        完成不可逆，按下去必须看得见）。任务 id 存在栏位里，所以中途重画不会把高亮弄丢。
+        """
+        self._flashed = task_id
         self._redraw()
 
     @property
@@ -206,7 +230,13 @@ class TaskPane(Pane):
         for group in self._groups:
             lines.append(group_header(group))
             for item in group.items:
-                lines.append(task_line(item, selected=len(line_of_row) == self._cursor))
+                lines.append(
+                    task_line(
+                        item,
+                        selected=len(line_of_row) == self._cursor,
+                        flash=item.task_id == self._flashed,
+                    )
+                )
                 line_of_row.append(len(lines) - 1)
         self._line_of_row = tuple(line_of_row)
         self.set_body(pane_body(lines, empty=self.EMPTY_TEXT))
