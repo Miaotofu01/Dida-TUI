@@ -159,7 +159,10 @@ class FakeBackend:
         """``complete(task_id)`` 收到的任务 id，按调用顺序。"""
 
         self.deferred: list[str] = []
-        """``defer(task_id)`` 收到的任务 id，按调用顺序。"""
+        """``defer(task_id, days=...)`` 收到的任务 id，按调用顺序。"""
+
+        self.deferred_days: list[int] = []
+        """每次顺延前进了几个逻辑日（``g`` 是 1、``G`` 是 7），与 ``deferred`` 一一对应。"""
 
         self._engine = SyncEngine(clock=clock, day_end=day_end, source=self.source)
 
@@ -189,5 +192,6 @@ class FakeBackend:
     def complete(self, task_id: str) -> None:
         self.completed.append(task_id)
 
-    def defer(self, task_id: str) -> None:
+    def defer(self, task_id: str, *, days: int = 1) -> None:
         self.deferred.append(task_id)
+        self.deferred_days.append(days)
