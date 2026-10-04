@@ -13,10 +13,11 @@ from textual.binding import Binding
 from textual.containers import Horizontal
 from textual.widgets import Footer
 
-from dida.sync.engine import Engine, UnknownTaskError
+from dida.sync.engine import Engine, UnknownTaskError, filter_groups
 from dida.tui.panes import (
     ConfirmScreen,
     DetailPane,
+    FilterInput,
     ListPane,
     QuickAddInput,
     RescheduleInput,
@@ -73,6 +74,8 @@ class DidaApp(App[None]):
         # 删除是这一屏唯一不可挽回的动作：服务端没有 undelete、没有回收站（api-contracts.md），
         # 所以 `d` 不直接删，先弹一次确认（t16）。
         Binding("d", "delete", "删除"),
+        Binding("p", "priority", "优先级"),
+        Binding("/", "filter", "过滤"),
     ]
     CSS = """
     #panes {
@@ -100,6 +103,8 @@ class DidaApp(App[None]):
     def __init__(self, engine: Engine) -> None:
         super().__init__()
         self.engine = engine
+        self._query = ""
+        """当前生效的过滤词（空串 = 不过滤）。框里的原文由 :class:`FilterInput` 拿着。"""
 
     def compose(self) -> ComposeResult:
         # 新建输入框：默认收起，按 a 才出现。它在三栏**上面**——它不瞄准任何一条任务，
@@ -111,6 +116,8 @@ class DidaApp(App[None]):
             yield DetailPane(id="detail-pane")
         # 改期输入框：默认收起，按 e 才出现（新建输入框归 t15，在顶部）
         yield RescheduleInput(id="reschedule-input")
+        # 过滤框：默认收起，按 / 才出现
+        yield FilterInput(id="filter-input")
         yield Footer()
         yield StatusBar(id="status-bar")
 
@@ -140,10 +147,19 @@ class DidaApp(App[None]):
         self.refresh_view()
 
     def refresh_view(self) -> None:
-        """读引擎的视图模型，重画三栏与状态栏。t09/t10/t11 在数据变化后调用。"""
+        """读引擎的视图模型，重画三栏与状态栏。t09/t10/t11 在数据变化后调用。
+
+        当前的过滤词在这里生效：筛是引擎那份纯函数（:func:`~dida.sync.view.filter_groups`）
+        干的，TUI 只是把筛过的分区交给中栏——所以刷新、完成、改期之后过滤都不会掉，
+        光标也不会落到一个已经被筛掉的任务上。
+        """
         view = self.engine.view()
         self.query_one(ListPane).render_lists(view.lists)
-        self.query_one(TaskPane).render_groups(view.groups, view.completed)
+        self.query_one(TaskPane).render_groups(
+            filter_groups(view.groups, self._query),
+            view.completed,
+            empty=TaskPane.NO_MATCH_TEXT if self._query else None,
+        )
         self.update_status()
 
     def update_status(self) -> None:
@@ -296,3 +312,38 @@ class DidaApp(App[None]):
             self.query_one(StatusBar).update(UNKNOWN_DELETE_MESSAGE)
             return
         self.refresh_view()
+    # ---------------------------------------------------------------- 优先级（t17）
+
+    def action_priority(self) -> None:
+        """``p``：把光标下那条任务的优先级推进一档（无 → 低 → 中 → 高 → 无）。
+
+        推进哪一档由引擎定：线上编码 ``0/1/3/5`` 是 API 的事实，TUI 不认识优先级取值，
+        只说「推进这一条」（与 ``x`` / ``g`` 一样）。光标下没有任务就什么都不做——
+        空屏上按键不该报错。
+        """
+        task_id = self.query_one(TaskPane).selected_task_id
+        if task_id is None:
+            return
+        self.engine.cycle_priority(task_id)
+        self.refresh_view()
+
+    # ---------------------------------------------------------------- 模糊过滤（t17）
+
+    def action_filter(self) -> None:
+        """``/``：打开过滤框，对当前列表做模糊过滤。"""
+        self.query_one(FilterInput).open()
+
+    def on_filter_input_changed(self, event: FilterInput.Changed) -> None:
+        """框里的字变了：立刻按它重画（边打边筛，不必按 Enter）。"""
+        self._query = event.query
+        self.refresh_view()
+
+    def on_filter_input_cancelled(self) -> None:
+        """``Esc``：清空过滤、恢复完整列表，焦点还给任务列。"""
+        self._query = ""
+        self.refresh_view()
+        self.query_one(TaskPane).focus()
+
+    def on_task_pane_selection_changed(self, event: TaskPane.SelectionChanged) -> None:
+        """光标换了一条任务：右栏跟着换（过滤期间因此不会指着一个被筛掉的任务）。"""
+        self.query_one(DetailPane).show(event.item)

@@ -205,6 +205,8 @@ class TaskPane(Pane):
 
     BORDER_TITLE = "今日"
     EMPTY_TEXT = "（今天没有未完成的任务）"
+    NO_MATCH_TEXT = "（没有匹配的任务）"
+    """过滤后一条都不剩时的话：与「今天真的没有任务」必须分得开。"""
     # `c`（已完成）收放底部那一区；键位表里没派给别的工单，也不是输入用的字符
     # `c`（已完成）收放底部那一区；键位表里没派给别的工单，也不是输入用的字符。
     # 光标键必须**重列一遍**：Textual 里子类的 BINDINGS 是覆盖而不是追加，只写 `c` 会把
@@ -224,20 +226,44 @@ class TaskPane(Pane):
         self._completed_expanded = False
         self._line_of_row: tuple[int, ...] = ()
         self._flashed: str | None = None
+        self._empty_text = self.EMPTY_TEXT
 
     def render_groups(
-        self, groups: Sequence[TaskGroup], completed: CompletedSection = CompletedSection()
+        self,
+        groups: Sequence[TaskGroup],
+        completed: CompletedSection = CompletedSection(),
+        *,
+        empty: str | None = None,
     ) -> None:
         """接住引擎给的分区与已完成区，光标回到第一行。
 
         展开与否**不**在这里重置：那是用户的看的姿势，不是数据；刷新之后把人家摊开的
         那一区又收回去，正是「刷新让屏幕闪」的另一副面孔。
+
+        ``groups`` 是**筛过**的那一份（过滤词由 ``DidaApp`` 交给
+        :func:`~dida.sync.view.filter_groups`）：光标底下的行表就是屏上那几行，所以光标
+        永远不会停在一个已经被筛掉的任务上（验收标准 #4）。
+
+        ``empty`` 是「一行都没有」时的那句话；省略就用本栏默认的那一句。过滤期间由
+        ``DidaApp`` 换成 :data:`NO_MATCH_TEXT`——屏上明明有任务却写「今天没有未完成的任务」
+        是在骗人。
         """
         self._groups = tuple(groups)
         self._completed = completed
+        self._empty_text = empty if empty is not None else self.EMPTY_TEXT
         self._rows = tuple(item for group in self._groups for item in group.items)
         self._cursor = 0
         self._redraw()
+        self._announce_selection()
+
+    def _move_cursor(self, step: int) -> None:
+        """光标上下移：移完告诉外面现在指着谁（右栏据此跟着走）。"""
+        super()._move_cursor(step)
+        self._announce_selection()
+
+    def _announce_selection(self) -> None:
+        """发一条「光标指着谁」：空屏或过滤后一条不剩时指的是 ``None``。"""
+        self.post_message(self.SelectionChanged(self.selected_item))
 
     def flash(self, task_id: str | None) -> None:
         """让刚完成的那一行高亮；``None`` 收起高亮。
@@ -269,6 +295,19 @@ class TaskPane(Pane):
         """光标下那条任务的标题；没有任务时是 ``None``（删除确认要点名是哪一条）。"""
         return self._rows[self._cursor].title if self._rows else None
 
+    @property
+    def selected_item(self) -> TaskItem | None:
+        """光标下那一行的成品（右栏画的就是它）；没有任务时是 ``None``。"""
+        item = self._rows[self._cursor] if self._rows else None
+        return item if isinstance(item, TaskItem) else None
+
+    class SelectionChanged(Message):
+        """光标换了一条任务（也包含「换成了没有」）：右栏据此跟着走。"""
+
+        def __init__(self, item: TaskItem | None) -> None:
+            self.item = item
+            super().__init__()
+
     def _line_of_cursor(self, index: int) -> int:
         return self._line_of_row[index]
 
@@ -288,21 +327,49 @@ class TaskPane(Pane):
                 line_of_row.append(len(lines) - 1)
         if not line_of_row and self._completed.count:
             # 今天全做完了：空状态那句话不能因为底下的已完成区把内容撑起来，就不说了
-            lines.append(Text(self.EMPTY_TEXT, style=EMPTY_STYLE))
+            lines.append(Text(self._empty_text, style=EMPTY_STYLE))
         if self._completed.count:
             lines.append(completed_header(self._completed, expanded=self._completed_expanded))
             if self._completed_expanded:
                 lines.extend(completed_line(item) for item in self._completed.items)
         self._line_of_row = tuple(line_of_row)
-        self.set_body(pane_body(lines, empty=self.EMPTY_TEXT))
+        self.set_body(pane_body(lines, empty=self._empty_text))
 
 
 class DetailPane(Pane):
-    """详情栏（右）：当前任务。内容归 t18，本工单只占位。"""
+    """详情栏（右）：当前任务。
+
+    内容归 t18（宽度分档、浮层、字段铺开）；t17 只放出**最小的一层**「指着谁」：
+    :meth:`show` 接住光标下那一行，:attr:`task_id` 说清现在指着哪条。这一层存在的原因
+    是验收标准 #4——过滤期间右栏绝不许指着一个已经被筛掉的任务，而「指着谁」必须有个
+    能测的出口。光标换一条由 :class:`TaskPane.SelectionChanged` 通知（t18 说的
+    「光标移动更新详情栏」就是这条线）。
+    """
 
     BORDER_TITLE = "详情"
     EMPTY_TEXT = PLACEHOLDER
     can_focus = False  # Tab 只在左栏与中栏之间切换
+
+    def __init__(self, *, id: str | None = None) -> None:
+        super().__init__(id=id)
+        self._item: TaskItem | None = None
+
+    @property
+    def task_id(self) -> str | None:
+        """右栏现在指着哪条任务；没有就是 ``None``（屏上是占位）。"""
+        return None if self._item is None else self._item.task_id
+
+    def show(self, item: TaskItem | None) -> None:
+        """把右栏指到 ``item`` 上；``None`` = 没有任务可指（空屏或过滤后一条不剩）。"""
+        self._item = item
+        self._redraw()
+
+    def _redraw(self) -> None:
+        if self._item is None:
+            self.set_body(Text(self.EMPTY_TEXT, style=EMPTY_STYLE))
+            return
+        # 复用任务行那一个渲染器：优先级标记与截止读法都不在这里重写一份
+        self.set_body(pane_body([task_line(self._item, selected=False)], empty=self.EMPTY_TEXT))
 
 
 class StatusBar(Static):
@@ -523,6 +590,75 @@ class QuickAddInput(Vertical):
         event.stop()
         self.post_message(self.Submitted(event.value))
 
+
+
+# ------------------------------------------------------------------ 模糊过滤（t17）
+
+FILTER_PLACEHOLDER = "过滤：打几个字"
+"""过滤框的占位文案：一眼看出这里写的是要筛的那几个字。"""
+
+
+class FilterInput(Vertical):
+    """模糊过滤框（``/``）：一行输入，边打边筛；``Esc`` 清空并收起。
+
+    这一层只做两件事：把用户写的**原文**原样交出去（每次改动发一条
+    :class:`FilterInput.Changed`），把 ``Esc`` 这一步交出去（:class:`FilterInput.Cancelled`）。
+    它不认识任务，也不认识模糊匹配——那是 :func:`dida.sync.view.fuzzy_match`，由 ``DidaApp``
+    拿着引擎那份纯函数去筛。
+
+    默认收起（``display: none``）：没按 ``/`` 时不占一行，也不进布局。``Esc`` 由这一层收：
+    过滤框与 t14 的改期框、t18 的浮层各有各的 Esc 语义，不往 app 上挂一个全局绑定去抢。
+    """
+
+    DEFAULT_CSS = """
+    FilterInput {
+        display: none;
+        height: auto;
+        border: round ansi_cyan;
+        padding: 0 1;
+    }
+    """
+    can_focus = False
+    BINDINGS = [Binding("escape", "cancel", "取消")]
+
+    class Changed(Message):
+        """框里的字变了：原文照递（空串 = 清空过滤）。"""
+
+        def __init__(self, query: str) -> None:
+            self.query = query
+            super().__init__()
+
+    class Cancelled(Message):
+        """用户按了 ``Esc``：清空过滤、恢复完整列表。"""
+
+    def compose(self) -> ComposeResult:
+        yield Input(placeholder=FILTER_PLACEHOLDER)
+
+    def open(self) -> None:
+        """打开过滤框并聚焦。每次打开都从空的开始（上一次筛的字不留着）。"""
+        self.query_one(Input).value = ""
+        self.display = True
+        self.query_one(Input).focus()
+
+    def close(self) -> None:
+        """收起过滤框（``Esc``）；框里的字一并清掉，下次打开是干净的。"""
+        self.query_one(Input).value = ""
+        self.display = False
+
+    @property
+    def query(self) -> str:
+        """框里的原文。"""
+        return self.query_one(Input).value
+
+    def action_cancel(self) -> None:
+        """``Esc``：清空过滤、收起过滤框（恢复完整列表是 app 的事）。"""
+        self.close()
+        self.post_message(self.Cancelled())
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """内层输入框每改一个字 → 自己的 ``Changed``：边打边筛。"""
+        event.stop()
+        self.post_message(self.Changed(event.value))
 
 # ------------------------------------------------------------------ 删除确认（t16）
 
