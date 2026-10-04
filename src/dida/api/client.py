@@ -35,6 +35,15 @@ class DidaApiClient:
         self._transport = transport
         self._base_url = base_url.rstrip("/")
 
+    async def list_projects(self) -> list[dict[str, Any]]:
+        """GET /open/v1/project —— 全部清单。
+
+        t03 用它做「token 验证」的那一次调用；t07 补分页（``offset`` / ``limit``，
+        服务端默认 200）与领域映射。现在不带任何查询参数。
+        """
+        response = await self._send(self._request("GET", "/open/v1/project"))
+        return response.json()
+
     async def get_project_data(self, project_id: str) -> dict[str, Any]:
         """GET /open/v1/project/{id}/data —— 该清单的未完成任务全量，无分页。"""
         response = await self._send(self._request("GET", f"/open/v1/project/{project_id}/data"))
