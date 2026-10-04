@@ -25,6 +25,7 @@ from textual.app import ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.message import Message
+from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
 from dida.sync.engine import (
@@ -262,6 +263,11 @@ class TaskPane(Pane):
     def selected_task_id(self) -> str | None:
         """光标下的任务 id；没有任务时是 ``None``。"""
         return self._rows[self._cursor].task_id if self._rows else None
+
+    @property
+    def selected_title(self) -> str | None:
+        """光标下那条任务的标题；没有任务时是 ``None``（删除确认要点名是哪一条）。"""
+        return self._rows[self._cursor].title if self._rows else None
 
     def _line_of_cursor(self, index: int) -> int:
         return self._line_of_row[index]
@@ -516,3 +522,62 @@ class QuickAddInput(Vertical):
         """内层输入框按了 ``Enter``：转成本控件自己的提交消息（原文照递）。"""
         event.stop()
         self.post_message(self.Submitted(event.value))
+
+
+# ------------------------------------------------------------------ 删除确认（t16）
+
+
+class ConfirmScreen(ModalScreen[bool]):
+    """一句提示 + 一个 Yes/No：``y`` 确认、``n`` 与 ``Esc`` 取消（工单 #16）。
+
+    这一层只负责**问**：提示语原文进来、按键结果 ``dismiss(True/False)`` 出去。删除动作
+    归 :meth:`dida.tui.app.DidaApp._finish_delete`，提示语归
+    :func:`dida.tui.app.delete_prompt` 拼——控件不认识任务，也不认识引擎，所以换一个
+    「确认」场景时不必动它。
+
+    为什么是一次浮层：删除是**这一屏唯一不可挽回的动作**。滴答清单的 Open API 里没有
+    undelete、没有回收站、没有「已删除」列表（``api-contracts.md`` 通篇没有这一类端点），
+    所以这一次确认就是全部的防线——按错就是永久少一条任务，多一次按键是这笔账里最便宜的
+    那一头。``Esc`` 也走取消：默认答案永远是「没删」。
+    """
+
+    DEFAULT_CSS = """
+    ConfirmScreen {
+        align: center middle;
+    }
+    ConfirmScreen #confirm-box {
+        width: auto;
+        max-width: 80%;
+        height: auto;
+        border: round ansi_yellow;
+        padding: 1 2;
+        background: $surface;
+    }
+    ConfirmScreen #confirm-prompt {
+        width: auto;
+        height: auto;
+    }
+    """
+
+    BINDINGS = [
+        Binding("y", "confirm", "确认删除"),
+        Binding("n", "cancel", "取消"),
+        Binding("escape", "cancel", "取消", show=False),
+    ]
+
+    def __init__(self, prompt: str) -> None:
+        super().__init__()
+        self.prompt = prompt
+        """提示语原文，原样显示。"""
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="confirm-box"):
+            yield Static(self.prompt, id="confirm-prompt")
+
+    def action_confirm(self) -> None:
+        """``y``：确认，浮层关掉并把 ``True`` 交回调用方。"""
+        self.dismiss(True)
+
+    def action_cancel(self) -> None:
+        """``n`` / ``Esc``：取消，什么都不做（``False``）。"""
+        self.dismiss(False)

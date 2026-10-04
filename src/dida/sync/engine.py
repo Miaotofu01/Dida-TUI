@@ -197,6 +197,10 @@ class Engine(Protocol):
         """写：顺延 ``days`` 个逻辑日（``g`` 是 1 天、``G`` 是 7 天）。"""
         ...
 
+    def delete(self, task_id: str) -> None:
+        """写：删除一条任务（服务端没有撤销，t16）。"""
+        ...
+
     def plan(self, text: str) -> ParsedTask:
         """读：用注入的钟与日界把一行输入解析成计划（新建与改期共用同一套语法）。"""
         ...
@@ -474,6 +478,18 @@ class SyncEngine:
         if changes is None:  # 没有截止时间可挪：无日期的任务不凭空长出一个日期来
             return
         self.write(task_id, changes=changes)
+
+    def delete(self, task_id: str) -> None:
+        """写：删除一条任务（``d``），本地当场摘掉快照、推送走 ``DELETE``（t16）。
+
+        就是 :meth:`write` 的一个预置，与 :meth:`complete` 同一条口径：乐观写 + 立即推送 +
+        进重试队列。**没有「撤销删除」这条路径**——滴答清单的 Open API 里没有 undelete、
+        没有回收站、也没有「已删除」列表（``api-contracts.md`` 通篇没有这一类端点），本地
+        自己造一个只会在下一次刷新时被服务端权威抹掉（ADR-0002 的那条规矩，删除方向一样成立）。
+
+        所以这次确认是唯一的防线，而它归 TUI：引擎这一层只保证「调用它就删」，不负责问。
+        """
+        self.write(task_id, kind=WriteKind.DELETE)
 
     # ---------------------------------------------------------------- 写路径
 
