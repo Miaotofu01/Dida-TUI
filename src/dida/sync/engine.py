@@ -64,8 +64,8 @@ __all__ = [
     "summarize_lists",
 ]
 
-DEFAULT_DAY_END = "24:00"
-"""t03 的配置落地前用的默认日界：逻辑日等于自然日。"""
+DEFAULT_DAY_END = "00:00"
+"""配置注入之前的默认日界：零偏移，逻辑日等于自然日（规范形式见 ADR 0003）。"""
 
 
 @dataclass(frozen=True)
