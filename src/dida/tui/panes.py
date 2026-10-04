@@ -26,13 +26,16 @@ from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
 from textual.message import Message
 from textual.screen import ModalScreen
+from textual.widget import Widget
 from textual.widgets import Input, Static
 
 from dida.sync.engine import (
+    NO_DUE_TEXT,
     CompletedItem,
     CompletedSection,
     GroupKind,
     ListSummary,
+    SubtaskItem,
     SyncStatus,
     TaskGroup,
     TaskItem,
@@ -755,6 +758,190 @@ class ConfirmScreen(ModalScreen[bool]):
         """``n`` / ``Esc``：取消，什么都不做（``False``）。"""
         self.dismiss(False)
 
+
+# ------------------------------------------------------------------ 子任务（t20）
+
+SUBTASK_HEADER = "子任务"
+"""右栏子任务列表的标题；后面跟着 ``已完成/总数``。"""
+
+SUBTASK_DONE_MARK = "☑"
+SUBTASK_TODO_MARK = "☐"
+"""子任务的两种状态标记：勾上 / 没勾。与已完成区的 ``▸``/``▾`` 一样，一眼可分。"""
+
+SUBTASK_DONE_STYLE = "dim"
+"""勾上的子任务整行暗灰。
+
+**不带删除线**：删除线是「已完成任务」的读法，而子任务的勾选是可逆的（再按一次 ``t``
+就退回来），两者必须一眼分得开。
+"""
+
+
+class SubtaskPane(Widget):
+    """右栏的子任务列表（工单 #20）：一行一个，``☑``/``☐`` 是完成状态。
+
+    它是**自成一体的一个控件**，挂在详情栏里（``DetailPane`` 的下面），所以详情栏怎么
+    排版、窄屏怎么降级都不必动它：详情栏被收起时它跟着一起收起来。
+
+    键盘：``s`` 把焦点移进来（``DidaApp`` 的绑定），``j``/``k``/``↑``/``↓`` 移光标，
+    ``t`` 勾选光标下那一个，``Esc`` 回任务列。光标行只在**有焦点**时显示：没进来的时候
+    这里是一份只读的列表，与 mockup 里「详情只读」的样子一致。
+
+    它只做两件事：把光标下那一个子任务的 **(任务 id, 子任务 id)** 交出去（
+    :class:`SubtaskPane.Toggled`），把 ``Esc`` 交出去（:class:`SubtaskPane.Dismissed`）。
+    重读、合并、写回、退避重试全在引擎里——控件不认识 ``items`` 数组，也不认识状态取值。
+    """
+
+    can_focus = True
+    BINDINGS = [
+        Binding("j", "cursor_down", "下移", show=False),
+        Binding("down", "cursor_down", "下移", show=False),
+        Binding("k", "cursor_up", "上移", show=False),
+        Binding("up", "cursor_up", "上移", show=False),
+        Binding("t", "toggle", "勾选"),
+        Binding("escape", "dismiss", "返回任务列"),
+    ]
+    DEFAULT_CSS = """
+    SubtaskPane {
+        height: auto;
+        width: 1fr;
+    }
+    """
+
+    class Toggled(Message):
+        """用户按了 ``t``：勾选哪条任务的哪个子任务。"""
+
+        def __init__(self, task_id: str, subtask_id: str) -> None:
+            self.task_id = task_id
+            self.subtask_id = subtask_id
+            super().__init__()
+
+    class Dismissed(Message):
+        """用户按了 ``Esc``：焦点回任务列（右栏照旧只读）。"""
+
+    def __init__(self, *, id: str | None = None) -> None:
+        super().__init__(id=id)
+        self._task_id: str | None = None
+        self._items: tuple[SubtaskItem, ...] = ()
+        self._cursor = 0
+        self._armed = False
+
+    def allow_focus(self) -> bool:
+        """只有被 ``s`` 叫到时才可聚焦（工单 #20）。
+
+        键位表里 Tab 只在清单栏与任务列之间切换（spec 的用户故事 #19）：多一个可聚焦控件
+        就把那个环变成三个，Tab 会从任务列掉进右栏，而用户再也回不到清单栏。所以默认不在
+        焦点链里（:meth:`allow_focus` 是 Textual 给的钩子，焦点链正是按它算的），``s``
+        进来之前先 :meth:`arm`。
+        """
+        return self._armed and super().allow_focus()
+
+    def arm(self) -> None:
+        """允许被聚焦：``s`` 进来之前调一次。"""
+        self._armed = True
+
+    def disarm(self) -> None:
+        """收回可聚焦性：焦点走了之后 Tab 的环里不能再有它。"""
+        self._armed = False
+
+    def show(self, task_id: str | None, items: Sequence[SubtaskItem]) -> None:
+        """接住某条任务的子任务。
+
+        换一条任务时光标回到第一行；**同一条任务**重画（勾选之后那一次）时保留光标——
+        用户正在这一条上连着勾几个，勾完一个就跳回第一行是没法用的。
+        """
+        if task_id != self._task_id:
+            self._cursor = 0
+        self._task_id = task_id
+        self._items = tuple(items)
+        if self._items:
+            self._cursor = min(self._cursor, len(self._items) - 1)
+        # layout=True：行数变了，高度得跟着重算。只 refresh() 的话块会按旧高度被裁掉
+        # ——屏幕上是「子任务 1/3」下面一片空白，而数据其实都在。
+        self.refresh(layout=True)
+
+    @property
+    def count(self) -> int:
+        """这条任务有几个子任务。"""
+        return len(self._items)
+
+    @property
+    def selected(self) -> tuple[str, str] | None:
+        """光标下那一个子任务：``(任务 id, 子任务 id)``；没有就是 ``None``。"""
+        if self._task_id is None or not self._items:
+            return None
+        return (self._task_id, self._items[self._cursor].subtask_id)
+
+    def action_cursor_down(self) -> None:
+        """下移一行（``j`` / ``↓``）。"""
+        self._move(1)
+
+    def action_cursor_up(self) -> None:
+        """上移一行（``k`` / ``↑``）。"""
+        self._move(-1)
+
+    def _move(self, step: int) -> None:
+        if not self._items:
+            return
+        self._cursor = min(max(self._cursor + step, 0), len(self._items) - 1)
+        self.refresh()
+
+    def action_toggle(self) -> None:
+        """``t``：把光标下那一个子任务交给外面（勾选是引擎的事）。"""
+        picked = self.selected
+        if picked is None:  # 没有子任务时按键什么都不做，不是错误
+            return
+        self.post_message(self.Toggled(*picked))
+
+    def action_dismiss(self) -> None:
+        """``Esc``：焦点回任务列。"""
+        self.post_message(self.Dismissed())
+
+    def on_focus(self) -> None:
+        """焦点进来：光标行显出来（没焦点时这里是一份只读列表）。"""
+        self.refresh(layout=True)
+
+    def on_blur(self) -> None:
+        """焦点走了：光标行收起来，可聚焦性一并收回（Tab 的环里不能留着它）。"""
+        self.disarm()
+        self.refresh(layout=True)
+
+    def render(self) -> Text:
+        """整块文本：标题 ``子任务 已完成/总数`` + 每个子任务一行。
+
+        没有子任务（或没有选中任务）时渲染空文本：详情栏里不占一行，也不说废话。
+        """
+        if not self._items:
+            return Text("")
+        body = Text()
+        body.append(f"{SUBTASK_HEADER} {self._done_count}/{len(self._items)}", style="bold")
+        for index, row in enumerate(self._items):
+            body.append("\n")
+            body.append_text(self._line(row, selected=index == self._cursor))
+        return body
+
+    @property
+    def _done_count(self) -> int:
+        return sum(1 for row in self._items if row.completed)
+
+    def _line(self, row: SubtaskItem, *, selected: bool) -> Text:
+        """一行子任务：``❯ ☑ 标题  今天 18:00``。
+
+        光标标记只在有焦点时出现；日期只有真的有日期时才写出来——**没有日期不是不显示
+        这一行的理由**（工单 #20 的验收标准 #1）。
+        """
+        focused = selected and self.has_focus
+        text = Text()
+        text.append(f"{CURSOR_MARK if focused else BLANK_MARK} ")
+        text.append(
+            SUBTASK_DONE_MARK if row.completed else SUBTASK_TODO_MARK,
+            style=SUBTASK_DONE_STYLE if row.completed else "",
+        )
+        text.append(f" {row.title}", style=SUBTASK_DONE_STYLE if row.completed else "")
+        if row.due_text != NO_DUE_TEXT:
+            text.append(f"  {row.due_text}", style=EMPTY_STYLE)
+        if focused:
+            text.stylize("reverse")
+        return text
 # ------------------------------------------------------------------ 窄屏浮层（t18）
 
 

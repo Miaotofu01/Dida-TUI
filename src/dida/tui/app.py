@@ -16,7 +16,7 @@ from textual.containers import Horizontal
 from textual.events import Resize
 from textual.widgets import Footer
 
-from dida.sync.engine import Engine, UnknownTaskError, filter_groups
+from dida.sync.engine import DidaError, Engine, TaskItem, UnknownTaskError, filter_groups
 from dida.tui.escape import open_in_browser, task_url
 from dida.tui.panes import (
     ConfirmScreen,
@@ -29,6 +29,7 @@ from dida.tui.panes import (
     QuickAddInput,
     RescheduleInput,
     StatusBar,
+    SubtaskPane,
     TaskPane,
     detail_body,
     format_status,
@@ -54,6 +55,27 @@ UNKNOWN_DELETE_MESSAGE = "没有删：这条任务已经不在本地缓存里了
 与改期那句分开写：这里**不能**说「刷新之后再试一次」——刷新会把它拉回来，看着像删掉了
 其实没有；而删除这条路径上「本来就没这条」与「删掉了」必须一眼分得清。
 """
+
+
+SUBTASK_ELSEWHERE_MESSAGE = "这条任务在别处改过：子任务已按服务端为准"
+"""重读发现任务在别处被改过时的话（工单 #20）。
+
+ADR-0002 的规矩：服务端权威可以覆盖本地，但**覆盖必须被用户看见**。这句话就是那个
+「看见」——不说的话，用户在手机上改的子任务会在这一屏上悄悄消失，而且没有任何痕迹。
+"""
+
+SUBTASK_GONE_MESSAGE = "这个子任务在服务端已经没有了：已按服务端为准"
+"""重读回来的那一份里已经没有这个子任务（别处删掉了）：以服务端为准，什么都没写回去。"""
+
+UNKNOWN_SUBTASK_MESSAGE = "没有勾成：这条任务已经不在本地缓存里了，刷新之后再试一次"
+"""引擎拒绝写入（本地没有这条任务的底稿，工单 #25）时的话：如实说没勾成。"""
+
+SUBTASK_READ_FAILED_MESSAGE = "没勾成：读不到服务端，待会儿再试一次"
+"""写前重读失败（断网、凭据被拒、服务端拒绝）时的话（工单 #20）。
+
+重读失败就没有「写回」可言，所以这一句必须说出来，而不是静默什么都不做：用户按了
+``t``，屏幕上却什么都没发生，他会以为勾上了。"""
+
 
 
 NO_BROWSER_PREFIX = "打不开浏览器：把这条链接自己粘到浏览器里 "
@@ -133,6 +155,8 @@ class DidaApp(App[None]):
         # 逃生舱（t19）：把光标下那一条交给系统浏览器。完成在服务端不可逆（ADR-0002），
         # 官方客户端又不接受任务深链，所以按错之后唯一能走的路就是这个键。
         Binding("o", "open", "浏览器"),
+        # 子任务（t20）：s 把焦点移到右栏那份子任务列表上，t 在那里勾选。
+        Binding("s", "subtasks", "子任务"),
         # 右栏详情的开合（t18）。三档语义一致：右栏在屏上就收放它，收起了就弹浮层。
         # 不抢输入框：焦点在 Input 里时 Enter 归 Input（提交），到不了这里。
         Binding("enter", "toggle_detail", "详情"),
@@ -452,6 +476,7 @@ class DidaApp(App[None]):
     def on_task_pane_selection_changed(self, event: TaskPane.SelectionChanged) -> None:
         """光标换了一条任务：右栏跟着换（过滤期间因此不会指着一个被筛掉的任务）。"""
         self.query_one(DetailPane).show(event.item)
+        self._show_subtasks(event.item)
 
     # ---------------------------------------------------------------- 逃生舱（t19）
 
@@ -485,6 +510,87 @@ class DidaApp(App[None]):
         if not opened:
             self.query_one(StatusBar).update(no_browser_message(url))
 
+    # ---------------------------------------------------------------- 子任务（t20）
+
+    def _show_subtasks(self, item: TaskItem | None) -> None:
+        """把右栏那份子任务列表指到 ``item`` 上（工单 #20）。
+
+        子任务数组存在**任务原文**里，读它要走引擎（``engine.subtasks``）：TUI 不认识
+        ``items``，也不认识 ``status`` 那对取值。光标没指着任务时给空的一份——右栏就是
+        没有子任务可显示，不是错误。
+        """
+        self._subtask_pane().show(
+            None if item is None else item.task_id,
+            () if item is None else self.engine.subtasks(item.task_id),
+        )
+
+    def _subtask_pane(self) -> SubtaskPane:
+        """右栏那份子任务列表；**第一次要用时才挂进详情栏**（工单 #20）。
+
+        延迟挂载而不是写在 ``compose`` 里，图的是两件事：
+
+        - 它排在详情栏自己那块内容**后面**（``mount`` 是追加），屏幕上就是「任务行，然后
+          子任务」，与 mockup 一致；
+        - 详情栏的排版归 t18，这一份不必去动 ``DetailPane`` 的定义，详情栏一收起它跟着
+          收起（它就是详情栏的孩子）。
+        """
+        found = self.query(SubtaskPane)
+        if found:
+            return found.first()
+        pane = SubtaskPane(id="subtask-pane")
+        self.query_one(DetailPane).mount(pane)
+        return pane
+
+    def action_subtasks(self) -> None:
+        """``s``：把焦点交给右栏那份子任务列表（工单 #20）。
+
+        光标下那条任务没有子任务时什么都不做——空屏上按键不该报错（与 ``x``/``g``/``e``
+        同一条口径）。已经在里面时再按一次就是出来：``s`` 是这一处的进出键，不用去记
+        ``Esc``（``Esc`` 也行，那是 :meth:`on_subtask_pane_dismissed`）。
+        """
+        pane = self._subtask_pane()
+        if pane.has_focus:
+            self.query_one(TaskPane).focus()
+            return
+        if not pane.count:
+            return
+        pane.arm()  # 它平时不在焦点链里（Tab 只在清单栏与任务列之间转）
+        pane.focus()
+
+    async def on_subtask_pane_toggled(self, event: SubtaskPane.Toggled) -> None:
+        """子任务列表按了 ``t``：交给引擎——**先重读该任务，再只写这一次改动**（工单 #20）。
+
+        重读是一次网络调用，所以这一条要 ``await``：写回必须建立在它带回来的底稿上，
+        没有底稿的写回会把别处改过的子任务一起抹掉（这正是本工单要挡的那件事）。
+
+        重读发现任务在别处被改过时，引擎按服务端那一份落地并报 ``changed_elsewhere``，
+        这里**必须说出来**（状态栏那一句）：服务端权威可以覆盖，但覆盖要看得见（ADR-0002）。
+
+        重画的是右栏这一份（引擎已经把重读回来的那一份给回来了），**不重画整个视图**：
+        中栏那些行不会因为一个子任务变了而变，而重画会把任务列的光标推回第一行——用户
+        正在这条任务上连着勾子任务，勾一个就跳走是没法用的。状态栏照旧要刷（待推送数量
+        会变）。
+        """
+        try:
+            report = await self.engine.toggle_subtask(event.task_id, event.subtask_id)
+        except UnknownTaskError:
+            self.query_one(StatusBar).update(UNKNOWN_SUBTASK_MESSAGE)
+            return
+        except DidaError:
+            # 重读那一步失败（网络断了、凭据被拒、服务端拒绝）：引擎的失败一律是结构化
+            # 错误，这里如实说一句，不让一个断网的机器把整个界面带走。
+            self.query_one(StatusBar).update(SUBTASK_READ_FAILED_MESSAGE)
+            return
+        self._subtask_pane().show(report.task_id, report.items)
+        self.update_status()
+        if not report.written:
+            self.query_one(StatusBar).update(SUBTASK_GONE_MESSAGE)
+        elif report.changed_elsewhere:
+            self.query_one(StatusBar).update(SUBTASK_ELSEWHERE_MESSAGE)
+
+    def on_subtask_pane_dismissed(self) -> None:
+        """子任务列表按了 ``Esc``：焦点回任务列。"""
+        self.query_one(TaskPane).focus()
     # ---------------------------------------------------------------- 详情开合（t18）
 
     def action_toggle_detail(self) -> None:
