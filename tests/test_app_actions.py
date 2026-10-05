@@ -16,7 +16,7 @@ from datetime import date, datetime, timedelta, timezone
 
 from dida.sync.engine import SyncStatus
 from dida.testing import FakeBackend, ManualClock
-from dida.tui.app import DidaApp, status_line
+from dida.tui.app import DidaApp, format_status, status_line
 from dida.tui.escape import URL_TEMPLATE
 from dida.tui.keys import LAYER_INDEX
 from dida.tui.messages import delete_prompt
@@ -69,7 +69,8 @@ def test_the_wording_still_says_sync_time_pending_count_and_logical_day():
         checked_at=T0, pending_count=3, last_refresh_at=T0, logical_day=date(2026, 3, 14)
     )
 
-    assert status_line(status).plain == "已同步 12:03 · 待推送 3 · 逻辑日 03-14"
+    assert format_status(status) == "已同步 12:03 · 待推送 3 · 逻辑日 03-14"
+    assert status_line(status).plain == format_status(status), "两份是同一句话（一处措辞）"
 
 
 def test_only_the_pending_count_carries_a_style_and_only_when_it_is_not_zero():
