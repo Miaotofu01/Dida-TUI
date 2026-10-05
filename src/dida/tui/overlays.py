@@ -53,7 +53,7 @@ FORM_QUIT_BINDINGS = [
 ]
 """表单上的退出键：**只取** :data:`~dida.tui.keys.QUIT_KEYS` 里不是字母的那些（工单 #42）。
 
-与 :data:`QUIT_BINDINGS`（上面那两张只读浮层用的那一份）差两处，两处都是故意的：
+它与下面那两张只读浮层用的 :data:`QUIT_BINDINGS` 差两处，两处都是故意的：
 
 - **字母不绑**：表单里 ``q`` 必须是一个字母（清单可以叫 ``quizzes``），而字母属于那一格。
   出口是 ``Esc``。真按 ``q`` 的地方（选择框上）如果突然退出，用户填了一半的东西就没了。
@@ -270,6 +270,10 @@ QUIT_BINDINGS = [Binding(key, f"app.{QUIT_ACTION}", "退出", show=False) for ke
 自己），所以这一条与页面上的 ``q`` / ``Ctrl+C`` 落到**同一个方法**上——不是第二个判断。
 只写动作名（``"quit"``）不行：那会解析到浮层自己头上，而浮层没有 ``action_quit``，于是
 这条绑定「命中但什么也不做」——按键被吃掉，app 反而再也收不到它。
+
+**表单浮层是个例外，而且只差一处**：它用的是 :data:`FORM_QUIT_BINDINGS`（下面那份取的不是
+字母的那些，并且压过 ``screen.copy_text``）——表单里 ``q`` 必须是一个字母。理由写在那份常量
+与 :class:`FormOverlay` 上。
 """
 
 
