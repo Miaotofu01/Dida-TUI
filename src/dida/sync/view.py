@@ -162,6 +162,14 @@ class TaskItem:
     all_day: bool
     due_text: str
 
+    overdue: bool = False
+    """逾期了没有（逻辑日判定，见 :func:`is_overdue`）。
+
+    日期判断全在引擎这一层（架构规则：TUI 拿到的是已经判断好的成品），所以「标红」这件事
+    的颜色由 TUI 决定、**位**由这里给：TUI 自己拿截止时间去比会写出第二份日期比较，那正是
+    全天任务与 ``04:00`` 边界上会各错一次的地方。
+    """
+
     desc: str = ""
     """描述，原样来自快照（TUI 不解析它）。"""
 
@@ -280,6 +288,7 @@ def task_item(snapshot: TaskSnapshot, names: dict[str, str], *, now: datetime, d
         due=snapshot.due,
         all_day=snapshot.all_day,
         due_text=format_due(snapshot.due, all_day=snapshot.all_day, now=now, day_end=day_end),
+        overdue=is_overdue(snapshot, today=logical_day(now, day_end).label, day_end=day_end),
         desc=snapshot.desc,
         content=snapshot.content,
         tags_text=format_tags(snapshot.tags),

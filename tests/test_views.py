@@ -17,6 +17,8 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
+from dida.testing import FakeBackend, ManualClock
+
 from dida.sync.view import TaskSnapshot
 from dida.sync.views import (
     Completion,
@@ -296,3 +298,74 @@ def test_the_completion_dimension_decides_who_is_a_member():
 
     assert titles(evaluated) == ["做完了 A", "做完了 B"]
     assert [item.overdue for item in evaluated] == [False, False], "做完的不算逾期"
+
+
+# ---------------------------------------------------------------- 接缝一：引擎的读路径
+
+
+def backend(*, now: datetime = T0, day_end: str = "24:00") -> FakeBackend:
+    """内存缓存 + **真引擎的读路径**（``FakeBackend`` 的读委托给生产那一份实现）。"""
+    return FakeBackend(clock=ManualClock(now), day_end=day_end)
+
+
+def test_the_engine_keeps_the_evaluated_order_and_marks_the_overdue_rows():
+    """进视图看到的那份列表：顺序是求值给的，逾期的那些带着 ``overdue`` 位（供标红）。
+
+    ``TaskItem`` 上没有这个位的话，TUI 要标红就只能自己判日期——那是架构规则不许的
+    （日期判断全在引擎这一层）。所以位在这里给，画在 #37。
+    """
+    fake = backend()
+    fake.add_task("前天到期", list_name="work", due=T0 - timedelta(days=2))
+    fake.add_task("今天 18 点", list_name="work", due=T0.replace(hour=18))
+    fake.add_task("明天", list_name="work", due=T0 + timedelta(days=1))
+
+    items = fake.tasks_in("today").items
+
+    assert [item.title for item in items] == ["前天到期", "今天 18 点"]
+    assert [item.overdue for item in items] == [True, False]
+
+
+def test_the_engine_pins_overdue_rows_at_the_logical_boundary():
+    """边界 ``04:00``、凌晨两点：昨夜 23:00 是「今天」，当天 03:00 反而逾期、置顶。"""
+    fake = backend(now=at(14, 2), day_end="04:00")
+    fake.add_task("昨夜 03 点", list_name="work", due=at(13, 3))
+    fake.add_task("今天的全天", list_name="work", due=at(13), all_day=True)
+    fake.add_task("昨晚 23 点", list_name="work", due=at(13, 23))
+
+    items = fake.tasks_in("today").items
+
+    assert [item.title for item in items] == ["昨夜 03 点", "今天的全天", "昨晚 23 点"]
+    assert [item.overdue for item in items] == [True, False, False]
+
+
+def test_a_view_shows_the_list_name_while_a_real_list_does_not():
+    """视图不是容器：同一个清单名在视图里重复显示是必要信息，在清单里是噪音。
+
+    判断归读模型（``TaskList.shows_list_name``），画归 TUI——这也正是「清单名重复一百遍」
+    那种噪音该在哪一层被裁掉的问题：页面不该自己去猜这个容器是不是视图。
+    """
+    fake = backend()
+    fake.add_list("工作", id="work")
+    fake.add_task("交报告", list_name="work", due=T0.replace(hour=18))
+
+    assert fake.tasks_in("work").shows_list_name is False
+    assert fake.tasks_in("today").shows_list_name is True
+    assert fake.tasks_in("today").items[0].list_name == "工作"
+
+
+def test_the_index_row_count_and_the_view_list_come_from_one_evaluation():
+    """索引里的条数与进去看到的列表来自**同一次求值**（#33 的契约，#35 不许破坏它）。
+
+    逾期那条同时在「今天」与「所有」里，但不在「最近七天」里——索引上的数字与容器里的
+    条数因此必须逐行对上。
+    """
+    fake = backend()
+    fake.add_task("昨天到期", list_name="work", due=T0 - timedelta(days=1))
+    fake.add_task("今天到期", list_name="work", due=T0.replace(hour=18))
+    fake.add_task("第八天后", list_name="work", due=T0 + timedelta(days=8))
+
+    rows = {row.id: row for row in fake.list_index()}
+
+    assert rows["today"].unfinished == len(fake.tasks_in("today").items) == 2
+    assert rows["next7"].unfinished == len(fake.tasks_in("next7").items) == 1
+    assert rows["all"].unfinished == len(fake.tasks_in("all").items) == 3
