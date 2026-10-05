@@ -53,16 +53,45 @@ class _UnusableTransport:
     async def send(self, request: httpx.Request) -> httpx.Response:
         raise NetworkError(f"连不上服务端：{self._reason}")
 
+    async def aclose(self) -> None:
+        """没有连接池可关。``_first_run`` 的 ``finally`` 会调它，所以这里必须有。"""
+        return None
 
-def default_transport(factory: Callable[[], Transport] = HttpxTransport) -> Transport:
+
+def default_transport(factory: Callable[[], Transport] | None = None) -> Transport:
     """真传输；建不出来就退化成 :class:`_UnusableTransport`（见那里的理由）。
 
     ``factory`` 可注入：测试用它模拟「这台机器建不出传输层」，不必去动真环境变量。
+    默认在**调用时**才取 :class:`HttpxTransport`，不写成参数默认值——那样会在定义时就把
+    类绑死，patch 模块属性一律看不见它（这也是它可测性的一部分）。
     """
+    if factory is None:
+        factory = HttpxTransport
     try:
         return factory()
     except Exception as exc:  # noqa: BLE001 - 建不出来的原因不该把整个 app 挡在门外
         return _UnusableTransport(str(exc))
+
+
+def _unreachable_message(error: NetworkError) -> str:
+    """「连不上服务端」时要说的话：真实原因 + 两条能照着做的出路。
+
+    首次运行这一步**必须**联网（token 要真的被服务端认一次才落盘，用户故事 2），所以这里
+    不能糊过去。但也不能把环境问题说成凭据问题——用户在这一屏能做的事只有两件：让代理
+    能用，或者绕开代理。
+
+    两条触发路径共用这一段话：传输层根本建不出来（本机 ``all_proxy`` 缺 ``socksio``），
+    以及建出来了但请求发失败（断网、超时）。两者都是「这台机器发不出请求」。
+    """
+    return (
+        f"连不上服务端：{error}\n"
+        "这不是 token 的问题，再粘一次也一样——是这台机器发不出请求。\n"
+        "两条出路：\n"
+        "  1. 让代理能用（本机 all_proxy 指向 socks5，需要 socksio）：\n"
+        "     uv tool install --with socksio dida-tui\n"
+        "  2. 绕开代理再跑（只在不需要代理也能上外网时有用）：\n"
+        "     env -u all_proxy -u ALL_PROXY -u http_proxy -u https_proxy dida"
+    )
 
 
 def store_path() -> Path:
@@ -150,13 +179,20 @@ async def paste_token(
     )
 
 
-async def _first_run() -> Config:
+async def _first_run(transport: Transport | None = None) -> Config:
     """首次运行的那一次网络调用：用完就关掉自己的传输层。
 
     单独造一个传输、并且关掉它，是因为它与随后那个 app 的传输不共用连接池：``httpx``
     的异步连接池绑在创建它的那个事件循环上，而这里跑在 ``asyncio.run`` 自己那个循环里。
+
+    走 :func:`default_transport` 而不是裸 ``HttpxTransport()``：建不出传输层的那台机器
+    在**这一步也会**建不出来，而降级之后的 :meth:`_UnusableTransport.send` 抛的是
+    :class:`_TransportUnavailable`，:func:`main` 据此把「发不出请求」与「token 被拒」
+    分开说。以前这里是裸构造，``ImportError`` 直接冒到 ``main``，被糊成一句
+    「凭据没验证通过，再运行一次重新粘贴」——两句都是错的。
     """
-    transport = HttpxTransport()
+    if transport is None:
+        transport = default_transport()
     try:
         return await paste_token(transport=transport)
     finally:
@@ -168,11 +204,15 @@ def main() -> None:
 
     首次运行先补 token（验证通过才落盘）；之后每次启动都直接起界面——本地缓存先上屏，
     全量刷新按 ``refresh_on_start`` 在后台跑（用户故事 3 + 4）。
+
+    「连不上」与「token 被拒」分开报：前者是环境问题，说「重新粘贴」帮不上任何忙。
     """
     config = load_config()
     if needs_token(config):
         try:
             config = asyncio.run(_first_run())
+        except NetworkError as exc:
+            raise SystemExit(_unreachable_message(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - 首次运行只有这一条出口：说清楚再退
             raise SystemExit(f"凭据没验证通过：{exc}\n再运行一次 dida 重新粘贴。") from exc
     build_app(config=config).run()
