@@ -88,6 +88,9 @@ BINDINGS: dict[str, tuple[Key, ...]] = {
         Key(("j", "down"), "cursor_down", "下一行"),
         Key(("k", "up"), "cursor_up", "上一行"),
         Key(("enter",), "enter", "进入这一行"),
+        Key(("n",), "new_list", "新建清单"),
+        Key(("e",), "edit_list", "改这一行的名字与颜色"),
+        Key(("d",), "delete_list", "删除这一行"),
     ),
     LAYER_TASKS: (
         Key(("j", "down"), "cursor_down", "下一条"),
