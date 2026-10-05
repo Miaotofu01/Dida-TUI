@@ -14,6 +14,15 @@ import asyncio
 import re
 from datetime import datetime, timedelta, timezone
 
+import httpx
+from textual import events
+from textual._xterm_parser import XTermParser
+
+from dida.api.client import DidaApiClient
+from dida.storage.store import Store
+from dida.sync.engine import NO_DUE_TEXT
+from dida.sync.engine import SyncEngine
+
 from rich.cells import cell_len
 
 import pytest
@@ -469,3 +478,388 @@ async def test_description_and_note_are_edited_independently():
     assert new_content not in field_row(text, "备注"), "改描述把备注盖掉了"
     assert new_desc in field_row(text, "备注"), f"备注没改成：\n{text}"
     assert new_desc not in field_row(text, "描述"), "改备注把描述盖掉了"
+
+
+# ------------------------------------------------------------------ 底部那一行 + 立刻推送
+
+
+async def test_the_bottom_line_always_says_saved_or_pending():
+    """页面底部常驻「已保存」或「待推送（N）」（验收标准 8）。
+
+    队列空着就是「已保存」，队列里还有改动就是「待推送（2）」——用户要能一眼看出刚才那一下
+    到底出去没有（用户故事 65）。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=(50, 14)) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        saved = screen_text(app)
+        fake.set_sync_state(last_refresh_at=T0, pending_count=2)
+        app.update_status()
+        await pilot.pause()
+        pending = screen_text(app)
+
+    assert messages.saved_message() in saved, f"队列空着时要写「已保存」：\n{saved}"
+    assert messages.pending_message(2) in pending, f"有没推上去的改动时要写出来：\n{pending}"
+
+
+async def test_the_bottom_line_is_still_there_when_the_page_is_long():
+    """那一行是**常驻**的：正文长到要滚动时它也不跟着滚走（验收标准 8）。
+
+    它钉在这一页自己的底边上（不是第三个 chrome 行）：正在改一段长描述的用户要能随时看见
+    这一下出去没有。
+    """
+    app = DidaApp(backend(content=LONG_CONTENT * 3, desc=LONG_CONTENT))
+
+    async with app.run_test(size=(50, 14)) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await pilot.press(*(["j"] * 6))  # 一路走到最后一个字段（正文早就超过一屏）
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert messages.saved_message() in text, f"滚动之后那一行不见了：\n{text}"
+    assert field_row(text, "标签").startswith(theme.CURSOR_MARK), f"光标不在最后一个字段上：\n{text}"
+
+
+async def test_every_field_is_pushed_the_moment_it_is_finished():
+    """每改完一个字段**立刻推送**，不攒到离开这一页（验收标准 7）。
+
+    断法：改完还在详细页上，推送**已经**发生过了（不是等 ``esc`` 退回任务列表才发）。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        before = fake.pushes
+        await pilot.press("enter")
+        await pilot.press(*clear(len(TITLE)))
+        await pilot.press(*"新标题")
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+        pushes = fake.pushes
+
+    assert pushes > before, "改完一个字段没有立刻推一轮"
+    assert has_field(text, "标签"), "推完还停在详细页上（没有为了推送而离开这一页）"
+    assert "新标题" in field_row(text, "标题"), f"改完的标题不在屏上：\n{text}"
+
+
+# ------------------------------------------------------------------ 接缝二：真引擎 + 假传输
+
+
+class Unreachable:
+    """假传输：每个请求都连不上（试「保存失败要说具体原因」）。"""
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+
+    async def send(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        raise httpx.ConnectError("连不上服务器")
+
+
+def real_app(tmp_path, transport) -> DidaApp:
+    """接缝二：真引擎 + 真库 + 打给假服务端的真客户端。
+
+    逐字段编辑的「立刻推送」与「保存失败说具体原因」是**网络这一侧**的事实：替身说了不算，
+    所以这一条走真推送路径（这也是 ``test_app_sync.py`` 用的那一套）。
+    """
+    store = Store(tmp_path / "dida.sqlite3")
+    store.apply_refresh(
+        lists=[{"id": "work", "name": "工作", "sortOrder": 0}],
+        tasks=[
+            {
+                "id": "t1",
+                "projectId": "work",
+                "title": TITLE,
+                "status": 0,
+                "content": CONTENT,
+                "desc": DESC,
+            }
+        ],
+    )
+    engine = SyncEngine(
+        clock=ManualClock(T0),
+        source=store,
+        client=DidaApiClient(token="tok", transport=transport),
+    )
+    return DidaApp(engine)
+
+
+async def test_a_change_that_cannot_be_pushed_says_why(tmp_path):
+    """保存失败显示**具体错误**（验收标准 9、用户故事 81）。
+
+    两件事一起断：这一笔**当场**就试着推出去了（还没离开详细页，更新请求已经发过一次），
+    以及推不出去时那一行写的是引擎记下来的**那句话**——不是一个笼统的「保存失败」。
+    """
+    transport = Unreachable()
+    app = real_app(tmp_path, transport)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await pilot.press("enter")  # 改标题
+        await pilot.press(*clear(len(TITLE)))
+        await pilot.press(*"新标题")
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+        method = transport.requests[0].method if transport.requests else None
+        body = transport.requests[0].content if transport.requests else b""
+
+    assert method == "POST", f"改完一个字段没有立刻推出去：{transport.requests}"
+    assert "新标题".encode() in body, "推出去的请求体里没有改完的标题"
+    assert messages.FIELD_SAVE_FAILED_PREFIX in text, f"没写「保存失败」：\n{text}"
+    assert "连不上服务器" in text, f"保存失败没有带上具体原因：\n{text}"
+    assert "新标题" in field_row(text, "标题"), f"本地那一份该照旧当场生效（乐观写）：\n{text}"
+
+
+# ------------------------------------------------------------------ 只读的那几段
+
+
+async def test_subtasks_reminders_and_repeat_are_read_only_but_visible():
+    """子任务（含完成状态）、提醒（含触发时间）、重复都只读地看得见（验收标准 10–12）。
+
+    只读显示不做成「一行暗字」：三种信息各自一行，子任务还带勾选状态（``☑`` / ``☐``，
+    ``status == 1`` 才算完成——那是**子任务**那一对取值，与任务级那对不是一回事）。
+    """
+    fake = backend(
+        raw={
+            "repeatFlag": "RRULE:FREQ=DAILY;INTERVAL=1",
+            "reminders": ["TRIGGER:P0DT9H0M0S"],
+            "items": [
+                {"id": "s1", "title": "收集数据", "status": 1},
+                {"id": "s2", "title": "写结论", "status": 0},
+            ],
+        }
+    )
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        subtasks = field_row(screen_text(app), "子任务")
+        reminders = field_row(screen_text(app), "提醒")
+        repeat = field_row(screen_text(app), "重复")
+
+    assert theme.SUBTASK_DONE_MARK in subtasks and "收集数据" in subtasks, subtasks
+    assert theme.SUBTASK_TODO_MARK in subtasks and "写结论" in subtasks, subtasks
+    assert "TRIGGER:P0DT9H0M0S" in reminders, reminders
+    assert "RRULE:FREQ=DAILY;INTERVAL=1" in repeat, repeat
+
+
+async def test_the_read_only_part_says_it_cannot_be_changed_here():
+    """明确告知这几样在客户端里改不了（验收标准 13、用户故事 76–78）。
+
+    光标也永远不停在它们上面：``enter`` 落不到一个改不了的东西上。
+    """
+    fake = backend(
+        raw={
+            "repeatFlag": "RRULE:FREQ=DAILY;INTERVAL=1",
+            "reminders": ["TRIGGER:P0DT9H0M0S"],
+            "items": [{"id": "s1", "title": "收集数据", "status": 1}],
+        }
+    )
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        text = screen_text(app)
+        walked = [app.detail_page().selected_id]
+        for _ in range(6):
+            await pilot.press("j")
+            walked.append(app.detail_page().selected_id)
+
+    assert messages.READ_ONLY_NOTE in text, f"没有一句话说清这几样改不了：\n{text}"
+    assert walked == ["title", "content", "desc", "list", "due", "priority", "tags"], (
+        f"光标停到了只读的行上：{walked}"
+    )
+    assert field_row(text, "子任务").startswith(theme.BLANK_MARK * 2), (
+        f"只读的那几行不该有光标记号：{field_row(text, '子任务')!r}"
+    )
+
+
+async def test_an_empty_read_only_section_is_not_drawn_at_all():
+    """只读那几段没有内容时整段不画（工单 #20 的结论，那一页的既有行为）。
+
+    与三个自由文本字段的区别正是这一票要的：**描述空的也要留着**（那是一扇门），只读的
+    没有内容就没什么可告知的。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        text = screen_text(app)
+
+    for label in ("子任务", "提醒", "重复"):
+        assert not has_field(text, label), f"没有内容的「{label}」还占着一行：\n{text}"
+    assert messages.READ_ONLY_NOTE not in text, "一段只读的都没有，那句说明也不该出现"
+
+
+async def test_an_empty_field_keeps_its_place_so_it_can_be_written():
+    """空的描述/备注照样留在字段列表里（画一句占位符），光标停得上去、进得去。
+
+    这是「能加描述」这件事的前提：整行不画的话，一条没有描述的任务就永远写不上描述了。
+    """
+    fake = backend(content="", desc="")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        text = screen_text(app)
+        await pilot.press("j")  # 描述
+        await pilot.press("enter")
+        await pilot.press(*"补一段描述")
+        await pilot.press("escape")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert messages.EMPTY_FIELD_TEXT in field_row(text, "描述"), f"空描述没有占位符：\n{text}"
+    assert fake.writes == [("t1", {"content": "补一段描述"})], f"空字段写不进去：{fake.writes}"
+    assert "补一段描述" in field_row(after, "描述"), f"写完之后那一段没画出来：\n{after}"
+
+
+# ------------------------------------------------------------------ 进出与剩下几条
+
+
+async def test_esc_on_the_field_list_goes_back_to_the_task_you_came_from():
+    """字段列表上 ``esc`` 退回任务列表页，光标还原到进来时那条任务（验收标准 5）。
+
+    从**第二条**任务进去（不是第一条），回来时任务列表页的光标还得在它上面——这是 #34 那条
+    规矩在详细页这一侧的延续：``esc`` 出栈，不是把用户踢回列表第一行。
+    """
+    fake = backend()
+    fake.add_task("另一条任务", list_name="work", id="t2")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        for _ in range(20):
+            if app.index_page().selected_id == "work":
+                break
+            await pilot.press("j")
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("j")  # 光标移到第二条任务上
+        await pilot.press("enter")  # 进它的详细页
+        await pilot.pause()
+        in_detail = screen_text(app)
+        await pilot.press("j", "j")  # 字段列表上走两格
+        await pilot.press("escape")  # 回任务列表页
+        await pilot.pause()
+        listed = screen_text(app)
+        back_on = app.tasks_page().selected_id
+        await pilot.press("enter")  # 再进来一次
+        await pilot.pause()
+        again = screen_text(app)
+
+    assert "另一条任务" in in_detail, f"进的不是第二条任务的详细页：\n{in_detail}"
+    assert "另一条任务" in listed, f"没有回到任务列表页：\n{listed}"
+    assert back_on == "t2", "回来时光标不在进来时那条任务上"
+    assert "另一条任务" in field_row(again, "标题"), f"再进来时进的是另一条任务：\n{again}"
+
+
+async def test_a_task_without_a_due_date_says_so_without_an_ambiguous_glyph():
+    """没有截止时间那一格不用歧义宽度的字形（``—`` U+2014 换成不含糊的读法）。
+
+    引擎给的是 ``sync.view.NO_DUE_TEXT``（``—``，东亚**歧义**宽度）：rich 量它 1 格，CJK
+    字体下终端可能画 2 格。详细页按**屏幕行**算光标与滚动，一格之差就是一行之差。
+    """
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_task(TITLE, list_name="work", id="t1", content=CONTENT, desc=DESC)
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        due = field_row(screen_text(app), "截止")
+
+    assert theme.NO_VALUE in due, f"没有截止时间该读作「{theme.NO_VALUE}」：{due!r}"
+    assert NO_DUE_TEXT not in due, f"引擎那个歧义宽度的记号漏到这一页上了：{due!r}"
+
+
+async def test_a_multiline_note_keeps_its_line_breaks():
+    """备注是多行文本（验收标准 6）：编辑器里的换行原样写出去、原样折行画出来。
+
+    ``enter`` 在多行框里是换行（单行框里才是提交）——这正是键位表里 ``enter`` 的两半。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=(60, 24)) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await pilot.press("j", "j")  # 备注
+        await pilot.press("enter")
+        await pilot.press(*clear(len(DESC)))
+        await pilot.press(*"第一行")
+        await pilot.press("enter")  # 多行框里它是换行
+        await pilot.press(*"第二行")
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert fake.writes == [("t1", {"desc": "第一行\n第二行"})], f"换行没带出去：{fake.writes}"
+    block = wrapped_block(text, "备注", "清单")
+    assert "第一行" in block[0] and "第二行" in block[-1], f"两行没有各占一行：{block}"
+
+
+# ------------------------------------------------------------------ 中文输入
+
+
+COMMIT = "这是一次上屏的长句子一共十五个字"
+"""一次输入法上屏的那一串：**超过四个汉字**（四个汉字是自测最容易被骗过去的长度）。"""
+assert len(COMMIT) > 4
+
+
+def test_a_long_cjk_commit_decodes_to_the_text_not_to_an_escape_sequence():
+    """一次上屏十五个汉字：终端送上来的那段字节解出来就是原文（验收标准 14）。
+
+    kitty 键盘协议关掉之后（``bootstrap.py`` 顶上那个开关，子进程检查在
+    ``tests/test_bootstrap.py``），输入法提交的汉字就是一段普通的 UTF-8 文本，解析器逐字给出
+    一个按键事件。开着那个协议时，一次上屏十几个汉字会被当成**一个**按键事件，解析器的
+    32 字符阈值让它放弃匹配、把整串当按键重发——中文直接变乱码。短词没事，长句才乱。
+
+    ⚠ 这条**不能**改成「喂一段 CSI-u 序列，断言字段拿到原文」：那是协议**开着**时的形状，
+    关掉之后同一段序列解出来是空的（实测），断言会反过来。这里喂的是真终端在协议关闭时
+    送的那串字节。真正的输入法是手测项（报告里写明了）。
+    """
+    parser = XTermParser()
+    keys = [event for event in parser.feed(COMMIT) if isinstance(event, events.Key)]
+
+    assert "".join(event.character or "" for event in keys) == COMMIT, (
+        f"十四个汉字没有逐字解出来：{[event.character for event in keys]!r}"
+    )
+
+
+async def test_a_long_cjk_commit_lands_in_the_field_verbatim():
+    """那一段原文落进字段就是原文（验收标准 14）：写出去的与屏幕上的逐字相同。
+
+    走的是正常输入那条路（焦点在编辑器上，逐字进来），断的是字段里与屏幕上都没有转义序列
+    的残渣——``[32;;`` / ``:30028u`` 这一类是乱码那一半的形状。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await pilot.press("enter")
+        await pilot.press(*clear(len(TITLE)))
+        await pilot.press(*COMMIT)
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert fake.writes == [("t1", {"title": COMMIT})], f"落进字段的不是原文：{fake.writes}"
+    assert COMMIT in field_row(text, "标题"), f"屏幕上不是那一段原文：\n{text}"
+    assert "[32;;" not in text and ":30028u" not in text, f"字段里留了转义序列：\n{text}"

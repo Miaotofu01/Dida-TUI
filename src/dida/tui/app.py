@@ -155,6 +155,20 @@ def format_status(status: SyncStatus) -> str:
     return status_line(status).plain
 
 
+def save_line(status: SyncStatus) -> str:
+    """详细页底部那一行的纯文本：**这一下到底出去没有**（用户故事 65 + 81）。
+
+    三种读法，一个都不许含糊：推不出去就带**具体**原因（断网、凭据失效、服务端拒绝的原话），
+    队列里还有改动就报数，都没有才是「已保存」。只说一句「保存失败」的话，用户不知道该刷新、
+    该重连、还是该重新粘 token——那是三种完全不同的下一步。
+    """
+    if status.last_error:
+        return messages.field_save_failed_message(status.last_error)
+    if status.pending_count:
+        return messages.pending_message(status.pending_count)
+    return messages.saved_message()
+
+
 class DidaApp(App[None]):
     """一栏 + 三层页面 + 状态栏。"""
 
@@ -382,8 +396,25 @@ class DidaApp(App[None]):
         return row.name if row is not None else container_id
 
     def update_status(self) -> None:
-        """把引擎的状态刷进状态栏。数据变化后都调它。"""
-        self._write_status(status_line(self.engine.status(), spinner=self._spinner()))
+        """把引擎的状态刷进状态栏与详细页底部那一行。数据变化后都调它。
+
+        两处说的是两件事（ADR-0007 四）：状态栏说「数据怎么样」（已同步 / 待推送 / 逻辑日），
+        详细页那一行说「你刚才那一下出去没有」。同一个 ``status()`` 读出来的两份读法，
+        所以它们永远不会互相矛盾。
+        """
+        status = self.engine.status()
+        self._write_status(status_line(status, spinner=self._spinner()))
+        self._write_save_line(save_line(status))
+
+    def _write_save_line(self, text: str) -> None:
+        """把详细页底部那一行写掉——与状态栏同一条规矩：**先问屏幕还在不在**。
+
+        它由 ``await`` 之后的那几次重画调到（逐字段编辑那一条路正好是跨 ``await`` 的），
+        关窗时页面已经拆了，再往它上面写就是 ``NoMatches``。
+        """
+        if not self.is_running:
+            return
+        self.detail_page().show_save(text)
 
     def _write_top(self) -> None:
         """把当前导航路径刷进顶栏（GLOSSARY 的「导航路径」：它是走出来的，不是猜的）。"""
