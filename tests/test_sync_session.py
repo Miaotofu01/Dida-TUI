@@ -18,6 +18,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from textual.css.query import NoMatches
 
 from dida.api.client import DidaApiClient
 from dida.api.errors import NetworkError
@@ -28,7 +29,7 @@ from dida.storage.store import Store
 from dida.sync.engine import SyncEngine
 from dida.testing import FakeBackend, ManualClock
 from dida.tui.app import DidaApp
-from dida.tui.panes import ConfirmScreen, TaskPane
+from dida.tui.panes import ConfirmScreen, StatusBar, TaskPane
 from support import screen_text
 
 TZ = timezone(timedelta(hours=8))
@@ -379,6 +380,90 @@ async def test_the_periodic_timer_pumps_the_queue_without_any_keypress(tmp_path)
 
     assert "待推送 0" in text, "没人按键，周期泵自己把队列推空了"
     assert len(server.requests) >= 2, "真的又发了一次请求"
+
+
+# --------------------------------------- 关窗与「回来晚了」的那一次（#41 观察、#34 属地）
+
+
+async def test_a_push_that_lands_after_the_ui_is_gone_does_not_raise(tmp_path):
+    """关窗时正在飞的那一次推送回来时，屏幕已经拆了——它不能再往状态栏写。
+
+    这一条钉的是「回来晚了的那一次」：``run_test`` 收尾之后 widget 全拆了、``app.is_running``
+    已经是假，而 ``await self.engine.push_pending()`` 恰好在这之后才回来。真实的偶发红就是
+    定时器在 ``_shutdown`` 那段窗口里跳了一下——那一跳与拆屏怎么交错没法从外面摆出来，所以
+    这里直接叫「回来晚了的那一次」，它走的是同一条路。修好之后它什么都不做，也不许抛。
+    """
+    store = open_store(tmp_path)
+    seed(store, task(id="t1", title="写周报", project_id="inbox"), lists=[inbox()])
+    server = Server(error=NetworkError("连不上"))
+    app = make_app(store, server, clock=ManualClock(T0))
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("p")  # 本地当场生效 + 立刻推一次（断网，失败）
+        await app.engine.wait_for_pushes()
+        await pilot.pause()
+
+    assert app.is_running is False, "出来时屏幕已经拆了"
+
+    await app.push_tick()  # 关窗时正在飞的那一次，回来时就是这样
+
+
+async def test_a_redraw_that_lands_after_the_ui_is_gone_does_not_raise(tmp_path):
+    """一轮同步回来得比拆屏晚时，重画那一屏也得是空操作——三栏已经不在了。
+
+    这是同一个洞的另一条路：``_sync`` 在 ``await`` 之后调 ``refresh_view()``，而 ``r`` 与
+    启动刷新都排得出这条路。窗口比周期泵那条窄，但错的是同一件事。
+    """
+    store = open_store(tmp_path)
+    seed(store, task(id="t1", title="写周报", project_id="inbox"), lists=[inbox()])
+    server = Server()
+    app = make_app(store, server, clock=ManualClock(T0))
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+
+    assert app.is_running is False, "出来时屏幕已经拆了"
+
+    app.refresh_view()  # 回来晚了的那次同步就是这样收尾的
+
+
+async def test_a_missing_status_bar_while_the_app_runs_is_still_an_error(tmp_path):
+    """守卫只放过关窗那一种：app 还在跑时状态栏不见了，照旧是 bug，不许被吞掉。
+
+    别的测试摆错东西时也要看得见错——一个「什么 NoMatches 都咽下去」的守卫，会把「状态栏
+    根本没组出来」这种真 bug 变成一片安静。
+    """
+    store = open_store(tmp_path)
+    seed(store, task(id="t1", title="写周报", project_id="inbox"), lists=[inbox()])
+    server = Server()
+    app = make_app(store, server, clock=ManualClock(T0))
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await app.query_one(StatusBar).remove()
+        await pilot.pause()
+
+        with pytest.raises(NoMatches):
+            app.update_status()
+
+
+async def test_the_pump_timer_is_stopped_when_the_app_unmounts(tmp_path):
+    """关窗时把周期泵停掉：不留一个还在跳的定时器（``on_unmount``）。
+
+    Textual 收尾时也会停 app 身上那批定时器，所以这里断的不是「它会一直跳到进程结束」——
+    断的是**这一层自己**留着泵的句柄，并在 ``on_unmount`` 里把它关掉，不靠框架兜。
+    """
+    store = open_store(tmp_path)
+    seed(store, task(id="t1", title="写周报", project_id="inbox"), lists=[inbox()])
+    server = Server()
+    app = make_app(store, server, clock=ManualClock(T0), push_tick_seconds=0.05)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        assert app._push_timer is not None, "开着的时候泵挂在定时器上"
+
+    assert app._push_timer is None, "关窗时自己把泵停掉"
 
 
 # ------------------------------------------------------------------ 退出拦截
