@@ -6,7 +6,10 @@
 
 当前状态：**正在从 v1 转向 v2。** v1 已实现，跑在 `feat/v1-today-console` 分支上（PR #28 尚未合并）——它是「今日执行台」：三栏、只显示与今天有关的任务、清单栏是装饰性的。真实使用后判定不可用，v2 改成通用客户端：一栏、三层页面（清单列表 → 任务列表 → 任务详细页），「今天」降级成内置视图之一。**v2 spec 落地前，不要按 v1 的定位去扩展代码。**
 
-- v1 的现状：`uv run pytest` 全绿（500+ 条，约一分钟），`uv run dida` 起的就是那个三栏执行台。
+- 现状（#34 落地后）：`uv run pytest` 全绿（400+ 条，约半分钟），`uv run dida` 起的是 **v2 的一栏三层页面**
+  （清单列表页 → 任务列表页 → 任务详细页，`enter` 向下、`esc` 向上）。v1 的三栏布局、`Tab` 焦点切换、
+  清单浮层、窄屏响应式降级与日期解析器都已删除；每层剩下的能力按 #35–#48 补齐，键位表在
+  `src/dida/tui/keys.py`（应用内 `?` 看到的就是它）。
 - v2 的设计决定已经落进 [GLOSSARY.md](GLOSSARY.md) 与 [docs/adr/](docs/adr/)——尤其看
   [ADR-0004](docs/adr/0004-terminal-client-not-today-console.md)（定位转变，含作废与保留清单）、
   [ADR-0002](docs/adr/0002-immediate-push-irreversible-complete.md)（「完成不可逆」已被实测推翻）、
