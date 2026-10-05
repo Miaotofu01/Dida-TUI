@@ -151,7 +151,7 @@ async def test_a_failed_push_keeps_the_priority_change_in_the_retry_queue(store)
 
 
 def make_backend() -> FakeBackend:
-    """一屏有代表性的缓存：今日三条（含一条没有截止时间的）。"""
+    """一屏有代表性的缓存：今日两条，外加一条没有截止时间的（收集箱无日期）。"""
     backend = FakeBackend(clock=ManualClock(T0), day_end="24:00")
     backend.add_task("交季度报告", list_name="工作", due=at(14, 9, 0), priority=5)
     backend.add_task("写周报", list_name="工作", due=at(14, 18, 0))
@@ -300,7 +300,8 @@ async def test_slash_filters_the_list_live_and_esc_restores_the_whole_list():
         await pilot.pause()
         shown = screen_text(app)
         assert FILTER_PLACEHOLDER not in shown, "Esc 收起过滤框"
-        assert "── 今日 · 3 项" in shown, "Esc 恢复完整列表"
+        assert "── 今日 · 2 项" in shown, "Esc 恢复完整列表"
+        assert "── 收集箱无日期 · 1 项" in shown, "无日期那条自成一区，Esc 也把它恢复回来"
         assert "交季度报告" in shown and "买牛奶" in shown
         assert isinstance(app.focused, TaskPane), "焦点回到任务列，j/k 立刻能用"
 

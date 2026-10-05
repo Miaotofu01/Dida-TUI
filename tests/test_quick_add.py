@@ -280,7 +280,8 @@ async def test_enter_creates_the_task_and_it_shows_up_in_the_today_section():
     """验收标准 #3：新建的任务**立刻**出现在对应分区里（乐观写，网络不是前置条件）。
 
     「今天 18:00 交季度报告」：逻辑日是 03-14（凌晨两点、边界 04:00），所以它落在今日区、
-    读作「今天 18:00」。计数从 2 涨到 3，说的就是这一条进的是今日区。
+    读作「今天 18:00」。今日区的计数从 1 涨到 2，说的就是这一条进的是今日区——原来那条
+    没有截止时间的仍在它自己的「收集箱无日期」区里，没被这一笔算进今日。
     """
     backend = make_backend()
     app = DidaApp(backend)
@@ -297,7 +298,7 @@ async def test_enter_creates_the_task_and_it_shows_up_in_the_today_section():
         assert backend.created_all_day == [False]
         assert PLACEHOLDER not in shown, "提交成功就该收起输入框"
         assert isinstance(app.focused, TaskPane), "焦点回到任务列，j/k 立刻能用"
-        assert "── 今日 · 3 项" in shown, "新建的那条当场进今日区"
+        assert "── 今日 · 2 项" in shown, "新建的那条当场进今日区（原来只有「写周报」一条）"
         assert shown.index("交季度报告") > shown.index("── 今日")
         assert "今天 18:00" in shown, "截止时间要读得出来"
 
@@ -326,7 +327,9 @@ async def test_one_line_carries_the_title_the_date_the_priority_and_the_tags():
         assert backend.created_priority == [5], "!高 是 5，不是 3（api-contracts.md）"
         assert backend.created_tags == [("工作",)]
         assert PLACEHOLDER not in shown, "提交成功就该收起输入框"
-        assert "── 今日 · 2 项" in shown, "明天的任务不进今天的屏：它不该被塞进今日区"
+        assert "── 今日 · 1 项" in shown, "明天的任务不进今天的屏：它不该被塞进今日区"
+        assert "── 收集箱无日期 · 1 项" in shown, "无日期那条仍在它自己那一区，条数没被明天这条动过"
+        assert "交季度报告" not in shown, "建出来了，但它属于明天，不在这张屏上"
 
 
 async def test_a_created_task_shows_the_priority_mark_it_was_written_with():
@@ -341,7 +344,7 @@ async def test_a_created_task_shows_the_priority_mark_it_was_written_with():
         await pilot.pause()
         shown = screen_text(app)
 
-        assert "── 今日 · 3 项" in shown
+        assert "── 今日 · 2 项" in shown
         assert "! 交月报" in shown, "高优先级在行首是 !（TUI 不自己判断，标记由引擎给）"
         assert "#工作" not in shown, "标签不是行内文字：解析器已经把它从标题里摘掉了"
 
@@ -382,8 +385,8 @@ async def test_any_diagnostic_is_shown_and_nothing_is_created(text, token):
 async def test_a_line_without_any_date_is_a_legitimate_quick_add():
     """没写日期是**合法**的：快速添加可以只写标题。
 
-    要挡的是「解析没成功还硬建」，不是「用户就是没写日期」——这条任务落在今日区、
-    读作「—」，等它们的分诊区落地后再分出去（t05 的口径）。
+    要挡的是「解析没成功还硬建」，不是「用户就是没写日期」——这条任务落进「收集箱无日期」
+    区（story 16），读作「—」，就在原来那条没有截止时间的旁边等着分诊。
     """
     backend = make_backend()
     app = DidaApp(backend)
@@ -398,7 +401,8 @@ async def test_a_line_without_any_date_is_a_legitimate_quick_add():
         assert backend.created == ["买酱油"]
         assert backend.created_due == [None]
         assert backend.created_priority == [None]
-        assert "── 今日 · 3 项" in shown
+        assert "── 收集箱无日期 · 2 项" in shown, "新建的无日期任务当场进这一区（原来只有「买牛奶」）"
+        assert shown.index("买酱油") > shown.index("── 收集箱无日期")
         assert "· 买酱油  收集箱  —" in shown, "没有截止时间读作「—」，不是「今天 00:00」"
 
 

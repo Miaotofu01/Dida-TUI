@@ -106,7 +106,8 @@ def test_completed_tasks_never_reach_the_view():
     assert [item.title for group in groups for item in group.items] == ["写周报"]
 
 
-def test_tasks_without_a_due_date_wait_in_today_and_read_as_no_due():
+def test_tasks_without_a_due_date_form_their_own_inbox_group():
+    """story 16：无日期的任务是单独一区，标题按接口契约的「收集箱无日期」。"""
     groups = group_tasks(
         [task("t1", "买牛奶", list_id="life"), task("t2", "写周报", due=at(14, 18, 0))],
         LISTS,
@@ -114,8 +115,11 @@ def test_tasks_without_a_due_date_wait_in_today_and_read_as_no_due():
         day_end="24:00",
     )
 
-    assert [group.kind for group in groups] == [GroupKind.TODAY]
-    assert [item.due_text for item in groups[0].items] == ["今天 18:00", "—"]
+    assert [group.kind for group in groups] == [GroupKind.TODAY, GroupKind.INBOX_UNDATED]
+    assert [group.title for group in groups] == ["今日", "收集箱无日期"]
+    assert [group.count for group in groups] == [1, 1]
+    assert [item.title for item in groups[1].items] == ["买牛奶"]
+    assert [item.due_text for item in groups[1].items] == ["—"]
 
 
 def test_future_tasks_are_not_part_of_today():
@@ -129,7 +133,7 @@ def test_future_tasks_are_not_part_of_today():
     assert groups == ()
 
 
-def test_dated_tasks_sort_by_due_and_undated_ones_follow():
+def test_dated_tasks_sort_by_due_and_undated_ones_keep_their_own_group():
     groups = group_tasks(
         [
             task("t1", "买牛奶", list_id="life"),
@@ -141,7 +145,70 @@ def test_dated_tasks_sort_by_due_and_undated_ones_follow():
         day_end="24:00",
     )
 
-    assert [item.title for item in groups[0].items] == ["写周报", "复习 Rust", "买牛奶"]
+    today, undated = groups
+    assert [item.title for item in today.items] == ["写周报", "复习 Rust"]
+    assert [item.title for item in undated.items] == ["买牛奶"]
+
+
+def test_the_three_groups_keep_the_order_the_interface_contract_asks_for():
+    """接口契约：逾期 / 今日 / 收集箱无日期；已完成区在中栏底部，不在这三个里。"""
+    groups = group_tasks(
+        [
+            task("t1", "交季度报告", due=at(11, 9, 0)),
+            task("t2", "写周报", due=at(14, 18, 0)),
+            task("t3", "买牛奶", list_id="life"),
+        ],
+        LISTS,
+        now=at(14, 12, 3),
+        day_end="24:00",
+    )
+
+    assert [group.kind for group in groups] == [
+        GroupKind.OVERDUE,
+        GroupKind.TODAY,
+        GroupKind.INBOX_UNDATED,
+    ]
+    assert [group.title for group in groups] == ["逾期", "今日", "收集箱无日期"]
+    assert [group.count for group in groups] == [1, 1, 1]
+
+
+def test_no_due_and_due_today_land_in_two_different_groups():
+    """story 23：「没有截止时间」与「今天截止」一眼可分——连区都不是同一个。"""
+    groups = group_tasks(
+        [
+            task("t1", "修水龙头", list_id="life", due=at(14), all_day=True),
+            task("t2", "买牛奶", list_id="life"),
+        ],
+        LISTS,
+        now=at(14, 12, 3),
+        day_end="24:00",
+    )
+
+    assert [(group.title, group.count) for group in groups] == [("今日", 1), ("收集箱无日期", 1)]
+    assert [item.due_text for item in groups[0].items] == ["今天"]
+    assert [item.due_text for item in groups[1].items] == ["—"]
+
+
+def test_undated_tasks_join_the_group_whatever_list_they_live_in():
+    """分诊看的是「有没有日期」，不是「在哪个清单」。
+
+    收集箱（``"inbox"``）之外的无日期任务也在这一区：留在今日区等于骗人，丢掉等于把
+    用户刚写下的一条藏起来。清单名仍然照显示，分诊时看得出来它本来属于哪儿。
+    """
+    groups = group_tasks(
+        [
+            task("t1", "买牛奶", list_id="life"),
+            task("t2", "记一笔", list_id="inbox"),
+        ],
+        LISTS + [ListSnapshot(id="inbox", name="收集箱")],
+        now=at(14, 12, 3),
+        day_end="24:00",
+    )
+
+    (undated,) = groups
+    assert undated.kind is GroupKind.INBOX_UNDATED
+    assert [item.title for item in undated.items] == ["买牛奶", "记一笔"]
+    assert [item.list_name for item in undated.items] == ["生活", "收集箱"]
 
 
 def test_empty_groups_are_left_out():
