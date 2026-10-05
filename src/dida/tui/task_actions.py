@@ -23,7 +23,7 @@ from dida.tui.messages import (
     delete_prompt,
     no_browser_message,
 )
-from dida.tui.panes import ConfirmScreen, StatusBar, TaskPane
+from dida.tui.panes import ConfirmScreen, TaskPane
 
 FLASH_SECONDS = 0.45
 """完成后那一行高亮多久：够看清这一下生效了，又不至于拖住下一次分诊。"""
@@ -33,7 +33,8 @@ class TaskActionsMixin:
     """挂在 app 上的五个动作（t11 / t13 / t16 / t17 / t19）。
 
     mixin 不是完整的 app：它用 ``self.engine`` / ``self.query_one`` / ``self.refresh_view``
-    ——这些都由 :class:`~dida.tui.app.DidaApp` 提供。
+    / ``self._write_status``——这些都由 :class:`~dida.tui.app.DidaApp` 提供。状态栏那句走
+    ``self._write_status``，不再自己查 widget（见 app.py：关窗时谁都不许再往屏幕上写）。
     """
 
     def action_complete(self) -> None:
@@ -57,7 +58,13 @@ class TaskActionsMixin:
         self.set_timer(FLASH_SECONDS, self._settle_after_complete)
 
     def _settle_after_complete(self) -> None:
-        """收起高亮，并按引擎的当前视图重画。定时器到点就调这一次。"""
+        """收起高亮，并按引擎的当前视图重画。定时器到点就调这一次。
+
+        这一次回调也是「可能回来晚了」的那一种：定时器到点时用户可能已经关了窗
+        （widget 都拆了），那就什么都不做——高亮没有人再看。
+        """
+        if not self.is_running:
+            return
         self.query_one(TaskPane).flash(None)
         self.refresh_view()
 
@@ -126,7 +133,7 @@ class TaskActionsMixin:
         try:
             self.engine.delete(task_id)
         except UnknownTaskError:
-            self.query_one(StatusBar).update(UNKNOWN_DELETE_MESSAGE)
+            self._write_status(UNKNOWN_DELETE_MESSAGE)
             return
         self.refresh_view()
 
@@ -160,4 +167,4 @@ class TaskActionsMixin:
             # 不让一个找不到浏览器的机器把整个界面带走。
             opened = False
         if not opened:
-            self.query_one(StatusBar).update(no_browser_message(url))
+            self._write_status(no_browser_message(url))

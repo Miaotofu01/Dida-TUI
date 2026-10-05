@@ -27,7 +27,7 @@ TUI 只通过 :class:`~dida.sync.engine.Engine` 读写；分组、排序、逾�
 
 from __future__ import annotations
 
-from typing import Callable
+from typing import TYPE_CHECKING, Callable
 
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal
@@ -66,6 +66,9 @@ from dida.tui.panes import (
     format_status,
 )
 from dida.tui.task_actions import FLASH_SECONDS, TaskActionsMixin
+
+if TYPE_CHECKING:  # 只为了标注周期泵那个句柄，运行时用不到
+    from textual.timer import Timer
 
 __all__ = [
     "MEDIUM_MIN_WIDTH",
@@ -173,6 +176,11 @@ class DidaApp(TaskActionsMixin, FormActionsMixin, PaneActionsMixin, App[None]):
         self._open_url = open_url
         self._refresh_on_start = refresh_on_start
         self._push_tick_seconds = push_tick_seconds
+        self._push_timer: Timer | None = None
+        """周期泵的定时器句柄（工单 #21）：``on_unmount`` 里拿它把泵停掉。
+
+        ``set_interval`` 回一个 ``Timer``，丢掉它就没有第二个人能停这一跳——关窗之后
+        它还挂在事件循环上。``None`` 表示泵没开（策略没给间隔）或者已经停了。"""
         self._query = ""
         """当前生效的过滤词（空串 = 不过滤）。框里的原文由 :class:`FilterInput` 拿着。"""
 
@@ -201,7 +209,18 @@ class DidaApp(TaskActionsMixin, FormActionsMixin, PaneActionsMixin, App[None]):
             self.start_sync()
         if self._push_tick_seconds is not None:
             # 重试队列的泵（t21）：写失败时改动留在队列里，退避到点了得有谁来推它。
-            self.set_interval(self._push_tick_seconds, self.push_tick)
+            # 句柄留着，关窗时好把它停掉（on_unmount）——泵的开关归这一层管。
+            self._push_timer = self.set_interval(self._push_tick_seconds, self.push_tick)
+
+    def on_unmount(self) -> None:
+        """关窗：把周期泵停掉——app 都拆了，没有人再需要它问那句「到点了没有」。
+
+        停掉只挡得住**后面**的跳；已经在飞的那一次要等 ``await`` 回来才算数，那由
+        :meth:`_write_status` 与 :meth:`refresh_view` 的「屏幕还在不在」守着（见下）。
+        """
+        if self._push_timer is not None:
+            self._push_timer.stop()
+            self._push_timer = None
 
     # ---------------------------------------------------------------- 重画
 
@@ -211,7 +230,11 @@ class DidaApp(TaskActionsMixin, FormActionsMixin, PaneActionsMixin, App[None]):
         当前的过滤词在这里生效：筛是引擎那份纯函数（:func:`~dida.sync.view.filter_groups`）
         干的，TUI 只是把筛过的分区交给中栏——所以刷新、完成、改期之后过滤都不会掉，
         光标也不会落到一个已经被筛掉的任务上。
+
+        屏幕已经拆掉时整体是空操作（关窗中，这一次回来晚了，见 :meth:`_write_status`）。
         """
+        if not self.is_running:
+            return
         view = self.engine.view()
         self.query_one(ListPane).render_lists(view.lists)
         self.query_one(TaskPane).render_groups(
@@ -223,7 +246,22 @@ class DidaApp(TaskActionsMixin, FormActionsMixin, PaneActionsMixin, App[None]):
 
     def update_status(self) -> None:
         """把引擎的状态刷进状态栏。数据变化后都调它。"""
-        self.query_one(StatusBar).update(format_status(self.engine.status()))
+        self._write_status(format_status(self.engine.status()))
+
+    def _write_status(self, message: str) -> None:
+        """把一句话写进状态栏——TUI 里状态栏的**唯一**写入口。
+
+        关窗时丢掉它：``await`` 回来的路上 app 可能已经拆了（用户按 ``q``、或者
+        ``run_test`` 收尾），那一刻 widget 已经不在 DOM 里，再往状态栏写就是
+        ``NoMatches``。周期泵正好撞在这个窗口上（工单 #41 观察到的偶发红，属地归 #34）；
+        凡是 ``await`` 之后写状态栏的路都走这里，省得每处各记一次。
+
+        只在**屏幕已经不在跑**时放过：app 还在跑时状态栏不见了仍然是 bug，照旧让
+        ``NoMatches`` 冒出去，不吞。
+        """
+        if not self.is_running:
+            return
+        self.query_one(StatusBar).update(message)
 
     # ---------------------------------------------------------------- 同步泵（t21）
 
@@ -233,7 +271,7 @@ class DidaApp(TaskActionsMixin, FormActionsMixin, PaneActionsMixin, App[None]):
         先写「同步中…」再排 worker：用户按了键，得有个「它动了」的信号；真正的活儿在
         事件循环上跑，界面不因为等网络而卡住（引擎那条 ``refresh()`` 是 async 的就是为这个）。
         """
-        self.query_one(StatusBar).update(SYNCING_MESSAGE)
+        self._write_status(SYNCING_MESSAGE)
         self.start_sync()
 
     def start_sync(self) -> None:
@@ -252,11 +290,14 @@ class DidaApp(TaskActionsMixin, FormActionsMixin, PaneActionsMixin, App[None]):
         不做——同一个网络问题会让它们一起失败，白跑两趟；已完成流失败时前两件已经落地，
         照旧重画，只是把「没拉到」说出来。缓存从头到尾都在：这一屏不因为没网就不能用
         （用户故事 62）。
+
+        三处 ``await`` 之后动界面的地方都不是裸写：状态栏走 :meth:`_write_status`、
+        重画走 :meth:`refresh_view`，两边都认得「关窗了」。
         """
         try:
             report = await self.engine.refresh()
         except DidaError as exc:
-            self.query_one(StatusBar).update(refresh_failed_message(exc))
+            self._write_status(refresh_failed_message(exc))
             return
         # 队列里那些到点的改动顺手推一轮：`r` 是用户能按的那个「现在再试一次」。
         await self.engine.push_pending()
@@ -270,9 +311,9 @@ class DidaApp(TaskActionsMixin, FormActionsMixin, PaneActionsMixin, App[None]):
         # 覆盖告知排在最后：服务端真的盖掉了用户的东西，这句话比什么都该留在屏幕上
         # （ADR-0002）。被待推送改动挡回去的不算——那些改动还在，没有被盖掉。
         if report.overwritten:
-            self.query_one(StatusBar).update(overwritten_message(len(report.overwritten)))
+            self._write_status(overwritten_message(len(report.overwritten)))
         elif completed_failed is not None:
-            self.query_one(StatusBar).update(completed_failed_message(completed_failed))
+            self._write_status(completed_failed_message(completed_failed))
 
     async def push_tick(self) -> None:
         """推一轮**到点**的待推送改动（工单 #21 的周期泵；也是测试的确定性入口）。
