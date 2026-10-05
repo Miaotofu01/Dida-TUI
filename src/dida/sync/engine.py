@@ -65,6 +65,21 @@ from dida.sync.completed import (
 from dida.sync.create import CreateMixin
 from dida.sync.priority import PriorityMixin
 from dida.sync.push import PushMixin, TaskWriter, backoff_delay
+from dida.sync.read import (
+    ListKind,
+    ListRow,
+    PayloadReader,
+    TaskDetail,
+    TaskList,
+    ViewReader,
+    ViewRow,
+    builtin_view_rows,
+    container_tasks,
+    is_inbox_id,
+    list_index,
+    resolve_lists,
+    task_detail,
+)
 from dida.sync.refresh import ProjectReader, RefreshMixin, RefreshTarget
 from dida.sync.schedule import ScheduleMixin
 from dida.sync.subtasks import SubtaskMixin, SubtaskWrite, TaskReader
@@ -110,9 +125,12 @@ __all__ = [
     "DidaError",
     "Engine",
     "GroupKind",
+    "ListKind",
+    "ListRow",
     "ListSnapshot",
     "ListSummary",
     "LocalEffect",
+    "PayloadReader",
     "ProjectReader",
     "RefreshTarget",
     "SUBTASK_COMPLETED_STATUS",
@@ -121,26 +139,36 @@ __all__ = [
     "SyncEngine",
     "SyncState",
     "SyncStatus",
+    "TaskDetail",
     "TaskGroup",
     "TaskItem",
+    "TaskList",
     "TaskReader",
     "TaskSnapshot",
     "TodayView",
     "UnknownTaskError",
+    "ViewReader",
+    "ViewRow",
     "ViewSource",
     "WireCall",
     "WriteKind",
     "WriteTarget",
     "backoff_delay",
+    "builtin_view_rows",
     "completed_section",
+    "container_tasks",
     "filter_groups",
     "format_due",
     "fuzzy_match",
     "group_tasks",
+    "is_inbox_id",
+    "list_index",
     "next_priority",
     "priority_mark",
+    "resolve_lists",
     "subtask_items",
     "summarize_lists",
+    "task_detail",
 ]
 
 DEFAULT_DAY_END = "00:00"
@@ -174,6 +202,18 @@ class Engine(Protocol):
 
     def view(self) -> TodayView:
         """读：分组后的视图模型。"""
+        ...
+
+    def list_index(self) -> tuple[ListRow, ...]:
+        """读：清单索引（内置视图、自定义视图、真实清单三种行）。"""
+        ...
+
+    def tasks_in(self, container_id: str) -> TaskList:
+        """读：某个容器的任务列表（一个清单，或一个视图）。"""
+        ...
+
+    def task_detail(self, task_id: str) -> TaskDetail | None:
+        """读：单条任务的详情；本地没有这条任务时 ``None``。"""
         ...
 
     async def refresh(self) -> RefreshReport:
@@ -302,6 +342,53 @@ class SyncEngine(
                 day_end=self._day_end,
                 window_hours=self._completed_window_hours,
             ),
+        )
+
+    def list_index(self) -> tuple[ListRow, ...]:
+        """读：清单索引——收集箱置顶，然后内置视图、自定义视图、真实清单（#33）。
+
+        缓存不在就是空索引，不是错误（与 :meth:`view` 空缓存给空视图同一条口径）。
+        """
+        if self._source is None:
+            return ()
+        return list_index(
+            tuple(self._source.lists()),
+            tuple(self._source.tasks()),
+            now=self._clock.now(),
+            day_end=self._day_end,
+        )
+
+    def tasks_in(self, container_id: str) -> TaskList:
+        """读：某个容器的任务列表——它的**全部**未完成任务（未来的也在）+ 已完成的那部分。
+
+        认不出来的容器给空列表（清单被删了、光标停在一条已经不在了的行上）。
+        """
+        if self._source is None:
+            return TaskList(container_id=container_id)
+        return container_tasks(
+            container_id,
+            tuple(self._source.lists()),
+            tuple(self._source.tasks()),
+            now=self._clock.now(),
+            day_end=self._day_end,
+            window_hours=self._completed_window_hours,
+        )
+
+    def task_detail(self, task_id: str) -> TaskDetail | None:
+        """读：单条任务的详情（重复规则、提醒、子任务、原文里的未知字段都在这）。"""
+        if self._source is None:
+            return None
+        tasks = tuple(self._source.tasks())
+        snapshot = next((item for item in tasks if item.id == task_id), None)
+        if snapshot is None:
+            return None
+        names = list_names(resolve_lists(tuple(self._source.lists()), tasks))
+        return task_detail(
+            snapshot,
+            self._payload_of(task_id),
+            names,
+            now=self._clock.now(),
+            day_end=self._day_end,
         )
 
     def _write_target(self) -> WriteTarget:

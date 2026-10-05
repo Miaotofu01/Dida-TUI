@@ -65,10 +65,21 @@ _GROUP_TITLES = {
 
 @dataclass(frozen=True)
 class ListSnapshot:
-    """缓存里的一条清单（API 叫 project）。"""
+    """缓存里的一条清单（API 叫 project）：只有事实，没有判断。
+
+    ``color`` / ``group_id`` / ``kind`` / ``permission`` 是服务端 ``Project`` 上的字段
+    （``kind`` 是 ``TASK`` / ``NOTE``，``permission`` 是 ``write`` / ``read`` / ``comment``），
+    清单索引页要用它们标出「装不了任务的」「改不动的」那些行（用户故事 23 / 24）。
+    ``is_inbox`` 是客户端认出来的收集箱那一行——服务端的清单索引里没有它（实测）。
+    """
 
     id: str
     name: str
+    color: str | None = None
+    group_id: str | None = None
+    kind: str | None = None
+    permission: str | None = None
+    is_inbox: bool = False
 
 
 @dataclass(frozen=True)
@@ -317,7 +328,7 @@ def group_tasks(
         buckets[kind].append(task_item(snapshot, names, now=now, day_end=day_end))
 
     return tuple(
-        TaskGroup(kind=kind, items=tuple(_by_due(buckets[kind])))
+        TaskGroup(kind=kind, items=tuple(by_due(buckets[kind])))
         for kind in GROUP_ORDER
         if buckets[kind]
     )
@@ -357,8 +368,12 @@ def format_due(due: datetime | None, *, all_day: bool, now: datetime, day_end: s
     return f"{word} {due.strftime('%H:%M')}"
 
 
-def _by_due(items: list[TaskItem]) -> list[TaskItem]:
-    """有截止时间的按时间升序在前，没有的按标题排在后面。"""
+def by_due(items: Sequence[TaskItem]) -> list[TaskItem]:
+    """有截止时间的按时间升序在前，没有的按标题排在后面。
+
+    读模型（:mod:`dida.sync.read`）也用它：容器里的行与「今天」那一屏的排序规矩是同一份。
+    排序规矩本身归 #37（截止时间 → 优先级 → 无日期在后 → 已完成沉底），这里先照 v1 的。
+    """
     dated = sorted((item for item in items if item.due is not None), key=lambda item: (item.due, item.title))
     undated = sorted((item for item in items if item.due is None), key=lambda item: (item.title, item.task_id))
     return dated + undated

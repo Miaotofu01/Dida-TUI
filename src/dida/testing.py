@@ -23,7 +23,16 @@ import httpx
 from dida.clock import Clock
 from dida.date_parser import ParsedTask
 from dida.storage.store import RefreshReport
-from dida.sync.engine import CompletedReport, SubtaskWrite, SyncEngine, SyncStatus
+from dida.sync.engine import (
+    CompletedReport,
+    ListRow,
+    SubtaskWrite,
+    SyncEngine,
+    SyncStatus,
+    TaskDetail,
+    TaskList,
+    ViewRow,
+)
 from dida.sync.view import (
     INBOX_NAME,
     ListSnapshot,
@@ -95,13 +104,47 @@ class InMemorySource:
 
         self._lists: dict[str, ListSnapshot] = {}
         self._tasks: dict[str, TaskSnapshot] = {}
+        self._views: dict[str, ViewRow] = {}
         self._seq = 0
 
-    def add_list(self, name: str, *, id: str | None = None) -> ListSnapshot:
-        """加一条清单；``id`` 默认就是名字。"""
-        snapshot = ListSnapshot(id=id if id is not None else name, name=name)
+    def add_list(
+        self,
+        name: str,
+        *,
+        id: str | None = None,
+        color: str | None = None,
+        group_id: str | None = None,
+        kind: str | None = None,
+        permission: str | None = None,
+        is_inbox: bool = False,
+    ) -> ListSnapshot:
+        """加一条清单；``id`` 默认就是名字。
+
+        ``is_inbox`` 摆 ``True`` 就是客户端补出来的收集箱那一行（服务端的清单索引里没有它）。
+        ``kind`` / ``permission`` 是服务端 ``Project`` 上那两个字段（``TASK``/``NOTE``、
+        ``write``/``read``/``comment``），清单索引页靠它们标出进不去的行（用户故事 23 / 24）。
+        """
+        snapshot = ListSnapshot(
+            id=id if id is not None else name,
+            name=name,
+            color=color,
+            group_id=group_id,
+            kind=kind,
+            permission=permission,
+            is_inbox=is_inbox,
+        )
         self._lists[snapshot.id] = snapshot
         return snapshot
+
+    def add_view(self, name: str, *, id: str | None = None, task_ids: Sequence[str] = ()) -> ViewRow:
+        """加一条自定义视图行（#36）：``task_ids`` 是这一层算好的求值结果。
+
+        替身不自己求值——过滤条件怎么算成一份任务列表是视图求值那一层的判断（#35/#36），
+        替身照收不误（与 ``set_subtasks`` 收成品行同一条口径）。
+        """
+        row = ViewRow(id=id if id is not None else name, name=name, task_ids=tuple(task_ids))
+        self._views[row.id] = row
+        return row
 
     def add_task(
         self,
@@ -144,6 +187,10 @@ class InMemorySource:
 
     def lists(self) -> tuple[ListSnapshot, ...]:
         return tuple(self._lists.values())
+
+    def views(self) -> tuple[ViewRow, ...]:
+        """自定义视图行（#36 的本地库那一样；替身里是 :meth:`add_view` 摆的）。"""
+        return tuple(self._views.values())
 
     def tasks(self) -> tuple[TaskSnapshot, ...]:
         return tuple(self._tasks.values())
@@ -266,8 +313,12 @@ class FakeBackend:
         now = self.clock.now()
         return CompletedReport(start=now, end=now)
 
-    def add_list(self, name: str, *, id: str | None = None) -> ListSnapshot:
-        return self.source.add_list(name, id=id)
+    def add_list(self, name: str, **kwargs: Any) -> ListSnapshot:
+        return self.source.add_list(name, **kwargs)
+
+    def add_view(self, name: str, *, id: str | None = None, task_ids: Sequence[str] = ()) -> ViewRow:
+        """摆一条自定义视图行（#36 的求值结果）：这个视图当前选中的那些任务 id。"""
+        return self.source.add_view(name, id=id, task_ids=task_ids)
 
     def add_task(self, title: str, **kwargs: Any) -> TaskSnapshot:
         return self.source.add_task(title, **kwargs)
@@ -277,6 +328,18 @@ class FakeBackend:
 
     def view(self) -> TodayView:
         return self._engine.view()
+
+    def list_index(self) -> tuple[ListRow, ...]:
+        """读：委托给真引擎——三种行怎么组装、收集箱那一行是谁、条数怎么数，都是生产那一份。"""
+        return self._engine.list_index()
+
+    def tasks_in(self, container_id: str) -> TaskList:
+        """读：委托给真引擎（某个容器的全部未完成任务 + 该显示的那部分已完成）。"""
+        return self._engine.tasks_in(container_id)
+
+    def task_detail(self, task_id: str) -> TaskDetail | None:
+        """读：委托给真引擎（详情页的字段，含原文里我们不认识的那些）。"""
+        return self._engine.task_detail(task_id)
 
     def status(self) -> SyncStatus:
         return self._engine.status()
