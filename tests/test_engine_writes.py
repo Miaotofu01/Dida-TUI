@@ -430,7 +430,20 @@ async def test_a_change_queued_behind_a_create_follows_it_to_the_real_id(store):
     local_id = engine.create("写周报", list_id="work")
     await engine.wait_for_pushes()
 
-    assert [change.task_id for change in store.pending()] == [local_id], "新建那笔在队列里"
+    # 排在它后面的那笔改动。走存储层的公开入口入队，而不是 ``engine.write``：写入那一侧
+    # 自己就挡着这条路（#53 的第一道，下一条测试钉它），这里要复现的是**队列里已经有一笔**
+    # 指向临时 id 的改动（#42 在清单那条路上量到的形状），好让认领那一步去处理它。
+    store.enqueue(
+        task_id=local_id,
+        kind=ChangeKind.UPDATE,
+        payload={"title": "写周报（改）"},
+        now=clock.now(),
+        list_id="work",
+    )
+
+    assert [change.task_id for change in store.pending()] == [local_id, local_id], (
+        "两笔都指向临时 id"
+    )
     assert local_id.startswith(LOCAL_TASK_PREFIX), "认领之前它是本地临时 id"
 
     clock.advance(timedelta(seconds=2))  # 退避到点，轮到这一笔了
@@ -440,7 +453,26 @@ async def test_a_change_queued_behind_a_create_follows_it_to_the_real_id(store):
     assert store.pending_count() == 0
     assert engine.status().pending_count == 0
     assert [item.id for item in store.tasks()] == ["srv-1"], "本地那一条落到服务端给的 id 上"
-    assert store.task_payload("srv-1")["title"] == "写周报", "用户写下的标题不许丢"
+
+    # 只挪队列里的 id 还不够（#53 的第 2 件）：那一笔得**真的**打到真 id 上。请求 URL 是最
+    # 外面那份证据——``local-…`` 还出现在里面，走的就是 404 那条路；而只重读队列、不挪 id
+    # 的话，这里发出去的仍然是临时 id。
+    urls = [str(request.url) for request in transport.requests]
+    assert urls == [
+        # 第一次新建：断网，失败退避（这一笔也是 POST 到集合端点——它的 URL 里没有 id）
+        "https://api.dida365.com/open/v1/task",
+        # 退避到点，新建推成功
+        "https://api.dida365.com/open/v1/task",
+        # 排在后面那笔改动：真 id，不是 local-…
+        "https://api.dida365.com/open/v1/task/srv-1",
+    ], "新建 POST 到集合端点；那笔改动 POST 到服务端给的真 id，不是临时 id"
+    assert transport.last_json["title"] == "写周报（改）", "用户改的那一份真的发出去了"
+
+    # 已知边界（不是本票修的那一件事，报给编排者）：本地那份的标题仍是服务端建它时回的
+    # 那一个。认领是「把本地那条挪到真 id 上」，而挪过去的那一份取自**新建当时的**原文
+    # 与服务端响应的合并——排在后面那笔改动的本地效果在临时 id 那一行上，没跟着走。
+    # 下一次全量刷新会由服务端权威把它拉正（服务端那份**是**改过的）。修法属于 #54 说的
+    # 「把改动并进那条还没成真的新建」那一类，本票不自己发明第二套。
 
 
 async def test_an_edit_after_an_unclaimed_create_is_refused_not_queued(store):
