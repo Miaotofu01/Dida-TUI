@@ -269,14 +269,28 @@ class InMemorySource:
         与 ``Store`` 同一条口径：本地当场生效（乐观写），服务端随后到。认得出的字段（标题、
         描述、备注、优先级、状态）盖进快照，其余原样并进那份服务端原文——详情页的只读字段
         读的就是原文。
+
+        ``dueDate`` / ``isAllDay`` 多一层翻译：服务端的字段名（``dueDate``）与快照上那两位
+        （``due`` / ``all_day``）不是同一个拼法，而 ``Store._snapshot`` 就是在这两个名字之间
+        翻译的。替身不翻译的话，「改完截止时间屏幕上就变了」这句话在接缝一根本测不到
+        （#44：详细页那一格读的是快照上的 ``due``）。**显式的 ``None`` 是清除**——与 ``Store``
+        把 ``dueDate: null`` 读成「没有日期」同一个口径（``_parse_time`` 只认字符串）。
         """
         snapshot = self._tasks.get(task_id)
         if snapshot is None:
             return
+        raw = {**self._raw.get(task_id, {}), **changes}
+        if "dueDate" in changes or "isAllDay" in changes:
+            due = raw.get("dueDate")
+            snapshot = replace(
+                snapshot,
+                due=datetime.fromisoformat(due) if isinstance(due, str) else None,
+                all_day=bool(raw.get("isAllDay")),
+            )
         known = {key: value for key, value in changes.items() if key in _SNAPSHOT_FIELDS}
-        if known:
-            self._tasks[task_id] = replace(snapshot, **known)
-        self._raw[task_id] = {**self._raw.get(task_id, {}), **changes}
+        snapshot = replace(snapshot, **known) if known else snapshot
+        self._tasks[task_id] = snapshot
+        self._raw[task_id] = raw
 
     def views(self) -> tuple[ViewRow, ...]:
         """自定义视图行（#36 的本地库那一样；替身里是 :meth:`add_view` 摆的）。"""
@@ -327,8 +341,8 @@ class FakeBackend:
         self.rescheduled: list[str] = []
         """``reschedule(task_id, due=, all_day=)`` 收到的任务 id，按调用顺序（t14 的改期）。"""
 
-        self.rescheduled_due: list[datetime] = []
-        """每次改期改到的截止时刻，与 ``rescheduled`` 一一对应。"""
+        self.rescheduled_due: list[datetime | None] = []
+        """每次改期改到的截止时刻（``None`` ＝ 清除这一格），与 ``rescheduled`` 一一对应。"""
 
         self.rescheduled_all_day: list[bool] = []
         """每次改期是不是全天，与 ``rescheduled`` 一一对应。"""
@@ -467,8 +481,13 @@ class FakeBackend:
         self.deferred.append(task_id)
         self.deferred_days.append(days)
 
-    def reschedule(self, task_id: str, *, due: datetime, all_day: bool = False) -> None:
-        """写：只记录（与 ``complete`` / ``defer`` 一样，替身不动缓存）。
+    def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> None:
+        """写：记下这一笔，**并且真的把新的截止时间摆进内存缓存**（#44 的改期 / 清除）。
+
+        与 ``write`` / ``create`` 同一条口径（那两个也是「真的摆进缓存」）：只记录的话，
+        「改完截止时间那一格就变了」「清除之后读作没有日期」这两句话在接缝一根本测不到——
+        而它们正是 #44 的验收标准。摆的是**服务端字段名**那一份（``dueDate`` / ``isAllDay``），
+        翻译交给 :meth:`InMemorySource.apply_changes`，与 ``Store._snapshot`` 同一个口径。
 
         摆了 ``reschedule_error`` 就记完这一笔再抛：模拟引擎当场拒绝（#25 的
         ``UnknownTaskError``），好试 TUI 拿到结构化错误时的反应。
@@ -478,6 +497,13 @@ class FakeBackend:
         self.rescheduled_all_day.append(all_day)
         if self.reschedule_error is not None:
             raise self.reschedule_error
+        self.source.apply_changes(
+            task_id,
+            {
+                "dueDate": None if due is None else due.isoformat(),
+                "isAllDay": all_day,
+            },
+        )
 
     def create(
         self,

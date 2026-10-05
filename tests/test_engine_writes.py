@@ -29,7 +29,7 @@ import pytest
 from dida.api.client import DidaApiClient
 from dida.api.errors import NetworkError
 from dida.storage.store import ChangeKind, Store
-from dida.sync.engine import SyncEngine
+from dida.sync.engine import NO_DUE_TEXT, SyncEngine
 from dida.testing import FakeTransport, ManualClock
 
 TZ = timezone(timedelta(hours=8))
@@ -480,3 +480,251 @@ async def test_a_failed_reschedule_push_stays_in_the_retry_queue(store):
     assert await engine.push_pending() == 1, "钟走到点，这一次推成功"
     assert store.pending() == ()
     assert engine.status().pending_count == 0
+
+
+# ---------------------------------------------------------------- 截止时间的请求形状（#44）
+
+
+async def test_clearing_the_due_date_writes_an_explicit_null_and_no_date_at_all(store):
+    """清除截止时间：``dueDate`` 显式写 **null**，``isAllDay`` 写 false（工单 #44）。
+
+    形状是**这一票自己定的**：api-shapes §A2 记着「省略的字段是被保留还是被清空，文档
+    没说」——所以清除**不能**靠「不发这个字段」。显式 null 是唯一一个把「清空」说出来的
+    形状；``isAllDay`` 一起写 false，是为了不留下一个「全天、但没有日期」的组合。
+
+    两件事一起断：请求体里那个 null，以及**本地**那份原文里的 ``dueDate`` 也真的没了
+    （不复原、不留一个 1970 年的时刻），于是详细页那一格回到「无」。
+    """
+    seed(store, task(id="t1", title="写周报", dueDate="2026-03-10T18:00:00+0800"))
+    transport = FakeTransport(json={"id": "t1"})
+    engine = make_engine(store, transport)
+
+    engine.reschedule("t1", due=None, all_day=False)
+    await engine.wait_for_pushes()
+
+    assert transport.last_request.method == "POST"
+    assert str(transport.last_request.url).endswith("/open/v1/task/t1")
+    body = transport.last_json
+    assert "dueDate" in body, "清除必须显式写 null，不能靠省略字段（文档没说省略是清空）"
+    assert body["dueDate"] is None
+    assert body["isAllDay"] is False
+    payload = store.task_payload("t1")
+    assert payload is not None
+    assert payload["dueDate"] is None, "本地那一份也不许留着旧日期"
+    assert engine.task_detail("t1").due is None
+    assert engine.task_detail("t1").due_text == NO_DUE_TEXT, "读法回到「没有日期」"
+    assert store.pending_count() == 0, "推成功了就该出队"
+
+
+async def test_a_write_of_the_due_date_leaves_start_date_exactly_as_the_server_gave_it(store):
+    """写截止时间**不动** ``startDate``（工单 #44 明确决定，见下面的理由）。
+
+    文档说 ``dueDate`` 与 ``startDate`` 是两个**独立**字段，从没说写一个会带上另一个
+    （api-shapes §D17 :2277/:2285）；ticket #44 那句「服务端会自动补一个同值的开始时间」是
+    v1 的观察，而文档里**没有这句话**（§E2(d)）。所以客户端不替服务端编一个开始时间：
+
+    - 自己造一份 ``startDate`` 就是把用户从来没设过的字段写进他的账号；
+    - 拿 ``dueDate`` 覆盖一份**已经存在**的 ``startDate`` 更糟——那正好是「静默位移」，
+      而且会动到用户没在改的那一格。
+
+    ``startDate`` 照旧**在请求体里**：它来自整份底稿（``merge_snapshot``），一个字都不变
+    ——「回写带上服务端给的未知字段」与这一条是同一件事的两面。
+    """
+    seed(
+        store,
+        task(
+            id="t1",
+            title="写周报",
+            dueDate="2026-03-10T18:00:00+0800",
+            startDate="2026-03-09T09:00:00+0800",
+        ),
+    )
+    transport = FakeTransport(json={"id": "t1"})
+    engine = make_engine(store, transport)
+
+    engine.reschedule("t1", due=at(20, 14, 0), all_day=False)
+    await engine.wait_for_pushes()
+
+    body = transport.last_json
+    assert body["dueDate"] == "2026-03-20T14:00:00+0800"
+    assert body["startDate"] == "2026-03-09T09:00:00+0800", (
+        "截止时间改了，开始时间一个字都不许动（我们也不给它补一个新的）"
+    )
+    assert store.task_payload("t1")["startDate"] == "2026-03-09T09:00:00+0800"
+
+
+async def test_a_task_without_a_start_date_does_not_grow_one(store):
+    """没有 ``startDate`` 的任务：改截止时间也**不**凭空长出一个开始时间。
+
+    与上一条是同一个决定的两面：观察到的「服务端会补一个同值的开始时间」既不能假定它总会
+    发生、也不能假定它不会（ticket 自己的措辞）。客户端能做的是**不表态**——把开始时间留给
+    服务端，而不是替它写一个。
+    """
+    seed(store, task(id="t1", title="写周报", dueDate="2026-03-10T18:00:00+0800"))
+    transport = FakeTransport(json={"id": "t1"})
+    engine = make_engine(store, transport)
+
+    engine.reschedule("t1", due=at(20, 14, 0), all_day=False)
+    await engine.wait_for_pushes()
+
+    assert "startDate" not in transport.last_json, (
+        f"底稿里没有开始时间，客户端不该自己造一个：{transport.last_json}"
+    )
+
+
+async def test_a_write_of_the_due_date_carries_the_time_zone_and_the_unknown_fields_verbatim(store):
+    """回写带上服务端给的未知字段，且 ``timeZone`` **原样**回去（工单 #44 验收标准 7 + 8）。
+
+    ``timeZone`` 是「写错就静默位移」那个坑的落点（api-shapes §D17），所以这里断的是**逐字
+    相等**：``+0800`` 不许变成 ``+08:00``、不许换成 UTC。手机端设的那些我们不认识的字段
+    （``focusSummaries`` / ``repeatFrom``）也一起回去——它们靠整份底稿（``merge_snapshot``）
+    才在请求体里，只发 ``{id, projectId, dueDate}`` 的话它们就没了。
+    """
+    seed(
+        store,
+        task(
+            id="t1",
+            title="写周报",
+            dueDate="2026-03-10T18:00:00+0800",
+            startDate="2026-03-10T18:00:00+0800",
+            timeZone="Asia/Shanghai",
+            repeatFrom="1",
+            focusSummaries=[{"pomoCount": 2}],
+        ),
+    )
+    transport = FakeTransport(json={"id": "t1"})
+    engine = make_engine(store, transport)
+
+    engine.reschedule("t1", due=at(20, 14, 0), all_day=False)
+    await engine.wait_for_pushes()
+
+    body = transport.last_json
+    assert body["timeZone"] == "Asia/Shanghai", "时区字段原样回写，不许被换成推算出来的东西"
+    assert body["repeatFrom"] == "1", "服务端给的、我们不认识的字段要一起带回去"
+    assert body["focusSummaries"] == [{"pomoCount": 2}], body
+    assert body["dueDate"] == "2026-03-20T14:00:00+0800", (
+        "写出去的那一刻是用户墙钟上的 14:00+0800——不是被换成 UTC 的 06:00"
+    )
+
+
+async def test_clearing_the_due_date_keeps_the_time_zone_and_the_unknown_fields(store):
+    """清除截止时间也走整份底稿：``timeZone`` 与陌生字段照旧在请求体里。
+
+    「清除」不是「清空整条任务」：只有 ``dueDate`` 与 ``isAllDay`` 这两笔变，其余一个字不动。
+    """
+    seed(
+        store,
+        task(
+            id="t1",
+            title="写周报",
+            dueDate="2026-03-10T18:00:00+0800",
+            timeZone="Asia/Shanghai",
+            repeatFrom="1",
+        ),
+    )
+    transport = FakeTransport(json={"id": "t1"})
+    engine = make_engine(store, transport)
+
+    engine.reschedule("t1", due=None, all_day=False)
+    await engine.wait_for_pushes()
+
+    body = transport.last_json
+    assert body["timeZone"] == "Asia/Shanghai"
+    assert body["repeatFrom"] == "1"
+    assert body["title"] == "写周报", "标题这些没被改的字段照旧在底稿里"
+    assert body["dueDate"] is None
+
+
+async def test_changing_the_due_date_sends_the_repeat_rule_byte_for_byte(store):
+    """改一条**重复任务**的截止时间：``repeatFlag`` 在请求体里与底稿逐字相等（验收标准 4）。
+
+    断在**请求体**上，不是断本地对象：重复规则是一个客户端完全不解释的字符串，任何一个
+    字节变了（大小写、分号、加一个 ``;INTERVAL=1``）都是另一条规则。它能原样出去，靠的是
+    「整份底稿 ⊕ 改动」那条既有策略——只发 ``{id, projectId, dueDate}`` 的请求体里根本没
+    有这个字段，服务端会按它自己的省略语义处理（文档没说）。
+    """
+    rule = "RRULE:FREQ=WEEKLY;INTERVAL=2;BYDAY=MO,TH;WKST=SU"
+    seed(
+        store,
+        task(
+            id="t1",
+            title="周会",
+            dueDate="2026-03-10T18:00:00+0800",
+            repeatFlag=rule,
+        ),
+    )
+    transport = FakeTransport(json={"id": "t1"})
+    engine = make_engine(store, transport)
+
+    engine.reschedule("t1", due=at(20, 14, 0), all_day=False)
+    await engine.wait_for_pushes()
+
+    body = transport.last_json
+    assert body["repeatFlag"] == rule, f"重复规则被动过了：{body.get('repeatFlag')!r}"
+    assert body["dueDate"] == "2026-03-20T14:00:00+0800", "只该有截止时间变"
+    assert store.task_payload("t1")["repeatFlag"] == rule
+
+
+async def test_a_task_without_a_date_never_carries_a_repeat_rule_out(store):
+    """没有日期的任务：清除截止时间的那一笔请求里**没有**重复规则（验收标准 5）。
+
+    服务端对「没有日期却有重复规则」的处理是**静默清空**（spec :158；``guards`` 的
+    ``DatelessRepeatError`` 就是拦它的）。一条从来没有日期的任务不该有任何规则可带——这里
+    断的就是请求体里连那个 key 都不出现，而不是「带了一个空串」。
+    """
+    seed(store, task(id="t1", title="写周报"))
+    transport = FakeTransport(json={"id": "t1"})
+    engine = make_engine(store, transport)
+
+    engine.reschedule("t1", due=None, all_day=False)
+    await engine.wait_for_pushes()
+
+    assert len(transport.requests) == 1
+    assert "repeatFlag" not in transport.last_json, transport.last_json
+
+
+async def test_clearing_a_repeating_tasks_due_date_is_refused_before_any_request(store):
+    """清除一条**重复任务**的截止时间：本地守卫在请求出门前拦下（工单 #44 验收标准 6 的推广）。
+
+    这一条不是「想让它红」写出来的——它是把两道既有守卫摆在一起之后**实测**出来的行为，
+    所以在这里钉住、并由详细页如实说出来：
+
+    - 清除要发的是 ``dueDate: null``（上一条测试钉的形状）；
+    - ``guards.guard_repeat_rule``（api/guards.py:144）在同一个请求体上看到
+      「``repeatFlag`` 非空、而 ``dueDate`` 与 ``startDate`` 都是 ``None``」，于是抛
+      ``DatelessRepeatError``——它防的是那个**服务端静默清空重复规则**的坑（spec :158）。
+
+    于是：**零请求**，改动留在队列里，状态与详细页底部那一行拿到的是那句说得清原因的话。
+    「零请求」与「服务端静默改掉用户的重复规则」之间，这一票选前者——后者在这个客户端里
+    没有任何办法被看见（服务端清空规则不发通知，下一次刷新才显形）。
+    """
+    rule = "RRULE:FREQ=DAILY;INTERVAL=1"
+    seed(store, task(id="t1", title="吃药", dueDate="2026-03-10T18:00:00+0800", repeatFlag=rule))
+    transport = FakeTransport(json={"id": "t1"})
+    engine = make_engine(store, transport)
+
+    engine.reschedule("t1", due=None, all_day=False)
+    await engine.wait_for_pushes()
+
+    assert transport.requests == [], "守卫该在请求出门前拦下它（api_date 同一类拦法）"
+    reason = engine.status().last_error
+    assert reason and "重复规则" in reason, f"拦下的原因要说得出名字：{reason!r}"
+    assert engine.status().pending_count == 1, "改动留在队列里，本地那一份照旧生效"
+    assert store.task_payload("t1")["repeatFlag"] == rule, "客户端一个字都不许动重复规则"
+
+
+async def test_clearing_a_due_date_does_not_touch_a_repeat_rule_that_is_not_there(store):
+    """一条没有日期、也没有重复规则的任务：清除也是一笔正常的、发得出去的写。
+
+    与上一条成对：拦住的是「有规则要保住」这一种，不是「清除」本身。
+    """
+    seed(store, task(id="t1", title="写周报", dueDate="2026-03-10T18:00:00+0800"))
+    transport = FakeTransport(json={"id": "t1"})
+    engine = make_engine(store, transport)
+
+    engine.reschedule("t1", due=None, all_day=False)
+    await engine.wait_for_pushes()
+
+    assert len(transport.requests) == 1, "没有重复规则要保住，这一笔正常出门"
+    assert transport.last_json["dueDate"] is None
+    assert "repeatFlag" not in transport.last_json
