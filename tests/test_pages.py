@@ -73,6 +73,20 @@ def row_of(text: str, name: str) -> str:
     raise AssertionError(f"屏幕上没有「{name}」这一行：\n{text}")
 
 
+async def move_cursor_to(pilot, page, row_id: str) -> None:
+    """把某一页的光标走到指定行上：先一直往上（夹在顶上），再一路往下找。
+
+    不依赖光标当前在哪，也不读内部状态之外的任何东西——``selected_id`` 是页面给外层的口子。
+    """
+    for _ in range(20):
+        await pilot.press("k")
+    for _ in range(60):
+        if page.selected_id == row_id:
+            return
+        await pilot.press("j")
+    raise AssertionError(f"光标没能走到 {row_id} 上，停在 {page.selected_id}")
+
+
 def index_rows(text: str) -> list[str]:
     """清单索引页上的那些行（收集箱与清单名出现在同一批行里）。"""
     return [line for line in text.splitlines() if any(mark in line for mark in (INBOX_MARK, LIST_MARK))]
@@ -362,3 +376,30 @@ async def test_the_restored_cursor_is_actually_visible_again():
         text = screen_text(app)
 
     assert "清单29" in text, "回来时光标那一行要滚回可见区里"
+
+
+async def test_a_different_container_starts_the_cursor_at_its_first_task():
+    """换一个容器进去，光标从它的第一条开始——上一层那个位置是**别的容器**的位置。
+
+    同一个容器再进去则原样保留（那是「回到我刚才看的那条任务」，是好事）；换一个容器还把
+    旧的行号带过去，落点就是随机的：清单 A 的第 2 条与视图 B 的第 2 条毫无关系。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+
+        await move_cursor_to(pilot, app.index_page(), "today")
+        await pilot.press("enter")  # 今天：写周报、季度报告
+        await pilot.pause()
+        await pilot.press("j")  # 光标移到第 2 条（季度报告）
+        assert app.tasks_page().selected_id == "t3"
+        await pilot.press("escape")
+        await pilot.pause()
+
+        await move_cursor_to(pilot, app.index_page(), "inbox1")  # 收集箱：写周报、交水费
+        await pilot.press("enter")
+        await pilot.pause()
+        first = app.tasks_page().selected_id
+
+    assert first == "t1", "换个容器进去，光标落在它的第一条上（不是上一层那个行号）"

@@ -85,14 +85,19 @@ class CursorPage(VerticalScroll):
         """
         return self._selected_id
 
-    def set_rows(self, rows: Sequence[Row]) -> None:
+    def set_rows(self, rows: Sequence[Row], *, keep_cursor: bool = True) -> None:
         """换一份行，并按**行 id** 把光标认回原来那一行。
 
         刷新走的就是这条路：行的条数会变、顺序会变，唯独光标不该跳（用户故事 21/57）。
+
+        ``keep_cursor=False`` 是「换了一份**别的东西**」：光标回到第一行。换了一个清单还把
+        上一个清单的行号带过去，落点就是随机的——两个清单的第 3 条毫无关系。
         """
-        previous = self._selected_id
+        previous = self._selected_id if keep_cursor else None
         self._rows = tuple(rows)
         selectable = [row.id for row in self._rows if row.id is not None]
+        if not keep_cursor:
+            self._cursor = 0
         if previous is not None and previous in selectable:
             self._cursor = selectable.index(previous)
         elif selectable:

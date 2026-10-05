@@ -63,6 +63,8 @@ class TasksPage(CursorPage):
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(id=id)
         self._name = ""
+        self._container_id: str | None = None
+        """当前铺开的是哪个容器（清单 / 视图的 id）：换了一个就把光标放回第一行。"""
 
     @property
     def container_name(self) -> str:
@@ -70,7 +72,13 @@ class TasksPage(CursorPage):
         return self._name
 
     def show_tasks(self, task_list: TaskList, *, name: str) -> None:
-        """铺开一个容器的任务：标题 + 未完成任务 + 已完成的那几条。"""
+        """铺开一个容器的任务：标题 + 未完成任务 + 已完成的那几条。
+
+        换了一个容器就把光标放回第一条；**同一个**容器再进来（``esc`` 回去又进来）则按行 id
+        认回原来那条任务——那是「回到我刚才看的地方」，是好事。
+        """
+        same_container = task_list.container_id == self._container_id
+        self._container_id = task_list.container_id
         self._name = name
         rows: list[Row] = [Row(id=None, text=Text(f"── {name} ──", style="bold"))]
         rows += [Row(id=item.task_id, text=task_line(item)) for item in task_list.items]
@@ -78,7 +86,7 @@ class TasksPage(CursorPage):
         if len(rows) == 1:
             # 空清单要说一句明确的话，而不是只留一个标题（用户故事 53）。
             rows.append(empty_row(self.EMPTY_TEXT))
-        self.set_rows(rows)
+        self.set_rows(rows, keep_cursor=same_container)
 
     def action_enter(self) -> None:
         """``enter``：进光标下那条任务的详细页。"""
