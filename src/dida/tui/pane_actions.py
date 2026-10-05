@@ -128,6 +128,9 @@ class PaneActionsMixin:
         中栏那些行不会因为一个子任务变了而变，而重画会把任务列的光标推回第一行——用户
         正在这条任务上连着勾子任务，勾一个就跳走是没法用的。状态栏照旧要刷（待推送数量
         会变）。
+
+        ``await`` 回来时屏幕可能已经拆了（用户按完就退出）：那一笔写已经落库，界面这一份
+        没有人再看，**不许**再去查 widget（``query_one(DetailPane)`` 会 ``NoMatches``）。
         """
         try:
             report = await self.engine.toggle_subtask(event.task_id, event.subtask_id)
@@ -138,6 +141,8 @@ class PaneActionsMixin:
             # 重读那一步失败（网络断了、凭据被拒、服务端拒绝）：引擎的失败一律是结构化
             # 错误，这里如实说一句，不让一个断网的机器把整个界面带走。
             self._write_status(SUBTASK_READ_FAILED_MESSAGE)
+            return
+        if not self.is_running:
             return
         self._subtask_pane().show(report.task_id, report.items)
         self.update_status()
