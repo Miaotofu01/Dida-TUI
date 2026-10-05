@@ -17,6 +17,7 @@ spec 的三层状态机里，任务列表页 ``enter`` 进这一页、``esc`` �
 
 from __future__ import annotations
 
+import re
 from dataclasses import dataclass
 
 from rich._wrap import divide_line
@@ -31,7 +32,7 @@ from dida.tui import messages, theme
 from dida.tui.keys import LAYER_DETAIL, bindings_for
 from dida.tui.pages.base import EMPTY_STYLE, CursorPage, Row, empty_row, rule_row
 
-__all__ = ["DetailPage", "Field", "field_line", "fields_of", "read_only_rows"]
+__all__ = ["DetailPage", "Field", "field_line", "fields_of", "read_only_rows", "reminder_text"]
 
 SUBTASK_DONE_MARK = theme.SUBTASK_DONE_MARK
 SUBTASK_TODO_MARK = theme.SUBTASK_TODO_MARK
@@ -137,6 +138,86 @@ def _screen_lines(text: str, width: int) -> int:
     return sum(len(divide_line(line, width, fold=True)) + 1 for line in text.split("\n"))
 
 
+_TRIGGER_PREFIX = "TRIGGER:"
+"""服务端提醒的形状：``TRIGGER:`` 加一段 ISO-8601 时长（``openapi-dida365.md:2280``）。"""
+
+_DURATION = re.compile(
+    r"^(?P<sign>[+-])?P"
+    r"(?:(?P<weeks>\d+)W"
+    r"|(?:(?P<days>\d+)D)?"
+    r"(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?"
+    r")$"
+)
+"""ISO-8601 时长里我们认得的那几种写法。
+
+刻意**不认**年与月（``P1Y`` / ``P1M``）：它们没有固定长度（一个月 28–31 天），换算成人话
+必然要四舍五入，而这是只读的一格——说错不如照原样。小数（``PT0.5H``）同理。
+"""
+
+_UNITS: tuple[tuple[str, str], ...] = (
+    ("weeks", "周"),
+    ("days", "天"),
+    ("hours", "小时"),
+    ("minutes", "分钟"),
+    ("seconds", "秒"),
+)
+"""时长各段与它们的中文读法，按从大到小。零的段不念出来。"""
+
+
+def _is_duration(match: re.Match[str]) -> bool:
+    """这一段是不是**写了**时长的某一段：``P`` / ``PT`` 一个数字都没有，不算时长。"""
+    return any(match.group(group) is not None for group, _ in _UNITS)
+
+
+def _duration_words(match: re.Match[str]) -> str:
+    """一段时长读成人话：``1 天 2 小时``；写了但全是零就是空串。"""
+    parts: list[str] = []
+    weeks = int(match.group("weeks") or 0)
+    if weeks:
+        # ISO-8601 里 ``W`` 不能与别的段同时出现，换算成 7 天没有歧义。
+        parts.append(f"{weeks * 7} 天")
+    for group, word in _UNITS[1:]:
+        value = int(match.group(group) or 0)
+        if value:
+            parts.append(f"{value} {word}")
+    return " ".join(parts)
+
+
+def reminder_text(trigger: str) -> str:
+    """一条提醒读成人话：``TRIGGER:P0DT9H0M0S`` → 「提前 9 小时」（工单 #55）。
+
+    这一格是**只读**的，它唯一的职责就是说明白；把 ``TRIGGER:`` 那种编码摊给用户看等于什么
+    都没说。三个已知的例子：``P0DT9H0M0S`` → 提前 9 小时、``PT0S`` → 准时、``P1DT2H`` →
+    提前 1 天 2 小时（不collapse 成 26 小时）。
+
+    ⚠ **正负号那一条是没有依据的，这里如实记下来。** 服务端的文档只给了两个**正**时长的例子
+    （``openapi-dida365.md:2280``：``["TRIGGER:P0DT9H0M0S", "TRIGGER:PT0S"]``），对负数一个字
+    都没有。而这个形状与 iCalendar 的 ``TRIGGER`` 属性一模一样，那边正负号的含义是**反过来**
+    的——RFC 5545 §3.8.6.3：「An alarm with a positive duration is triggered after the
+    associated start or end… A negative duration is triggered before」，例子是
+    ``TRIGGER:-PT15M`` ＝ 提前 15 分钟。TickTick 是不是照抄这一条，文档没说、也不许拿真账号
+    去试。所以：
+
+    - **正时长读作「提前 N」是这张工单的前提**（它按用户实际看到的提醒习惯定的），不是这里
+      验证出来的事实；
+    - **负时长不猜方向**，只说「相对截止时间 N」——猜错就是把「提前 30 分钟」显示成「延后
+      30 分钟」，含糊一句比说反了强。
+
+    解析不了的一律**原样返回**：安静地少显示一个提醒，比显示得难看严重得多。
+    """
+    if not trigger.startswith(_TRIGGER_PREFIX):
+        return trigger
+    match = _DURATION.match(trigger[len(_TRIGGER_PREFIX) :])
+    if match is None or not _is_duration(match):
+        return trigger
+    words = _duration_words(match)
+    if not words:
+        return "准时"
+    if match.group("sign") == "-":
+        return f"相对截止时间 {words}"
+    return f"提前 {words}"
+
+
 def read_only_rows(detail: TaskDetail) -> tuple[Row, ...]:
     """只读的那几段：子任务（含完成状态）、提醒（含触发时间）、重复（用户故事 76–78）。
 
@@ -145,6 +226,9 @@ def read_only_rows(detail: TaskDetail) -> tuple[Row, ...]:
     :data:`~dida.tui.messages.READ_ONLY_NOTE`，说清这几样在这一页改不了。
 
     这些行 ``id=None``：光标越过它们，``enter`` 永远落不到只读的东西上。
+
+    提醒是**读法**、不是原文（:func:`reminder_text`）：多条之间照旧两个空格——人话变长了，
+    但这一页折行，窄终端下它们各占几行而不是被裁掉。
     """
     rows: list[Row] = []
     if detail.subtasks:
@@ -161,7 +245,14 @@ def read_only_rows(detail: TaskDetail) -> tuple[Row, ...]:
             )
         )
     if detail.reminders:
-        rows.append(Row(id=None, text=field_line("提醒", "  ".join(detail.reminders))))
+        rows.append(
+            Row(
+                id=None,
+                text=field_line(
+                    "提醒", "  ".join(reminder_text(item) for item in detail.reminders)
+                ),
+            )
+        )
     if detail.repeat_flag:
         rows.append(Row(id=None, text=field_line("重复", detail.repeat_flag)))
     if rows:
