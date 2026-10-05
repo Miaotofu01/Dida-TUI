@@ -287,9 +287,10 @@ async def test_content_that_overflows_keeps_its_gutter_and_its_ellipsis(width: i
     """会溢出的**内容**行照旧：两格行首空档 + 按格裁到页边 + 行尾一个 ``…``。
 
     细线不要那两格，内容行要——光标字形与标题之间的那一列不能跟着一起消失。纯 ASCII 那条
-    标题是个算式：页面有 ``width`` 格，行首两格归光标，裁断记号自己占一格，所以标题看得见
-    的部分正好是前 ``width - 3`` 格。汉字那条也在（他的 locale 是 ``zh_CN.UTF-8``）：一个
-    汉字两格，断在哪一格按格算，不按字符数。
+    标题是个算式：页面有 ``width`` 格，行首两格归光标，**再两格归优先级标记那一列**
+    （工单 #37 加的行首列），裁断记号自己占一格，所以标题看得见的部分正好是前 ``width - 5``
+    格。汉字那条也在（他的 locale 是 ``zh_CN.UTF-8``）：一个汉字两格，断在哪一格按格算，
+    不按字符数。
     """
     ascii_title = "abcdefghij" * 12
     cjk_title = "把这一条标题写得足够长，让每一个宽度上都溢出页面——窄终端、普通终端、宽屏都得裁断，而裁断的位置要按格算不按字符数"
@@ -306,7 +307,8 @@ async def test_content_that_overflows_keeps_its_gutter_and_its_ellipsis(width: i
         text = screen_text(app)
 
     ascii_row = line_with(text, "abcdefghij")
-    assert ascii_row == f"❯ {ascii_title[: width - 3]}{theme.ELLIPSIS}", (
+    # 行首两格是光标空档，紧跟的两格是优先级标记那一列（``.`` = 低/无，工单 #37）。
+    assert ascii_row == f"❯ . {ascii_title[: width - 5]}{theme.ELLIPSIS}", (
         f"@{width} 的行首空档或裁断位置变了：{ascii_row!r}"
     )
     cjk_row = line_with(text, "把这一条标题")
@@ -508,7 +510,8 @@ async def test_the_cursor_marker_survives_the_travelling_bar():
     assert instant.startswith("❯"), "数据选中必须**立刻**到位，不能等装饰条"
     assert after.startswith("❯"), "条子飞过之后，光标记号还得在"
     assert "交水费" in after, "条子不许盖住标题"
-    assert after.lstrip().startswith("❯ 交水费"), "条子退场之后那一行与平时一模一样"
+    # 行首多一列优先级标记（``.`` = 低/无）——工单 #37 给任务行加的那一列。
+    assert after.lstrip().startswith("❯ . 交水费"), "条子退场之后那一行与平时一模一样"
 
 
 async def test_the_travelling_bar_is_a_short_lived_accent_block():

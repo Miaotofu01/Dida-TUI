@@ -54,7 +54,9 @@ def test_due_three_days_ago_reads_as_days_ago():
 
 
 def test_no_due_date_is_visually_distinct_from_due_today():
-    assert format_due(None, all_day=False, now=at(14, 12, 3), day_end="24:00") == "—"
+    # 没有日期读作一道**宽度无歧义**的短横（工单 #37）：原来的 ``—``（U+2014）是东亚
+    # 歧义宽度，进了对齐列就会歪；``今天`` 是字，两者一眼可分。
+    assert format_due(None, all_day=False, now=at(14, 12, 3), day_end="24:00") == "-"
     assert format_due(at(14), all_day=True, now=at(14, 12, 3), day_end="24:00") == "今天"
 
 
@@ -125,7 +127,7 @@ def test_tasks_without_a_due_date_form_their_own_inbox_group():
     assert [group.title for group in groups] == ["今日", "收集箱无日期"]
     assert [group.count for group in groups] == [1, 1]
     assert [item.title for item in groups[1].items] == ["买牛奶"]
-    assert [item.due_text for item in groups[1].items] == ["—"]
+    assert [item.due_text for item in groups[1].items] == ["-"]
 
 
 def test_future_tasks_are_not_part_of_today():
@@ -192,7 +194,7 @@ def test_no_due_and_due_today_land_in_two_different_groups():
 
     assert [(group.title, group.count) for group in groups] == [("今日", 1), ("收集箱无日期", 1)]
     assert [item.due_text for item in groups[0].items] == ["今天"]
-    assert [item.due_text for item in groups[1].items] == ["—"]
+    assert [item.due_text for item in groups[1].items] == ["-"]
 
 
 def test_undated_tasks_join_the_group_whatever_list_they_live_in():
@@ -293,14 +295,18 @@ def test_the_priority_cycle_walks_the_wire_values_0_1_3_5(current, expected):
 @pytest.mark.parametrize(
     ("wire", "mark"),
     [
-        (0, "·"),  # 无
-        (1, "·"),  # 低与无是同一个标记
+        (0, "."),  # 无
+        (1, "."),  # 低与无是同一个标记
         (3, "~"),  # 中
         (5, "!"),  # 高
     ],
 )
 def test_each_priority_wire_value_has_its_one_mark(wire, mark):
-    """线上编码 → 标记是一张完整的表，不是只有「高」那一格（工单 #32 搬出来的）。"""
+    """线上编码 → 标记是一张完整的表，不是只有「高」那一格（工单 #32 搬出来的）。
+
+    低/无的标记从 ``·``（U+00B7）换成 ``.``（U+002E）：前者是东亚**歧义**宽度，rich 量它
+    1 格而 zh_CN 的终端可能画 2 格——它站在任务行的第一列，歪的是整行（工单 #37）。
+    """
     assert priority_mark(wire) == mark
 
 

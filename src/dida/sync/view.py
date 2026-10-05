@@ -26,14 +26,20 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from enum import Enum
 from typing import Any, Mapping, Protocol, Sequence
 
 from dida.logical_day import logical_day
+from dida.sync.rows import completed_window_start, row_sort_key
 
-NO_DUE_TEXT = "—"
-"""没有截止时间的读法；与「今天」一眼可分。"""
+NO_DUE_TEXT = "-"
+"""没有截止时间的读法；与「今天」一眼可分。
+
+原来是 ``—``（U+2014）：rich 量它 1 格，而它的东亚宽度是**歧义**——zh_CN 的终端可能画
+2 格，一旦它进了对齐列（截止时间那一列）整列就歪。换成 ASCII 的连字符：任何 locale 下
+都是 1 格，形状仍然是「一道短横」。
+"""
 
 INBOX_ID = "inbox"
 """收集箱在 API 里的 projectId 别名。"""
@@ -114,6 +120,16 @@ class TaskSnapshot:
     tags: tuple[str, ...] = ()
     """服务端的 ``tags``：标签名，按服务端给的顺序。"""
 
+    repeat_flag: str = ""
+    """服务端的 ``repeatFlag``（重复规则原文，如 ``RRULE:FREQ=WEEKLY``）。
+
+    任务行只需要「是不是重复任务」（空串 = 不是），规则原文照旧原样留着——它只读，而且
+    回写时一个字都不许动（spec 的「改期绝不触碰重复规则」）。
+    """
+
+    reminders: tuple[str, ...] = ()
+    """服务端的 ``reminders``（提醒触发器原文）：行里只读「有没有提醒」，不改。"""
+
 
 @dataclass(frozen=True)
 class SyncState:
@@ -182,6 +198,20 @@ class TaskItem:
     没有标签就是空串——「这一行要不要画」由这个空串回答，详情栏不自己判断有没有标签。
     """
 
+    repeat_flag: str = ""
+    """服务端的 ``repeatFlag``：非空就是重复任务（行里画一个重复标记）。"""
+
+    reminders: tuple[str, ...] = ()
+    """服务端的 ``reminders``：非空就是有提醒（行里画一个提醒标记）。"""
+
+    completed: bool = False
+    """这条任务已完成。
+
+    「已完成沉底」要在**读模型**这一层成立，不能只靠界面把两段拼起来：视图的成员是混的
+    （自定义视图的过滤条件里就有完成状态这一维），一个含已完成成员的视图会把做完的任务
+    插在未完成中间。判定只看 ``status``（工单 #37 / spec 的「本地判定已完成」）。
+    """
+
 
 @dataclass(frozen=True)
 class TaskGroup:
@@ -238,8 +268,13 @@ class TodayView:
 
 
 def priority_mark(priority: int) -> str:
-    """优先级标记：高 ``!``、中 ``~``、低与无 ``·``。"""
-    return {5: "!", 3: "~"}.get(priority, "·")
+    """优先级标记：高 ``!``、中 ``~``、低与无 ``.``。
+
+三个字形都必须是宽度无歧义的（``tests/test_task_row_model.py`` 守着）：它们站在任务行的
+最左边，是整行的第一列。低优先级原来是 ``·``（U+00B7，东亚**歧义**宽度）——rich 量 1 格
+而终端可能画 2 格，于是每一行都比终端实际画的宽一格。
+"""
+    return {5: "!", 3: "~"}.get(priority, ".")
 
 
 PRIORITY_CYCLE: tuple[int, ...] = (0, 1, 3, 5)
@@ -292,6 +327,9 @@ def task_item(snapshot: TaskSnapshot, names: dict[str, str], *, now: datetime, d
         desc=snapshot.desc,
         content=snapshot.content,
         tags_text=format_tags(snapshot.tags),
+        repeat_flag=snapshot.repeat_flag,
+        reminders=snapshot.reminders,
+        completed=snapshot.completed,
     )
 
 
@@ -393,14 +431,13 @@ def format_due(due: datetime | None, *, all_day: bool, now: datetime, day_end: s
 
 
 def by_due(items: Sequence[TaskItem]) -> list[TaskItem]:
-    """有截止时间的按时间升序在前，没有的按标题排在后面。
+    """按 spec 的排序链排：截止时间升序 → 优先级降序 → 无日期在后 → 已完成沉底。
 
-    读模型（:mod:`dida.sync.read`）也用它：容器里的行与「今天」那一屏的排序规矩是同一份。
-    排序规矩本身归 #37（截止时间 → 优先级 → 无日期在后 → 已完成沉底），这里先照 v1 的。
+    键在 :func:`dida.sync.rows.row_sort_key`（纯函数，直接测）：这一份与「今天」那一屏、
+    某个容器的任务列表、以及视图求值用的是同一个顺序——**客户端统一重排**，服务端的
+    ``sortOrder`` 一律不看（spec 的「一个已知的、故意的取舍」）。
     """
-    dated = sorted((item for item in items if item.due is not None), key=lambda item: (item.due, item.title))
-    undated = sorted((item for item in items if item.due is None), key=lambda item: (item.title, item.task_id))
-    return dated + undated
+    return sorted(items, key=row_sort_key)
 
 
 # ------------------------------------------------------------------ 模糊过滤（t17）
@@ -459,7 +496,7 @@ def completed_section(
     纯函数：「现在」与窗口大小都从参数进来，这一层不读时钟（t12 的窗口由引擎按注入的
     配置给）。
     """
-    window_start = now - timedelta(hours=window_hours)
+    window_start = completed_window_start(now, window_hours)
     names = list_names(lists)
     rows = [
         CompletedItem(
