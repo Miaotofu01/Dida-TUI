@@ -174,3 +174,46 @@ def test_the_inbox_row_is_synthesised_even_when_nothing_is_known_yet():
     assert rows[0].is_inbox is True
     assert (rows[0].name, rows[0].unfinished) == ("收集箱", 0)
 
+
+# ---------------------------------------------------------------- 任务列表：某个容器
+
+
+def test_a_list_task_list_holds_every_unfinished_task_including_future_ones():
+    """某个清单的任务列表是这个清单的**全部**未完成任务——截止时间在未来的也在。
+
+    v1 的读路径把未来的任务整条丢掉（「未来的任务不属于今日」），所以这是 v2 与 v1 的
+    分界线之一：进了清单就要看到这个清单里的全部东西。已完成的沉在底部的已完成区里。
+    """
+    backend = make_backend()
+    backend.add_list("工作", id="work")
+    backend.add_task("昨天到期", list_name="work", due=T0 - timedelta(days=1))
+    backend.add_task("今天到期", list_name="work", due=T0.replace(hour=18))
+    backend.add_task("下个月", list_name="work", due=T0 + timedelta(days=30))
+    backend.add_task("没日期", list_name="work")
+    backend.add_task("做完了", list_name="work", completed=True, completed_at=T0)
+    backend.add_task("别的清单", list_name="life")
+    backend.add_task("别的清单做完了", list_name="life", completed=True, completed_at=T0)
+
+    task_list = backend.tasks_in("work")
+
+    assert [item.title for item in task_list.items] == [
+        "昨天到期",
+        "今天到期",
+        "下个月",
+        "没日期",
+    ], "有截止时间的按时间升序，没日期的排最后；未来的那条不能丢"
+    assert {item.list_name for item in task_list.items} == {"工作"}
+    assert [row.title for row in task_list.completed.items] == ["做完了"]
+    assert task_list.container_id == "work"
+
+
+def test_an_empty_or_unknown_container_reads_as_empty():
+    """空清单与认不出来的容器都给空列表，不是错误（空态文案是界面的事）。"""
+    backend = make_backend()
+    backend.add_list("空清单", id="empty")
+
+    assert backend.tasks_in("empty").items == ()
+    assert backend.tasks_in("empty").completed.items == ()
+    assert backend.tasks_in("已经不在的清单").items == ()
+
+
