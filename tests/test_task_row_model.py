@@ -19,7 +19,14 @@ from rich.cells import cell_len
 from dida.config import Config
 from dida.storage.store import Store
 from dida.sync.completed import DEFAULT_COMPLETED_WINDOW_HOURS
-from dida.sync.engine import NO_DUE_TEXT, SyncEngine, TaskItem, completed_section, priority_mark
+from dida.sync.engine import (
+    NO_DUE_TEXT,
+    ListKind,
+    SyncEngine,
+    TaskItem,
+    completed_section,
+    priority_mark,
+)
 from dida.sync.rows import completed_window_start, row_sort_key
 from dida.sync.view import ListSnapshot, TaskSnapshot
 from dida.testing import InMemorySource, ManualClock
@@ -372,3 +379,143 @@ def test_every_mark_that_goes_into_a_column_is_width_unambiguous():
             f"{name} {glyph!r} 的东亚宽度是 {width}：rich 量它 1 格，"
             "而 zh_CN 的终端可能画 2 格——整列会歪"
         )
+
+
+# ------------------------------------------------------------------ 逾期
+
+
+def test_a_past_due_task_is_overdue_and_a_later_one_is_not():
+    """逾期 = 有截止时间、且它属于**早于**当前逻辑日的那一天（用户故事 25 的那一位）。"""
+    source = work_source()
+    source.add_task("昨天就该做的", list_name="work", due=at(13, 9, 0))
+    source.add_task("今天要做的", list_name="work", due=at(14, 18, 0))
+    source.add_task("明天要做的", list_name="work", due=at(15, 9, 0))
+    source.add_task("没日期的", list_name="work")
+
+    items = engine_with(source).tasks_in("work").items
+
+    assert {item.title: item.overdue for item in items} == {
+        "昨天就该做的": True,
+        "今天要做的": False,
+        "明天要做的": False,
+        "没日期的": False,
+    }
+
+
+def test_overdue_follows_the_logical_day_not_the_wall_clock():
+    """日界配成 ``04:00`` 时，凌晨两点看到的昨天 23:00 截止**不算逾期**——它是今天的事。
+
+    用户故事 83：夜猫子的「今天」还没过完。
+    """
+    source = work_source()
+    source.add_task("昨晚就该做的", list_name="work", due=at(14, 23, 0))
+
+    night_owl = SyncEngine(clock=ManualClock(at(15, 2, 0)), day_end="04:00", source=source)
+    plain = SyncEngine(clock=ManualClock(at(15, 2, 0)), day_end="24:00", source=source)
+
+    assert night_owl.tasks_in("work").items[0].overdue is False
+    assert plain.tasks_in("work").items[0].overdue is True, "同一个时刻，日界不同判定就不同"
+
+
+def test_a_completed_task_is_never_overdue():
+    """已经做完的不算逾期：它该有的样子是划掉沉底，不是标红（用户故事 25 只管未完成的）。"""
+    source = work_source()
+    source.add_task("昨天做完的", list_name="work", due=at(13, 9, 0), completed=True, completed_at=T0)
+    source.add_view("混的", id="mix", task_ids=("t1",))
+
+    items = engine_with(source).tasks_in("mix").items
+
+    assert [item.overdue for item in items] == [False]
+
+
+def test_an_all_day_task_due_on_the_current_logical_day_is_overdue_only_after_it():
+    """全天任务的截止是**日期标记**：当天 00:00 不该在当天一开始就被判成逾期。
+
+    按时刻算（00:00 早于「现在」）会把今天到期的全天任务整天标红——那是「今天要做」的
+    那一条，不是逾期的。
+    """
+    source = work_source()
+    source.add_task("今天全天的", list_name="work", due=at(14, 0, 0), all_day=True)
+
+    item = engine_with(source).tasks_in("work").items[0]
+
+    assert item.due_text == "今天"
+    assert item.overdue is False
+
+
+# ------------------------------------------------------------------ 清单名：清单里不重复，视图里必须显示
+
+
+def test_the_read_model_says_whether_the_container_is_a_list_or_a_view():
+    """「这一行要不要写清单名」由读模型回答：清单是容器，视图不是（工单 #37 的验收标准）。"""
+    source = work_source()
+    source.add_task("写周报", list_name="work", due=at(14, 18, 0))
+    source.add_view("我的一天", id="mine", task_ids=("t1",))
+    engine = engine_with(source)
+
+    assert engine.tasks_in("work").container_kind is ListKind.LIST
+    assert engine.tasks_in("today").container_kind is ListKind.BUILTIN
+    assert engine.tasks_in("mine").container_kind is ListKind.CUSTOM
+    assert engine.tasks_in("已经不在的清单").container_kind is None
+
+
+# ------------------------------------------------------------------ 窄终端：丢弃顺序
+
+
+def crowded_row(**fields) -> TaskItem:
+    """一条注解齐全的任务：标题、所属清单、标签、重复 + 提醒标记、截止时间都在。"""
+    source = work_source()
+    source.add_task(
+        fields.pop("title", "回邮件给产品经理"),
+        list_name="work",
+        due=fields.pop("due", at(13, 18, 0)),
+        tags=("周报",),
+        repeat_flag="RRULE:FREQ=WEEKLY",
+        reminders=("TRIGGER:P0DT9H0M0S",),
+        **fields,
+    )
+    return engine_with(source).tasks_in("work").items[0]
+
+
+@pytest.mark.parametrize(
+    ("width", "expected"),
+    [
+        # 47 格：标签放不下了（先丢它），其余都在
+        (47, ". 回邮件给产品经理        工作  ↻ ⚑  昨天 18:00"),
+        # 40 格：标记也丢了，只剩所属清单与截止时间
+        (40, ". 回邮件给产品经理      工作  昨天 18:00"),
+        # 35 格：截止时间也丢了，所属清单留着（视图里它是验收标准要求必须显示的）
+        (35, ". 回邮件给产品经理             工作"),
+        # 23 格：注解一个都不留，标题**一个字都不少**
+        (23, ". 回邮件给产品经理"),
+        # 16 格：实在放不下才截标题，按格截、带省略号
+        (16, ". 回邮件给产品 …"),
+    ],
+)
+def test_the_discard_order_is_tags_then_marks_then_due_then_the_title(width, expected):
+    """宽度不够时按用户定的顺序丢：**标签 → 重复/提醒标记 → 截止时间 → 最后才截标题**。
+
+    标题是内容，其余是注解：终端只有 30 列时，用户最需要知道的是「这条是什么」，不是
+    「它什么时候到期」。所属清单名排在截止时间后面丢——视图里它是必须显示的那一样。
+    """
+    line = task_line(crowded_row(), width=width, show_list_name=True)
+
+    assert line.plain == expected
+    assert cell_len(line.plain) <= width, "一行不许超出它拿到的格数"
+
+
+def test_a_row_that_fits_puts_its_annotations_against_the_right_edge():
+    """放得下时注解块贴着右边缘：截止时间因此落在每一行的同一个位置上（一列）。"""
+    line = task_line(crowded_row(), width=60, show_list_name=True)
+
+    assert line.plain.startswith(". 回邮件给产品经理")
+    assert line.plain.endswith("工作  #周报  ↻ ⚑  昨天 18:00")
+    assert cell_len(line.plain) == 60
+
+
+def test_the_title_keeps_its_cells_when_the_row_gets_narrow():
+    """窄到只剩标题时，标题拿满它要的格——「一行只放一条任务」的另一半。"""
+    line = task_line(crowded_row(), width=23, show_list_name=True)
+
+    assert line.plain == ". 回邮件给产品经理"
+    assert theme.ELLIPSIS not in line.plain
