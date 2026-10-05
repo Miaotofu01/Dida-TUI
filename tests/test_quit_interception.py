@@ -194,6 +194,28 @@ async def test_a_quit_key_over_the_help_overlay_does_not_stack_a_second_prompt()
         assert app.is_running, "退出键在浮层上照样要被拦"
         assert confirm_panels(app) == 1, f"确认框应该只有一个：\n{text}"
 
+        await pilot.press("y")
+        await pilot.pause()
+        assert_exited(app)
+
+
+async def test_cancelling_from_the_help_overlay_leaves_the_help_overlay_up():
+    """在帮助浮层上取消退出：回到帮助——浮层没被那一问顺带关掉，``y`` / ``n`` 也没丢。"""
+    app = DidaApp(backend(pending=3))
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("question_mark")
+        await pilot.pause()
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        await pilot.press("n")
+        await pilot.pause()
+
+        assert app.is_running
+        assert "键位" in screen_text(app), "取消之后就回到帮助，不是连帮助一起关掉"
+        assert confirm_panels(app) == 0, "确认框已经收掉了"
+
 
 # ---------------------------------------------------------------- 没有待推送改动：两个键直接退
 
