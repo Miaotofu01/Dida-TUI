@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import json
 import re
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -26,6 +27,8 @@ from dida.sync.engine import SyncEngine
 from dida.testing import FakeBackend, FakeTransport, ManualClock
 from dida.tui import messages, theme
 from dida.tui.app import DidaApp
+from dida.tui.pages.detail import LIST_PICKER_TITLE, PRIORITY_PICKER_TITLE, TAGS_PICKER_TITLE
+from rich.cells import cell_len
 from support import screen_sgr, screen_text
 
 TZ = timezone(timedelta(hours=8))
@@ -33,6 +36,15 @@ T0 = datetime(2026, 3, 14, 12, 3, tzinfo=TZ)
 WIDE = (100, 30)
 
 TITLE = "交季度报告"
+
+
+@pytest.fixture(autouse=True)
+def a_colour_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """摘掉 shell 的 ``NO_COLOR``：否则 ``App`` 会挂一层 Monochrome，样式断言全部假绿。
+
+    颜色断言必须**在 app 构造之前**摘（#35 的教训：渲染之前摘已经晚了）。
+    """
+    monkeypatch.delenv("NO_COLOR", raising=False)
 CONTENT = "记得附上上周的对比数据"
 DESC = "先问一下财务再发"
 
@@ -432,12 +444,22 @@ async def test_the_priority_field_offers_the_four_levels_and_writes_the_wire_cod
     assert "低" in field_row(after, "优先级"), f"改完那一格没变：\n{after}"
 
 
-def tag_marked(text: str, name: str) -> bool:
-    """挑选器里 ``name`` 那个标签现在打上了没有（``☑`` / ``☐`` 那一列）。"""
+def tag_line(text: str, name: str) -> str:
+    """挑选器里 ``name`` 那个标签那一行（``☑`` / ``☐`` 那一列就是它）。"""
     for line in text.splitlines():
         if name in line and (theme.CHECK_ON in line or theme.CHECK_OFF in line):
-            return theme.CHECK_ON in line
+            return line
     raise AssertionError(f"挑选器里没有「{name}」这个标签：\n{text}")
+
+
+def tag_marked(text: str, name: str) -> bool:
+    """挑选器里 ``name`` 那个标签现在打上了没有。"""
+    return theme.CHECK_ON in tag_line(text, name)
+
+
+def cursor_on(text: str, name: str) -> bool:
+    """挑选器里的光标现在停在 ``name`` 那个标签上（``❯`` 那一列）。"""
+    return theme.CURSOR_MARK in tag_line(text, name)
 
 
 async def test_the_tag_field_picks_from_existing_tags_and_says_new_ones_come_from_the_official_client():
@@ -504,3 +526,208 @@ async def test_a_tag_list_that_cannot_be_fetched_is_said_out_loud_and_local_tags
     )
     assert "连不上服务器" in picker, f"没说清是哪一种失败：\n{picker}"
     assert tag_marked(picker, "工作") and tag_marked(picker, "季度"), f"本地已有的标签挑不动：\n{picker}"
+
+
+async def test_every_pick_is_pushed_at_once_and_the_bottom_line_stays():
+    """三个字段都遵循「改完立刻推送 + 底部常驻状态」（验收标准 7）。
+
+    三笔各走各的端点，但收尾是同一件事：还在详细页上、推送**已经**发生过了（不是等离开
+    这一页才发），而底部那一行照旧常驻写着「已保存 / 待推送（N）」。
+    """
+    fake = backend()
+    fake.set_tags("工作", "季度", "紧急")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        pushes = []
+        for key in ("list", "priority", "tags"):
+            await walk_to(pilot, app, key)
+            before = fake.pushes
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("right" if key != "tags" else "space")
+            await pilot.press("enter")
+            await pilot.pause()
+            pushes.append(fake.pushes - before)
+        text = screen_text(app)
+
+    assert pushes == [1, 1, 1], f"有一次挑完没有立刻推：{pushes}"
+    assert messages.saved_message() in text, f"底部那一行不见了：\n{text}"
+    assert fake.moved and fake.writes, f"三笔没有各走各的路：{fake.moved} / {fake.writes}"
+
+
+async def test_a_long_tag_list_shows_a_window_and_says_how_many_are_hidden():
+    """标签多到一屏放不下时只画一段，并**说清还有几个没画**（不静默地藏）。
+
+    光标照样走得过去：看不见的那几个会被它带进窗口。藏起来的那几个如果不说，用户会以为
+    自己的标签只剩这几个了。
+    """
+    fake = backend()  # 任务上已经有 工作 / 季度 两个
+    staged = tuple(f"tag{i}" for i in range(10))
+    fake.set_tags(*staged)
+    total = len(staged) + 2
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "tags")
+        await pilot.press("enter")
+        await pilot.pause()
+        opened = screen_text(app)
+        # 一路往下走，直到光标落到一个**一开始没画出来**的标签上（窗口要跟着它走）。
+        for _ in range(total):
+            await pilot.press("down")
+            await pilot.pause()
+            if any(
+                "tag9" in line and theme.CURSOR_MARK in line
+                for line in screen_text(app).splitlines()
+            ):
+                break
+        walked = screen_text(app)
+
+    shown = [
+        line
+        for line in opened.splitlines()
+        if theme.CHECK_ON in line or theme.CHECK_OFF in line
+    ]
+    assert len(shown) == theme.PICKER_VISIBLE_ROWS, f"画出来的行数不是窗口大小：\n{opened}"
+    assert messages.hidden_choices_message(total - theme.PICKER_VISIBLE_ROWS) in opened, (
+        f"没说清还有几个没画出来：\n{opened}"
+    )
+    assert cursor_on(walked, "tag9"), f"光标走不到看不见的那几个上：\n{walked}"
+
+
+async def test_a_picker_with_no_tags_at_all_still_opens_and_says_where_to_make_one():
+    """一个标签都没有时这一格照样开，而且**正是最该说那句话的时候**（验收标准 6）。
+
+    「没有可选项」加上「新建标签要回官方客户端」两句缺一不可：只有前一句，用户会以为
+    这个客户端坏了。
+    """
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_task(TITLE, list_name="work", id="t1")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "tags")
+        await pilot.press("enter")
+        await pilot.pause()
+        picker = screen_text(app)
+
+    assert messages.NO_CHOICES_TEXT in picker, f"没说清这一格是空的：\n{picker}"
+    assert "这个客户端不做新建标签" in picker, f"没说清要去哪儿建：\n{picker}"
+
+
+async def test_escape_closes_the_tag_picker_while_the_multi_select_has_focus():
+    """``Esc`` 是出口，而且**焦点在多选那一格上时也到得了**（#42 那条规矩的落点）。
+
+    这一层没有文本框，``q`` 在表单里本来就不绑（字母归输入框，继承不重定）——所以出口只有
+    ``Esc`` 与 ``Ctrl+C``。键必须绑在**浮层**上：浮层开着时 app 的绑定够不着（#47 实测）。
+    """
+    fake = backend()
+    fake.set_tags("工作", "季度")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "tags")
+        await pilot.press("enter")
+        await pilot.pause()
+        focused = app.focused
+        await pilot.press("space")
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert focused is not None and focused.id == "field-tags", "焦点不在多选那一格上"
+    assert fake.writes == [], "取消不该写任何东西"
+    assert field_row(text, "标签").startswith(theme.CURSOR_MARK), f"没有回到字段列表：\n{text}"
+
+
+async def test_ctrl_c_still_quits_from_the_multi_select():
+    """``Ctrl+C`` 在多选那一格上照旧是**退出**（#42 的决定，继承不重定）。
+
+    有待推送改动时先问一句，所以「屏幕上出现了那句确认」就是「它真的走到了 app 的退出」。
+    """
+    fake = backend()
+    fake.set_tags("工作", "季度")
+    fake.set_sync_state(pending_count=1)
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "tags")
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert "仍然退出" in text, f"多选那一格上 Ctrl+C 没有走到退出：\n{text}"
+
+
+async def test_the_picker_leaks_no_truecolour():
+    """挑选浮层里一个真彩色都不能有（ADR-0007 一）。
+
+    多选那一格是这一票**新挂的控件**：它漏真彩色时不会有任何别的测试变红（#43 的实测交接
+    写着这件事——那些 ``ansi_*`` 覆盖是绑在控件 id 上的，没有渲染级断言）。所以这一条真把
+    浮层挂起来、用一个真彩色控制台读一遍屏幕字节：``38;2;`` / ``48;2;`` 一个都不许有。
+    """
+    fake = backend()
+    fake.set_tags("工作", "季度", "紧急")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "tags")
+        await pilot.press("enter")
+        await pilot.pause()
+        emitted = screen_sgr(app)
+
+    assert "38;2;" not in emitted, f"多选那一格漏了真彩色前景：\n{emitted[:400]}"
+    assert "48;2;" not in emitted, f"多选那一格漏了真彩色背景：\n{emitted[:400]}"
+
+
+def test_the_multi_select_columns_use_unambiguous_width_glyphs():
+    """多选那一列的字形宽度钉死（#37 在任务行那一列立的规矩，照做不另发明）。
+
+    ``❯``（光标）与 ``☑``/``☐``（打上没有）都进**对齐的列**：rich 量 1 格而终端画 2 格的话，
+    整块在 CJK 字体下歪一格。三个判据一起断，缺一个都拦不住（``☰`` 是 rich 量 2 格、
+    ``·`` 是 rich 量 1 格但东亚歧义）。
+    """
+    for glyph in (theme.CURSOR_MARK, theme.CHECK_ON, theme.CHECK_OFF):
+        assert len(glyph) == 1, f"{glyph!r} 不是一个字形"
+        assert cell_len(glyph) == 1, f"{glyph!r} 在 rich 那里不是 1 格"
+        assert unicodedata.east_asian_width(glyph) not in "AWF", f"{glyph!r} 的东亚宽度含糊"
+
+
+def test_the_picker_copy_uses_no_ambiguous_width_glyphs():
+    """这一票新写的字里不许出现东亚**歧义**宽度的字形（#48 在帮助正文上立的同一条规矩）。
+
+    浮层是 ``width: auto``——宽度正由最宽那行算出来（#48 实测：抬头那四个 ``─`` 让框从
+    右边框上溢出去）。提示里那两个方向键因此写成「上下方向键」，不是 ``↑↓``。
+    """
+    texts = [
+        messages.TAGS_PICKER_HINT,
+        messages.NO_CHOICES_TEXT,
+        messages.hidden_choices_message(3),
+        messages.tags_load_failed_message("连不上服务器"),
+        LIST_PICKER_TITLE,
+        PRIORITY_PICKER_TITLE,
+        TAGS_PICKER_TITLE,
+    ]
+    offenders = [
+        (text, char)
+        for text in texts
+        for char in text
+        if unicodedata.east_asian_width(char) == "A"
+    ]
+    assert offenders == [], f"挑选浮层的字里出现了歧义宽度的字形：{offenders}"

@@ -39,6 +39,9 @@ __all__ = [
     "Picker",
     "field_line",
     "fields_of",
+    "LIST_PICKER_TITLE",
+    "PRIORITY_PICKER_TITLE",
+    "TAGS_PICKER_TITLE",
     "list_picker",
     "priority_picker",
     "picker_spec",
@@ -155,6 +158,15 @@ PRIORITY_FIELD = "priority"
 TAGS_FIELD = "tags"
 """三个挑选型字段在 ``{字段名: 值}`` 里的键（就是字段注册表里那几个 ``key``）。"""
 
+LIST_PICKER_TITLE = "搬到哪个清单"
+PRIORITY_PICKER_TITLE = "优先级"
+TAGS_PICKER_TITLE = "标签"
+"""三张挑选浮层顶上那一行（工单 #45）。
+
+写成常量而不是散在 :func:`picker_spec` 里：它们与上面那三个键一样，是这一页对外说得出口的
+东西（宽度守卫 ``tests/test_picker_fields.py`` 也照着它们查歧义字形）。
+"""
+
 
 @dataclass(frozen=True)
 class Picker:
@@ -260,11 +272,11 @@ def picker_spec(
     静默什么都不做，比开一张空浮层好。
     """
     if key == "list":
-        return Picker("搬到哪个清单", list_picker(detail, lists))
+        return Picker(LIST_PICKER_TITLE, list_picker(detail, lists))
     if key == "priority":
-        return Picker("优先级", priority_picker(detail))
+        return Picker(PRIORITY_PICKER_TITLE, priority_picker(detail))
     if key == "tags":
-        return Picker("标签", tags_picker(detail, tags), messages.tags_picker_hint(notice))
+        return Picker(TAGS_PICKER_TITLE, tags_picker(detail, tags), messages.tags_picker_hint(notice))
     return None
 
 
