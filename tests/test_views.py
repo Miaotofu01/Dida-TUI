@@ -1,11 +1,17 @@
 """视图求值（#35）：视图定义 + 全量任务缓存 + 当前逻辑日 → 确定的、排好序的任务列表。
 
-**无接缝（纯函数）**：这一组直接调 :func:`dida.sync.views.evaluate_view`——「求值是纯函数、
-不碰网络不碰存储」本身就是验收标准的一条，所以它不需要 app 也不需要假后端。期望值来自
-spec（issue #30 的「视图定义」与「排序」两节）与 :mod:`dida.logical_day`，不是照抄实现。
+**接缝一（纯函数）**：这一组的大半直接调 :func:`dida.sync.views.evaluate_view`——「求值是
+纯函数、不碰网络不碰存储」本身就是验收标准的一条，所以它不需要 app 也不需要假后端。
+期望值来自 spec（issue #30 的「视图定义」与「排序」两节）与 :mod:`dida.logical_day`，
+不是照抄实现。
+
+**接缝二（引擎 / 界面）**：同一批判断在 ``FakeBackend``（内存缓存 + 真引擎的读路径）与
+真 ``DidaApp`` + Pilot 上再断一次——「我按了这个键，屏幕上出现了什么」。跨层的那几条
+（三个内置视图是索引里的行、进去看到过滤后的任务、视图里的行写着所属清单名、逾期标红）
+只有在真 app 上才有意义。
 
 三个内置视图就是三个写死的 :class:`~dida.sync.views.ViewDefinition`，走的是**和自定义视图
-同一条**求值路径：文件末尾那条测试用一个不属于内置三个的定义证明这条路不是为内置写死的
+同一条**求值路径：中间那条测试用一个不属于内置三个的定义证明这条路不是为内置写死的
 （#36 的自定义视图从这里接）。
 
 逻辑日是这一组的另一半：所有日期判断都按**当前逻辑日**算，不按自然日。``day_end = "04:00"``
@@ -15,10 +21,14 @@ spec（issue #30 的「视图定义」与「排序」两节）与 :mod:`dida.log
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
 
-from dida.testing import FakeBackend, ManualClock
+import pytest
 
+from dida.testing import FakeBackend, ManualClock
+from dida.tui.app import DidaApp
+from dida.tui.pages.index import BUILTIN_MARK, CUSTOM_MARK, INBOX_MARK, LIST_MARK
 from dida.sync.view import TaskSnapshot
 from dida.sync.views import (
     Completion,
@@ -27,6 +37,7 @@ from dida.sync.views import (
     builtin_view_definitions,
     evaluate_view,
 )
+from support import screen_styled_text, screen_text
 
 TZ = timezone(timedelta(hours=8))
 T0 = datetime(2026, 3, 14, 12, 3, tzinfo=TZ)
@@ -369,3 +380,152 @@ def test_the_index_row_count_and_the_view_list_come_from_one_evaluation():
     assert rows["today"].unfinished == len(fake.tasks_in("today").items) == 2
     assert rows["next7"].unfinished == len(fake.tasks_in("next7").items) == 1
     assert rows["all"].unfinished == len(fake.tasks_in("all").items) == 3
+
+
+# ---------------------------------------------------------------- 接缝一（界面）：真 app + Pilot
+
+WIDE = (100, 30)
+
+INBOX_SERVER_ID = "inbox1234567890"
+"""服务端为收集箱返回的那一串（实测形状：``inbox`` 加一截数字）。"""
+
+SGR = re.compile(r"\x1b\[([0-9;]*)m")
+
+
+@pytest.fixture(autouse=True)
+def a_colour_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """摘掉 shell 的 ``NO_COLOR``：否则 ``App`` 会挂一层 Monochrome，颜色断言全部假绿。"""
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+
+def sgr_parameters(line: str) -> set[int]:
+    """这一行里出现过的每一个 SGR 参数（``\\x1b[31;49m`` → ``{31, 49}``）。
+
+    断的是**参数**不是整串：Textual 会把前景与背景并进同一条序列，按整串写会假红。
+    """
+    out: set[int] = set()
+    for group in SGR.findall(line):
+        out.update(int(part) for part in group.split(";") if part)
+    return out
+
+
+def line_with(text: str, needle: str) -> str:
+    """屏幕上写着 ``needle`` 的那一行（没有就是测试写错了）。"""
+    for line in text.splitlines():
+        if needle in line:
+            return line
+    raise AssertionError(f"屏幕上没有「{needle}」这一行：\n{text}")
+
+
+async def enter_view(pilot, app: DidaApp, view_id: str) -> None:
+    """从清单列表页走进一个视图：光标从收集箱往下走到那一行，再 ``enter``。"""
+    for _ in range(10):
+        if app.index_page().selected_id == view_id:
+            break
+        await pilot.press("j")
+    await pilot.press("enter")
+    await pilot.pause()
+
+
+def app_with(*, now: datetime = T0, day_end: str = "24:00") -> DidaApp:
+    fake = FakeBackend(clock=ManualClock(now), day_end=day_end)
+    fake.add_list("工作", id="work")
+    fake.add_list("生活", id="life")
+    fake.add_task("交报告", list_name="work", due=T0.replace(hour=18))
+    fake.add_task("遛狗", list_name="life", due=T0 - timedelta(days=1))
+    fake.add_task("下个月", list_name="work", due=T0 + timedelta(days=30))
+    fake.add_task("没日期", list_name="life")
+    return DidaApp(fake)
+
+
+async def test_the_three_builtins_are_index_rows_marked_by_prefix_character():
+    """三个内置视图是清单列表页里的行，**用前缀字符**与真实清单一眼分开（用户故事 10）。
+
+    前缀而不是颜色：色弱、``NO_COLOR``、只有 8 色的终端上颜色都不算数，所以「一眼可分」
+    这件事必须落在字符上。三个视图与真实清单、收集箱的记号两两不同。
+    """
+    app = app_with()
+    async with app.run_test(size=WIDE) as pilot:
+        text = screen_text(app)
+
+        for name in ("今天", "最近七天", "所有"):
+            assert f"{BUILTIN_MARK} {name}" in line_with(text, name), (
+                f"「{name}」这一行没有内置视图的前缀"
+            )
+        assert f"{LIST_MARK} 工作" in line_with(text, "工作"), "真实清单是另一个记号"
+        assert len({BUILTIN_MARK, LIST_MARK, INBOX_MARK, CUSTOM_MARK}) == 4, "记号本身要互不相同"
+        assert app.index_page().selected_id is not None
+
+
+async def test_entering_today_shows_overdue_and_then_todays_task():
+    """进「今天」看到的是逾期 ∪ 今天到期，**逾期在上**（用户故事 25）。
+
+    这是那一层最外部的行为：我没有按任何「排序」键，屏幕上的先后就是求值给的先后。
+    明天的、没日期的都不在里面——「今天」不是「所有」。
+    """
+    app = app_with()
+    async with app.run_test(size=WIDE) as pilot:
+        await enter_view(pilot, app, "today")
+        text = screen_text(app)
+
+        assert "遛狗" in text and "交报告" in text
+        assert text.index("遛狗") < text.index("交报告"), "逾期置顶"
+        assert "下个月" not in text, "未来截止的不算今天"
+        assert "没日期" not in text, "没有截止时间的不算今天"
+
+
+async def test_entering_all_shows_what_no_list_would_show():
+    """进「所有」看到全部未完成任务（用户故事 27）：未来的、没日期的都在。
+
+    v1 让用户看不到的正是这一个视图，所以这条断的是「它真的把那些行放出来了」。
+    """
+    app = app_with()
+    async with app.run_test(size=WIDE) as pilot:
+        await enter_view(pilot, app, "all")
+        text = screen_text(app)
+
+        for title in ("交报告", "遛狗", "下个月", "没日期"):
+            assert title in text, f"「所有」里少了「{title}」"
+
+
+async def test_rows_in_a_view_show_their_list_name_and_rows_in_a_list_do_not():
+    """视图里的每条任务显示所属清单名；真实清单里不重复显示（用户故事 34 / 58）。
+
+    断的是**任务行**而不是整屏：清单那一屏的抬头本来就叫「工作」，所以「屏幕上没有工作
+    两个字」是个错的断言。要看的是「交报告」这一行。
+    """
+    app = app_with()
+    async with app.run_test(size=WIDE) as pilot:
+        await enter_view(pilot, app, "all")
+        in_view = line_with(screen_text(app), "交报告")
+        assert "工作" in in_view, "视图不是容器：这一行要写出它属于哪个清单"
+
+        await pilot.press("escape")
+        await pilot.pause()
+        for _ in range(10):
+            if app.index_page().selected_id == "work":
+                break
+            await pilot.press("j")
+        await pilot.press("enter")
+        await pilot.pause()
+        in_list = line_with(screen_text(app), "交报告")
+        assert "工作" not in in_list, "清单里的行不重复写清单名（抬头已经写着它了）"
+
+
+async def test_the_overdue_row_is_red_and_the_todays_row_is_not():
+    """逾期标红（用户故事 25 / 93）：断 SGR **参数**里的 ``31``（红），不写死整串。
+
+    光标那一行整体会被换成强调色（``CursorPage._redraw`` 的 ``SELECTED``），所以这条必须
+    把光标从逾期那条上移开——不然测到的是光标，不是逾期。这是真行为，不是测试的将就：
+    用户在「今天」里看到的第一条（逾期的）正是光标停着的那条，它不红是因为光标压着它。
+    """
+    app = app_with()
+    async with app.run_test(size=WIDE) as pilot:
+        await enter_view(pilot, app, "today")
+        await pilot.press("j")  # 光标从逾期那条移到今天到期那条
+        await pilot.pause()
+        styled = screen_styled_text(app)
+
+        assert 31 in sgr_parameters(line_with(styled, "遛狗")), "逾期那条没有标红"
+        assert 31 not in sgr_parameters(line_with(styled, "交报告")), "今天到期那条不该标红"
+        assert "38;2;" not in styled, "红是真彩色：终端主题被顶掉了"
