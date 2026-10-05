@@ -356,6 +356,7 @@ class SyncEngine(
             tuple(self._source.tasks()),
             now=self._clock.now(),
             day_end=self._day_end,
+            views=self._view_rows(),
         )
 
     def tasks_in(self, container_id: str) -> TaskList:
@@ -372,6 +373,7 @@ class SyncEngine(
             now=self._clock.now(),
             day_end=self._day_end,
             window_hours=self._completed_window_hours,
+            views=self._view_rows(),
         )
 
     def task_detail(self, task_id: str) -> TaskDetail | None:
@@ -390,6 +392,15 @@ class SyncEngine(
             now=self._clock.now(),
             day_end=self._day_end,
         )
+
+    def _view_rows(self) -> tuple[ViewRow, ...]:
+        """本地库里的自定义视图行（#36 把视图定义落库、求值）。
+
+        源上没有这个能力就是「没有自定义视图」，不是错误——与写路径上那几个
+        ``isinstance`` 门同一条口径。内置视图不走这里（:func:`builtin_view_rows` 自己算）。
+        """
+        source = self._source
+        return tuple(source.views()) if isinstance(source, ViewReader) else ()
 
     def _write_target(self) -> WriteTarget:
         """写路径要写的那个本地副本。没接上就大声报错——绝不假装写成功了。"""

@@ -26,7 +26,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import datetime, timedelta
 from enum import Enum
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Collection, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.logical_day import logical_day
 from dida.sync.view import (
@@ -167,18 +167,15 @@ class ViewRow:
 
     ``task_ids`` 是**视图求值的结果**：内置视图由 :func:`builtin_view_rows` 算（#35 会把
     求值长全），自定义视图由本地库那一层算（#36 把视图定义落库并求值）。行上的未完成条数
-    就是它的长度——索引里的数字与进去看到的列表因此来自同一次求值，不可能对不上。
+    由 :func:`list_index` 从缓存里数**成员里未完成的那些**——索引里的数字与进去看到的列表
+    因此来自同一次求值，不可能对不上（「最近完成」那种视图里也有已完成的成员，所以条数
+    不是 ``len(task_ids)``）。
     """
 
     id: str
     name: str
     task_ids: tuple[str, ...] = ()
     builtin: bool = False
-
-    @property
-    def unfinished(self) -> int:
-        """这个视图里的未完成条数。"""
-        return len(self.task_ids)
 
 
 @dataclass(frozen=True)
@@ -347,14 +344,24 @@ def list_index(
     *,
     now: datetime,
     day_end: str,
+    views: Sequence[ViewRow] = (),
 ) -> tuple[ListRow, ...]:
-    """清单索引：收集箱置顶，然后真实清单（照缓存给的顺序）。
+    """清单索引：收集箱置顶 → 内置视图 → 自定义视图 → 真实清单（照缓存给的顺序）。
 
-    空区不出现在结果里——缓存是空的时时候，索引里也只剩收集箱那一行。
+    ``views`` 是本地库里那些自定义视图行（#36）；内置视图这一层自己算
+    （:func:`builtin_view_rows`）。三种行的条数都从同一份缓存里数，所以索引里的数字与
+    进去看到的列表不可能对不上。
     """
     resolved = resolve_lists(lists, tasks)
     unfinished = _unfinished_counts(tasks)
-    return tuple(_list_row(row, unfinished) for row in resolved)
+    unfinished_ids = {snapshot.id for snapshot in tasks if not snapshot.completed}
+    rows = [_list_row(resolved[0], unfinished)]
+    rows += [
+        _view_row(view, unfinished_ids)
+        for view in builtin_view_rows(tasks, now=now, day_end=day_end) + tuple(views)
+    ]
+    rows += [_list_row(row, unfinished) for row in resolved[1:]]
+    return tuple(rows)
 
 
 def container_tasks(
@@ -365,6 +372,7 @@ def container_tasks(
     now: datetime,
     day_end: str,
     window_hours: int,
+    views: Sequence[ViewRow] = (),
 ) -> TaskList:
     """某个容器的任务列表：全部未完成任务（未来的也在）+ 该显示的那部分已完成任务。
 
@@ -373,19 +381,38 @@ def container_tasks(
     """
     resolved = resolve_lists(lists, tasks)
     names = list_names(resolved)
-    members = [snapshot for snapshot in tasks if not snapshot.completed and snapshot.list_id == container_id]
-    items = tuple(by_due([task_item(snapshot, names, now=now, day_end=day_end) for snapshot in members]))
-    return TaskList(
-        container_id=container_id,
-        items=items,
-        completed=completed_section(
+    row = next(
+        (
+            item
+            for item in list_index(lists, tasks, now=now, day_end=day_end, views=views)
+            if item.id == container_id
+        ),
+        None,
+    )
+    if row is None:
+        return TaskList(container_id=container_id)
+
+    if row.kind is ListKind.LIST:
+        members = [
+            snapshot
+            for snapshot in tasks
+            if not snapshot.completed and snapshot.list_id == container_id
+        ]
+        completed = completed_section(
             [snapshot for snapshot in tasks if snapshot.list_id == container_id],
             resolved,
             now=now,
             day_end=day_end,
             window_hours=window_hours,
-        ),
+        )
+    else:
+        # 视图不是容器：成员由视图求值给（#35 的内置视图 / #36 的自定义视图）。
+        members = _view_members(container_id, tasks, now=now, day_end=day_end, views=views)
+        completed = CompletedSection()
+    items = tuple(
+        by_due([task_item(snapshot, names, now=now, day_end=day_end) for snapshot in members])
     )
+    return TaskList(container_id=container_id, items=items, completed=completed)
 
 
 def task_detail(
@@ -466,6 +493,33 @@ def _unfinished_counts(tasks: Sequence[TaskSnapshot]) -> dict[str, int]:
         if not snapshot.completed:
             counts[snapshot.list_id] = counts.get(snapshot.list_id, 0) + 1
     return counts
+
+
+def _view_members(
+    view_id: str,
+    tasks: Sequence[TaskSnapshot],
+    *,
+    now: datetime,
+    day_end: str,
+    views: Sequence[ViewRow],
+) -> list[TaskSnapshot]:
+    """视图的成员：求值结果给的那些任务 id（求值里已经不在缓存里的 id 跳过）。"""
+    rows = builtin_view_rows(tasks, now=now, day_end=day_end) + tuple(views)
+    row = next((item for item in rows if item.id == view_id), None)
+    if row is None:
+        return []
+    by_id = {snapshot.id: snapshot for snapshot in tasks}
+    return [by_id[task_id] for task_id in row.task_ids if task_id in by_id]
+
+
+def _view_row(view: ViewRow, unfinished_ids: Collection[str]) -> ListRow:
+    """视图行 → 索引行。条数是**成员里未完成的那些**（「最近完成」那种视图里也有已完成的）。"""
+    return ListRow(
+        id=view.id,
+        name=view.name,
+        kind=ListKind.BUILTIN if view.builtin else ListKind.CUSTOM,
+        unfinished=sum(1 for task_id in view.task_ids if task_id in unfinished_ids),
+    )
 
 
 def _list_row(snapshot: ListSnapshot, unfinished: Mapping[str, int]) -> ListRow:
