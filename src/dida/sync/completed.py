@@ -16,13 +16,20 @@ from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_chec
 
 from dida.api.errors import MalformedResponseError
 from dida.api.guards import api_date
+from dida.sync.rows import completed_window_start
 
 if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能在这里 import
     from dida.storage.store import StoredSyncState
 
 
-DEFAULT_COMPLETED_WINDOW_HOURS = 24
-"""已完成流往回看多少小时（配置键 ``completed_window_hours`` 的兜底值）。"""
+DEFAULT_COMPLETED_WINDOW_HOURS = 168
+"""已完成流往回看多少小时（配置键 ``completed_window_hours`` 的兜底值）：**7 天**。
+
+与 ``Config.completed_window_hours`` 的默认值是同一个数，两处都从 24 改过来（工单 #37）：
+只改配置那一处的话，**直接构造出来的** ``SyncEngine``（测试、别的组合根）窗口还是 24 小时，
+而「只显示最近 7 天完成的」在屏幕上就还是 1 天。两处相等由
+``tests/test_task_row_model.py`` 的一条守卫钉着。
+"""
 
 
 COMPLETED_PAGE_LIMIT = 200
@@ -121,7 +128,7 @@ class CompletedStreamMixin:
 
     def _completed_window_start(self, now: datetime, cursor: str | None) -> datetime:
         """这次拉取从哪一刻开始：配置窗口与持久化游标里**较晚**的那个。"""
-        start = now - timedelta(hours=self._completed_window_hours)
+        start = completed_window_start(now, self._completed_window_hours)
         resumed = _parse_moment(cursor)
         return resumed if resumed is not None and resumed > start else start
 

@@ -10,10 +10,10 @@
 
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Protocol
 
-__all__ = ["RowFacts", "row_sort_key"]
+__all__ = ["RowFacts", "completed_window_start", "row_sort_key"]
 
 
 class RowFacts(Protocol):
@@ -52,3 +52,13 @@ def row_sort_key(item: RowFacts) -> tuple:
         item.title,
         item.task_id,
     )
+
+
+def completed_window_start(now: datetime, window_hours: int) -> datetime:
+    """已完成区的左端：``now`` 往回 ``window_hours`` 小时。
+
+    纯函数（「现在」与窗口大小都从参数进来），窗口的两处用法共用它：拉取时写进请求的
+    ``startDate``，以及本地已完成区的过滤（:func:`dida.sync.view.completed_section`）。
+    **同一个算式**是「屏幕上只显示最近 7 天」与「请求只拉最近 7 天」不会各说各话的原因。
+    """
+    return now - timedelta(hours=window_hours)

@@ -26,12 +26,12 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
+from datetime import date, datetime
 from enum import Enum
 from typing import Any, Mapping, Protocol, Sequence
 
 from dida.logical_day import logical_day
-from dida.sync.rows import row_sort_key
+from dida.sync.rows import completed_window_start, row_sort_key
 
 NO_DUE_TEXT = "—"
 """没有截止时间的读法；与「今天」一眼可分。"""
@@ -444,7 +444,7 @@ def completed_section(
     纯函数：「现在」与窗口大小都从参数进来，这一层不读时钟（t12 的窗口由引擎按注入的
     配置给）。
     """
-    window_start = now - timedelta(hours=window_hours)
+    window_start = completed_window_start(now, window_hours)
     names = list_names(lists)
     rows = [
         CompletedItem(
