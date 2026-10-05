@@ -184,16 +184,17 @@ class DayEndReader:
     def current(self) -> str | None:
         """现在配置里写着的 ``day_end``；读不了就是 ``None``（调用方沿用上一次那个日界）。
 
-        三种「读不了」都算 ``None``，而且**都不出声**：文件不在（不替用户建一份默认的——
-        那是启动时 :func:`load_config` 的事，不是一秒问一次的读手该干的）、TOML 写坏了、
-        值非法或键不认识（:class:`ConfigError` 一族）。读手抛出去的下场是：用户手改到一半
-        保存一次，界面就当场崩掉。
+        「读不了」的几种情形都算 ``None``，而且**都不出声**：文件不在（不替用户建一份默认的
+        ——那是启动时 :func:`load_config` 的事，不是一秒问一次的读手该干的）、TOML 写坏了、
+        值非法或键不认识（:class:`ConfigError` 一族）、打开就失败（``OSError``：权限、悬空的
+        软链、路径上根本不是个文件）。抛出去的下场是：用户手改到一半保存一次，界面就当场崩
+        掉——而这东西是挂在定时器上的。
         """
         if not self._path.exists():
             return None
         try:
             return load_config(self._path).day_end
-        except ConfigError:
+        except (ConfigError, OSError):
             return None
 
 

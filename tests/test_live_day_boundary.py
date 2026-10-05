@@ -39,6 +39,10 @@ def at(day: int, hour: int = 0, minute: int = 0) -> datetime:
     return datetime(2026, 3, day, hour, minute, tzinfo=TZ)
 
 
+T0 = at(14, 2, 0)
+"""凌晨两点：``24:00`` 下是 03-14，``04:00`` 下还是 03-13——两个日界在这一刻分得最开。"""
+
+
 def write_day_end(path: Path, day_end: str) -> None:
     """改配置里的边界值：**只换这一个键**，其余原样（用户就是这么改的）。
 
@@ -94,6 +98,14 @@ def test_a_config_that_cannot_be_read_is_no_value_not_an_exception(tmp_path, con
     """读不了的配置给 ``None``，不抛：一秒问一次的读手不允许把界面带走（沿用上一次那个日界）。"""
     path = tmp_path / "config.toml"
     path.write_text(content, encoding="utf-8")
+
+    assert DayEndReader(path).current() is None
+
+
+def test_a_path_that_is_not_a_readable_file_is_no_value_either(tmp_path):
+    """路径上根本不是个文件（目录 / 悬空软链）：同样是「读不了」，同样不出声。"""
+    path = tmp_path / "config.toml"
+    path.mkdir()
 
     assert DayEndReader(path).current() is None
 
@@ -192,11 +204,7 @@ def test_deferring_lands_on_the_next_logical_day_of_the_current_boundary(store):
 
 # ------------------------------------------------------------------ 界面层：改配置 → 屏幕跟着变
 
-T0 = at(14, 2, 0)
-"""凌晨两点：``24:00`` 下是 03-14，``04:00`` 下还是 03-13——两个日界在这一刻分得最开。"""
-
-
-def task_ids(fake: FakeBackend) -> FakeBackend:
+def stocked(fake: FakeBackend) -> FakeBackend:
     """三条任务摆进一个真实清单（「今天」是算出来的，不是摆出来的）：
 
     - ``early`` 03-13 09:00、``late`` 03-13 23:00：两个日界下都在「今天」里（逾期那两条）；
@@ -218,7 +226,7 @@ def live_app(tmp_path: Path) -> tuple[DidaApp, Path]:
     path = tmp_path / "config.toml"
     save_config(Config(day_end="24:00"), path)
     reader = DayEndReader(path)
-    fake = task_ids(FakeBackend(clock=ManualClock(T0), day_end=reader.current()))
+    fake = stocked(FakeBackend(clock=ManualClock(T0), day_end=reader.current()))
     return DidaApp(fake, day_boundary=reader.current), path
 
 
@@ -408,3 +416,32 @@ async def test_the_composition_root_follows_the_config_file_it_was_given(tmp_pat
 
     assert "逻辑日 03-14" in before
     assert "逻辑日 03-13" in after
+
+
+def test_the_command_hands_the_app_the_config_file_it_just_read(monkeypatch, tmp_path):
+    """``dida`` 装出来的 app 跟着**它刚读过的那一份**配置走（生产那条路，工单 #46）。
+
+    ``main()`` 里那一行接线（``config_file=config_path()``）没有别的东西守着：忘了它，
+    「日界立刻生效」在生产里就是静默关掉的，而其他测试照样全绿。`HOME` 指到 tmp，配置与库
+    都落在那里；`DidaApp.run` 被换掉——真的 `run()` 会进 alt-screen 并阻塞到用户按 `q`，
+    这里换掉的是框架边界，不是被测的那一段接线。钟按接缝一摆到凌晨两点（`main()` 没有注入
+    `Clock` 的口子，所以直接钉 :class:`SystemClock`）。
+    """
+    from dida.bootstrap import main
+    from dida.clock import SystemClock
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setattr(SystemClock, "now", lambda self: T0)
+    config_file = tmp_path / ".config" / "dida-tui" / "config.toml"
+    save_config(Config(token="tok-探针", day_end="24:00", refresh_on_start=False), config_file)
+
+    composed: list[DidaApp] = []
+    monkeypatch.setattr(DidaApp, "run", lambda self: composed.append(self))
+    main()
+    (app,) = composed
+
+    write_day_end(config_file, "04:00")
+
+    assert app.reload_day_boundary() is True, "改完文件，重读要真的拿到新值"
+    assert app.engine.status().logical_day == date(2026, 3, 13), "凌晨两点 + 04:00 是前一天"
+    assert app.reload_day_boundary() is False, "没变就不算变过"
