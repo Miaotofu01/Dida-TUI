@@ -420,20 +420,25 @@ async def test_neither_the_app_nor_the_pages_shadow_textuals_animator():
 
     ``pages/base.py`` 的 ``_motion`` 是对的做法（那里第 130 行起的文档就写着这个坑）；这条
     顺手把三张页面也真按一次，不靠「以为它是干净的」。
+
+    ⚠ 便宜的守卫查的是**类**上有没有这个名字，不能查 ``vars(app)``：``App.__init__`` 自己就
+    往实例上放了 ``_animate``（绑好的 animator），所以它一直都在实例名字空间里——查那儿的
+    话这条断言两边都绿，什么也证明不了。
     """
     app = DidaApp(backend())
 
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
+        pages = [app.index_page(), app.tasks_page(), app.detail_page()]
         app.probe_value = 0.0
         app.animate("probe_value", 1.0, duration=0.01)  # 撞名时这里抛 TypeError
-        for page in (app.index_page(), app.tasks_page(), app.detail_page()):
+        for page in pages:
             page.animate("scroll_y", 0, duration=0.01)  # 页面那一半也要能用
         await pilot.pause(0.05)
 
-    assert "_animate" not in vars(app), "动效开关不许占用 Textual 的 animator 那个名字"
+    assert "_animate" not in DidaApp.__dict__, "开关不许在类上占用 Textual 的 animator 那个名字"
     assert callable(app._animate), "Textual 的 animator 被盖掉了"
-    for page in (app.index_page(), app.tasks_page(), app.detail_page()):
+    for page in pages:
         assert callable(page._animate), "页面上的 animator 被盖掉了"
 
 
