@@ -317,6 +317,27 @@ def test_the_switch_resolves_auto_off_for_remote_and_dumb_terminals():
     assert theme.animations_enabled("off", {"TERM": "xterm-kitty"}) is False
 
 
+async def test_resizing_the_window_keeps_you_on_the_page_you_were_on():
+    """窗口宽度变了，舞台要重新对齐到**当前那一页**。
+
+    三段并排停着，位置是按「第几页 × 屏宽」算的：宽度一变，那个算式就变了。不重算的话
+    用户会停在两页之间的缝里——屏幕上什么都没有，看起来像 app 坏了。
+    """
+    app = DidaApp(backend(), animations="on")
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_work(pilot, app)
+        await pilot.resize_terminal(72, 24)
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert "写周报" in after, f"缩放之后应当还停在任务列表页：\n{after}"
+    row = line_with(after, "写周报")
+    assert row.lstrip().startswith("❯") or row.lstrip().startswith("交水费"), row
+    assert lines(after)[0].count("▸") == 2, "顶栏还写着两段路径（没有回到清单列表页）"
+
+
 # ------------------------------------------------------------------ 会追赶的光标条
 
 
