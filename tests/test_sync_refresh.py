@@ -88,6 +88,75 @@ def urls(transport: FakeTransport) -> list[str]:
     return [str(request.url) for request in transport.requests]
 
 
+class PagedProjectServer:
+    """**会真的分页**的假服务端（#41）。
+
+    与 :class:`~dida.testing.FakeTransport` 的差别正是这个假服务端的全部意义：那个按队列
+    回放，给什么就是什么，翻不翻页它都照给；这一个照文档办事——``offset``/``limit`` 切片，
+    而**不给分页参数就按 200 的默认上限截断**（真实服务端的默认，见 notes/openapi-dida365.md
+    的 ``GET /open/v1/project``）。一条不翻页的读路径因此真的会拿丢第 201 条起的东西。
+
+    收集箱不在 ``GET /open/v1/project`` 里（ADR-0001）：索引没给过的清单，它的 data 就只回
+    ``tasks``，不回 ``project``。
+    """
+
+    DEFAULT_LIMIT = 200
+    """不给分页参数时服务端的默认上限（文档：给了任一参数才默认 200，这里照真实行为建模）。"""
+
+    def __init__(self, projects: list[dict], tasks: dict[str, list[dict]] | None = None) -> None:
+        self.projects = list(projects)
+        self.tasks = dict(tasks or {})
+        self.index_requests: list[httpx.Request] = []
+        """收到过的清单索引请求，按顺序（翻页几页就有几条）。"""
+
+        self.data_requests: list[str] = []
+        """收到过的 ``.../data`` 请求的清单 id，按顺序。"""
+
+    @property
+    def index_pages(self) -> int:
+        """清单索引被请求了几页。"""
+        return len(self.index_requests)
+
+    async def send(self, request: httpx.Request) -> httpx.Response:
+        url = request.url
+        if url.path == "/open/v1/project":
+            self.index_requests.append(request)
+            offset = int(url.params.get("offset") or 0)
+            limit = int(url.params.get("limit") or self.DEFAULT_LIMIT)
+            return httpx.Response(200, json=self.projects[offset : offset + limit])
+        project_id = url.path.split("/")[4]
+        self.data_requests.append(project_id)
+        payload: dict = {"tasks": self.tasks.get(project_id, [])}
+        known = next((item for item in self.projects if item["id"] == project_id), None)
+        if known is not None:
+            payload["project"] = known
+        return httpx.Response(200, json=payload)
+
+
+async def test_the_project_index_is_paged_until_a_short_page(store):
+    """清单索引超过服务端一页的上限时要翻页拿全（#41 的第一条验收标准）。
+
+    250 个清单、服务端一页 200 条：不翻页的读路径只会拿到前 200 个，第 201 个起**永远
+    看不见**，而且不报错。响应是一个没有 total 的裸数组，所以「还有没有下一页」只能靠
+    「这一页拿满了没有」推断。
+    """
+    server = PagedProjectServer(
+        projects=[
+            project(id=f"p{n}", name=f"清单{n}", sort_order=n + 1) for n in range(250)
+        ],
+        tasks={"p249": [task(id="deep", title="第 250 个清单里的任务", project_id="p249")]},
+    )
+    engine = make_engine(store, server)
+
+    await engine.refresh()
+
+    assert len(store.lists()) == 250, "第 201 个清单起不许被截断"
+    assert [item.name for item in engine.view().lists][-1] == "清单249"
+    assert store.task_payload("deep") is not None, "翻页才看得见的那个清单里的任务也要在"
+    assert server.index_pages == 2
+    assert server.index_requests[0].url.params.get("limit") == "200"
+
+
 async def test_refresh_fetches_every_list_and_writes_the_first_payload(store):
     transport = FakeTransport()
     serve(
@@ -100,7 +169,7 @@ async def test_refresh_fetches_every_list_and_writes_the_first_payload(store):
     report = await engine.refresh()
 
     assert urls(transport) == [
-        "https://api.dida365.com/open/v1/project",
+        "https://api.dida365.com/open/v1/project?offset=0&limit=200",
         "https://api.dida365.com/open/v1/project/inbox/data",
         "https://api.dida365.com/open/v1/project/work/data",
     ]
@@ -115,7 +184,9 @@ async def test_the_second_identical_refresh_writes_nothing(store):
     """头条：同一份数据拉第二次，本地库零写入——「刷新」与「刷新且屏幕不闪」的区别。
 
     证明用的是 ``apply_refresh`` 自己给的 ``RefreshReport``（t08 的口径），不是去翻
-    数据库内部：报告整份为空，就说明清单、任务、覆盖、豁免四样都没动。
+    数据库内部：报告整份为空，就说明清单、任务、覆盖、豁免四样都没动。**剪枝（#41）也算
+    在里面**：``RefreshReport`` 多出 ``pruned_lists`` / ``pruned_tasks`` 之后，这一句
+    同时钉住了「没东西可剪的时候一个也不剪」。
     """
     transport = FakeTransport()
     index = [inbox(), project()]
@@ -148,7 +219,8 @@ async def test_refresh_never_uses_a_date_window_for_unfinished_tasks(store):
 
     ``task/undone``、``task/filter`` 这类日期窗口会**静默**漏掉「日期在很久以后、但刚被
     改过」的任务；漏了不报错，只会在某天表现为「我的任务不见了」。所以这里钉死请求集合：
-    只有列清单 + 每个清单恰好一次 data，没有别的路径，也没有任何查询串。
+    只有列清单 + 每个清单恰好一次 data，没有别的路径。列清单那一次带的是**翻页参数**
+    （#41 的第一条，取全清单索引用的），逐清单的 data 一次不带任何查询串。
     """
     transport = FakeTransport()
     serve(
@@ -161,7 +233,7 @@ async def test_refresh_never_uses_a_date_window_for_unfinished_tasks(store):
     await engine.refresh()
 
     assert [(request.method, str(request.url)) for request in transport.requests] == [
-        ("GET", "https://api.dida365.com/open/v1/project"),
+        ("GET", "https://api.dida365.com/open/v1/project?offset=0&limit=200"),
         ("GET", "https://api.dida365.com/open/v1/project/inbox/data"),
         ("GET", "https://api.dida365.com/open/v1/project/work/data"),
     ]
@@ -257,6 +329,242 @@ async def test_only_the_task_that_changed_is_written(store):
     assert [(item.task_id, item.field, item.local, item.server) for item in report.overwritten] == [
         ("t2", "title", "买牛奶", "买牛奶（改了）")
     ]
+
+
+async def test_the_inbox_is_never_pruned_even_when_the_index_never_mentions_it(store):
+    """收集箱不在清单索引里，所以「索引没提它」不等于「服务端没有它」（#41 的第四条）。
+
+    ``GET /open/v1/project`` **不包含收集箱**（ADR-0001），它是默认清单。照「索引里没有的
+    就剪掉」办，第一次刷新就会把收集箱从本地库里删掉：左栏少一格、随手记的任务无处可去，
+    而且不报错。
+    """
+    server = PagedProjectServer(
+        projects=[inbox(), project()],
+        tasks={"inbox": [task(id="t9", project_id="inbox", title="随手记")]},
+    )
+    engine = make_engine(store, server)
+    await engine.refresh()
+
+    # 第二次：索引照真实服务端的样子只回工作清单，而收集箱的 data 根本没有 project 字段。
+    index_only = PagedProjectServer(projects=[project()])
+    engine = make_engine(store, index_only)
+
+    report = await engine.refresh()
+
+    assert [item.name for item in store.lists()] == ["收集箱", "工作"]
+    assert [item.name for item in engine.view().lists] == ["收集箱", "工作"]
+    assert report.pruned_lists == 0
+
+
+async def test_a_task_deleted_remotely_disappears_from_the_local_library(store):
+    """远端已经没有的任务，刷新之后不许留在本地库里（#41 的第三条验收标准）。
+
+    落库原先只做插入与更新、从不删除，所以用户在手机上删掉的任务会永远留在本地：屏幕上
+    看得见一条服务端已经不存在的任务，而且刷新多少次都在。
+    """
+    transport = FakeTransport()
+    index = [inbox(), project()]
+    serve(
+        transport,
+        index=index,
+        data=[data(inbox()), data(project(), [task(id="t1"), task(id="t2", title="买牛奶")])],
+    )
+    serve(
+        transport,
+        index=index,
+        data=[data(inbox()), data(project(), [task(id="t2", title="买牛奶")])],
+    )
+    engine = make_engine(store, transport)
+    await engine.refresh()
+
+    report = await engine.refresh()
+
+    assert [item.id for item in store.tasks()] == ["t2"]
+    assert report.pruned_tasks == 1
+    assert report.written_tasks == 0, "留下那条没变，一个字节都不写"
+    assert [item.title for group in engine.view().groups for item in group.items] == ["买牛奶"]
+
+
+async def test_a_list_deleted_remotely_disappears_from_the_library(store):
+    """远端已经没有的清单，刷新之后不许留在本地库里（#41 的第四条验收标准的前半）。
+
+    「还在本地库里」就是「还在清单列表页上」：清单页读的是本地那份索引。
+    """
+    transport = FakeTransport()
+    serve(
+        transport,
+        index=[inbox(), project()],
+        data=[data(inbox()), data(project(), [task()])],
+    )
+    serve(transport, index=[inbox()], data=[data(inbox())])
+    engine = make_engine(store, transport)
+    await engine.refresh()
+
+    report = await engine.refresh()
+
+    assert [item.name for item in store.lists()] == ["收集箱"]
+    assert [item.name for item in engine.view().lists] == ["收集箱"]
+    assert report.pruned_lists == 1
+
+
+async def test_a_task_with_an_unpushed_change_is_never_pruned(store):
+    """剪枝不误删待推送改动对应的任务（#41 的第五条验收标准）。
+
+    两类都在这里：改过还没推上去的老任务（服务端这次没给），和刚刚在本地新建、服务端
+    根本还没见过的任务（临时 id）。剪掉任何一个都等于把用户刚做的操作悄悄撤销。
+    """
+    transport = FakeTransport()
+    index = [inbox(), project()]
+    serve(transport, index=index, data=[data(inbox()), data(project(), [task(id="t1")])])
+    engine = make_engine(store, transport)
+    await engine.refresh()
+
+    store.enqueue(
+        task_id="t1", kind=ChangeKind.UPDATE, payload={"title": "写周报（我改的）"}, now=T0
+    )
+    store.enqueue(
+        task_id="local-new",
+        kind=ChangeKind.CREATE,
+        payload={"title": "随手记", "projectId": "inbox"},
+        now=T0,
+        list_id="inbox",
+    )
+
+    serve(transport, index=index, data=[data(inbox()), data(project(), [])])
+    report = await engine.refresh()
+
+    assert store.pending_count() == 2, "两条改动都还在队列里"
+    assert store.task_payload("t1")["title"] == "写周报（我改的）"
+    assert store.task_payload("local-new")["title"] == "随手记"
+    assert [item.title for group in engine.view().groups for item in group.items] == [
+        "写周报（我改的）",
+        "随手记",
+    ]
+    assert report.pruned_tasks == 0
+
+
+async def test_a_refresh_that_deletes_several_remote_records_keeps_unrelated_local_changes(store):
+    """一次刷新里删掉多条远端记录时，不会把未受影响的本地改动一起清掉（#41 的第六条）。
+
+    这一趟远端删掉了一整个清单（家里的买牛奶那条就挂在那张清单下）与另一个清单里的一条
+    任务；本地那条买牛奶上有一笔还没推成功的标题改动。删归删，那笔改动与它那条任务都要
+    原封不动：队列里的行不能少一条、也不能被换成新的一行（那等于把用户的操作重来一遍）。
+    """
+    transport = FakeTransport()
+    home = project(id="home", name="生活", sort_order=2)
+    serve(
+        transport,
+        index=[inbox(), project(), home],
+        data=[
+            data(inbox()),
+            data(project(), [task(id="t1")]),
+            data(home, [task(id="t2", title="买牛奶", project_id="home")]),
+        ],
+    )
+    engine = make_engine(store, transport)
+    await engine.refresh()
+
+    store.enqueue(
+        task_id="t2", kind=ChangeKind.UPDATE, payload={"title": "买牛奶（我改的）"}, now=T0
+    )
+    queued = store.pending()
+
+    serve(transport, index=[inbox(), project()], data=[data(inbox()), data(project(), [])])
+    report = await engine.refresh()
+
+    assert [item.id for item in store.lists()] == ["inbox", "work"], "只剩远端还有的清单"
+    assert [item.id for item in store.tasks()] == ["t2"], "远端没有的剪掉，有本地改动的那条留住"
+    assert store.pending() == queued, "队列里那一笔原封不动"
+    assert store.task_payload("t2")["title"] == "买牛奶（我改的）"
+    assert [item.title for group in engine.view().groups for item in group.items] == ["买牛奶（我改的）"]
+    assert report.pruned_lists == 1
+    assert report.pruned_tasks == 1
+
+
+async def test_a_refresh_after_a_prune_writes_and_prunes_nothing(store):
+    """剪枝会收敛：剪完之后的下一趟彻底空转，报告整份为空（#41 不许破坏 ADR-0001 的只写变化）。
+
+    这件事直接长在界面上：每一趟都写点什么（哪怕只是「再删一次已经没有的东西」）的话，
+    左栏与光标每刷新一次就抖一次。
+    """
+    transport = FakeTransport()
+    index = [inbox(), project()]
+    kept = [data(inbox()), data(project(), [task(id="t2", title="买牛奶")])]
+    serve(
+        transport,
+        index=index,
+        data=[data(inbox()), data(project(), [task(id="t1"), task(id="t2", title="买牛奶")])],
+    )
+    serve(transport, index=index, data=kept)
+    serve(transport, index=index, data=kept)
+    engine = make_engine(store, transport)
+    await engine.refresh()
+
+    first = await engine.refresh()
+    after_the_prune = await engine.refresh()
+
+    assert (first.pruned_tasks, first.pruned_lists) == (1, 0)
+    assert after_the_prune == RefreshReport()
+
+
+async def test_an_index_that_never_advances_is_a_structured_error_not_a_hang(store):
+    """一页拿满就一直问下一页：服务端要是压根不认 ``offset``，得报错，不能死循环。
+
+    代理不认查询串时就是这个样子：每一页都把第一页原样再给一遍。客户端不能一直问下去
+    （挂死、内存一路上涨，屏幕上一句解释都没有）。清单 id 在索引里不会重复，所以「这一页
+    的 id 见过了」就是它没有前进的证据。
+    """
+
+    class StuckIndexServer(PagedProjectServer):
+        """分页参数被无视的服务端：每一页都给同一份。
+
+        问到第 6 页还不停就当场炸：真挂死的话这个测试会一直转下去，那不是一个好的红灯。
+        """
+
+        async def send(self, request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/open/v1/project":
+                self.index_requests.append(request)
+                assert self.index_pages <= 5, "索引问了 5 页还没停：翻页没有前进"
+                return httpx.Response(200, json=self.projects[: self.DEFAULT_LIMIT])
+            return await super().send(request)
+
+    server = StuckIndexServer(
+        projects=[project(id=f"p{n}", name=f"清单{n}", sort_order=n + 1) for n in range(200)]
+    )
+    engine = make_engine(store, server)
+
+    with pytest.raises(MalformedResponseError):
+        await engine.refresh()
+
+    assert store.lists() == ()
+
+
+async def test_a_failed_index_page_writes_and_prunes_nothing(store):
+    """索引翻到一半失败：整份刷新失败，本地库一动不动——**尤其是一行都不剪**（#41）。
+
+    没翻完的索引是一份**残缺**的清单集合。它要是落了库、或者照它剪了枝，第 201 个清单起
+    连同里面的任务就会被当成「远端已经删掉了」而消失，而且不报错。所以翻页的每一页失败都
+    照旧往上抛：取数没取全就绝不落库（ADR-0001 的全有全无）。
+    """
+    transport = FakeTransport()
+    index = [inbox(), project()]
+    serve(transport, index=index, data=[data(inbox()), data(project(), [task()])])
+    engine = make_engine(store, transport)
+    await engine.refresh()
+    cached = (store.lists(), store.tasks())
+
+    # 第一页拿满 200 条（于是「可能还有下一页」），要第二页时服务端 500。
+    transport.enqueue(
+        httpx.Response(
+            200, json=[project(id=f"p{n}", name=f"清单{n}", sort_order=n + 1) for n in range(200)]
+        )
+    )
+    transport.enqueue(httpx.Response(500, json={"error": "boom"}))
+
+    with pytest.raises(ServerRejectionError):
+        await engine.refresh()
+
+    assert (store.lists(), store.tasks()) == cached, "没取全的索引连一行都不许落，更不许照它剪"
 
 
 async def test_a_failed_list_fetch_writes_nothing(store):
@@ -395,7 +703,7 @@ async def test_the_inbox_is_fetched_even_when_the_project_index_omits_it(store):
     report = await engine.refresh()
 
     assert urls(transport) == [
-        "https://api.dida365.com/open/v1/project",
+        "https://api.dida365.com/open/v1/project?offset=0&limit=200",
         "https://api.dida365.com/open/v1/project/work/data",
         "https://api.dida365.com/open/v1/project/inbox/data",
     ]

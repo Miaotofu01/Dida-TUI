@@ -7,10 +7,12 @@
 - 待推送改动（Pending Change）：创建时间、尝试次数、下次重试时间、最后一次错误，
 - 同步状态：已完成流游标、上次刷新完成时间、上次算出的逻辑日。
 
-「增量」是这一层的概念：全量拉回来的数据在这里比对，只写变化（ADR 0001）。
-冲突裁决也在这里：服务端权威胜出，但待推送改动豁免（ADR 0002）——**没有这个豁免，
-一次推送失败加一次全量刷新就会把用户刚做出的操作悄悄撤销掉**。豁免是逐字段的：
-改动碰过的字段本地值赢，其余字段服务端照旧赢；未推送的删除则整条任务豁免。
+「增量」是这一层的概念：全量拉回来的数据在这里比对，只写变化（ADR 0001）。服务端已经没有
+的东西也在这里删掉（剪枝，#41）：清单与未完成任务只在「这一路这次取全了」的断言下才剪，
+断言就是 ``apply_refresh`` 的 ``prune_*`` 参数。冲突裁决也在这里：服务端权威胜出，但待推送
+改动豁免（ADR 0002）——**没有这个豁免，一次推送失败加一次全量刷新就会把用户刚做出的操作
+悄悄撤销掉**。豁免是逐字段的：改动碰过的字段本地值赢，其余字段服务端照旧赢；未推送的删除
+则整条任务豁免。剪枝读的是同一份豁免：有没推成功的改动的任务一个都不剪。
 
 ``Store`` 同时是 t05 的 ``ViewSource`` 的生产实现（``lists`` / ``tasks`` / ``sync_state``），
 所以引擎与 TUI 拿到的形状和它们已经写好的测试一致。
@@ -24,9 +26,9 @@
 - 开关：``close()``、``with Store(path) as store``；
 - 读（``ViewSource``）：``lists()`` / ``tasks()`` / ``sync_state()``；
 - 读（完整记录）：``list_records()`` / ``task_payload(task_id)`` / ``stored_sync_state()``；
-- 写：``apply_refresh(lists=, tasks=)``（只写变化，返回 ``RefreshReport``）、
-  ``enqueue(...)`` / ``pending()`` / ``pending_count()`` / ``record_attempt(...)`` /
-  ``resolve(change_id)`` / ``set_sync_state(...)``。
+- 写：``apply_refresh(lists=, tasks=, prune_lists=, prune_unfinished_tasks=)``（只写变化、
+  顺手剪枝，返回 ``RefreshReport``）、``enqueue(...)`` / ``pending()`` / ``pending_count()`` /
+  ``record_attempt(...)`` / ``resolve(change_id)`` / ``set_sync_state(...)``。
 
 ``task_payload()`` 是给 t07 的 ``update_task(snapshot=)`` 用的那一份：**字典形状**，
 不是领域 dataclass，客户端不认识的字段一个都不丢。
@@ -161,6 +163,9 @@ class FieldOverride:
 class RefreshReport:
     """一次全量刷新的结果。
 
+    ``written_*`` 是这次真正写进去的行数：同一份数据拉第二次全是 0，界面因此不闪、光标
+    因此不丢。``pruned_*`` 是这次**从本地库里删掉**的行数——服务端已经没有它们了（#41）。
+
     ``overwritten`` 是服务端权威真的把本地值盖掉的字段（ADR-0002 要求这种覆盖能被
     用户看见）；``suppressed`` 是被待推送改动挡回去的那些——两者都不含没变化的东西，
     所以重复拉同一份数据的报告是空的。
@@ -168,6 +173,8 @@ class RefreshReport:
 
     written_lists: int = 0
     written_tasks: int = 0
+    pruned_lists: int = 0
+    pruned_tasks: int = 0
     overwritten: tuple[FieldOverride, ...] = ()
     suppressed: tuple[FieldOverride, ...] = ()
 
@@ -199,21 +206,32 @@ class Store:
         *,
         lists: Sequence[Mapping[str, Any]] = (),
         tasks: Sequence[Mapping[str, Any]] = (),
+        prune_lists: bool = False,
+        prune_unfinished_tasks: bool = False,
     ) -> RefreshReport:
-        """把一次全量刷新的原文写进来，只写变化，并裁决冲突。
+        """把一次全量刷新的原文写进来，只写变化，并裁决冲突，顺手剪枝。
 
-        整次刷新是一个事务：要么整份落地，要么一点都不落地。
+        整次刷新是一个事务：要么整份落地，要么一点都不落地。剪枝也在**这同一个事务**里
+        （#41）：删到一半失败不会留下半份刷新。
 
         冲突裁决的规矩就一句（ADR-0002）：**服务端权威，除非有还没推成功的待推送改动**。
         每个字段单独判：改动碰过的字段本地值赢，其余字段服务端照旧赢。
 
         服务端传来的是一份完整的任务原文，所以本地多出来的、服务端没有的字段会被丢掉
         ——除了被豁免的那些。
+
+        ``prune_lists`` / ``prune_unfinished_tasks`` 是**调用方的断言**（#41）：它在断言
+        「这一路这一次真的取全了」。断言成立时，本地那些服务端已经不再给的清单 / 未完成
+        任务就在这里删掉。缺省是 ``False``：不落库、不删——只拿回来一部分的调用方（已完成
+        流只拉一个时间窗口）绝不会顺手剪掉窗口外的东西。
         """
         written_lists = 0
         written_tasks = 0
+        pruned_lists = 0
+        pruned_tasks = 0
         overwritten: list[FieldOverride] = []
         suppressed: list[FieldOverride] = []
+        remote_tasks: set[str] = set()
 
         # 整次刷新一个事务：成功才提交，中途出岔子就整份回滚。半份刷新比旧数据更难查。
         with self._db:
@@ -221,6 +239,8 @@ class Store:
                 written_lists += int(self._write_list(payload))
             for payload in tasks:
                 task_id = str(payload["id"])
+                # 服务端这次给了的 id 全记下来：剪枝要的就是「这次没给的那些」（#41）。
+                remote_tasks.add(task_id)
                 exempt = self._exempt_fields(task_id)
                 if exempt is None:
                     # 有未推送的删除：服务端这份整个不许写回来，否则任务会复活。
@@ -241,10 +261,16 @@ class Store:
                     if field in local and local[field] != value and field not in exempt
                 )
                 written_tasks += int(self._write_task(merged))
+            if prune_lists:
+                pruned_lists = self._prune_lists({str(payload["id"]) for payload in lists})
+            if prune_unfinished_tasks:
+                pruned_tasks = self._prune_unfinished_tasks(remote_tasks)
 
         return RefreshReport(
             written_lists=written_lists,
             written_tasks=written_tasks,
+            pruned_lists=pruned_lists,
+            pruned_tasks=pruned_tasks,
             overwritten=tuple(overwritten),
             suppressed=tuple(suppressed),
         )
@@ -334,9 +360,9 @@ class Store:
     def adopt_created(self, local_id: str, payload: Mapping[str, Any]) -> None:
         """新建推成功：把本地那条临时 id 的任务挪到服务端给的 id 上（t15）。
 
-        服务端建好之后才知道真 id。不挪的话，下一次全量刷新会把真 id 那条拉回来，而临时
-        id 这条不会被清掉（``apply_refresh`` 不剪枝，t08 的口径）——同一条任务在屏幕上
-        出现两遍，而且永远合不上。
+        服务端建好之后才知道真 id。不挪的话，真 id 那条会被下一次全量刷新拉回来，而临时
+        id 这条要等那一次刷新的剪枝才消失（#41）——中间这段时间同一条任务在屏幕上出现
+        两遍；挪一下则是当场合上，一次都不多画。
 
         ``payload`` 是服务端回的原文（含我们不认识的字段），原样存。两步在同一个事务里：
         不会留下「两条都在」或者「一条都没有」的中间状态。
@@ -492,6 +518,57 @@ class Store:
             "SELECT * FROM pending_changes WHERE id = ?", (change_id,)
         ).fetchone()
         return None if row is None else _change(row)
+
+    def _prune_lists(self, remote_ids: set[str]) -> int:
+        """删掉服务端这次没给的清单（收集箱除外），返回删了几行。
+
+        收集箱**不在** ``GET /open/v1/project`` 里（ADR-0001），所以索引里没有它不代表它
+        不存在：它是默认清单，剪掉它的表现是左栏少一格、随手记的任务无处可去。收集箱那一行
+        的 ``is_inbox`` 写进去就是 1（``_write_list`` 的口径），所以这一条也挡住了字面量
+        ``inbox`` 那一行。
+        """
+        rows = self._db.execute("SELECT id, is_inbox FROM lists").fetchall()
+        gone = [
+            str(row["id"])
+            for row in rows
+            if str(row["id"]) not in remote_ids and not row["is_inbox"]
+        ]
+        for list_id in gone:
+            self._db.execute("DELETE FROM lists WHERE id = ?", (list_id,))
+        return len(gone)
+
+    def _prune_unfinished_tasks(self, remote_ids: set[str]) -> int:
+        """删掉服务端这次没给的未完成任务，返回删了几行。
+
+        两条例外，都是「用户还没上去的那份不许被悄悄撤销」：
+
+        - **本地还有没推成功的改动**（ADR-0002 的豁免就是为它立的，加这一次剪枝也一样）：
+          连新建都算——本地刚建的那条服务端根本还没见过，剪掉它就是用户刚写的东西凭空
+          消失。留着它，推的时候推不动会作为错误说出来，而不是静默丢掉。
+        - **本地已经是已完成**：已完成任务是另一条流的地盘（``refresh_completed`` 按完成
+          时间窗口拉），这次取的是未完成任务，没取到它不代表它没了。
+
+        远端删掉一条任务、与把它勾选完成，对这条未完成流来说长得一样，所以本地那条会被
+        删掉；它要真被完成了，下一趟已完成流会把它作为已完成带回来。
+        """
+        rows = self._db.execute("SELECT id, raw FROM tasks").fetchall()
+        gone = [
+            str(row["id"])
+            for row in rows
+            if str(row["id"]) not in remote_ids
+            and json.loads(row["raw"]).get("status") != COMPLETED_STATUS
+            and not self._has_pending_change(str(row["id"]))
+        ]
+        for task_id in gone:
+            self._db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
+        return len(gone)
+
+    def _has_pending_change(self, task_id: str) -> bool:
+        """这条任务上还有没有没推成功的改动（不关心是哪种）。"""
+        row = self._db.execute(
+            "SELECT 1 FROM pending_changes WHERE task_id = ? LIMIT 1", (task_id,)
+        ).fetchone()
+        return row is not None
 
     def _write_list(self, payload: Mapping[str, Any]) -> bool:
         """写一条清单；内容没变就不写（ADR 0001 的「只写变化」）。"""

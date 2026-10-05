@@ -102,14 +102,20 @@ backend.add_task("写周报", list_name="工作", due=T0.replace(hour=18))
 app = DidaApp(backend)
 ```
 
-## 写路径：全量刷新（t09，ADR-0001）
+## 写路径：全量刷新（t09 / #41，ADR-0001）
 
 `await engine.refresh() -> RefreshReport`：先 `GET /open/v1/project` 拿清单索引（服务端说了算），
-再逐个清单 `GET /open/v1/project/{id}/data`——**未完成任务只能这样拉**，日期窗口会静默漏掉
-「日期在很久以后、但刚被改过」的任务（ADR-0001）。全部取回之后才 `apply_refresh` 落库，所以中途
-失败不会留下半份刷新；返回的 `RefreshReport` 里 `written_lists` / `written_tasks` 是这次真正写了
-几行，同一份数据拉第二次时两个都是 0（界面不闪、光标不丢），`overwritten` / `suppressed` 是
-服务端权威盖掉了什么、哪些被待推送改动挡回去了。
+**翻页翻到底**（响应没有 total，所以靠「这一页拿满了没有」推断还有没有下一页，`sync/refresh.py`
+的 `_project_index`），再逐个清单 `GET /open/v1/project/{id}/data`——**未完成任务只能这样拉**，
+日期窗口会静默漏掉「日期在很久以后、但刚被改过」的任务（ADR-0001）。全部取回之后才
+`apply_refresh` 落库，所以中途失败不会留下半份刷新；返回的 `RefreshReport` 里 `written_lists` /
+`written_tasks` 是这次真正写了几行，同一份数据拉第二次时两个都是 0（界面不闪、光标不丢），
+`overwritten` / `suppressed` 是服务端权威盖掉了什么、哪些被待推送改动挡回去了。
+
+落库这一步顺手**剪枝**（#41）：远端已经没有的清单与未完成任务在同一个事务里删掉，`pruned_lists` /
+`pruned_tasks` 报出删了几行。两条豁免：本地还有没推成功的改动的任务不剪，本地已经是已完成的任务
+不剪（那是已完成流的地盘）；收集箱也不剪（它不在清单索引里）。剪枝**只**发生在落库这一步，
+不在翻页途中——取数没取全就绝不落库。
 
 它是 **async** 的：网络等待不能阻塞界面，而 t08 的 `Store` 用的是普通 sqlite 连接（线程亲和），
 写必须发生在创建连接的那个线程上。异步协程跑在事件循环同一个线程里，两条同时满足——**不许**
