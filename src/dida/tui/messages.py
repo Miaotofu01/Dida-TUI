@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from dida.sync.engine import AuthError, DidaError, UnknownListError
+from dida.sync.engine import AuthError, DidaError, UnknownListError, UnclaimedTaskError
 
 UNKNOWN_TASK_MESSAGE = "没有改成：这条任务已经不在本地缓存里了，刷新之后再试一次"
 """引擎拒绝写入（本地没有这条任务的底稿，工单 #25）时的话：如实说没改成。"""
@@ -135,6 +135,18 @@ def refresh_failed_message(error: DidaError) -> str:
     if isinstance(error, AuthError):
         return f"凭据失效，请重新粘贴 token：{error}"
     return f"同步失败：{error}"
+
+
+def create_failed_message(error: DidaError) -> str:
+    """新建当场失败时的话（#39）。
+
+    被拒绝的两种情形分开说，因为用户该做的事不一样：``UnclaimedTaskError`` 是「**你自己**
+    刚建的那条还没同步完」——等一下再按一次就对（下一次刷新会带回真 id）；别的失败是网络
+    或服务端说不行。两句话都不许暗示「已经建好了」：那会让用户以为东西在服务端上。
+    """
+    if isinstance(error, UnclaimedTaskError):
+        return f"没建成：{error}"
+    return f"新建失败：{error}"
 
 
 def completed_failed_message(error: DidaError) -> str:

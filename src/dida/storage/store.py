@@ -53,7 +53,7 @@ from typing import Any, Mapping, Sequence
 
 from dida.sync.lists import ListLocalEffect, ListWriteKind
 from dida.sync.view import INBOX_ID, ListSnapshot, SyncState, TaskSnapshot
-from dida.sync.writes import LocalEffect, WriteKind
+from dida.sync.writes import LOCAL_TASK_PREFIX, LocalEffect, WriteKind
 
 ChangeKind = WriteKind
 """改动种类：对应 API 的四个写操作（新建 / 更新 / 完成 / 删除）。
@@ -466,12 +466,26 @@ class Store:
         id 这条要等那一次刷新的剪枝才消失（#41）——中间这段时间同一条任务在屏幕上出现
         两遍；挪一下则是当场合上，一次都不多画。
 
-        ``payload`` 是服务端回的原文（含我们不认识的字段），原样存。两步在同一个事务里：
+        ``payload`` 是服务端回的原文（含我们不认识的字段），原样存。三步在同一个事务里：
         不会留下「两条都在」或者「一条都没有」的中间状态。
+
+        服务端给的 id 与临时 id 相同时只写、不删（删了就是把刚写的那一行删掉）。
+
+        **这条任务后面还排着几笔改动时，它们也跟着挪到真 id 上**（#53）：建好之后又改了
+        它（断网时先建后改，很正常）会留下一条 ``task_id`` 指向本地临时 id 的改动，而服务端
+        没有那个 id——不挪的话它 POST 到 ``/open/v1/task/local-…``、404、退避重试、
+        **永远出不了队**，状态栏那个数一直非零（与 :class:`~dida.sync.writes.UnknownTaskError`
+        挡的是同一类安静错误）。形状照抄清单版的 :meth:`adopt_created_list`。
         """
+        target = str(payload["id"])
         with self._db:
             self._write_task(payload)
-            self._db.execute("DELETE FROM tasks WHERE id = ?", (local_id,))
+            if target != local_id:
+                self._db.execute("DELETE FROM tasks WHERE id = ?", (local_id,))
+                self._db.execute(
+                    "UPDATE pending_changes SET task_id = ? WHERE task_id = ?",
+                    (target, local_id),
+                )
 
     def pending(self) -> tuple[PendingChange, ...]:
         """还没推成功的改动，按发生顺序（t10 的重试队列按这个顺序挑）。

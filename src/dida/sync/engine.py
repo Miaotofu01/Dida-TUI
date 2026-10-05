@@ -121,7 +121,15 @@ from dida.sync.view import (
     subtask_items,
     summarize_lists,
 )
-from dida.sync.writes import LocalEffect, UnknownTaskError, WireCall, WriteKind, WriteTarget
+from dida.sync.writes import (
+    LOCAL_TASK_PREFIX,
+    LocalEffect,
+    UnclaimedTaskError,
+    UnknownTaskError,
+    WireCall,
+    WriteKind,
+    WriteTarget,
+)
 from dida.sync.views import (
     BUILTIN_VIEW_DAYS,
     Completion,
@@ -130,6 +138,7 @@ from dida.sync.views import (
     ViewTask,
     builtin_view_definitions,
     evaluate_view,
+    implied_due_for,
     order_key,
 )
 
@@ -138,6 +147,7 @@ if TYPE_CHECKING:  # 只为了标注：storage 反过来 import dida.sync.view�
 
 __all__ = [
     "INBOX_ID",
+    "LOCAL_TASK_PREFIX",
     "NO_DUE_TEXT",
     "AuthError",
     "BUILTIN_VIEW_DAYS",
@@ -176,6 +186,7 @@ __all__ = [
     "ProjectWriter",
     "TaskSnapshot",
     "TodayView",
+    "UnclaimedTaskError",
     "UnknownListError",
     "UnknownTaskError",
     "ViewDefinition",
@@ -196,6 +207,7 @@ __all__ = [
     "format_due",
     "fuzzy_match",
     "group_tasks",
+    "implied_due_for",
     "is_inbox_id",
     "list_index",
     "next_priority",
@@ -287,13 +299,19 @@ class Engine(Protocol):
     def create(
         self,
         title: str,
+        list_id: str,
         *,
         due: datetime | None = None,
         all_day: bool = False,
         priority: int | None = None,
         tags: Sequence[str] = (),
     ) -> str:
-        """写：新建一条任务到收集箱（``a``），返回本地那条的 id（t15）。"""
+        """写：新建一条任务到 ``list_id``（``n``），返回本地那条的 id（#39）。
+
+        ``list_id`` **必填**：在清单里建就传那个清单的 id，在视图里建传收集箱
+        （``INBOX_ID``——视图不是容器），视图隐含的日期由调用方从
+        ``tasks_in(视图).implied_due`` 读出来交给 ``due=``。
+        """
     def create_list(self, name: str, *, color: str | None = None) -> str:
         """写：新建一个清单（``n``），返回本地那一行的 id（#42）。"""
         ...

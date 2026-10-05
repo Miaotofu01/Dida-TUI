@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 from collections import deque
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta
 from typing import Any, Mapping, Sequence
 
@@ -33,7 +33,7 @@ from dida.sync.engine import (
     ViewRow,
 )
 from dida.sync.view import (
-    INBOX_NAME,
+    INBOX_ID,
     ListSnapshot,
     SubtaskItem,
     SyncState,
@@ -56,6 +56,23 @@ class ManualClock:
 
     def set(self, now: datetime) -> None:
         self._now = now
+
+
+@dataclass(frozen=True)
+class CreatedTask:
+    """假后端记下的一条新建：**它落在哪儿**也在这里（#39）。
+
+    落点（``list_id``）是这个记录存在的理由：``FakeBackend.create`` 原来把
+    ``list_name=收集箱`` 写死，于是「在 工作 里新建，落在 工作」这条断言会安静地绿成
+    「落在收集箱」。谁要断落点，读这一个字段。
+    """
+
+    id: str
+    title: str
+    list_id: str
+    due: datetime | None = None
+    all_day: bool = False
+    tags: tuple[str, ...] = ()
 
 
 class FakeTransport:
@@ -172,6 +189,7 @@ class InMemorySource:
         title: str,
         *,
         list_name: str = "收集箱",
+        list_id: str | None = None,
         due: datetime | None = None,
         all_day: bool = False,
         priority: int = 0,
@@ -194,12 +212,15 @@ class InMemorySource:
         ``raw`` 是**服务端原文里多出来的那些字段**（重复规则、提醒、子任务、我们不认识的
         字段）：替身把它们盖在按快照拼出来的那份原文上，详情页因此读得到它们（#33）。
         替身不自己编这些字段——编出来的东西会让「详情页读得到」这句话变成空话（#39 的教训）。
+
+        ``list_id`` 显式给的时候就用它（而 ``list_name`` 只是显示用的名字）：``create``
+        那条路必须能把任务放进**指定的那个**清单里，否则「落点对不对」根本测不出来。
         """
         self._seq += 1
         snapshot = TaskSnapshot(
             id=id if id is not None else f"t{self._seq}",
             title=title,
-            list_id=list_name,
+            list_id=list_id if list_id is not None else list_name,
             due=due,
             all_day=all_day,
             priority=priority,
@@ -326,6 +347,9 @@ class FakeBackend:
         self.created_tags: list[tuple[str, ...]] = []
         """每次新建写进去的标签，与 ``created`` 一一对应。"""
 
+        self.created_tasks: list[CreatedTask] = []
+        """每次新建的完整记录，**含落点**（#39）：要断「落在哪个清单里」就读这里。"""
+
         self.deleted: list[str] = []
         """``delete(task_id)`` 收到的任务 id，按调用顺序（t16 的删除）。"""
 
@@ -443,30 +467,51 @@ class FakeBackend:
     def create(
         self,
         title: str,
+        list_id: str = INBOX_ID,
         *,
         due: datetime | None = None,
         all_day: bool = False,
         priority: int | None = None,
         tags: Sequence[str] = (),
     ) -> str:
-        """写：记下这一笔，**并且真的把它摆进内存缓存**（t15 的新建）。
+        """写：记下这一笔（含落点），**并且真的把它摆进内存缓存**（t15 / #39 的新建）。
 
         与 ``complete`` / ``defer`` 那种「只记录」不一样：新建是凭空多出一条任务，而
-        「新建的任务立刻出现在对应分区里」正是工单 #15 的验收标准之一——只记录的话，
-        接缝一根本测不到这句话。落点与引擎同一口径：收集箱。
+        「新建的任务立刻出现在对应分区里」正是验收标准之一——只记录的话，接缝一根本测不到
+        这句话。
+
+        **落点由 ``list_id`` 给**（#39 的验收标准 8）：原来这里把 ``list_name=收集箱`` 写死，
+        于是「在 工作 里新建，落在 工作」会静默断言成收集箱——假替身说了假话，测试全绿。
+        默认收集箱只是给「落点不是这条测试的重点」的那些调用留的方便（与引擎那一侧
+        「在视图里建传 ``INBOX_ID``」是同一个值）。
+
+        ``priority or 0``：API 的「无」是 ``0``（快照那一侧的编码），而 ``None`` 是「调用方
+        没写这个字段」——两者在快照里是同一个意思。
         """
         self.created.append(title)
         self.created_due.append(due)
         self.created_all_day.append(all_day)
         self.created_priority.append(priority)
         self.created_tags.append(tuple(tags))
-        return self.source.add_task(
+        task_id = self.source.add_task(
             title,
-            list_name=INBOX_NAME,
+            list_id=list_id,
             due=due,
             all_day=all_day,
             priority=priority or 0,
+            tags=tuple(tags),
         ).id
+        self.created_tasks.append(
+            CreatedTask(
+                id=task_id,
+                title=title,
+                list_id=list_id,
+                due=due,
+                all_day=all_day,
+                tags=tuple(tags),
+            )
+        )
+        return task_id
 
     def delete(self, task_id: str) -> None:
         """写：只记录（t16 的 ``d``；替身不动缓存，与 ``complete`` / ``defer`` 一样）。

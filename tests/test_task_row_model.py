@@ -460,6 +460,39 @@ def test_the_read_model_says_whether_the_container_is_a_list_or_a_view():
     assert engine.tasks_in("已经不在的清单").shows_list_name is False
 
 
+def test_the_read_model_says_which_date_a_view_implies_for_a_new_task():
+    """在哪个视图里新建会带上哪一天，也由读模型回答（工单 #39 / 用户故事 35）。
+
+    「今天」隐含当前**逻辑日**那一个日期（03-14 中午、日界 24:00 ⇒ 逻辑日 03-14），写法是
+    全天任务的日期标记（当天 00:00）。另外三个容器都不隐含：
+
+    - 「最近七天」是**一段**窗口（七天），挑其中一天是替用户做决定；
+    - 「所有」连截止时间都不看；
+    - 真实清单根本不是日期视图（它那一屏里什么日期的都有）。
+
+    期望值是测试直接给出的 ``at(14)``，不是照 ``logical_day`` 再算一遍。
+    """
+    source = work_source()
+    engine = engine_with(source)
+
+    assert engine.tasks_in("today").implied_due == at(14), "「今天」隐含的是那个逻辑日"
+    assert engine.tasks_in("next7").implied_due is None, "七天是一段窗口，藏不进一个日期"
+    assert engine.tasks_in("all").implied_due is None
+    assert engine.tasks_in("work").implied_due is None, "清单不隐含日期"
+
+
+def test_the_implied_date_follows_the_logical_day_not_the_natural_one():
+    """日界 04:00 时，凌晨两点的「今天」是 03-14——隐含日期跟着逻辑日走（#39）。
+
+    读模型给的是那条新任务该带的日期，所以它必须与视图成员用的是同一个逻辑日：写成自然日
+    03-15 的话，在「今天」里新建的那条任务当场成了明天的，从这一屏上消失。
+    """
+    source = work_source()
+    engine = SyncEngine(clock=ManualClock(at(15, 2, 0)), day_end="04:00", source=source)
+
+    assert engine.tasks_in("today").implied_due == at(14), "凌晨两点仍是逻辑日 03-14"
+
+
 # ------------------------------------------------------------------ 窄终端：丢弃顺序
 
 

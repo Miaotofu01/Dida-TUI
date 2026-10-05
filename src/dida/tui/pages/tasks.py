@@ -34,17 +34,33 @@ from textual.message import Message
 from dida.sync.engine import CompletedItem, TaskItem, TaskList
 from dida.tui import messages, theme
 from dida.tui.keys import LAYER_TASKS, bindings_for
+from dida.tui.overlays import FormField
 from dida.tui.pages.base import EMPTY_STYLE, CursorPage, Row, empty_row, heading_row, rule_row
 
 __all__ = [
     "ANNOTATION_GAP",
     "COMPLETED_STYLE",
     "DONE_MARK",
+    "NEW_TASK_TITLE_FIELD",
     "TITLE_GAP",
     "TasksPage",
     "completed_line",
+    "new_task_form_fields",
     "task_line",
 ]
+
+NEW_TASK_TITLE_FIELD = "title"
+"""新建任务表单里「标题」那一格的名字（表单浮层按字段名把值交回来，#39）。"""
+
+
+def new_task_form_fields() -> tuple[FormField, ...]:
+    """新建任务的表单字段：**只有标题**（工单 #39 / 用户故事 44）。
+
+    这一步是随手记的路径，不问截止时间也不问优先级——两样都能建完再改（#44 / #45），
+    而多问一句就多一次「我先不建了」。所以它是一张单格表单，用的还是 #42 搭好的那个壳子
+    （:class:`~dida.tui.overlays.FormOverlay`，字段是参数）。
+    """
+    return (FormField(name=NEW_TASK_TITLE_FIELD, label="标题"),)
 
 DONE_MARK = theme.DONE_MARK
 """已完成那一行的前缀字符（它站在优先级标记那一列上）。"""
@@ -187,6 +203,9 @@ class TasksPage(CursorPage):
     class Back(Message):
         """用户按了 ``esc``：退回清单列表页（光标还原到进来的那一行）。"""
 
+    class NewTask(Message):
+        """用户按了 ``n``：新建一条任务（#39，浮层与写路径都在外层）。"""
+
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(id=id)
         self._heading = ""
@@ -278,6 +297,10 @@ class TasksPage(CursorPage):
         """``enter``：进光标下那条任务的详细页。"""
         if self.selected_id is not None:
             self.post_message(self.Entered(self.selected_id))
+
+    def action_new_task(self) -> None:
+        """``n``：新建一条任务（只填标题，浮层与写路径都在外层，这一页只转发）。"""
+        self.post_message(self.NewTask())
 
     def action_back(self) -> None:
         """``esc``：退回清单列表页。"""

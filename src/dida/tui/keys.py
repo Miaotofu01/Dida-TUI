@@ -119,6 +119,7 @@ BINDINGS: dict[str, tuple[Key, ...]] = {
         Key(("j", "down"), "cursor_down", "下一条"),
         Key(("k", "up"), "cursor_up", "上一条"),
         Key(("enter",), "enter", "任务详细页"),
+        Key(("n",), "new_task", "新建任务"),
         Key(("escape",), "back", "退回清单列表页"),
     ),
     LAYER_DETAIL: (

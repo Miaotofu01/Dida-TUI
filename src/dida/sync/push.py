@@ -19,7 +19,14 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import DidaError
-from dida.sync.writes import UnknownTaskError, WireCall, WriteKind
+from dida.sync.writes import (
+    UnclaimedTaskError,
+    UnknownTaskError,
+    WireCall,
+    WriteKind,
+    is_addressable,
+    is_addressable_task,
+)
 
 if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能在这里 import
     from dida.storage.store import PendingChange
@@ -137,6 +144,11 @@ class PushMixin:
         snapshot = target.task_payload(task_id)
         if snapshot is None or not snapshot.get("projectId"):
             raise UnknownTaskError(task_id)
+        if not is_addressable_task(task_id, kind):
+            # 新建还没被认领（#53）：本地这条的 id 服务端从没见过，排在它上面的改动会
+            # POST 到 /open/v1/task/local-…、404、退避重试、永远出不了队。这条路径会自愈
+            # （下一次全量刷新带回真 id 那一行），所以诚实的回答是「等这一步同步完」。
+            raise UnclaimedTaskError(task_id)
         target.enqueue(
             task_id=task_id,
             kind=kind,
@@ -174,15 +186,22 @@ class PushMixin:
         ——等待发生在调用方（t14 那种定时器或下一次写），引擎只负责算清楚什么时候能推。
 
         一条失败不影响后面那些：队列按发生顺序走完，失败的留在队列里等下一次。
+
+        **每一笔都重新取一次队列**（不是先取一份快照再遍历，#53）：新建推成功会把这一条任务
+        排在后面的改动挪到服务端给的 id 上（``Store.adopt_created``），同一轮里紧接着的那一笔
+        必须看见新的 id——拿开头读进来的快照，它仍然会带着 ``local-…`` 去推。形状与清单版的
+        :meth:`~dida.sync.lists.ListMixin._push_lists` 同一份（#42 两件都做了）。循环一定会停：
+        每一轮要么删掉一行、要么把它的 ``next_retry_at`` 推到将来。
         """
         target = self._write_target()
         writer = self._writer()
         pushed = 0
         async with self._push_lock:
-            for change in target.pending():
+            while True:
                 now = self._clock.now()
-                if not _is_due(change, now):
-                    continue
+                change = next((item for item in target.pending() if _is_due(item, now)), None)
+                if change is None:
+                    return pushed
                 try:
                     await self._send(writer, target, change)
                 except DidaError as exc:
@@ -197,7 +216,6 @@ class PushMixin:
                     continue
                 target.resolve(change.id)
                 pushed += 1
-        return pushed
 
     async def wait_for_pushes(self) -> None:
         """等 :meth:`write` 排下的那几轮推送跑完。
@@ -244,6 +262,12 @@ class PushMixin:
         再 import 存储层：判断用哪一个端点，与「改动存在哪里」无关。
         """
         wire = change.kind.wire  # 打哪一个端点由词表说（dida.sync.writes），不在这里再列一遍成员
+        if not is_addressable(change):
+            # 新建**自己**当然带着临时 id（它就是去换真 id 的那一笔，而它的 URL 里没有 id）；
+            # 这里挡的是排在它后面那些：本地这条的 id 服务端从没见过，改 / 完成 / 删都会打到
+            # 一个不存在的任务上（#53）。写入那一侧也挡了一道（``write``），这是第二道，防的是
+            # 别处再长出一条入队路径——两道都不许把这种改动**安静地**推到一个 404 上。
+            raise UnclaimedTaskError(change.task_id)
         if wire is WireCall.UPDATE_TASK:
             await writer.update_task(
                 change.list_id,

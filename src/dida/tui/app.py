@@ -40,6 +40,7 @@ from textual.widgets import Static
 from dida.sync.engine import (
     DidaError,
     Engine,
+    INBOX_ID,
     ListRow,
     SyncStatus,
     TaskDetail,
@@ -63,6 +64,7 @@ from dida.tui.pages.index import (
     list_form_fields,
     list_write_refusal,
 )
+from dida.tui.pages.tasks import NEW_TASK_TITLE_FIELD, new_task_form_fields
 
 if TYPE_CHECKING:  # 只为了标注周期泵那个句柄，运行时用不到
     from textual.timer import Timer
@@ -453,6 +455,52 @@ class DidaApp(App[None]):
     def on_detail_page_back(self, event: DetailPage.Back) -> None:
         """详细页上按了 ``esc``：回任务列表页。"""
         self.back_to_tasks()
+
+    # ---------------------------------------------------------------- 新建任务（#39）
+
+    def on_tasks_page_new_task(self, event: TasksPage.NewTask) -> None:
+        """``n``：开「只填标题」的表单（字段见 :func:`~dida.tui.pages.tasks.new_task_form_fields`）。"""
+        self.push_screen(
+            FormOverlay(title="新建任务", fields=new_task_form_fields()),
+            self._finish_new_task,
+        )
+
+    def _finish_new_task(self, values: dict[str, str] | None) -> None:
+        """表单关掉了：``None`` 是取消，否则按填的标题建一条（空标题不建，如实说一句）。
+
+        落点与隐含日期都**读读模型**（:meth:`~dida.sync.engine.Engine.tasks_in`）：
+
+        - 真实清单里建 → 落在当前打开的这个清单里（用户故事 45）；
+        - 视图里建 → 落在收集箱（``INBOX_ID``，视图不是容器），视图隐含的日期
+          （``TaskList.implied_due``，「今天」才有）跟着带上（用户故事 35）。
+
+        「这个容器是不是视图」只在一处判（``TaskList.shows_list_name``），这一层不自己认识
+        视图——两处各判一次就是两处会漂。
+        """
+        if values is None:
+            return
+        title = values.get(NEW_TASK_TITLE_FIELD, "").strip()
+        if not title:
+            self._write_status(messages.NO_TITLE_MESSAGE)
+            return
+        container = self._container_id
+        if container is None:
+            return
+        task_list = self.engine.tasks_in(container)
+        destination = INBOX_ID if task_list.shows_list_name else container
+        try:
+            self.engine.create(
+                title,
+                destination,
+                due=task_list.implied_due,
+                # 隐含日期写成**全天**任务的日期标记：「今天」的意思是「今天要做」，
+                # 不是某个时刻（那个逻辑日自己怎么算由引擎给，这一层不算日期）。
+                all_day=task_list.implied_due is not None,
+            )
+        except DidaError as exc:
+            self._write_status(messages.create_failed_message(exc))
+            return
+        self.refresh_view()
 
     # ---------------------------------------------------------------- 清单的建 / 改 / 删（#42）
 

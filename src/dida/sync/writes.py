@@ -43,7 +43,36 @@ from dida.sync.view import ViewSource
 if TYPE_CHECKING:  # 只为了标注：storage 反过来 import dida.sync.view，运行时不能在这里 import
     from dida.storage.store import PendingChange
 
-__all__ = ["LocalEffect", "UnknownTaskError", "WireCall", "WriteKind", "WriteTarget"]
+__all__ = [
+    "LOCAL_TASK_PREFIX",
+    "LocalEffect",
+    "UnclaimedTaskError",
+    "UnknownTaskError",
+    "WireCall",
+    "WriteKind",
+    "WriteTarget",
+    "is_addressable",
+    "is_addressable_task",
+    "is_local_task_id",
+]
+
+LOCAL_TASK_PREFIX = "local-"
+"""本地临时**任务** id 的前缀（t15 / #39）：新建的任务在服务端给出真 id 之前先用它占位。
+
+它同时是一个**状态**：id 还挂着这个前缀，就说明那条任务的新建**还没有被认领**
+（:meth:`~dida.storage.store.Store.adopt_created` 才是认领那一步）。服务端从没见过这个
+id，所以任何带着它的改动都推不出去——:meth:`~dida.sync.create.CreateMixin.create` 造 id
+与 :func:`is_addressable` 判「发不发得出去」读的是**同一个**常量，两处不会漂。
+"""
+
+
+def is_local_task_id(value: str) -> bool:
+    """这个 id 是不是本地临时占位的（服务端没见过它）。
+
+    与 :func:`dida.sync.lists.is_local_list_id` 同形同名：清单与任务各有一个本地占位前缀，
+    两个判断各留一处，所以别处不许再写 ``startswith("local-")``。
+    """
+    return value.startswith(LOCAL_TASK_PREFIX)
 
 
 class LocalEffect(Enum):
@@ -200,6 +229,47 @@ class WriteTarget(ViewSource, Protocol):
         ...
 
 
+def is_addressable(change: PendingChange) -> bool:
+    """这一笔任务改动现在**发得出去**吗（#53）。
+
+    与清单版的 :func:`dida.sync.lists.is_addressable` 是同一个判断、同一个名字，判据只差
+    一处，差的是**要确认哪一个 id**：
+
+    - 清单那条路的 URL 里是**清单** id（``POST /open/v1/project/{projectId}``），所以它看
+      ``change.list_id``；
+    - 任务这条路的 URL 里是**任务** id（``POST /open/v1/task/{taskId}``、
+      ``.../task/{taskId}/complete``、``DELETE .../task/{taskId}``），所以它看
+      ``change.task_id``。任务这一侧没有等价于「清单的 projectId」那样单独要确认的第二个
+      id：``projectId`` 只在更新请求**体**里，而它的缺席由 :class:`UnknownTaskError` 那条
+      底稿检查挡着（``write()`` 先要 ``task_payload`` 里有 ``projectId`` 才肯入队）。
+
+    不发的两类（与清单版同形）：
+
+    - 改 / 完成 / 删一个**本地临时 id** —— 服务端没有那个任务，打过去只会 404、然后永远
+      重试、永远出不了队；
+    - （新建不在此列：``POST /open/v1/task`` 的 URL 里没有 id，带着临时 id 的**正是它自己**
+      ——它就是去换真 id 的那一笔，照发。）
+
+    发不出去不等于丢掉：它留在队列里，等认领拿到真 id 之后自然变得可寻址。
+
+    **这一处也是「入队之前先问一句」的那个判断**：写入那一侧要的无非是「这条任务现在可寻址
+    吗」，而它手里还没有那笔改动——所以它走下面那个 :func:`is_addressable_task`，判据由这里
+    分派，全仓库仍然只有一个出处。
+    """
+    return is_addressable_task(change.task_id, change.kind)
+
+
+def is_addressable_task(task_id: str, kind: WriteKind = WriteKind.UPDATE) -> bool:
+    """``is_addressable`` 的判据本体：这个任务 id + 这种写，现在发得出去吗。
+
+    ``kind`` 默认按「已有任务的写」算（改 / 完成 / 删都是同一条判据）；只有新建例外，
+    因为它的 URL 里没有 id。写入那一侧在**入队之前**问的就是这个函数。
+    """
+    if kind.wire is WireCall.CREATE_TASK:
+        return True
+    return not is_local_task_id(task_id)
+
+
 class UnknownTaskError(DidaError):
     """这条写推不出去，所以拒绝它：本地没有一条能拼出请求的底稿（工单 #25）。
 
@@ -220,3 +290,30 @@ class UnknownTaskError(DidaError):
         )
         self.task_id = task_id
         """请求写入的那条任务 id，UI 可以直接显示出来。"""
+
+
+class UnclaimedTaskError(DidaError):
+    """这条任务的新建**还没被认领**，所以拒绝在它上面排队（#53）。
+
+    认领 = 服务端建好之后回了 id、``adopt_created`` 把本地那条从 ``local-…`` 挪到真 id 上。
+    在那之前，本地这一行的 id 服务端**从没见过**：排在它上面的改动会 POST 到
+    ``/open/v1/task/local-…``、404、退避重试、**永远出不了队**——状态栏那个数一直非零，
+    而用户的编辑永远到不了服务端，正是 :class:`UnknownTaskError` 挡的那类安静错误。
+
+    为什么不干脆接受它：这条路径**会自愈**（下一次全量刷新带回真 id 那一行、并剪掉临时那
+    一行），所以诚实的回答是「等这一步同步完」，不是安静地排一条永远失败的改动。
+    完整机制（把改动并进那条还没成真的新建、或认领延迟到下一次刷新）归 #54；这一层只做
+    最小的那一版：**拒绝，并且如实说出为什么**。
+
+    ``POST /open/v1/task`` 的响应表里 200 带 body、201 无 content **两条都写着**
+    （``openapi-dida365.md`` 的 Create Task 一节），所以「认领没发生」是一条真实会走到的路，
+    不是假设。
+    """
+
+    def __init__(self, task_id: str) -> None:
+        super().__init__(
+            f"这条任务还在等同步（本地 id 是 {task_id}，服务端还没给它 id）："
+            "这一步同步完再改它"
+        )
+        self.task_id = task_id
+        """还没被认领的那条任务 id，UI 可以直接显示出来。"""
