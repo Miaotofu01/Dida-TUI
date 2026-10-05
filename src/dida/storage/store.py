@@ -63,7 +63,9 @@ CREATE TABLE IF NOT EXISTS lists (
     color       TEXT,
     sort_order  INTEGER,
     group_id    TEXT,
-    is_inbox    INTEGER NOT NULL DEFAULT 0
+    is_inbox    INTEGER NOT NULL DEFAULT 0,
+    kind        TEXT,
+    permission  TEXT
 );
 
 CREATE TABLE IF NOT EXISTS tasks (
@@ -95,7 +97,11 @@ CREATE TABLE IF NOT EXISTS sync_state (
 
 @dataclass(frozen=True)
 class ListRecord:
-    """缓存里一条清单的完整记录（spec 的清单 schema：名称、颜色、排序、项目组、是否收集箱）。"""
+    """缓存里一条清单的完整记录（spec 的清单 schema）。
+
+    ``kind`` / ``permission`` 是服务端 ``Project`` 上那两个字段（``TASK``/``NOTE``、
+    ``write``/``read``/``comment``）：清单索引页靠它们标出进不去的行（用户故事 23 / 24）。
+    """
 
     id: str
     name: str
@@ -103,6 +109,8 @@ class ListRecord:
     sort_order: int | None = None
     group_id: str | None = None
     is_inbox: bool = False
+    kind: str | None = None
+    permission: str | None = None
 
 
 @dataclass(frozen=True)
@@ -180,7 +188,20 @@ class Store:
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA foreign_keys = ON")
         self._db.executescript(_SCHEMA)
+        self._migrate()
         self._db.commit()
+
+    def _migrate(self) -> None:
+        """老库补列：``CREATE TABLE IF NOT EXISTS`` 不给已经存在的表加列。
+
+        没有迁移框架，也不需要有：补的都是可空列，``NULL`` 有明确的「不知道」语义，
+        所以 ``ALTER TABLE ... ADD COLUMN`` 一条就够，加过的不再加（用户手上那个 v1 时代的
+        库就是这样长出 ``kind`` / ``permission`` 的）。
+        """
+        columns = {row["name"] for row in self._db.execute("PRAGMA table_info(lists)")}
+        for name in ("kind", "permission"):
+            if name not in columns:
+                self._db.execute(f"ALTER TABLE lists ADD COLUMN {name} TEXT")
 
     def close(self) -> None:
         """关掉连接。"""
@@ -261,8 +282,23 @@ class Store:
         return None if row is None else json.loads(row["raw"])
 
     def lists(self) -> tuple[ListSnapshot, ...]:
-        """全部清单（``ViewSource``）。"""
-        return tuple(ListSnapshot(id=row["id"], name=row["name"]) for row in self._list_rows())
+        """全部清单（``ViewSource``）：清单索引页要的事实都在这里。
+
+        v1 只给了 id 与名字，颜色、项目组、``kind``、``permission`` 全被丢掉——清单索引页
+        因此标不出「装不了任务的」与「改不动的」那些行（用户故事 23 / 24）。
+        """
+        return tuple(
+            ListSnapshot(
+                id=row["id"],
+                name=row["name"],
+                color=row["color"],
+                group_id=row["group_id"],
+                kind=row["kind"],
+                permission=row["permission"],
+                is_inbox=bool(row["is_inbox"]),
+            )
+            for row in self._list_rows()
+        )
 
     def list_records(self) -> tuple[ListRecord, ...]:
         """全部清单的完整记录。"""
@@ -274,6 +310,8 @@ class Store:
                 sort_order=row["sort_order"],
                 group_id=row["group_id"],
                 is_inbox=bool(row["is_inbox"]),
+                kind=row["kind"],
+                permission=row["permission"],
             )
             for row in self._list_rows()
         )
@@ -502,20 +540,24 @@ class Store:
             "sort_order": payload.get("sortOrder"),
             "group_id": payload.get("groupId"),
             "is_inbox": 1 if payload.get("isInbox") or payload.get("id") == INBOX_ID else 0,
+            "kind": payload.get("kind"),
+            "permission": payload.get("permission"),
         }
         row = self._db.execute("SELECT * FROM lists WHERE id = ?", (values["id"],)).fetchone()
         if row is not None and all(row[key] == value for key, value in values.items()):
             return False
         self._db.execute(
             """
-            INSERT INTO lists (id, name, color, sort_order, group_id, is_inbox)
-            VALUES (:id, :name, :color, :sort_order, :group_id, :is_inbox)
+            INSERT INTO lists (id, name, color, sort_order, group_id, is_inbox, kind, permission)
+            VALUES (:id, :name, :color, :sort_order, :group_id, :is_inbox, :kind, :permission)
             ON CONFLICT(id) DO UPDATE SET
                 name = excluded.name,
                 color = excluded.color,
                 sort_order = excluded.sort_order,
                 group_id = excluded.group_id,
-                is_inbox = excluded.is_inbox
+                is_inbox = excluded.is_inbox,
+                kind = excluded.kind,
+                permission = excluded.permission
             """,
             values,
         )
@@ -538,7 +580,7 @@ class Store:
             INSERT INTO tasks (id, list_id, raw) VALUES (?, ?, ?)
             ON CONFLICT(id) DO UPDATE SET list_id = excluded.list_id, raw = excluded.raw
             """,
-            (task_id, str(payload.get("projectId") or INBOX_ID), raw),
+            (task_id, _list_id_of(payload), raw),
         )
         return True
 
@@ -546,6 +588,17 @@ class Store:
 def _dumps(payload: Mapping[str, Any]) -> str:
     """任务原文的规范序列化：键排序，保证同一份内容只有一个字符串形式。"""
     return json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _list_id_of(payload: Mapping[str, Any]) -> str:
+    """任务在哪个清单：**只有服务端说了才算**。
+
+    缺失的 ``projectId`` 读作空串（「不知道在哪个清单」），不再猜成字面量 ``inbox``（#33）：
+    收集箱的真实 id 是每账户不同的一串（实测 ``inbox1025205395``），猜出来的那个字面量跟它
+    一条都对不上——左栏徽标是 0、清单名也对不上，而且不报错。取数侧（``sync.refresh``）知道
+    这条任务是从哪个清单拉回来的，补也是由它补一个**服务端返回的** id。
+    """
+    return str(payload.get("projectId") or "")
 
 
 def _snapshot(payload: Mapping[str, Any]) -> TaskSnapshot:
@@ -559,7 +612,7 @@ def _snapshot(payload: Mapping[str, Any]) -> TaskSnapshot:
     return TaskSnapshot(
         id=str(payload["id"]),
         title=str(payload.get("title") or ""),
-        list_id=str(payload.get("projectId") or INBOX_ID),
+        list_id=_list_id_of(payload),
         due=_parse_time(due) if isinstance(due, str) else None,
         all_day=bool(payload.get("isAllDay")),
         priority=int(payload.get("priority") or 0),
