@@ -104,10 +104,15 @@ KEY_NAMES: dict[str, str] = {
     "question_mark": "?",
     "escape": "esc",
     "enter": "enter",
-    "down": "↓",
-    "up": "↑",
 }
-"""帮助里怎么写这些键名：Textual 的名字（``question_mark``）不是给人看的。"""
+"""帮助里怎么写这些键名：Textual 的名字（``question_mark``）不是给人看的。
+
+**这里只许放宽度不含糊的拼法。** 这张表的输出进的是 ``?`` 那块 ``width: auto`` 的浮层，宽度由
+rich 量出来的最宽那行决定；而 ``↓``（U+2193）与 ``↑``（U+2191）是东亚**歧义**宽度——rich 量 1
+格、CJK 字体下终端画 2 格，于是 ``j / ↓`` 那一行比它自称的宽一格，说明列右移一格（#48 实测）。
+方向键在 Textual 里的键名本来就是 ASCII 的 ``down`` / ``up``，所以它们**没有**条目：查不到就
+原样显示键名，那正好是两边都算 1 格的拼法。
+"""
 
 
 def key_text(key: str) -> str:
@@ -132,7 +137,7 @@ class HelpRow:
     """``?`` 那张表里的一行：左边是怎么按，右边是做什么。"""
 
     key: str
-    """帮助里的键位写法，如 ``j / ↓``。"""
+    """帮助里的键位写法，如 ``j / down``。"""
 
     label: str
 
@@ -143,7 +148,7 @@ class HelpRow:
 def help_rows(layer: str) -> tuple[HelpRow, ...]:
     """当前这一层的帮助行：全局 + 这一层，顺序与绑定表一致。
 
-    一个 :class:`Key` 里的多个键并成一行：``j / ↓``。这不是「手抄一份」——键名与说明都
+    一个 :class:`Key` 里的多个键并成一行：``j / down``。这不是「手抄一份」——键名与说明都
     是从表里读出来的，表改一行这里就跟着变。
     """
     return tuple(
@@ -170,12 +175,18 @@ def help_body(layer: str) -> str:
     抬头就是层名（用户故事 119：帮助里是**当前这一层**可用的键，而不是一张混杂了所有层的
     大表）。#48 接手时改的是这一段的排版与那道守卫，键与说明仍然只有 :data:`BINDINGS`
     这一个来源。
+
+    **每一行都得「说多宽就多宽」**：这块浮层是 ``width: auto``，宽度由 rich 量出来的最宽那行
+    决定，而终端按自己的宽度表画。所以抬头用 :data:`~dida.tui.theme.HEADING_RULE`（ASCII）
+    而不是 ``─``，:data:`KEY_NAMES` 里也只许放宽度不含糊的拼法；``tests/test_keymap.py``
+    的宽度守卫逐行对这两笔账。
     """
     rows = help_rows(layer)
-    # 按**格**补空格，不按字符数：``ljust`` 遇到 2 格宽的字形（CJK、emoji、歧义宽度的符号）
-    # 会把右边那一列推歪。今天键名里每个字形恰好都是 1 格，所以输出没变——这道算法是给
-    # 以后加进来的字形留的（#48 接手这张表时用它）。
+    # 按**格**补空格，不按字符数：``ljust`` 遇到 2 格宽的字形（CJK、歧义宽度的符号）会把右边
+    # 那一列推歪。今天键名里每个字形两边都算 1 格，所以输出与 ``ljust`` 一样——这道算法是给
+    # 以后加进来的 CJK 字形留的（那时的前提是宽度守卫仍然绿）。
     width = max(cell_len(row.key) for row in rows) + 2
-    lines = [f"── {LAYER_TITLES[layer]} ──", ""]
+    rule = theme.HEADING_RULE
+    lines = [f"{rule * 2} {LAYER_TITLES[layer]} {rule * 2}", ""]
     lines += [f"{theme.pad(row.key, width)}{row.label}" for row in rows]
     return "\n".join(lines)

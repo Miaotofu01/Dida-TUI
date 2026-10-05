@@ -55,6 +55,7 @@ __all__ = [
     "DONE_MARK",
     "ELLIPSIS",
     "HEADING",
+    "HEADING_RULE",
     "INBOX_MARK",
     "LIST_MARK",
     "MUTED",
@@ -206,6 +207,16 @@ Unicode 里根本没有宽度不含糊的制表符（原型 README 的结论）�
 上下相连，看起来是一条连续的线。
 """
 
+HEADING_RULE = "-"
+"""行内抬头两侧那一段横线（U+002D，ASCII）。
+
+**为什么不是 ``─``**：与 :data:`RULE` 同一条理由——U+2500 是东亚**歧义**宽度，rich 量它 1 格，
+CJK 字体下终端画 2 格。抬头是**行内**的、不是列，所以这一格差在列里看不出来；它坏的是另一件事：
+``─`` 出现两次时这一行比 rich 的量法宽 4 格，而 ``?`` 那块浮层是 ``width: auto``——宽度正是由
+rich 量出来的最宽那行决定的，于是多出来的格把右边框挤掉（#48 实测）。ASCII 的 ``-`` 在任何
+locale 里都是 1 格，所以抬头的宽度账两边一致。
+"""
+
 ELLIPSIS = "…"
 """裁断记号（U+2026，EAW=Ambiguous）。
 
@@ -235,12 +246,16 @@ STRUCTURAL_GLYPHS: Final = (
     SUBTASK_TODO_MARK,
     BLOCKED_GLYPH,
     RULE,
+    HEADING_RULE,
     *SPINNER_FRAMES,
 )
-"""会进入**列结构**的每一个字形：守卫照着它逐个查宽度。
+"""会进入**列结构或宽度算式**的每一个字形：守卫照着它逐个查宽度。
 
 两个方向都会错，所以两个方向都要查（``tests/test_theme.py``）：``☰`` 是 rich 量 2 格而
 Unicode 说中性；``▣ ★ · ─ ╭╮╰╯ ↑↓`` 是 rich 量 1 格而 Unicode 说是**歧义**宽度。
+
+「宽度算式」这一半是 #48 加的：抬头不在列里，但 ``width: auto`` 的浮层宽度**就是**由最宽那行
+算出来的，所以行内抬头里的字形与列里的字形一样承重。
 """
 
 DECORATION_GLYPHS: Final = (ELLIPSIS, WORDMARK_ICON)
