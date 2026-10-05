@@ -203,6 +203,8 @@ class DidaApp(App[None]):
         for name, page in pages.items():
             page.display = name == layer
         pages[layer].focus()
+        # 切回来时光标不止要「还在那一行」，还要看得见（#34 的验收标准 8）。
+        pages[layer].scroll_cursor_into_view()
 
     def open_container(self, container_id: str) -> None:
         """进层二：某个清单或视图里的任务（``enter``）。"""

@@ -72,7 +72,8 @@ class CursorPage(VerticalScroll):
         """光标那一行的 id；没有可停的行时是 ``None``。"""
 
     def compose(self) -> ComposeResult:
-        yield Static(Text(self.EMPTY_TEXT, style=EMPTY_STYLE), classes="page-body")
+        # 一页只有这一块正文；重画就是换它。给它一个 id，好让后来加的控件不与它混淆。
+        yield Static(Text(self.EMPTY_TEXT, style=EMPTY_STYLE), id="page-body")
 
     # ---------------------------------------------------------------- 数据
 
@@ -100,6 +101,7 @@ class CursorPage(VerticalScroll):
             self._cursor = 0
         self._selected_id = selectable[self._cursor] if selectable else None
         self._redraw()
+        self.scroll_cursor_into_view()
 
     # ---------------------------------------------------------------- 光标
 
@@ -118,14 +120,14 @@ class CursorPage(VerticalScroll):
         self._cursor = min(max(self._cursor + step, 0), len(selectable) - 1)
         self._selected_id = selectable[self._cursor]
         self._redraw()
-        self._scroll_cursor_into_view()
+        self.scroll_cursor_into_view()
 
     # ---------------------------------------------------------------- 画
 
     def _redraw(self) -> None:
         """按当前光标重画这一块文本。"""
         if not self._rows:
-            self.query_one(Static).update(Text(self.EMPTY_TEXT, style=EMPTY_STYLE))
+            self.query_one("#page-body", Static).update(Text(self.EMPTY_TEXT, style=EMPTY_STYLE))
             return
         body = Text()
         for index, row in enumerate(self._rows):
@@ -138,7 +140,7 @@ class CursorPage(VerticalScroll):
             if selected:
                 line.stylize("reverse")
             body.append_text(line)
-        self.query_one(Static).update(body)
+        self.query_one("#page-body", Static).update(body)
 
     def _line_of_cursor(self) -> int:
         """光标那一行画在这一块文本的第几行上。"""
@@ -147,9 +149,14 @@ class CursorPage(VerticalScroll):
                 return index
         return 0
 
-    def _scroll_cursor_into_view(self) -> None:
-        """让光标行留在可见区里（清单比一屏长时这一步就是「能滚动」）。"""
-        if not self._rows:
+    def scroll_cursor_into_view(self) -> None:
+        """让光标行留在可见区里（清单比一屏长时这一步就是「能滚动」）。
+
+        不在屏上的那一页与还没量过尺寸的那一帧都跳过：那时 ``size`` 是 0，按它算出来的
+        偏移毫无意义，还会在切回来的时候留下一屏错位。``esc`` 回来时由外层再叫一次
+        （:meth:`dida.tui.app.DidaApp._show`）——光标不只是「还在那一行」，还得看得见。
+        """
+        if not self._rows or not self.display or self.size.height <= 0:
             return
         line = self._line_of_cursor()
         top = self.scroll_offset.y

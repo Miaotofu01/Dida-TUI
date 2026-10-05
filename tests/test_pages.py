@@ -335,3 +335,30 @@ async def test_an_empty_cache_still_shows_the_inbox_and_the_builtin_views():
 
     assert INBOX_MARK in text and "收集箱" in text, "收集箱那一行是客户端补的，空缓存里也要有"
     assert "今天" in text and "最近七天" in text and "所有" in text
+
+
+async def test_the_restored_cursor_is_actually_visible_again():
+    """``esc`` 回来时，还原的那一行还得**看得见**——不只是「选中了」。
+
+    清单长到超过一屏时这两件事会分家：光标记着，屏幕却停在顶上，用户面对一屏找不到自己在
+    哪一行。这条与上一条各钉一半。
+    """
+    fake = backend()
+    for index in range(30):
+        fake.add_list(f"清单{index:02d}", id=f"list{index:02d}")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=(100, 12)) as pilot:
+        await pilot.pause()
+        for _ in range(50):
+            await pilot.press("j")  # 一路按到「清单29」（最后一行）
+        await pilot.pause()
+        assert "清单29" in screen_text(app)
+
+        await pilot.press("enter")  # 进这个空清单
+        await pilot.pause()
+        await pilot.press("escape")  # 回来
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert "清单29" in text, "回来时光标那一行要滚回可见区里"
