@@ -5,7 +5,8 @@
 
 - 清单行：``❯ 清单名  未完成条数``。
 - 分区标题：``── 逾期 · 3 项``；逾期区标红，且排在最前（顺序由引擎给）。
-- 任务行：``❯ ! 标题  清单名  今天 18:00``，光标行反色。
+- 任务行：``❯ ! 标题  清单名  今天 18:00``，光标行反色；逾期区的行整行标红
+  （与分区标题标红是同一件事的两半，见 :data:`OVERDUE_ROW_STYLE`）。
 - 刚完成的那一行再叠一层高亮（:data:`FLASH_STYLE`）：完成不可逆，这一下必须看得见。
 - 已完成区（底部，默认收起）：标题 ``▸ 已完成 N 项``，``c`` 展开/收起；展开后每行
   ``标题  清单名  完成时间``，整行暗灰 + 删除线。已完成行不参与光标移动。
@@ -54,6 +55,15 @@ GROUP_HEADER_STYLE = "bold"
 GROUP_HEADER_OVERDUE_STYLE = "bold red"
 """逾期区标题标红——逾期置顶之外的另一半。"""
 
+OVERDUE_ROW_STYLE = "red"
+"""逾期**行**标红（故事 14「逾期任务置顶并标红」）：标题之外，行本身也要认得出来。
+
+「这一行算逾期」是引擎的判断（``TaskGroup.kind`` 是 ``OVERDUE``）：栏位只是把引擎给的那
+一个事实画成红色，自己不碰日期、不比重。整行铺一层底红，标题与截止时间因此都红；清单名
+那一层 ``dim`` 叠在红上（读作暗红，仍是背景信息），优先级标记仍是它自己的颜色，完成后
+的 :data:`FLASH_STYLE` 照旧盖在红上（绿比红后加）。终端 16 色里的 ``red``，不写死 hex。
+"""
+
 FLASH_STYLE = "bold green"
 """刚完成的那一行的高亮（几秒后由 ``TaskPane.flash(None)`` 收起）。
 
@@ -73,13 +83,17 @@ def group_header(group: TaskGroup) -> Text:
     return Text(f"── {group.title} · {group.count} 项", style=style)
 
 
-def task_line(item: TaskItem, *, selected: bool, flash: bool = False) -> Text:
+def task_line(item: TaskItem, *, selected: bool, flash: bool = False, overdue: bool = False) -> Text:
     """任务行：优先级标记 + 标题 + 清单名 + 人类可读的截止时间。
 
     ``flash`` 是「刚完成」的那一层额外高亮（见 :data:`FLASH_STYLE`），与 ``selected``
     独立：完成的那一行通常正是光标行，两层要能叠。
+
+    ``overdue`` 是「这一行在逾期区」这一个事实（见 :data:`OVERDUE_ROW_STYLE`）。它是
+    **栏位从分区的 ``kind`` 读出来传进来的**，不是这一层自己判的——逾期判定归引擎。
+    文字一个字都不变，只是多一层底色：标红是样式，不是往行里塞字符。
     """
-    text = Text()
+    text = Text(style=OVERDUE_ROW_STYLE if overdue else "")
     text.append(f"{CURSOR_MARK if selected else BLANK_MARK} ")
     text.append(item.priority_mark, style=PRIORITY_STYLES.get(item.priority_mark, ""))
     text.append(f" {item.title}  ")
@@ -116,14 +130,18 @@ def pane_body(lines: Sequence[Text], *, empty: str) -> Text:
 
 
 def detail_body(item: TaskItem | None) -> Text:
-    """详情栏的内容：标题 + 清单 / 优先级 / 截止（工单 #18）。
+    """详情栏的内容：标题 + 清单 / 优先级 / 截止 + 描述 / 标签 / 备注（工单 #18、#20）。
 
-    四样字段全部取视图模型里的**成品**：``list_name``、``priority_mark``、``due_text``
-    都是引擎算好的读法（人类可读的截止时间、优先级的标记符号），这里一个都不重算——
-    分组、排序、逾期判定、截止读法都在 :mod:`dida.sync.engine` 那边（TUI 不做业务判断）。
+    七样字段全部取视图模型里的**成品**：``list_name``、``priority_mark``、``due_text``、
+    ``tags_text`` 都是引擎算好的读法（人类可读的截止时间、优先级的标记符号、标签的
+    ``#`` 写法），这里一个都不重算——分组、排序、逾期判定、截止读法都在
+    :mod:`dida.sync.engine` 那边（TUI 不做业务判断）。
 
     优先级只画那个标记符号、不翻译成「高/中/低」：中栏那一列画的就是这个符号，两处
     必须长得一样，而「哪个符号算高」是引擎的事实，不该在这里再写一份。
+
+    描述 / 标签 / 备注是**空的那一行不画**（工单 #20 的右栏要的是常驻显示，不是三个空
+    标签）：判断的依据就是视图模型给的空串，不是这一层去问「有没有」。
     """
     if item is None:
         return Text(DETAIL_EMPTY_TEXT, style=EMPTY_STYLE)
@@ -137,6 +155,11 @@ def detail_body(item: TaskItem | None) -> Text:
     body.append("\n")
     body.append("截止  ", style=EMPTY_STYLE)
     body.append(item.due_text, style=EMPTY_STYLE if item.due is None else "")
+    for label, value in (("描述", item.desc), ("标签", item.tags_text), ("备注", item.content)):
+        if not value:
+            continue
+        body.append(f"\n{label}  ", style=EMPTY_STYLE)
+        body.append(value)
     return body
 
 
@@ -375,6 +398,8 @@ class TaskPane(Pane):
                         item,
                         selected=len(line_of_row) == self._cursor,
                         flash=item.task_id == self._flashed,
+                        # 行红不红跟着它所在的分区走（引擎的判断），栏位不自己比日期
+                        overdue=group.kind is GroupKind.OVERDUE,
                     )
                 )
                 line_of_row.append(len(lines) - 1)
@@ -1030,7 +1055,7 @@ KEY_HELP: tuple[tuple[str, str], ...] = (
     ("j / k", "上下移动光标"),
     ("Enter", "开合右栏详情（窄屏：浮层）"),
     ("q", "退出"),
-    ("x", "完成这条"),
+    ("x / Space", "完成这条"),
     ("g", "顺延一天"),
     ("G", "顺延一周"),
     ("e", "改期"),
@@ -1044,6 +1069,13 @@ KEY_HELP: tuple[tuple[str, str], ...] = (
     ("l", "清单浮层"),
     ("?", "这份帮助"),
     ("Esc", "关闭浮层"),
+    # 评审修 A3：下面几行是「已经能按、帮助里却找不到」的键。``↑``/``↓`` 与 ``j``/``k``
+    # 是同一件事的两种写法，``Tab`` 是左栏与中栏之间的焦点环（spec 用户故事 #19），
+    # ``s``/``t`` 是子任务那两步（t20）。
+    ("↑ / ↓", "上下移动光标（同 j / k）"),
+    ("Tab", "切换左栏 / 中栏的焦点"),
+    ("s", "子任务（焦点移进右栏）"),
+    ("t", "勾选子任务"),
 )
 """键位表：一个键一行，第二列是它干什么（工单 #18，验收标准 #6）。
 
@@ -1051,6 +1083,11 @@ KEY_HELP: tuple[tuple[str, str], ...] = (
 头几个，而且它只显示 :class:`~dida.tui.app.DidaApp` 自己绑的键——``c`` 是任务列绑的
 （:class:`~dida.tui.panes.TaskPane`），footer 根本不提它；``j``/``k`` 是栏位绑的，
 footer 也不提。漏一行的后果不是「少个说明」，是那个功能没人找得到。
+
+这条规矩现在有测试守着：``tests/test_key_help.py`` 拿 ``DidaApp`` / ``TaskPane`` /
+``SubtaskPane`` 的绑定逐键对这张表，少一行就点名那个键。同一个动作绑两个键（``x`` /
+``Space``）写成一格，用 `` / `` 分隔——与 ``j`` / ``k`` 同一写法，测试就是按这个分隔符
+把一格拆成两个键的（所以裸的 ``/`` 那个键不会被拆坏）。
 """
 
 

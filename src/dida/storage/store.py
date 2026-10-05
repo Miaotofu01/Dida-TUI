@@ -562,6 +562,9 @@ def _snapshot(payload: Mapping[str, Any]) -> TaskSnapshot:
         priority=int(payload.get("priority") or 0),
         completed=payload.get("status") == COMPLETED_STATUS,
         completed_at=_parse_time(completed_at) if isinstance(completed_at, str) else None,
+        desc=_text(payload.get("desc")),
+        content=_text(payload.get("content")),
+        tags=_tag_names(payload.get("tags")),
     )
 
 
@@ -593,3 +596,24 @@ def _parse_time(value: str) -> datetime | None:
         return datetime.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _text(value: Any) -> str:
+    """服务端的一段文字（``desc`` / ``content``）→ 快照上的字符串。
+
+    不是字符串就当没有（与 :func:`_parse_time` 同一条口径）：一条脏字段不该把整次刷新带崩，
+    右栏少一行远好过一屏都读不出来。
+    """
+    return value if isinstance(value, str) else ""
+
+
+def _tag_names(value: Any) -> tuple[str, ...]:
+    """任务上的 ``tags`` → 标签名。
+
+    服务端给的是一串名字（``probe-update-semantics.py`` 实测写进去的是 ``["probe-tag"]``）。
+    不是数组、或者数组里混了不是字符串的东西，就跳过那一个：标签是展示用的，不值得为它
+    丢掉一整次刷新。顺序照服务端给的来——排序是服务端的事。
+    """
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(item for item in value if isinstance(item, str) and item)
