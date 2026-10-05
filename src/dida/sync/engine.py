@@ -5,7 +5,8 @@ TUI 读写一切只能走本模块；分组、排序、逾期判定、冲突裁�
 
 - ``status() -> SyncStatus`` —— 读：状态栏所需的全部信息。
 - ``view() -> TodayView`` —— 读：分组视图模型（类型见 :mod:`dida.sync.view`）。
-- ``refresh() -> RefreshReport`` —— 写：全量刷新，**async**（:mod:`dida.sync.refresh`）。
+- ``refresh() -> RefreshReport`` —— 写：全量刷新，**async**（:mod:`dida.sync.refresh`；清单索引
+  翻页翻到底、远端已经没有的清单与任务顺手剪掉，#41）。
 - ``write(task_id, changes=, kind=)`` —— 写：乐观写，本地当场生效、立即推送（:mod:`dida.sync.push`）。
 - ``complete(task_id)`` / ``delete(task_id)`` —— 写：完成与删除的两个预置（:mod:`dida.sync.push`）。
 - ``refresh_completed() -> CompletedReport`` —— 写：已完成流，**async**（:mod:`dida.sync.completed`）。

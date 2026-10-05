@@ -1,8 +1,9 @@
-"""全量刷新（t09，ADR-0001）：逐清单取回未完成 → 与本地快照 diff → 只写变化。
+"""全量刷新（t09 / #41，ADR-0001）：逐清单取回未完成 → 与本地快照 diff → 只写变化。
 
 这一片只管一件事：**一次全量刷新怎么取数、怎么落库**。为什么是逐清单全量而不是日期窗口、
-为什么全部取回之后才落库（中途失败不留半份刷新）、为什么收集箱要单独拉——都是这一个变化
-原因。增量发生在本地（``apply_refresh`` 只写变化），不在这里。
+为什么全部取回之后才落库（中途失败不留半份刷新）、为什么收集箱要单独拉、清单索引为什么要
+翻页、剪枝为什么跟着落库走而不是边翻边剪——都是这一个变化原因。增量发生在本地
+（``apply_refresh`` 只写变化），不在这里。
 
 :class:`RefreshMixin` 的方法挂在组装好的 :class:`~dida.sync.engine.SyncEngine` 上。
 """
@@ -18,6 +19,15 @@ from dida.sync.view import INBOX_ID, ViewSource
 
 if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能在这里 import
     from dida.storage.store import RefreshReport, StoredSyncState
+
+
+PROJECT_PAGE_SIZE = 200
+"""清单索引一页要多少条（#41）。
+
+200 是文档写着的默认值：给了任一分页参数时，``limit`` 的缺省就是 200。文档**没有**写
+上限，所以这里不试探更大的页——要一个文档没写过的数，可能被服务端静默截断，而截断在这里
+恰恰是不可见的（响应里没有 total）。按文档的默认值要，服务端一定会照办。
+"""
 
 
 class ProjectReader(Protocol):
@@ -90,17 +100,20 @@ class RefreshMixin:
 
 
     async def refresh(self) -> RefreshReport:
-        """全量刷新（ADR 0001）：逐清单取回未完成 → 与本地快照 diff → 只写变化。
+        """全量刷新（ADR 0001）：逐清单取回未完成 → 与本地快照 diff → 只写变化 + 剪枝。
 
-        返回 :class:`~dida.storage.store.RefreshReport`：这次到底写了什么、服务端盖掉了
-        哪些本地值、哪些被待推送改动挡回去了（ADR-0002 要求覆盖能被看见）。
+        返回 :class:`~dida.storage.store.RefreshReport`：这次到底写了什么、**删了什么**
+        （远端已经没有的清单与任务，#41）、服务端盖掉了哪些本地值、哪些被待推送改动挡回去了
+        （ADR-0002 要求覆盖能被看见）。
 
         **网络层没有「增量」**：日期窗口会静默漏掉「日期在很久以后、但刚被改过」的任务，
-        所以未完成任务的唯一来源是逐清单全量。增量发生在本地：同一份数据拉第二次时，
-        ``written_lists`` 与 ``written_tasks`` 都是 0，界面因此不闪、光标因此不丢。
+        所以未完成任务的唯一来源是逐清单全量。增量发生在本地（只写变化、顺手剪枝）：同一份
+        数据拉第二次时，``written_*`` 与 ``pruned_*`` 全是 0，界面因此不闪、光标因此不丢。
 
-        取数顺序：先清单索引（服务端的），再逐个清单的 data。**全部取回之后才落库**，
-        所以中途任何一次失败都不会留下半份刷新：要么整份落地，要么本地库一动不动。
+        取数顺序：先清单索引（**翻页翻到底**，响应没有 total，靠「这一页拿满了没有」推断
+        还有没有下一页），再逐个清单的 data。**全部取回之后才落库**，所以中途任何一次失败
+        都不会留下半份刷新：要么整份落地，要么本地库一动不动——剪枝也跟着留在这最后一步，
+        绝不会出现「索引只翻到一半，于是把第 201 个清单起当成远端已删」这种事。
         失败照旧是 :class:`~dida.api.errors.DidaError` 的结构化错误，不吞。
         """
         target = self._refresh_target()
@@ -162,15 +175,6 @@ class RefreshMixin:
         return self._client
 
 
-PROJECT_PAGE_SIZE = 200
-"""清单索引一页要多少条（#41）。
-
-200 是文档写着的默认值：给了任一分页参数时，``limit`` 的缺省就是 200。文档**没有**写
-上限，所以这里不试探更大的页——要一个文档没写过的数，可能被服务端静默截断，而截断在这里
-恰恰是不可见的（响应里没有 total）。按文档的默认值要，服务端一定会照办。
-"""
-
-
 async def _project_index(reader: ProjectReader) -> list[Mapping[str, Any]]:
     """``GET /open/v1/project``：清单索引，**翻页翻到底**（#41）。
 
@@ -183,11 +187,19 @@ async def _project_index(reader: ProjectReader) -> list[Mapping[str, Any]]:
     落库（ADR-0001 的全有全无），因此一次没翻完的索引也不会被当成完整的索引去剪枝。
     """
     pages: list[Mapping[str, Any]] = []
+    seen: set[str] = set()
     offset = 0
     while True:
         page = _project_index_page(
             await reader.list_projects(offset=offset, limit=PROJECT_PAGE_SIZE)
         )
+        ids = {str(item["id"]) for item in page}
+        if ids & seen:
+            # 服务端没有往前走（代理不认查询串时就是这个样子）：再问下去是死循环——挂死、
+            # 内存一路上涨，屏幕上一句解释都没有。清单 id 在索引里不会重复，所以「又见一遍」
+            # 是硬证据，不是猜测。
+            raise MalformedResponseError(f"清单索引翻页没有前进：{min(ids & seen)} 又给了一遍")
+        seen |= ids
         pages.extend(page)
         if len(page) < PROJECT_PAGE_SIZE:
             return pages
