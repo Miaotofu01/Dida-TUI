@@ -13,6 +13,7 @@
 from __future__ import annotations
 
 import json
+import re
 from datetime import datetime, timedelta, timezone
 
 import httpx
@@ -385,3 +386,47 @@ async def test_escape_closes_the_picker_without_writing_anything():
     assert fake.moved == [] and fake.writes == [], "取消不该写任何东西"
     assert "搬到哪个清单" not in text, f"浮层没有关掉：\n{text}"
     assert field_row(text, "清单").startswith(theme.CURSOR_MARK), f"没有回到字段列表：\n{text}"
+
+
+def picked_option(text: str) -> str:
+    """挑选器上现在写着哪一档（``< 中 >``）——选择框一行只画当前那一档。"""
+    match = re.search(r"< (.+?) >", text)
+    if match is None:
+        raise AssertionError(f"屏幕上没有挑选项：\n{text}")
+    return match.group(1)
+
+
+async def test_the_priority_field_offers_the_four_levels_and_writes_the_wire_code():
+    """优先级能在**无 / 低 / 中 / 高**之间改（验收标准 4）：屏幕上是四档用户语言，
+    写出去的是线上编码。
+
+    四档的名字是 spec 用户故事 73 那几个字（不是照抄实现里那张表）；``0/1/3/5`` 是线上编码，
+    **不进文案**——所以这里逐个走一遍，看到的只许是那四个汉字。
+    """
+    fake = backend()  # 优先级 5（高）
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "priority")
+        await pilot.press("enter")
+        await pilot.pause()
+        opened = picked_option(screen_text(app))
+        walked = []
+        for _ in range(3):
+            await pilot.press("left")
+            await pilot.pause()
+            walked.append(picked_option(screen_text(app)))
+        await pilot.press("right")  # 无 → 低（左右都能换档）
+        await pilot.pause()
+        back = picked_option(screen_text(app))
+        await pilot.press("enter")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert opened == "高", f"挑选器没有停在当前那一档上：{opened!r}"
+    assert walked == ["中", "低", "无"], f"四档不是按顺序排的：{walked}"
+    assert back == "低", "右方向键换不回去"
+    assert fake.writes == [("t1", {"priority": 1})], f"写出去的不是线上编码：{fake.writes}"
+    assert "低" in field_row(after, "优先级"), f"改完那一格没变：\n{after}"

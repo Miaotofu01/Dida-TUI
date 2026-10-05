@@ -40,6 +40,7 @@ __all__ = [
     "field_line",
     "fields_of",
     "list_picker",
+    "priority_picker",
     "picker_spec",
     "read_only_rows",
 ]
@@ -136,6 +137,7 @@ def fields_of(detail: TaskDetail) -> tuple[Field, ...]:
             "优先级",
             value=messages.priority_name(detail.priority),
             display=messages.priority_name(detail.priority),
+            picker=True,
         ),
         Field("tags", "标签", value=detail.tags_text, display=detail.tags_text or messages.EMPTY_FIELD_TEXT),
     )
@@ -185,6 +187,30 @@ def list_picker(detail: TaskDetail, lists: Sequence[ListRow]) -> tuple[FormField
     )
 
 
+def priority_picker(detail: TaskDetail) -> tuple[FormField, ...]:
+    """「优先级」那一格：无 / 低 / 中 / 高（工单 #45）。
+
+    选项的**值**是线上编码 ``0/1/3/5``、**标签**是 ``messages.PRIORITY_NAMES`` 那张表里的
+    名字——那一张表是用户语言的唯一一份（``priority_name`` 读的也是它），这里不再抄第二份，
+    ``0/1/3/5`` 也不进文案：那是服务端的编码，不是用户说的档位。
+
+    表外的取值（服务端理论上不该给的 ``2`` / ``4``）读作「无」——与 ``priority_name`` /
+    ``priority_mark`` 同一条口径。不这么归一的话，``ChoiceField`` 会把那个认不出来的值原样
+    加成一档，屏幕上就出现一个**裸数字**（那正是这一票不许有的东西）；而归一之后「挑无」
+    与屏幕上写着的那一档一致，所以打开不动直接 ``Enter`` 也不会凭空写一笔。
+    """
+    names = messages.PRIORITY_NAMES
+    current = detail.priority if detail.priority in names else 0
+    return (
+        FormField(
+            name=PRIORITY_FIELD,
+            label="优先级",
+            options=tuple(FormOption(str(code), name) for code, name in names.items()),
+            value=str(current),
+        ),
+    )
+
+
 def picker_spec(
     key: str,
     detail: TaskDetail,
@@ -199,6 +225,8 @@ def picker_spec(
     """
     if key == "list":
         return Picker("搬到哪个清单", list_picker(detail, lists))
+    if key == "priority":
+        return Picker("优先级", priority_picker(detail))
     return None
 
 

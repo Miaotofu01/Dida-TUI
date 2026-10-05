@@ -58,7 +58,7 @@ from dida.tui.keys import (
 )
 from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay
 from dida.tui.pages import DetailPage, IndexPage, TasksPage
-from dida.tui.pages.detail import LIST_FIELD, picker_spec
+from dida.tui.pages.detail import LIST_FIELD, PRIORITY_FIELD, picker_spec
 from dida.tui.pages.index import (
     LIST_COLOR_FIELD,
     LIST_NAME_FIELD,
@@ -584,6 +584,10 @@ class DidaApp(App[None]):
         """
         if field == LIST_FIELD:
             self.engine.move_task(task_id, to_list_id=values[LIST_FIELD])
+        elif field == PRIORITY_FIELD:
+            picked = values[PRIORITY_FIELD]
+            if picked.isdigit():
+                self.engine.write(task_id, changes={"priority": int(picked)})
 
     # ---------------------------------------------------------------- 清单的建 / 改 / 删（#42）
 
