@@ -197,6 +197,15 @@ class SyncStatus:
 class Engine(Protocol):
     """TUI 眼里的引擎：它只用得到这几个。t11/t13/t14 的实现必须仍然满足它。"""
 
+    def set_day_end(self, day_end: str) -> bool:
+        """配置：换掉「一天结束的时刻」（工单 #46），真变了才返回 ``True``。
+
+        界面上的「现在」永远是注入的钟给的，而**日界是配置给的、随时可能被用户改掉**。三处
+        消费者（「今天」视图 / 逾期判定 / 顺延）读的都是这一个字段，所以换这一处就够——它们
+        不可能各看一个日界。
+        """
+        ...
+
     def status(self) -> SyncStatus:
         """读：状态栏要的全部信息。"""
         ...
@@ -310,6 +319,20 @@ class SyncEngine(
         self._push_lock = asyncio.Lock()
         # 已在飞的推送轮次；wait_for_pushes() 等它们。
         self._inflight: set[asyncio.Task[int]] = set()
+
+    def set_day_end(self, day_end: str) -> bool:
+        """换掉「一天结束的时刻」（工单 #46）；真变了才返回 ``True``。
+
+        日界是**唯一**一处「现在」之外的配置性输入，而它随时可能被用户改（#46：改完立刻
+        生效，不用重启）。读路径每一处都读 :attr:`_day_end`，所以换在这里，下一次读就整体
+        按新的逻辑日重算。
+
+        返回值是给调用方省一次重画的：``False`` = 递进来的值与现在这个一样，什么都不用做。
+        """
+        if day_end == self._day_end:
+            return False
+        self._day_end = day_end
+        return True
 
     def status(self) -> SyncStatus:
         """读：状态栏要的全部信息。"""
