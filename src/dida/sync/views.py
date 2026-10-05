@@ -161,7 +161,12 @@ def evaluate_view(
         for snapshot in tasks
         if _matches(definition, snapshot, today=today, day_end=day_end)
     ]
-    return tuple(sorted(members, key=lambda item: order_key(item.snapshot, today=today, day_end=day_end)))
+    return tuple(
+        sorted(
+            members,
+            key=lambda item: order_key(item.snapshot, today=today, day_end=day_end),
+        )
+    )
 
 
 def order_key(snapshot: TaskSnapshot, *, today: date, day_end: str) -> tuple:

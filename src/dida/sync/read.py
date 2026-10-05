@@ -8,7 +8,8 @@ v1 的读入口只有一个 :meth:`~dida.sync.engine.SyncEngine.view`，返回�
 - :func:`list_index` —— **清单索引**：内置视图、自定义视图、真实清单三种行（:class:`ListKind`），
   每行带未完成条数；真实清单还带颜色、项目组、``kind``、``permission``。
 - :func:`container_tasks` —— **某个容器的任务列表**：这个清单的**全部**未完成任务（未来的也在），
-  外加这个容器里该显示的那部分已完成任务。
+  外加这个容器里该显示的那部分已完成任务；视图那个容器的成员与顺序由**视图求值**给
+  （:mod:`dida.sync.views`，#35），它不是一个容器。
 - :func:`task_detail` —— **单条任务的详情**：标题、描述、备注、清单、截止、优先级、标签，
   以及只读的重复规则、提醒、子任务与原文里我们不认识的字段。
 
@@ -511,7 +512,10 @@ def _view_members(
     day_end: str,
     views: Sequence[ViewRow],
 ) -> list[TaskSnapshot]:
-    """视图的成员：求值结果给的那些任务 id（求值里已经不在缓存里的 id 跳过）。"""
+    """视图的成员：求值结果给的那些任务 id，**按求值给的顺序**（已经不在缓存里的 id 跳过）。
+
+    顺序是承重的：视图的排序（逾期置顶）由求值决定，这里再排一遍就把它盖掉了。
+    """
     rows = builtin_view_rows(tasks, now=now, day_end=day_end) + tuple(views)
     row = next((item for item in rows if item.id == view_id), None)
     if row is None:

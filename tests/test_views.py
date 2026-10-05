@@ -386,9 +386,6 @@ def test_the_index_row_count_and_the_view_list_come_from_one_evaluation():
 
 WIDE = (100, 30)
 
-INBOX_SERVER_ID = "inbox1234567890"
-"""服务端为收集箱返回的那一串（实测形状：``inbox`` 加一截数字）。"""
-
 SGR = re.compile(r"\x1b\[([0-9;]*)m")
 
 
