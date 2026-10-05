@@ -546,6 +546,44 @@ class DidaApp(App[None]):
             return
         self.refresh_view()
 
+    # ---------------------------------------------------------------- 任务的删除与顺延（#40）
+
+    def on_tasks_page_delete(self, event: TasksPage.Delete) -> None:
+        """``d``：删光标那条任务——**先如实问一句**，``y`` 才真的删（验收标准 1、3）。
+
+        确认文案在 :func:`dida.tui.messages.delete_prompt`：整份官方文档里没有回收站、没有
+        undelete、也没有「已删除」列表（``api-shapes.md`` §A6），所以那一句话不许承诺任何恢复
+        ——这次确认就是全部的防线。删掉的那条任务本地当场摘掉、推送走 ``DELETE``。
+        """
+        detail = self.engine.task_detail(event.task_id)
+        if detail is None:
+            return
+        self.push_screen(
+            ConfirmOverlay(messages.delete_prompt(detail.title), title="删除任务"),
+            partial(self._finish_delete_task, event.task_id),
+        )
+
+    def _finish_delete_task(self, task_id: str, confirmed: bool | None) -> None:
+        """删除确认关掉了：只有 ``True`` 才真的删（``n`` / ``Esc`` 与 ``None`` 都不动）。"""
+        if not confirmed:
+            return
+        try:
+            self.engine.delete(task_id)
+        except DidaError as exc:
+            self._write_status(messages.delete_failed_message(exc))
+            return
+        self.refresh_view()
+
+    def on_tasks_page_defer(self, event: TasksPage.Defer) -> None:
+        """``g`` / ``G``：顺延 ``days`` 个逻辑日，**截止时间以外的字段一个都不动**（验收标准 4–7）。
+
+        落点由引擎按注入的日界算（``sync/schedule.py``），这一层不重算日期、也不经过任何日期
+        解析。没有截止时间的任务引擎不动它——顺延不凭空给一条任务长出一个日期来，所以这里
+        没有「当场失败」要报的那种情况（引擎那一支没有可抛的结构化错误）。
+        """
+        self.engine.defer(event.task_id, days=event.days)
+        self.refresh_view()
+
     # ---------------------------------------------------------------- 清单的建 / 改 / 删（#42）
 
     def on_index_page_new_list(self, event: IndexPage.NewList) -> None:

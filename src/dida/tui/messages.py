@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from dida.sync.engine import AuthError, DidaError, UnknownListError
+from dida.sync.engine import AuthError, DidaError, UnknownListError, UnknownTaskError
 
 UNKNOWN_TASK_MESSAGE = "没有改成：这条任务已经不在本地缓存里了，刷新之后再试一次"
 """引擎拒绝写入（本地没有这条任务的底稿，工单 #25）时的话：如实说没改成。"""
@@ -286,11 +286,28 @@ def no_browser_message(url: str) -> str:
 
 
 def delete_prompt(title: str) -> str:
-    """删除确认浮层上的那句话（工单 #16）。
+    """删除确认浮层上的那句话（工单 #16 / #40）。
 
     措辞是这一屏最要紧的一行字：**不许暗示还能找回来**。滴答清单 Open API 里没有
     undelete、没有回收站、没有「已删除」列表，所以这里只说删了就没有了，绝不说「可恢复」
     「稍后可找回」「已移入回收站」——那种话会让用户在按 ``y`` 的时候以为还有退路，
     而实际上没有。
+
+    最后一行那个分隔符是 **ASCII** 的 ``，`` 之外一个都不放：这块浮层是 ``width: auto``，
+    宽度由 rich 量出来的最宽那行决定，而 ``·``（U+00B7）是东亚**歧义**宽度——rich 量 1 格、
+    CJK 字体下终端画 2 格，多出来的那格会把右边框挤掉（#48 在帮助正文上立的是同一条规矩，
+    ``tests/test_task_delete_defer.py`` 在这句文案上守它）。
     """
-    return f"删除「{title}」？\n删掉就找不回来了，滴答清单没有回收站。\n\ny 确认删除 · n / Esc 取消"
+    return f"删除「{title}」？\n删掉就找不回来了，滴答清单没有回收站。\n\ny 确认删除，n / Esc 取消"
+
+
+def delete_failed_message(error: DidaError) -> str:
+    """删除当场失败时的话（工单 #40）。
+
+    与 :func:`list_write_failed_message` 同一条口径：引擎当场拒绝的（本地已经没有这条任务的
+    底稿）与别的失败分开说——前者刷新一下再看，后者是网络或权限。删除这一支尤其不能含糊：
+    这句话说的是「**没**删成」，而不是「删了」。
+    """
+    if isinstance(error, UnknownTaskError):
+        return UNKNOWN_DELETE_MESSAGE
+    return f"没有删：{error}"
