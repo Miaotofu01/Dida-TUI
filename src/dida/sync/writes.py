@@ -1,4 +1,4 @@
-"""写词汇：一次乐观写有哪几种（t32）。
+"""写词汇：一次乐观写有哪几种、每一种怎么落地（t32）。
 
 **这个模块是写类型的唯一定义处。** 引擎的 ``WriteKind`` 与存储的 ``ChangeKind`` 说的是同一
 套词汇，指的也是**同一个对象**（``dida.storage.store`` 里那个名字只是别名）：加一种写只需要
@@ -12,17 +12,27 @@
 模块，而不是把词表留在存储层：``dida.storage.store`` 在模块级 import ``dida.sync.view``，
 所以引擎**不能**在顶层 import 存储（那条延迟 import 的注释记着这件事）。
 
+**一种写的全部行为都记在同一个地方**：:data:`_BEHAVIOUR` 那张表，每个成员一行——本地快照
+怎么变（``local``）、推送调客户端的哪一个方法（``wire``）、要不要顺手写下 ``status``
+（``marks_completed``）、冲突裁决时整条任务豁不豁免（``whole_row``）。分派这些行为的地方
+（:meth:`dida.storage.store.Store.enqueue`、:meth:`~dida.storage.store.Store._exempt_fields`、
+:meth:`dida.sync.push.PushMixin._send` / ``_local_effect``）一律**读表**，不再逐个成员写 ``if``：
+以前新增一种写要在两处枚举、一个换算函数、三处分派里各改一次，现在只在这里加一行。
+
 写路径上共享的另外两样也在这里：本地副本要会的那几件事（:class:`WriteTarget`），以及
 「这条写没有底稿、推不出去」的那个错误（:class:`UnknownTaskError`）——三片写路径
 （:mod:`dida.sync.push` / :mod:`dida.sync.schedule` / :mod:`dida.sync.subtasks` …）都要它们，
 放在这里才不会让它们互相 import。
 
-加一种写类型，改动落在这里与它的推送分支（:meth:`dida.sync.push.PushMixin._send`）——
-词表本身不再有第二处要同步。
+加一种写类型：在 :class:`WriteKind` 里加一个成员、在 :data:`_BEHAVIOUR` 里加一行，就完了——
+两层枚举、换算、分派都读这一处。只有「这条写要打一个**新形状**的端点」（例如 v2 的
+``task/move`` 搬运、``task/batch`` 取消完成）才另外要在 :class:`WireCall` 里加一种调用形状：
+那是新的外部行为，不是要同步的词汇。
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from datetime import datetime
 from enum import Enum
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_checkable
@@ -33,7 +43,50 @@ from dida.sync.view import ViewSource
 if TYPE_CHECKING:  # 只为了标注：storage 反过来 import dida.sync.view，运行时不能在这里 import
     from dida.storage.store import PendingChange
 
-__all__ = ["UnknownTaskError", "WriteKind", "WriteTarget"]
+__all__ = ["LocalEffect", "UnknownTaskError", "WireCall", "WriteKind", "WriteTarget"]
+
+
+class LocalEffect(Enum):
+    """一次写在**本地快照**上的效果；存储层照着它改本地那一份。"""
+
+    MERGE = "merge"
+    """把 ``payload`` 的字段盖上去。本地没有这条任务时就是「凭空多出一条」——新建走这里。"""
+
+    REMOVE = "remove"
+    """本地摘掉这条任务（删除的本地效果不是「等推送成功再摘」）。"""
+
+
+class WireCall(Enum):
+    """推送时调客户端的哪一个方法；引擎照着它分派。
+
+    端点形状是 API 的事实，不是词汇的一部分，所以单独一个枚举——但**每一种写属于哪一种
+    形状**记在这一处的表里，不散在分派代码里。
+    """
+
+    CREATE_TASK = "create_task"
+    """``POST /open/v1/task``，请求体就是这份 payload。"""
+
+    UPDATE_TASK = "update_task"
+    """``POST /open/v1/task/{taskId}``，改动 + 本地那份完整底稿（未知字段靠它回写）。"""
+
+    COMPLETE_TASK = "complete_task"
+    """``POST .../task/{taskId}/complete``，没有请求体。"""
+
+    DELETE_TASK = "delete_task"
+    """``DELETE .../task/{taskId}``，没有请求体。"""
+
+
+@dataclass(frozen=True)
+class WriteBehaviour:
+    """一种写的行为说明（见模块文档的 :data:`_BEHAVIOUR`）。"""
+
+    local: LocalEffect
+    wire: WireCall
+    marks_completed: bool = False
+    """本地还要顺手写下「已完成」的 ``status``（值从存储层取，同一份 API 事实只留一处）。"""
+
+    whole_row: bool = False
+    """冲突裁决时**整条任务**豁免于服务端权威（删除就是这一种）。"""
 
 
 class WriteKind(Enum):
@@ -56,6 +109,47 @@ class WriteKind(Enum):
 
     DELETE = "delete"
     """删除：本地立刻摘掉快照，推送走 ``DELETE .../task/{taskId}``。"""
+
+    @property
+    def behaviour(self) -> WriteBehaviour:
+        """这一种写在本地与推送两端分别怎么落地（:data:`_BEHAVIOUR` 那一行）。"""
+        return _BEHAVIOUR[self]
+
+    @property
+    def local(self) -> LocalEffect:
+        """本地快照怎么变（存储层读这个，不读成员名）。"""
+        return _BEHAVIOUR[self].local
+
+    @property
+    def wire(self) -> WireCall:
+        """推送调客户端的哪一个方法（推送分派读这个，不读成员名）。"""
+        return _BEHAVIOUR[self].wire
+
+    @property
+    def marks_completed(self) -> bool:
+        """本地要不要顺手写下 ``status``（完成是唯一的一种）。"""
+        return _BEHAVIOUR[self].marks_completed
+
+    @property
+    def whole_row(self) -> bool:
+        """整条任务豁不豁免于服务端权威（删除是唯一的一种）。"""
+        return _BEHAVIOUR[self].whole_row
+
+
+_BEHAVIOUR: dict[WriteKind, WriteBehaviour] = {
+    WriteKind.CREATE: WriteBehaviour(local=LocalEffect.MERGE, wire=WireCall.CREATE_TASK),
+    WriteKind.UPDATE: WriteBehaviour(local=LocalEffect.MERGE, wire=WireCall.UPDATE_TASK),
+    WriteKind.COMPLETE: WriteBehaviour(
+        local=LocalEffect.MERGE, wire=WireCall.COMPLETE_TASK, marks_completed=True
+    ),
+    WriteKind.DELETE: WriteBehaviour(
+        local=LocalEffect.REMOVE, wire=WireCall.DELETE_TASK, whole_row=True
+    ),
+}
+"""**一处**记全每种写的行为。加一种写只改这里（外加它要打的新端点形状）。
+
+四个成员一个不少：``tests/test_write_kind.py`` 会逐个访问这些属性，漏一行当场红。
+"""
 
 
 @runtime_checkable

@@ -7,8 +7,9 @@
 :class:`PushMixin` 的方法挂在组装好的 :class:`~dida.sync.engine.SyncEngine` 上：它们要用
 ``self._clock`` / ``self._source`` / ``self._write_target()``，单独一个 mixin 不完整。
 
-「改一种写的推送方式」与「加一种写」都落在 :meth:`PushMixin._send` 那一个分派里；写词汇本身
-在 :mod:`dida.sync.writes`（t32 之后只有一处定义）。
+**这里不列写类型的成员**（t32）：打哪个端点读 ``kind.wire``，本地要不要补 ``status`` 读
+``kind.marks_completed``——两者都写在 :mod:`dida.sync.writes` 那张表里。只有「这条写要打一个
+新形状的端点」才在这里加一个分支（那是新的外部行为，不是要同步的词汇）。
 """
 
 from __future__ import annotations
@@ -18,7 +19,7 @@ from datetime import datetime, timedelta
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import DidaError
-from dida.sync.writes import UnknownTaskError, WriteKind
+from dida.sync.writes import UnknownTaskError, WireCall, WriteKind
 
 if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能在这里 import
     from dida.storage.store import PendingChange
@@ -242,7 +243,8 @@ class PushMixin:
         ``kind`` 是引擎与存储共用的那一套词汇（:mod:`dida.sync.writes`），所以这里不需要
         再 import 存储层：判断用哪一个端点，与「改动存在哪里」无关。
         """
-        if change.kind is WriteKind.UPDATE:
+        wire = change.kind.wire  # 打哪一个端点由词表说（dida.sync.writes），不在这里再列一遍成员
+        if wire is WireCall.UPDATE_TASK:
             await writer.update_task(
                 change.list_id,
                 change.task_id,
@@ -250,11 +252,11 @@ class PushMixin:
                 # 底稿是本地那份完整原文：不认识的字段靠它才能一个不丢地回写。
                 snapshot=target.task_payload(change.task_id),
             )
-        elif change.kind is WriteKind.COMPLETE:
+        elif wire is WireCall.COMPLETE_TASK:
             await writer.complete_task(change.list_id, change.task_id)
-        elif change.kind is WriteKind.DELETE:
+        elif wire is WireCall.DELETE_TASK:
             await writer.delete_task(change.list_id, change.task_id)
-        elif change.kind is WriteKind.CREATE:
+        elif wire is WireCall.CREATE_TASK:
             # 新建才知道服务端给的 id，所以这一条推成功之后要顺手认领它（t15）。
             self._adopt_created(target, change, await writer.create_task(change.payload))
         else:
@@ -304,6 +306,6 @@ class PushMixin:
         端点，而且 ``status`` 本来也不是新建/更新接受的字段（同文件第 5 条）。
         """
         merged = dict(changes or {})
-        if kind is WriteKind.COMPLETE:
+        if kind.marks_completed:  # 「本地立刻完成」这件事由词表说（dida.sync.writes）
             merged.setdefault("status", _completed_status())
         return merged

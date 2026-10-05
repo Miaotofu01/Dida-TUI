@@ -22,7 +22,7 @@ from pathlib import Path
 import pytest
 
 from dida.storage.store import ChangeKind, Store
-from dida.sync.engine import WriteKind
+from dida.sync.engine import LocalEffect, WireCall, WriteKind
 
 ROOT = Path(__file__).resolve().parents[1]
 SRC = ROOT / "src"
@@ -111,3 +111,70 @@ def test_every_member_of_the_engine_vocabulary_is_a_member_of_the_storage_one():
     """引擎能说的每一种写，存储都认得——不是靠值碰巧对得上。"""
     for kind in WriteKind:
         assert ChangeKind(kind.value) is kind
+
+
+def test_every_write_kind_carries_its_behaviour_in_the_one_table():
+    """每个成员都带齐自己的行为说明：本地效果 + 推送走哪一个端点。
+
+    加一种写而没写说明，这里当场红——而补说明的地方也只有一处（``dida.sync.writes``）。
+    """
+    described = {}
+
+    for kind in WriteKind:
+        described[kind] = (kind.local, kind.wire)
+
+    assert set(described) == set(WriteKind)
+    assert len(set(described.values())) == len(described), "两种写的行为说明不该完全相同"
+    assert all(isinstance(local, LocalEffect) for local, _ in described.values())
+    assert all(isinstance(wire, WireCall) for _, wire in described.values())
+
+
+def test_no_second_module_dispatches_on_the_write_vocabulary():
+    """除了词表本身，没有哪个生产模块按成员逐个分派——那种地方就是「第二处」。
+
+    逐个 ``if kind is WriteKind.X`` 的分派正是「新增一种写要四处同步」的形状：成员表改了，
+    分派忘了改，直到那条路径被走到才炸。分派一律读词表上的说明（``kind.local`` /
+    ``kind.wire`` / ``kind.whole_row`` / ``kind.marks_completed``），所以除词表自己以外，
+    任何生产模块都不该拿成员名去比较。
+    """
+    dispatched: dict[str, set[str]] = {}
+    for path in sorted(SRC.rglob("*.py")):
+        if path == SRC / "dida" / "sync" / "writes.py":
+            continue  # 词表自己：成员名就住在这里
+        members: set[str] = set()
+        for node in ast.walk(ast.parse(path.read_text(encoding="utf-8"))):
+            if not isinstance(node, ast.Compare):
+                continue
+            for side in [node.left, *node.comparators]:
+                if isinstance(side, ast.Attribute) and isinstance(side.value, ast.Name):
+                    if side.value.id in {"WriteKind", "ChangeKind"}:
+                        members.add(side.attr)
+        if members:
+            dispatched[path.relative_to(SRC).as_posix()] = members
+
+    assert dispatched == {}, f"这些模块还在按写类型逐个分派：{dispatched}"
+
+
+@pytest.mark.parametrize(
+    ("kind", "keeps_its_row"),
+    [
+        (WriteKind.CREATE, True),
+        (WriteKind.UPDATE, True),
+        (WriteKind.COMPLETE, True),
+        # 删除的本地效果是「这条任务不再存在」：入队当场摘掉快照（不是等推送成功再摘）。
+        (WriteKind.DELETE, False),
+    ],
+)
+def test_the_local_effect_of_a_write_is_what_its_kind_says(store, kind, keeps_its_row):
+    """四种写各自的本地效果（外部行为，独立于实现里那张表）。"""
+    store.apply_refresh(lists=[{"id": "inbox", "name": "收集箱"}], tasks=[_task()])
+
+    store.enqueue(
+        task_id="t1",
+        kind=kind,
+        payload={"title": "改过的标题"},
+        now=datetime(2026, 3, 14, 12, 0, tzinfo=TZ),
+    )
+
+    assert (store.task_payload("t1") is not None) is keeps_its_row
+    assert [change.kind for change in store.pending()] == [kind]

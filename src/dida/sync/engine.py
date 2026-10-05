@@ -94,7 +94,7 @@ from dida.sync.view import (
     subtask_items,
     summarize_lists,
 )
-from dida.sync.writes import UnknownTaskError, WriteKind, WriteTarget
+from dida.sync.writes import LocalEffect, UnknownTaskError, WireCall, WriteKind, WriteTarget
 
 if TYPE_CHECKING:  # 只为了标注：storage 反过来 import dida.sync.view，运行时不能在这里 import
     from dida.storage.store import RefreshReport
@@ -112,6 +112,7 @@ __all__ = [
     "GroupKind",
     "ListSnapshot",
     "ListSummary",
+    "LocalEffect",
     "ProjectReader",
     "RefreshTarget",
     "SUBTASK_COMPLETED_STATUS",
@@ -127,6 +128,7 @@ __all__ = [
     "TodayView",
     "UnknownTaskError",
     "ViewSource",
+    "WireCall",
     "WriteKind",
     "WriteTarget",
     "backoff_delay",
