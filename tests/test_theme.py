@@ -107,17 +107,19 @@ def test_every_css_colour_is_spelled_ansi():
         )
 
 
-def test_the_overdue_token_is_a_token_and_nothing_more():
-    """逾期只给一个语义 token，**不实现**标红（#37 给位、#52 接线）。
+def test_the_overdue_token_is_a_token_the_row_can_read():
+    """逾期 = 一个语义 token（``theme.OVERDUE``）**加**引擎给的那一位（``TaskItem.overdue``）。
 
-    这条守的是范围：``TaskItem`` 今天没有 overdue 位，TUI 也不许判断日期（架构的允许表里
-    没有 ``dida.logical_day``），所以地基里能做出来的只有这个名字。
+    #51 只放得下 token——那时 ``TaskItem`` 还没有这一位，而 TUI 不许自己判日期（架构的
+    允许表里没有 ``dida.logical_day``）。#37 把位补上，行只负责把它读成颜色。
     """
+    import dataclasses
+
     from dida.sync.engine import TaskItem
 
-    assert theme.OVERDUE, "逾期得有个语义 token 让 #52 接线"
-    assert not hasattr(TaskItem, "overdue"), (
-        "TaskItem 长出 overdue 位了：那是 #37 的工单，本票只提供 token，不实现标红"
+    assert theme.OVERDUE, "逾期得有个语义 token"
+    assert "overdue" in {field.name for field in dataclasses.fields(TaskItem)}, (
+        "TaskItem 得有一位现成的 overdue：没有它，行要标红就只能自己去判日期——那是不许的"
     )
 
 

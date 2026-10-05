@@ -33,8 +33,13 @@ from typing import Any, Mapping, Protocol, Sequence
 from dida.logical_day import logical_day
 from dida.sync.rows import completed_window_start, row_sort_key
 
-NO_DUE_TEXT = "—"
-"""没有截止时间的读法；与「今天」一眼可分。"""
+NO_DUE_TEXT = "-"
+"""没有截止时间的读法；与「今天」一眼可分。
+
+原来是 ``—``（U+2014）：rich 量它 1 格，而它的东亚宽度是**歧义**——zh_CN 的终端可能画
+2 格，一旦它进了对齐列（截止时间那一列）整列就歪。换成 ASCII 的连字符：任何 locale 下
+都是 1 格，形状仍然是「一道短横」。
+"""
 
 INBOX_ID = "inbox"
 """收集箱在 API 里的 projectId 别名。"""
@@ -115,6 +120,16 @@ class TaskSnapshot:
     tags: tuple[str, ...] = ()
     """服务端的 ``tags``：标签名，按服务端给的顺序。"""
 
+    repeat_flag: str = ""
+    """服务端的 ``repeatFlag``（重复规则原文，如 ``RRULE:FREQ=WEEKLY``）。
+
+    任务行只需要「是不是重复任务」（空串 = 不是），规则原文照旧原样留着——它只读，而且
+    回写时一个字都不许动（spec 的「改期绝不触碰重复规则」）。
+    """
+
+    reminders: tuple[str, ...] = ()
+    """服务端的 ``reminders``（提醒触发器原文）：行里只读「有没有提醒」，不改。"""
+
 
 @dataclass(frozen=True)
 class SyncState:
@@ -173,6 +188,20 @@ class TaskItem:
     """标签的成品读法（``#工作 #季度``，见 :func:`format_tags`）。
 
     没有标签就是空串——「这一行要不要画」由这个空串回答，详情栏不自己判断有没有标签。
+    """
+
+    repeat_flag: str = ""
+    """服务端的 ``repeatFlag``：非空就是重复任务（行里画一个重复标记）。"""
+
+    reminders: tuple[str, ...] = ()
+    """服务端的 ``reminders``：非空就是有提醒（行里画一个提醒标记）。"""
+
+    overdue: bool = False
+    """这条任务逾期了（截止时间早于当前逻辑日）。
+
+    判定在引擎里（TUI 不许自己判日期——架构的允许表里没有 ``dida.logical_day``），
+    行只负责把这一位读成颜色（:data:`dida.tui.theme.OVERDUE`）。已完成的不是逾期：
+    它已经做完了，划掉沉底才是它该有的样子。
     """
 
     completed: bool = False
@@ -239,8 +268,13 @@ class TodayView:
 
 
 def priority_mark(priority: int) -> str:
-    """优先级标记：高 ``!``、中 ``~``、低与无 ``·``。"""
-    return {5: "!", 3: "~"}.get(priority, "·")
+    """优先级标记：高 ``!``、中 ``~``、低与无 ``.``。
+
+三个字形都必须是宽度无歧义的（``tests/test_task_row_model.py`` 守着）：它们站在任务行的
+最左边，是整行的第一列。低优先级原来是 ``·``（U+00B7，东亚**歧义**宽度）——rich 量 1 格
+而终端可能画 2 格，于是每一行都比终端实际画的宽一格。
+"""
+    return {5: "!", 3: "~"}.get(priority, ".")
 
 
 PRIORITY_CYCLE: tuple[int, ...] = (0, 1, 3, 5)
@@ -277,6 +311,17 @@ def format_tags(tags: Sequence[str]) -> str:
     return " ".join(f"#{tag}" for tag in tags)
 
 
+def is_overdue(snapshot: TaskSnapshot, *, now: datetime, day_end: str) -> bool:
+    """这条任务逾期了吗：有截止时间、且它属于**早于**当前逻辑日的那一天。
+
+    逻辑日判定与分组、与「今天」视图用的是同一份（:func:`due_day`）：``day_end = "04:00"``
+    时凌晨两点看到的昨天 23:00 截止**不算逾期**，它是今天的事（用户故事 83）。
+    """
+    if snapshot.completed or snapshot.due is None:
+        return False
+    return due_day(snapshot.due, all_day=snapshot.all_day, day_end=day_end) < logical_day(now, day_end).label
+
+
 def task_item(snapshot: TaskSnapshot, names: dict[str, str], *, now: datetime, day_end: str) -> TaskItem:
     """一条任务快照 → 一行成品。"""
     return TaskItem(
@@ -292,6 +337,9 @@ def task_item(snapshot: TaskSnapshot, names: dict[str, str], *, now: datetime, d
         desc=snapshot.desc,
         content=snapshot.content,
         tags_text=format_tags(snapshot.tags),
+        repeat_flag=snapshot.repeat_flag,
+        reminders=snapshot.reminders,
+        overdue=is_overdue(snapshot, now=now, day_end=day_end),
         completed=snapshot.completed,
     )
 

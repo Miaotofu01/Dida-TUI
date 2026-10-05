@@ -9,18 +9,22 @@
 
 from __future__ import annotations
 
+import unicodedata
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import pytest
+from rich.cells import cell_len
 
 from dida.config import Config
 from dida.storage.store import Store
 from dida.sync.completed import DEFAULT_COMPLETED_WINDOW_HOURS
-from dida.sync.engine import SyncEngine, completed_section
+from dida.sync.engine import NO_DUE_TEXT, SyncEngine, TaskItem, completed_section, priority_mark
 from dida.sync.rows import completed_window_start, row_sort_key
 from dida.sync.view import ListSnapshot, TaskSnapshot
 from dida.testing import InMemorySource, ManualClock
+from dida.tui import theme
+from dida.tui.pages.tasks import task_line
 
 TZ = timezone(timedelta(hours=8))
 
@@ -293,3 +297,78 @@ def test_a_completed_timestamp_alone_does_not_make_a_task_completed(store):
 
     assert snapshot.completed is False
     assert snapshot.completed_at == at(14, 12, 5), "完成时刻原样留着：那是服务端的事实，不是判据"
+
+
+# ------------------------------------------------------------------ 行的读法
+
+
+def one_row(**fields) -> "TaskItem":
+    """一条任务的成品行（走真引擎的读路径，与 TUI 拿到的是同一份）。"""
+    source = work_source()
+    source.add_task(fields.pop("title", "写周报"), list_name="work", **fields)
+    return engine_with(source).tasks_in("work").items[0]
+
+
+def test_a_row_reads_the_priority_mark_the_title_the_due_the_tags_and_the_marks():
+    """一行读成：优先级标记、标题、标签、重复标记、提醒标记、人类可读的截止时间。
+
+    注解块**贴着行的右边缘**（截止时间因此是一列），所以这一行正好是 ``width`` 格。
+    """
+    item = one_row(
+        due=at(14, 18, 0),
+        priority=5,
+        tags=("工作",),
+        repeat_flag="RRULE:FREQ=WEEKLY",
+        reminders=("TRIGGER:P0DT9H0M0S",),
+    )
+
+    line = task_line(item, width=60)
+
+    assert line.plain.startswith("! 写周报")
+    assert line.plain.endswith("#工作  ↻ ⚑  今天 18:00")
+    assert cell_len(line.plain) == 60, "注解块贴着右边缘，所以这一行正好是 width 格"
+
+
+def test_a_plain_task_row_carries_no_marks_at_all():
+    """没有标签、不重复、没有提醒的任务，行里一个多余的字形都不出现。"""
+    line = task_line(one_row(due=at(14, 18, 0)), width=40)
+
+    assert line.plain.startswith(". 写周报")
+    assert line.plain.endswith("今天 18:00")
+    assert cell_len(line.plain) == 40
+    for absent in ("#", theme.REPEAT_MARK, theme.REMINDER_MARK):
+        assert absent not in line.plain
+
+
+def test_the_marks_are_the_ones_the_theme_owns():
+    """重复与提醒的记号来自 :mod:`dida.tui.theme`（视觉常量只有一个出处）。"""
+    line = task_line(one_row(due=at(14, 18, 0), repeat_flag="RRULE:FREQ=DAILY", reminders=("TRIGGER:P0DT9H0M0S",)), width=60)
+
+    assert theme.REPEAT_MARK in line.plain
+    assert theme.REMINDER_MARK in line.plain
+
+
+def test_every_mark_that_goes_into_a_column_is_width_unambiguous():
+    """进列的字形必须宽度无歧义：rich 量 1 格，而 Unicode 不说它是东亚歧义宽度。
+
+    两处都会错，而且两处都已经发生过：``☰`` 是「rich 量 2 格、Unicode 说中性」（每行宽一
+    格），``·``（低优先级）与 ``—``（没有截止时间）是「rich 量 1 格、Unicode 说是歧义宽度」
+    （CJK 字体下终端可能画 2 格）。用户 ``LANG=zh_CN.UTF-8``——**一旦有列，歪的就是整列**。
+    """
+    glyphs = {
+        "低优先级标记": priority_mark(1),
+        "中优先级标记": priority_mark(3),
+        "高优先级标记": priority_mark(5),
+        "没有截止时间": NO_DUE_TEXT,
+        "重复标记": theme.REPEAT_MARK,
+        "提醒标记": theme.REMINDER_MARK,
+    }
+
+    for name, glyph in glyphs.items():
+        assert len(glyph) == 1, f"{name} {glyph!r} 不是一个字形"
+        assert cell_len(glyph) == 1, f"{name} {glyph!r} 被 rich 量成 {cell_len(glyph)} 格"
+        width = unicodedata.east_asian_width(glyph)
+        assert width not in ("A", "W", "F"), (
+            f"{name} {glyph!r} 的东亚宽度是 {width}：rich 量它 1 格，"
+            "而 zh_CN 的终端可能画 2 格——整列会歪"
+        )

@@ -189,6 +189,13 @@ class TaskList:
     completed: CompletedSection = CompletedSection()
     """这个容器里窗口内完成的任务（真实清单才有；视图的成员由视图求值决定）。"""
 
+    container_kind: ListKind | None = None
+    """这个容器是哪一种行（:class:`ListKind`）；认不出来的容器是 ``None``。
+
+    「行里要不要写所属清单名」由它回答（工单 #37 的验收标准）：清单是容器，行里重复一百
+    遍同一个名字是噪音；视图不是容器，行里的清单名是真信息。**读模型说了算**，界面不自己推。
+    """
+
 
 @dataclass(frozen=True)
 class TaskDetail:
@@ -420,7 +427,12 @@ def container_tasks(
     items = tuple(
         by_due([task_item(snapshot, names, now=now, day_end=day_end) for snapshot in members])
     )
-    return TaskList(container_id=container_id, items=items, completed=completed)
+    return TaskList(
+        container_id=container_id,
+        items=items,
+        completed=completed,
+        container_kind=row.kind,
+    )
 
 
 def task_detail(

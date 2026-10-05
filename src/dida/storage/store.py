@@ -698,6 +698,9 @@ def _snapshot(payload: Mapping[str, Any]) -> TaskSnapshot:
         desc=_text(payload.get("desc")),
         content=_text(payload.get("content")),
         tags=_tag_names(payload.get("tags")),
+        # 重复规则与提醒只读（v2 不改它们），行里要的只是「有没有」；原文照旧整份留在 raw 里。
+        repeat_flag=_text(payload.get("repeatFlag")),
+        reminders=_texts(payload.get("reminders")),
     )
 
 
@@ -729,6 +732,17 @@ def _parse_time(value: str) -> datetime | None:
         return datetime.fromisoformat(value)
     except ValueError:
         return None
+
+
+def _texts(value: Any) -> tuple[str, ...]:
+    """服务端的一段**字符串数组**（``reminders``）→ 元组；不是数组就当没有。
+
+    与 :func:`_text` 同一条口径：脏字段不该把整次刷新带崩。元素逐条转成字符串——触发器
+    原文长什么样不由这一层解释（那是只读展示的事）。
+    """
+    if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
+        return ()
+    return tuple(str(item) for item in value)
 
 
 def _text(value: Any) -> str:
