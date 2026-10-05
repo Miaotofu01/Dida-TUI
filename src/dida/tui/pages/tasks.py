@@ -1,7 +1,7 @@
 """层二：任务列表页——当前清单（或视图）里的全部任务。
 
-**这一页先只画标题**：行的样子（优先级标记、人类可读的截止时间、标签、重复与提醒标记、
-已完成划掉沉底、排序）归 #37 那张工单。这里定下来的是**结构**：进得来、光标能在任务之间
+**这一页只画标题（+ 视图里的清单名 + 逾期标红，#35）**：行的其余样子（优先级标记、人类可读的
+截止时间、标签、重复与提醒标记、窄屏下的丢弃顺序）归 #37 那张工单。这里定下来的是**结构**：进得来、光标能在任务之间
 走、``enter`` 进详细页、``esc`` 退回清单列表页、空清单有一句明确的空态文案（用户故事 53）、
 后台刷新不把光标踢回第一条（用户故事 57）。
 
@@ -18,7 +18,7 @@ from textual.message import Message
 from dida.sync.engine import CompletedItem, TaskItem, TaskList
 from dida.tui import messages, theme
 from dida.tui.keys import LAYER_TASKS, bindings_for
-from dida.tui.pages.base import CursorPage, Row, empty_row, heading_row, rule_row
+from dida.tui.pages.base import EMPTY_STYLE, CursorPage, Row, empty_row, heading_row, rule_row
 
 __all__ = ["COMPLETED_STYLE", "DONE_MARK", "TasksPage", "task_line"]
 
@@ -33,12 +33,24 @@ COMPLETED_STYLE = theme.DONE
 """
 
 
-def task_line(item: TaskItem) -> Text:
-    """一条任务的行。
+def task_line(item: TaskItem, *, list_name: bool = False) -> Text:
+    """一条任务的行：标题（+ 视图里的所属清单名），逾期的整条标红。
 
-    这一票只画标题——行的样子归 #37。标题是引擎给的成品，这一层不加工。
+    #35 在这一票里只加**求值需要写出来的那两件**：视图里的所属清单名（视图不是容器，
+    同一个清单名重复显示是必要信息）与逾期标红（谁逾期是引擎判的 ``TaskItem.overdue``，
+    这一层只上色——它自己不许比日期）。行的其余样子（优先级标记、人类可读的截止时间、
+    标签、重复与提醒标记、窄屏下的丢弃顺序）归 #37，那时这个函数是它的起点。
+
+    颜色进 **span**（``stylize``），不是 ``Text(title, style="red")``：后者把样式放进 base
+    style，Textual 拿 CSS 颜色解析器去读——那里 ``red`` 是 ``#FF0000`` 真彩色，会把「跟随
+    终端主题」静默毁掉（ADR-0007 一）。
     """
-    return Text(item.title)
+    text = Text(item.title)
+    if item.overdue:
+        text.stylize(theme.OVERDUE)
+    if list_name:
+        text.append(f"  {item.list_name}", style=EMPTY_STYLE)
+    return text
 
 
 def completed_line(item: CompletedItem) -> Text:
@@ -90,7 +102,10 @@ class TasksPage(CursorPage):
             heading_row(theme.styled(name, theme.HEADING)),
             rule_row(),
         ]
-        rows += [Row(id=item.task_id, text=task_line(item)) for item in task_list.items]
+        rows += [
+            Row(id=item.task_id, text=task_line(item, list_name=task_list.shows_list_name))
+            for item in task_list.items
+        ]
         rows += [Row(id=None, text=completed_line(item)) for item in task_list.completed.items]
         if len(rows) == 3:
             # 空清单要说一句明确的话，而不是只留一个标题（用户故事 53）。
