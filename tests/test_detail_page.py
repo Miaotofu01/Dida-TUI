@@ -1207,3 +1207,38 @@ async def test_the_due_editor_writes_out_an_explicit_null_shape(tmp_path):
     assert body["isAllDay"] is False, body
     assert body["timeZone"] == "Asia/Shanghai", "时区字段原样回写（验收标准 7）"
     assert body["focusSummaries"] == [{"pomoCount": 1}], "服务端给的陌生字段一起回去（验收标准 8）"
+
+
+async def test_the_due_editor_emits_no_truecolor():
+    """截止时间编辑器里**一格真彩色都没有**（工单 #44；ADR-0007 的第一条决定）。
+
+    这是 #43 的 merger 在真 pty 里手工数出来、而当时**没有任何测试守着**的那件事：新挂一个
+    Textual 组件（``Input`` / ``TextArea`` / ``Select``……）默认从 ``$surface`` / ``$boost`` /
+    ``$input-cursor-*`` 那几个主题变量上色，那些值在 ``textual-dark`` 下是**真彩色**
+    （``#1E1E1E`` 这种）。漏覆盖的表现是真终端收到 ``38;2;`` / ``48;2;``，而
+    **屏幕上看不出异常**——只有读 SGR 才发现。
+
+    所以这一条断的是**渲染字节**（``screen_sgr``：拿一个 ``color_system="truecolor"`` 的控制台
+    去渲染当前这一屏），覆盖的是编辑器**整屏**：那两格、提示行、以及页面上其余一切。
+    断言按**参数**看，不比整串——Textual 把前景与背景拼进同一条序列（``\\x1b[36;49m``）。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to_the_due_field(pilot, app)
+        await pilot.press("enter")
+        await pilot.pause()
+        editing = screen_sgr(app)
+        await pilot.press("x")  # 连「全天」那一档也渲染一遍
+        await pilot.pause()
+        toggled = screen_sgr(app)
+
+    for label, emitted in (("日期/时刻两格", editing), ("全天那一档", toggled)):
+        parameters = sgr_parameters(emitted)
+        assert 38 not in {p for p in parameters if p >= 38 and p <= 48}, (
+            f"{label}漏了真彩色前景色（38;2;…）：{sorted(parameters)}"
+        )
+        assert "38;2;" not in emitted, f"{label}里有真彩色前景色：{emitted[:200]!r}"
+        assert "48;2;" not in emitted, f"{label}里有真彩色背景色：{emitted[:200]!r}"
