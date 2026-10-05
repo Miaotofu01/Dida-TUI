@@ -297,3 +297,67 @@ async def test_a_task_completed_more_than_seven_days_ago_does_not_take_the_scree
 
     assert "六天前做完的" in text
     assert "八天前做完的" not in text
+
+
+# ------------------------------------------------------------------ 光标跨刷新
+
+
+async def test_a_background_refresh_keeps_the_cursor_on_the_same_task():
+    """后台刷新之后光标仍在原来那一条上（验收标准；用户故事 21/57）。
+
+    刷新会重排整份行（新任务可能排到光标前面、已完成的那条会冒出来），所以「光标还在
+    原来那条」只能按**行 id** 认回来，不能按行号。
+    """
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_task("写周报", list_name="work", id="t1", due=at(14, 18, 0))
+    fake.add_task("交水费", list_name="work", id="t2", due=at(14, 20, 0))
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_work(pilot, app)
+        await pilot.press("j")  # 光标走到第二条（交水费）
+        assert app.tasks_page().selected_id == "t2"
+
+        # 后台刷新落地：一条更早的排到了光标前面，另一条在别处完成了。
+        fake.add_task("更早的一条", list_name="work", id="t3", due=at(14, 1, 0))
+        fake.add_task("刚做完的", list_name="work", id="t4", completed=True, completed_at=at(14, 12, 0))
+        app.refresh_view()
+        await pilot.pause()  # 让这一帧重排完（行的条数变了，正文的高度跟着变）
+        text = screen_text(app)
+        selected = app.tasks_page().selected_id
+
+    assert selected == "t2", "光标被刷新踢到别的任务上了"
+    row = line_with(text, "交水费")
+    assert row.lstrip().startswith(theme.CURSOR_MARK), f"光标记号不在原来那一条上：{row!r}"
+    assert "更早的一条" in text, "新来的那条排到了前面，但光标不许跟着走"
+
+
+async def test_resizing_the_window_keeps_the_cursor_and_re_lays_the_row():
+    """窗口变窄：行按新宽度重排（注解块贴右边缘），光标仍停在同一条任务上。
+
+    行是**按格**排出来的，所以宽度一变就得重排——重排按行 id 认光标，不按行号。
+    """
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_task("写周报", list_name="work", id="t1", due=at(14, 18, 0), tags=("周报",))
+    fake.add_task("交水费", list_name="work", id="t2", due=at(14, 20, 0))
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_work(pilot, app)
+        await pilot.press("j")
+        assert app.tasks_page().selected_id == "t2"
+
+        await pilot.resize_terminal(30, 24)
+        await pilot.pause()
+        narrow = screen_text(app)
+        selected = app.tasks_page().selected_id
+
+    assert selected == "t2", "缩放把光标踢走了"
+    row = line_with(narrow, "交水费")
+    assert row.lstrip().startswith(theme.CURSOR_MARK), f"光标记号不在原来那一条上：{row!r}"
+    assert row.rstrip().endswith("今天 20:00"), f"注解块按新宽度重新贴到右边缘：{row!r}"
+    assert cell_len(row) == 30, f"这一行要正好铺满 30 列（现在是 {cell_len(row)} 格）：{row!r}"
