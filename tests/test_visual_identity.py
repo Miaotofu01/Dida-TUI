@@ -16,6 +16,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 import pytest
+from rich.cells import cell_len
 
 from dida.sync.engine import DidaError
 from dida.testing import FakeBackend, ManualClock
@@ -200,6 +201,91 @@ async def test_a_long_title_is_clipped_with_an_ellipsis_and_never_wraps():
     assert rows[0].lstrip().startswith("❯"), f"光标字形被挤到别处去了：{rows[0]!r}"
     assert rows[0].rstrip().endswith(theme.ELLIPSIS), f"裁断要留一个省略号：{rows[0]!r}"
     assert len(rows[0]) <= 60, "这一行不许超出终端宽度"
+
+
+# ------------------------------------------------------------------ 通栏细线
+
+
+RULE_WIDTHS = (40, 60, 100)
+"""三档宽度：窄终端、普通、宽屏。细线是按**格**铺的，所以每一档都看一眼。"""
+
+
+def rule_lines(text: str) -> list[str]:
+    """屏幕上那些通栏细线。
+
+    ``…`` 也收进来：出 bug 时细线行比页面宽两格，被正文的 ``nowrap`` + ``ellipsis`` 裁掉
+    并补上一个省略号——只认「整行都是细线」的话，这条测试会**看不见**那些坏行。
+    """
+    return [
+        line
+        for line in lines(text)
+        if line.strip() and set(line.strip()) <= {theme.RULE, theme.ELLIPSIS}
+    ]
+
+
+@pytest.mark.parametrize("width", RULE_WIDTHS)
+async def test_a_rule_spans_the_page_and_never_ends_in_an_ellipsis(width: int):
+    """通栏细线 = **整幅页面宽、齐左、没有省略号**。
+
+    细线不可停光标，所以它不参与光标那一列的行首空档。带上那两格之后这一行就是
+    ``width + 2`` 格，正文的 ``text-wrap: nowrap`` + ``text-overflow: ellipsis`` 会裁掉一格
+    再补一个 ``…``——屏幕上看到的是「缩进两格、以省略号收尾的一条线」。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=(width, 20)) as pilot:
+        await pilot.pause()
+        index = screen_text(app)
+        await enter_work(pilot, app)
+        tasks = screen_text(app)
+
+    for page, text in (("清单列表页", index), ("任务列表页", tasks)):
+        found = rule_lines(text)
+        assert found, f"{page}@{width} 上一条细线都没有：\n{text}"
+        for line in found:
+            assert not line.endswith(theme.ELLIPSIS), (
+                f"{page}@{width} 的细线被裁断了——它比页面宽：{line!r}"
+            )
+            assert cell_len(line) == width, (
+                f"{page}@{width} 的细线不是整幅页面宽（{cell_len(line)} 格）：{line!r}"
+            )
+            assert line == theme.RULE * width, (
+                f"{page}@{width} 的细线不是齐左铺满（左边那两格是光标空档）：{line!r}"
+            )
+
+
+@pytest.mark.parametrize("width", RULE_WIDTHS)
+async def test_content_that_overflows_keeps_its_gutter_and_its_ellipsis(width: int):
+    """会溢出的**内容**行照旧：两格行首空档 + 按格裁到页边 + 行尾一个 ``…``。
+
+    细线不要那两格，内容行要——光标字形与标题之间的那一列不能跟着一起消失。纯 ASCII 那条
+    标题是个算式：页面有 ``width`` 格，行首两格归光标，裁断记号自己占一格，所以标题看得见
+    的部分正好是前 ``width - 3`` 格。汉字那条也在（他的 locale 是 ``zh_CN.UTF-8``）：一个
+    汉字两格，断在哪一格按格算，不按字符数。
+    """
+    ascii_title = "abcdefghij" * 12
+    cjk_title = "把这一条标题写得足够长，让每一个宽度上都溢出页面——窄终端、普通终端、宽屏都得裁断，而裁断的位置要按格算不按字符数"
+    fake = backend()
+    fake.add_task(ascii_title, list_name="work", id="t9")
+    fake.add_task(cjk_title, list_name="work", id="t10")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=(width, 20)) as pilot:
+        await pilot.pause()
+        await enter_work(pilot, app)
+        await pilot.press("j")  # 走到那条纯 ASCII 的长标题上
+        await pilot.pause()
+        text = screen_text(app)
+
+    ascii_row = line_with(text, "abcdefghij")
+    assert ascii_row == f"❯ {ascii_title[: width - 3]}{theme.ELLIPSIS}", (
+        f"@{width} 的行首空档或裁断位置变了：{ascii_row!r}"
+    )
+    cjk_row = line_with(text, "把这一条标题")
+    assert cjk_row.endswith(theme.ELLIPSIS), f"汉字标题也要留省略号：{cjk_row!r}"
+    assert cell_len(cjk_row) == width, (
+        f"@{width} 这条内容行要一直画到页边（现在是 {cell_len(cjk_row)} 格）：{cjk_row!r}"
+    )
 
 
 # ------------------------------------------------------------------ 平移与开关
