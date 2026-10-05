@@ -38,11 +38,20 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
-from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from dida.sync.view import INBOX_ID, ListSnapshot, SyncState, TaskSnapshot
+from dida.sync.writes import LocalEffect, WriteKind
+
+ChangeKind = WriteKind
+"""改动种类：对应 API 的四个写操作（新建 / 更新 / 完成 / 删除）。
+
+**别名，不是第二份定义**（t32）：词表住在 :mod:`dida.sync.writes`，引擎的 ``WriteKind`` 与
+这里的 ``ChangeKind`` 是同一个枚举。以前这里另写了一份成员一字不差的枚举，于是新增一种写
+要在两处各改一次——两层现在只剩一个来源。``ChangeKind`` 这个名字留着是因为「待推送改动的
+种类」在存储层读起来顺，指的还是同一个对象。每种写的**本地效果**（``kind.local``）与
+**冲突豁免**（``kind.whole_row``）也读这张词表，这一层不再按成员名分派。"""
 
 COMPLETED_STATUS = 2
 """任务「已完成」的 ``status`` 值（api-contracts.md：Completed 是 2，不是 1）。"""
@@ -82,15 +91,6 @@ CREATE TABLE IF NOT EXISTS sync_state (
     logical_day      TEXT
 );
 """
-
-
-class ChangeKind(Enum):
-    """改动种类：对应 API 的四个写操作（新建 / 更新 / 完成 / 删除）。"""
-
-    CREATE = "create"
-    UPDATE = "update"
-    COMPLETE = "complete"
-    DELETE = "delete"
 
 
 @dataclass(frozen=True)
@@ -301,13 +301,13 @@ class Store:
 
         ``now`` 由调用方给：这一层没有时钟，「现在」永远是注入进来的（CONTEXT 的硬规矩）。
 
-        ``DELETE`` 的特殊之处是它的本地效果是「这条任务不再存在」——所以直接摘掉快照。
+        本地效果**读词表**（``kind.local``，t32）：``REMOVE`` 直接摘掉快照，其余盖字段。
         清单 id 记在改动行上，推送时仍然拼得出 URL。
         """
         resolved_list = list_id or self._list_of(task_id)
         # 本地生效与入队同一个事务：不会出现「生效了但没进队列」这种下次刷新就丢的状态。
         with self._db:
-            if kind is ChangeKind.DELETE:
+            if kind.local is LocalEffect.REMOVE:
                 self._db.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
             else:
                 self._apply_locally(task_id, payload)
@@ -463,11 +463,14 @@ class Store:
         返回 ``None`` 表示**整条任务**都豁免：本地有一条还没推成功的删除，
         服务端那份一个字也不许写回来。除此之外豁免是逐字段的——改动碰过的字段本地赢，
         没碰过的照旧服务端赢。
+
+        「哪些改动整条豁免」读词表（``kind.whole_row``，t32），不在这里点名成员：下一批
+        「这条任务不再存在」的写（例如 v2 的搬走）只要在表里标一下，这里自动跟着变。
         """
         rows = self._db.execute(
             "SELECT kind, payload FROM pending_changes WHERE task_id = ?", (task_id,)
         ).fetchall()
-        if any(row["kind"] == ChangeKind.DELETE.value for row in rows):
+        if any(ChangeKind(row["kind"]).whole_row for row in rows):
             return None
         exempt: set[str] = set()
         for row in rows:

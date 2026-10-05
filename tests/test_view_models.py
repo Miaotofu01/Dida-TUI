@@ -5,12 +5,18 @@
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from dida.sync.view import (
     GroupKind,
     ListSnapshot,
     TaskSnapshot,
+    filter_groups,
     format_due,
+    fuzzy_match,
     group_tasks,
+    next_priority,
+    priority_mark,
     summarize_lists,
 )
 
@@ -264,3 +270,86 @@ def test_all_day_due_is_a_date_marker_not_a_moment():
 
     assert [group.kind for group in groups] == [GroupKind.TODAY]
     assert groups[0].items[0].due_text == "今天"
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [
+        (0, 1),  # 无 → 低
+        (1, 3),  # 低 → 中
+        (3, 5),  # 中 → 高
+        (5, 0),  # 高 → 无（循环）
+    ],
+)
+def test_the_priority_cycle_walks_the_wire_values_0_1_3_5(current, expected):
+    """优先级循环走的是 ``0/1/3/5``，不是稠密的 1/2/3（api-contracts.md 第 3 条）。
+
+    原本钉在界面测试 ``test_priority_filter.py`` 里（工单 #32 搬出来的）：``p`` 那个**键**
+    在 v2 里归 #45 重做，但「线上编码是哪四个值、循环顺序是什么」是 API 的事实，与界面无关。
+    """
+    assert next_priority(current) == expected
+
+
+@pytest.mark.parametrize(
+    ("wire", "mark"),
+    [
+        (0, "·"),  # 无
+        (1, "·"),  # 低与无是同一个标记
+        (3, "~"),  # 中
+        (5, "!"),  # 高
+    ],
+)
+def test_each_priority_wire_value_has_its_one_mark(wire, mark):
+    """线上编码 → 标记是一张完整的表，不是只有「高」那一格（工单 #32 搬出来的）。"""
+    assert priority_mark(wire) == mark
+
+
+# ---------------------------------------------------------------- v1 的模糊过滤（#32 搬出来的）
+
+
+@pytest.mark.parametrize(
+    ("query", "title", "expected"),
+    [
+        ("", "写周报", True),  # 空查询 = 一行都不筛掉
+        ("周", "写周报", True),
+        ("写报", "写周报", True),  # 子序列：中间隔着字也算命中
+        ("报写", "写周报", False),  # 顺序不对就不算
+        ("周报x", "写周报", False),  # 少一个字就不算
+        ("wr", "Write Report", True),  # 大小写不敏感
+    ],
+)
+def test_fuzzy_match_is_an_ordered_subsequence(query, title, expected):
+    """``/`` 那套模糊匹配的语义（原本钉在 ``test_priority_filter.py`` 里，#32 搬出来的）。
+
+    ⚠ v2 没有 ``/`` 过滤（spec：模糊过滤不在这一版里），所以 ``fuzzy_match`` /
+    ``filter_groups`` 这两个纯函数是**待删**的——删它们的那张工单（视图求值归 #35）
+    把下面三条一起删掉。搬到这里只是为了：在它们还是生产代码的这段日子里，
+    「子序列怎么算」「过滤后条数与行数一致」这两个结论不能没人守。
+    """
+    assert fuzzy_match(query, title) is expected
+
+
+def test_filter_groups_keeps_the_matching_rows_and_drops_the_empty_groups():
+    """过滤后的行与标题上的条数必须一致：标题写「3 项」而屏上只有一行，就是在骗人。"""
+    tasks = (
+        TaskSnapshot(id="t1", title="交季度报告", list_id="work", due=at(14, 9, 0)),
+        TaskSnapshot(id="t2", title="写周报", list_id="work", due=at(14, 18, 0)),
+        TaskSnapshot(id="t3", title="买牛奶", list_id="home"),
+    )
+    groups = group_tasks(
+        tasks, [ListSnapshot(id="work", name="工作")], now=at(14, 12, 3), day_end="24:00"
+    )
+
+    filtered = filter_groups(groups, "周报")
+
+    assert [(group.kind, group.count, [item.task_id for item in group.items]) for group in filtered] == [
+        (GroupKind.TODAY, 1, ["t2"])
+    ]
+
+
+def test_filter_groups_with_no_match_returns_nothing_at_all():
+    """一条都没命中：分区一个都不留（屏上因此是空状态，而不是空标题）。"""
+    tasks = (TaskSnapshot(id="t1", title="写周报", list_id="work", due=at(14, 18, 0)),)
+    groups = group_tasks(tasks, [], now=at(14, 12, 3), day_end="24:00")
+
+    assert filter_groups(groups, "不存在的任务") == ()
