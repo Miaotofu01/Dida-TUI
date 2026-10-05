@@ -267,6 +267,10 @@ async def test_an_all_day_create_writes_the_date_marker_verbatim(store):
     assert transport.last_json["dueDate"] == "2026-03-14T00:00:00+0800"
     assert transport.last_json["isAllDay"] is True
     assert "priority" not in transport.last_json, "没写优先级就不写这个字段，服务端默认就是「无」"
+    items = [item for group in engine.view().groups for item in group.items]
+    assert [(item.title, item.due_text, item.all_day) for item in items] == [
+        ("还信用卡", "今天", True)
+    ], "全天任务的「今天」要落在今日区，且不许读成「今天 00:00」"
 
 
 async def test_a_thin_create_response_does_not_drop_what_the_user_wrote(store):
@@ -420,6 +424,10 @@ async def test_an_all_day_reschedule_is_written_verbatim_as_a_date_marker(store)
 
     assert transport.last_json["dueDate"] == "2026-03-14T00:00:00+0800"
     assert transport.last_json["isAllDay"] is True
+    items = [item for group in engine.view().groups for item in group.items]
+    assert [(item.title, item.due_text, item.all_day) for item in items] == [
+        ("还信用卡", "今天", True)
+    ], "全天任务的「今天」要落在今日区，且不许读成「今天 00:00」"
 
 
 async def test_rescheduling_an_all_day_task_to_a_time_clears_the_all_day_flag(store):

@@ -5,12 +5,16 @@
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from dida.sync.view import (
     GroupKind,
     ListSnapshot,
     TaskSnapshot,
     format_due,
     group_tasks,
+    next_priority,
+    priority_mark,
     summarize_lists,
 )
 
@@ -264,3 +268,35 @@ def test_all_day_due_is_a_date_marker_not_a_moment():
 
     assert [group.kind for group in groups] == [GroupKind.TODAY]
     assert groups[0].items[0].due_text == "今天"
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [
+        (0, 1),  # 无 → 低
+        (1, 3),  # 低 → 中
+        (3, 5),  # 中 → 高
+        (5, 0),  # 高 → 无（循环）
+    ],
+)
+def test_the_priority_cycle_walks_the_wire_values_0_1_3_5(current, expected):
+    """优先级循环走的是 ``0/1/3/5``，不是稠密的 1/2/3（api-contracts.md 第 3 条）。
+
+    原本钉在界面测试 ``test_priority_filter.py`` 里（工单 #32 搬出来的）：``p`` 那个**键**
+    在 v2 里归 #45 重做，但「线上编码是哪四个值、循环顺序是什么」是 API 的事实，与界面无关。
+    """
+    assert next_priority(current) == expected
+
+
+@pytest.mark.parametrize(
+    ("wire", "mark"),
+    [
+        (0, "·"),  # 无
+        (1, "·"),  # 低与无是同一个标记
+        (3, "~"),  # 中
+        (5, "!"),  # 高
+    ],
+)
+def test_each_priority_wire_value_has_its_one_mark(wire, mark):
+    """线上编码 → 标记是一张完整的表，不是只有「高」那一格（工单 #32 搬出来的）。"""
+    assert priority_mark(wire) == mark

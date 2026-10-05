@@ -2,7 +2,10 @@
 
 from datetime import date, datetime, timedelta, timezone
 
-from dida.sync.engine import SyncEngine
+import pytest
+
+from dida.storage.store import Store
+from dida.sync.engine import NO_DUE_TEXT, SyncEngine
 from dida.sync.view import GroupKind, SyncState, TodayView
 from dida.testing import InMemorySource, ManualClock
 
@@ -74,3 +77,67 @@ def test_view_groups_a_last_night_due_date_into_today_at_two_in_the_morning():
 
     assert today.kind is GroupKind.TODAY
     assert today.items[0].due_text == "今天 23:00"
+
+
+# ------------------------------------------------------- 子任务：只读那两半（#43）
+
+
+def item(id: str, title: str, status: int = 0, **extra: object) -> dict:
+    """一份 ``ChecklistItem`` 原文：子任务状态是 ``0/1`` 那一对，日期字段叫 ``startDate``。"""
+    return {"id": id, "title": title, "status": status, **extra}
+
+
+@pytest.fixture
+def store(tmp_path):
+    """指向临时文件的库；关掉时不留句柄。"""
+    opened = Store(tmp_path / "dida.sqlite3")
+    yield opened
+    opened.close()
+
+
+def seed(store: Store, *tasks: dict) -> None:
+    """直接把一份缓存摆进库里。"""
+    store.apply_refresh(lists=[{"id": "work", "name": "工作", "sortOrder": 1}], tasks=list(tasks))
+
+
+def test_subtasks_show_title_and_completion_state_even_without_a_due_date(store):
+    """``subtasks()`` 每一行都有标题与完成状态，**没有日期的照样在**（工单 #32 搬出来的）。
+
+    v2 的子任务是只读显示（spec 用户故事 76），所以这一条比 v1 更要紧：行是右栏唯一能给的
+    东西，缺了日期就不显示的话，大多数子任务会整行消失。没有日期读作 ``NO_DUE_TEXT``，
+    不是「不该出现」。
+    """
+    seed(
+        store,
+        {
+            "id": "t1",
+            "projectId": "work",
+            "title": "交季度报告",
+            "status": 0,
+            "items": [
+                item("i1", "收集数据", 1),  # 完成了，而且没有日期
+                item("i2", "画图表", 0),  # 没完成，也没有日期
+                item("i3", "写结论", 0, startDate="2026-03-15T18:00:00+0800"),
+            ],
+        },
+    )
+    engine = SyncEngine(clock=ManualClock(at(14, 12, 3)), day_end="24:00", source=store)
+
+    subtasks = engine.subtasks("t1")
+
+    assert [(row.title, row.completed) for row in subtasks] == [
+        ("收集数据", True),
+        ("画图表", False),
+        ("写结论", False),
+    ]
+    assert subtasks[0].due_text == NO_DUE_TEXT, "没有日期的子任务不是「不该出现」，是「读作没有日期」"
+    assert subtasks[1].due_text == NO_DUE_TEXT
+    assert subtasks[2].due_text != NO_DUE_TEXT, "有日期的子任务照样读出人类可读的截止时间"
+
+
+def test_a_task_without_subtasks_reads_as_no_rows(store):
+    """没有 ``items`` 的任务不是错误：右栏就是没有子任务可显示。"""
+    seed(store, {"id": "t1", "projectId": "work", "title": "交季度报告", "status": 0})
+    engine = SyncEngine(clock=ManualClock(at(14, 12, 3)), day_end="24:00", source=store)
+
+    assert engine.subtasks("t1") == ()
