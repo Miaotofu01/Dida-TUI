@@ -24,7 +24,7 @@ v1 的读入口只有一个 :meth:`~dida.sync.engine.SyncEngine.view`，返回�
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import Any, Collection, Mapping, Protocol, Sequence, runtime_checkable
 
@@ -473,7 +473,7 @@ def builtin_view_rows(
 
 
 def _in_builtin_view(
-    view_id: str, snapshot: TaskSnapshot, *, label: Any, day_end: str
+    view_id: str, snapshot: TaskSnapshot, *, label: date, day_end: str
 ) -> bool:
     """这条任务在不在这个内置视图里（逻辑日判定走 :func:`dida.sync.view.due_day`）。"""
     if view_id == "all":
