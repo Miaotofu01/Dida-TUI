@@ -429,6 +429,33 @@ async def test_q_is_interrupted_once_and_says_how_many_are_pending(tmp_path):
         assert app.is_running is False, "确认了才真的退"
 
 
+async def test_the_quit_prompt_does_not_claim_the_queue_is_lost(tmp_path):
+    """那句话不许说「就丢了」：待推送改动落在本地库里，下次启动接着补推（t21 的周期泵）。
+
+    屏幕上的话必须与实现一致。实测过一次——断网写一笔、退出、重开同一个缓存文件，
+    ``push_pending()`` 把它推了出去；写路径那一侧的
+    ``test_a_restart_still_has_the_queue_and_pushes_it`` 钉着这件事。吓唬用户说丢了，
+    是拿一句不真的话换他一次犹豫。
+    """
+    store = open_store(tmp_path)
+    seed(store, task(id="t1", title="写周报", project_id="inbox"), lists=[inbox()])
+    app = make_app(store, Server(error=NetworkError("连不上")))
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("p")  # 本地生效 + 推送失败 → 队列里一处
+        await app.engine.wait_for_pushes()
+        await pilot.pause()
+
+        await pilot.press("q")
+        await pilot.pause()
+        prompt = screen_text(app)
+
+        assert "1 处" in prompt, "还是得说清有几处没推上去"
+        assert "下次打开" in prompt, "要说清它们去哪儿了：留在本地，下次接着补推"
+        assert "丢了" not in prompt, "它们没丢——本地库里有，下次启动会接着推"
+
+
 # ------------------------------------------------------------------ 覆盖告知
 
 

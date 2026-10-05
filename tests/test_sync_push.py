@@ -315,3 +315,42 @@ async def test_pushing_without_a_client_fails_loudly(store):
 
     with pytest.raises(RuntimeError, match="API 客户端"):
         await engine.push_pending()
+
+
+DATE_IN_MARCH = "2026-03-20T09:00:00.000+0800"
+"""一个合法的 ``dueDate`` 原文（API 的形状）：推出去时必须逐字节不变。"""
+
+
+async def test_a_restart_still_has_the_queue_and_pushes_it(tmp_path):
+    """待推送改动活在本地库里：进程结束不等于它们没了，下次启动的周期泵接着推。
+
+    这条钉的是 ``quit_prompt`` 那句退出文案的事实依据。断网写一笔 → 关掉库（等于退出
+    dida）→ 拿同一个文件重开一次：队列还在，退避到点之后 ``push_pending()`` 把它推出去。
+    「推不动就留在队列里」如果只活在内存里，那句话就得反过来说。
+    """
+    path = tmp_path / "cache.sqlite3"
+    opened = Store(path)
+    down = FakeTransport()
+    for _ in range(4):
+        down.enqueue(httpx.ConnectError("断网"))
+    seed(opened, task(id="t1", title="写周报"))
+    first = make_engine(opened, down)
+    first.write("t1", changes={"dueDate": DATE_IN_MARCH})
+    await first.wait_for_pushes()
+    assert opened.pending_count() == 1, "推失败 → 留在队列里"
+    opened.close()
+
+    reopened = Store(path)
+    try:
+        assert reopened.pending_count() == 1, "进程结束不等于队列没了：它在本地库那张表里"
+
+        ok = FakeTransport(json={"id": "t1"})
+        # 重启发生在几分钟之后：退避（2s × 2ⁿ，封顶 5 分钟）已经到点
+        later = make_engine(reopened, ok, clock=ManualClock(T0 + timedelta(minutes=10)))
+        pushed = await later.push_pending()
+
+        assert pushed == 1, "下次启动的周期泵推得出去"
+        assert reopened.pending_count() == 0
+        assert ok.last_json["dueDate"] == DATE_IN_MARCH, "推出去的是原来那一笔，未知字段照旧带回"
+    finally:
+        reopened.close()
