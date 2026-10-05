@@ -125,6 +125,25 @@ async def test_a_refused_write_never_reaches_the_queue_or_the_wire(store, kind):
     assert engine.status().pending_count == 0, "待推送计数不许卡在非零"
 
 
+def test_rescheduling_a_task_outside_the_cache_is_refused_not_queued(store):
+    """缓存里没有这条任务：``reschedule()`` 当场拒绝（结构化错误），本地一个字都不写。
+
+    与 ``defer()`` 的静默 no-op 不同——用户在输入框里写了日期、按了 Enter，悄悄什么都不做
+    正是「如实呈现」要消灭的那种安静。界面那一侧把 ``UnknownTaskError`` 翻成一句提示
+    （那条测试随界面作废）；这里留下的是引擎那一半：拒绝就得是拒绝，一条永远推不出去的
+    改动都不许入队，没有底稿连请求都不该发。原本钉在 ``test_reschedule.py`` 里（#32 搬出）。
+    """
+    transport = FakeTransport(json={"id": "t2"})
+    engine = make_engine(store, transport)
+
+    with pytest.raises(UnknownTaskError) as caught:
+        engine.reschedule("t2", due=at(20, 14, 0), all_day=False)
+
+    assert caught.value.task_id == "t2"
+    assert store.pending() == (), "拒绝就得是拒绝：不许留一条永远推不出去的改动"
+    assert transport.requests == [], "没有底稿就连请求都不该发"
+
+
 def test_a_snapshot_without_a_list_id_is_refused_too(store):
     """底稿没有 ``projectId`` 也不许写：否则存储层会拿收集箱兜底，发一个**猜来的**清单。
 

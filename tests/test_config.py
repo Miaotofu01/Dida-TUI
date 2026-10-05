@@ -244,5 +244,36 @@ async def test_an_empty_paste_never_reaches_the_network(tmp_path):
 
 def test_the_token_never_leaks_into_a_repr():
     assert "tok-1" not in repr(Config(token="tok-1"))
+
+
+async def test_a_rejected_token_is_never_printed_in_the_failure(tmp_path):
+    """401：错误里不许出现那串 token——它会被日志、终端回滚、截图一起带走。
+
+    「验证没过就什么都不落盘」已经由上面那条钉着；这里补的是另一半：**说出来的话**里也
+    不许有它。原本钉在 ``test_sync_session.py`` 里（#32 搬出来的）。
+    """
+    path = tmp_path / "config.toml"
+    credentials = Credentials(transport=FakeTransport(status_code=401, json={}), path=path)
+
+    with pytest.raises(CredentialsError) as caught:
+        await credentials.verify_and_store("tok-secret")
+
+    assert "tok-secret" not in str(caught.value), "token 不许进错误消息（日志、回滚都看得到）"
+    assert "重新粘贴" in str(caught.value)
+    assert not path.exists()
+
+
+async def test_a_network_failure_never_prints_the_token_either(tmp_path):
+    """断网：报的是网络失败，而且那串 token 一个字都不许出现在里面。"""
+    path = tmp_path / "config.toml"
+    transport = FakeTransport()
+    transport.enqueue(httpx.ConnectError("连不上"))
+    credentials = Credentials(transport=transport, path=path)
+
+    with pytest.raises(NetworkError) as caught:
+        await credentials.verify_and_store("tok-secret")
+
+    assert "tok-secret" not in str(caught.value)
+    assert not path.exists(), "验证没过就一个文件都不该写"
     assert "None" in repr(Config())  # 没 token 时仍然看得出「还没有」
     assert "day_end='04:00'" in repr(Config(token="tok-1", day_end="04:00"))

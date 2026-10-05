@@ -72,6 +72,36 @@ def test_task_snapshot_keeps_server_fields_the_client_does_not_know(store):
     assert payload["someFieldTheClientNeverHeardOf"] == {"nested": [1, 2]}
 
 
+def test_a_refresh_carries_desc_content_and_tags_onto_the_snapshot(store):
+    """服务端原文里的 ``desc`` / ``content`` / ``tags`` 落到快照的同名字段上。
+
+    深模块的那条路是：``TaskSnapshot``（缓存里的事实）→ ``TaskItem``（引擎算好的成品）→
+    右栏。这一条钉的是头一段——期望的**字段名**来自 ``api-contracts.md`` 的 ``Task`` 字段表。
+
+    它刻意不碰中文标签（「描述」「备注」各对应哪一个字段）：v1 把两者标反了，#43 负责
+    把它翻过来（``GLOSSARY.md`` 说 描述=``content``、备注=``desc``）。哪一边是哪一边与
+    「服务端给的东西有没有原样落进快照」是两件事，这一条只管后者。原本钉在
+    ``test_detail_description.py`` 里（#32 搬出来的）。
+    """
+    store.apply_refresh(
+        lists=[project(name="工作")],
+        tasks=[
+            task(
+                title="写周报",
+                desc="本周的三件事",
+                content="记得附上上周的对比数据",
+                tags=["工作", "季度"],
+            )
+        ],
+    )
+
+    snapshot = next(item for item in store.tasks() if item.id == "t1")
+
+    assert snapshot.desc == "本周的三件事"
+    assert snapshot.content == "记得附上上周的对比数据"
+    assert snapshot.tags == ("工作", "季度")
+
+
 def test_tasks_expose_the_view_source_snapshot(store):
     """``tasks()`` 是 ``ViewSource`` 要的形状：事实、带时区的截止时刻、已完成也返回。"""
     store.apply_refresh(
