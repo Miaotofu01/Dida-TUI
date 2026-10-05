@@ -424,10 +424,14 @@ def test_a_payload_we_do_not_understand_degrades_to_a_usable_definition():
     decoded = view_from_payload(
         {"name": "半条", "due": "不是字典", "completion": "不认识", "priorities": ["x", 5]}
     )
+    empty_window = view_from_payload({"name": "空的区间", "due": {}})
 
     assert isinstance(decoded, ViewDefinition)
     assert (decoded.name, decoded.due, decoded.completion) == ("半条", None, Completion.UNFINISHED)
     assert decoded.priorities == (5,)
+    assert empty_window.due is None, (
+        "``{}`` 不能当成默认的 DueWindow（那是 first=0/last=0，只收今天到期的）"
+    )
 
 
 # ---------------------------------------------------------------- 接缝一：本地库与引擎

@@ -425,9 +425,9 @@ def view_form_values(
             ANY_VALUE,
         ),
         VIEW_PRIORITY_FIELD: " ".join(
-            _PRIORITY_LABELS[item]
-            for item in definition.priorities
-            if item in _PRIORITY_LABELS
+            # 认不出来的档照原样显示成数字（手改过的库）：静默丢掉一维就是静默筛错东西，
+            # 而写成数字之后用户一按确认就会被拒、并且被告知是哪一个词。
+            _PRIORITY_LABELS.get(item, str(item)) for item in definition.priorities
         ),
         VIEW_TAGS_FIELD: " ".join(definition.tags),
         VIEW_COMPLETION_FIELD: definition.completion.value,
@@ -504,7 +504,12 @@ def parse_view_form(
 
 
 def _tokens(text: str) -> tuple[str, ...]:
-    """一格文本 → 几个词：空格、逗号、顿号都算分隔符（用户按哪种习惯写都认）。"""
+    """一格文本 → 几个词：空格、逗号、顿号都算分隔符（用户按哪种习惯写都认）。
+
+    **代价写在这里**：名字里带空格的标签（``read later``）没法在这一格里表达——它会被切成
+    两个词。这一层不猜「哪一段是名字的哪一半」（猜错就是静默筛错东西），而多选控件是
+    #45 那张票的挑选型字段；在那之前，这一格认的是单词与逗号分隔的写法。
+    """
     return tuple(token for token in re.split(r"[,，、\s]+", text.strip()) if token)
 
 
@@ -602,17 +607,25 @@ def view_from_payload(payload: Mapping[str, Any], *, view_id: str = "") -> ViewD
     return ViewDefinition(
         id=view_id or str(payload.get("id") or ""),
         name=str(payload.get("name") or ""),
-        due=(
-            DueWindow(**{key: due[key] for key in ("first", "last", "dated", "undated") if key in due})
-            if isinstance(due, Mapping)
-            else None
-        ),
+        due=_due_of(due),
         completion=_completion_of(payload.get("completion")),
         lists=_string_tuple(payload.get("lists")),
         priorities=_int_tuple(payload.get("priorities")),
         tags=_string_tuple(payload.get("tags")),
         completed_days=_completed_days_of(str(payload.get("completed_days") or "")),
     )
+
+
+def _due_of(value: Any) -> DueWindow | None:
+    """原文里那一维 → 一个区间；不是字典、或者四个字段一个都没有，就是**不限**。
+
+    ``{}`` 不能当成 ``DueWindow()``：那是个默认值——``first=0, last=0``，也就是「只收今天
+    到期的」。坏一行就悄悄换成一个筛错东西的视图，比读不出来坏得多。
+    """
+    if not isinstance(value, Mapping):
+        return None
+    known = {key: value[key] for key in ("first", "last", "dated", "undated") if key in value}
+    return DueWindow(**known) if known else None
 
 
 def _string_tuple(value: Any) -> tuple[str, ...]:
