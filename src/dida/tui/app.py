@@ -445,6 +445,30 @@ class DidaApp(App[None]):
         """详细页上按了 ``esc``：回任务列表页。"""
         self.back_to_tasks()
 
+    async def on_detail_page_field_edited(self, event: DetailPage.FieldEdited) -> None:
+        """详细页上改完一个字段：**立刻写出去**，并把结果留在那一页底部（工单 #43）。
+
+        乐观写（``write``）：本地当场生效、推送排到事件循环上立刻跑——用户按完 ``esc`` 不等
+        网络。后面那一次 ``push_pending`` 是**等这一笔落地**的确定性那一次（队列只有一条，
+        两次推送不会重复发），它回来之后底部那一行才知道该写「已保存」还是「待推送（N）」。
+
+        写失败分两种，两种都说出**具体**原因（用户故事 81）：引擎当场拒绝（本地没有这条任务
+        的底稿）在这里接住；推不出去（断网、服务端拒绝）由引擎记在队列上，下一次
+        :meth:`update_status` 会把它读出来。
+        """
+        try:
+            self.engine.write(event.task_id, changes={event.field: event.value})
+        except DidaError as exc:
+            self.refresh_view()
+            if not self.is_running:
+                return
+            self.detail_page().show_save(messages.field_save_failed_message(exc))
+            return
+        await self.engine.push_pending()
+        if not self.is_running:
+            return
+        self.refresh_view()
+
     # ---------------------------------------------------------------- 当前任务 / 浏览器（工单 #19）
 
     def current_task_id(self) -> str | None:

@@ -396,6 +396,80 @@ DetailPage #page-body {
     height: 1;
     visibility: hidden;
 }
+/* 详细页底部那一行：钉在这一页自己的底边上（不是第三个 chrome 行——它跟着这一页走）。
+
+   ``dock: bottom`` 落在**这一页**里，与钉在屏幕底部的状态栏不是同一个容器，所以
+   ADR-0007 里那条「两个 dock: bottom 会互相盖掉、吃掉汉字格」的教训在这里不适用。 */
+#detail-save {
+    dock: bottom;
+    height: 1;
+    width: 100%;
+    background: {page};
+}
+/* 编辑器：平时藏着（进编辑才亮出来），颜色一律走 ANSI 槽位。
+
+   Textual 那两个输入框自带的样式用的是主题变量（surface / boost / border 这几个名字），
+   它们是**真彩色**——不覆盖就等于把「跟随终端主题」在编辑态里丢掉，而且屏幕上看不出来
+   （只有读 SGR 才发现）。所以边框、底色、光标块、选中块全部在这里改写成 ansi_*，
+   内层那几个类名（input--* / text-area--*）也逐一盖掉。 */
+#detail-edit {
+    display: none;
+    height: 1fr;
+    width: 100%;
+    background: {page};
+}
+#detail-edit-label {
+    height: 1;
+    width: 100%;
+    background: {page};
+}
+#detail-input, #detail-text {
+    background: {page};
+    color: ansi_default;
+    border: none;
+    padding: 0;
+    height: 1fr;
+}
+#detail-input {
+    height: 1;
+}
+#detail-input:focus, #detail-text:focus {
+    border: none;
+}
+#detail-input .input--cursor {
+    background: {accent};
+    color: {page};
+    text-style: bold;
+}
+#detail-input .input--selection {
+    background: {accent};
+    color: {page};
+}
+#detail-input .input--placeholder, #detail-input .input--suggestion {
+    color: ansi_default;
+    text-style: dim;
+}
+#detail-text .text-area--cursor {
+    background: {accent};
+    color: {page};
+    text-style: bold;
+}
+#detail-text .text-area--cursor-line {
+    background: {page};
+}
+#detail-text .text-area--selection {
+    background: {accent};
+    color: {page};
+}
+#detail-text .text-area--gutter, #detail-text .text-area--cursor-gutter {
+    color: ansi_default;
+    background: {page};
+    text-style: none;
+}
+#detail-text .text-area--matching-bracket, #detail-text .text-area--suggestion {
+    background: {page};
+    color: ansi_default;
+}
 #status-bar {
     dock: bottom;
     height: 1;

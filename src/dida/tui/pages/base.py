@@ -344,8 +344,22 @@ class CursorPage(VerticalScroll):
         first = self._line_of_cursor()
         last = first + self._cursor_lines() - 1
         top = self.scroll_offset.y
-        height = max(1, self.size.height)
+        height = self._viewport_height()
         if first < top:
             self.scroll_to(y=first, animate=False)
         elif last >= top + height:
             self.scroll_to(y=min(first, last - height + 1), animate=False)
+
+    def _viewport_height(self) -> int:
+        """正文真正能占的那几**行**：这一页自己的高度，减去钉在上下两边的那些。
+
+        详细页底部常驻那一行是 ``dock: bottom``（不随正文滚动，见 ``#detail-save``），可它
+        占掉的是一行**看得见**的高度：不减掉它，:meth:`scroll_cursor_into_view` 会把光标那
+        一段滚到那一行背后——屏幕上就是「光标不见了」。
+        """
+        docked = sum(
+            child.size.height
+            for child in self.children
+            if child.styles.dock in ("top", "bottom")
+        )
+        return max(1, self.size.height - docked)

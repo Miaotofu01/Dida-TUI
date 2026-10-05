@@ -31,6 +31,7 @@ from dida.sync.engine import (
     TaskDetail,
     TaskList,
     ViewRow,
+    WriteKind,
 )
 from dida.sync.view import (
     INBOX_NAME,
@@ -40,6 +41,15 @@ from dida.sync.view import (
     TaskSnapshot,
     TodayView,
 )
+
+
+_SNAPSHOT_FIELDS = frozenset({"title", "content", "desc", "priority", "completed", "due", "all_day"})
+"""一次写里能直接盖进 :class:`TaskSnapshot` 的那些字段名。
+
+引擎给的是**服务端字段名**（``content`` / ``desc`` / ``title``……），快照上那几位恰好同名；
+其余（``dueDate``、``items``、未知字段）只并进服务端原文。替身不自己翻译字段——那一层
+是 ``Store`` 的事，替身照它的口径做最小的那一份。
+"""
 
 
 class ManualClock:
@@ -224,6 +234,21 @@ class InMemorySource:
     def lists(self) -> tuple[ListSnapshot, ...]:
         return tuple(self._lists.values())
 
+    def apply_changes(self, task_id: str, changes: Mapping[str, Any]) -> None:
+        """把一次写盖到缓存里那条任务上（假后端 ``write`` 的本地效果）。
+
+        与 ``Store`` 同一条口径：本地当场生效（乐观写），服务端随后到。认得出的字段（标题、
+        描述、备注、优先级、状态）盖进快照，其余原样并进那份服务端原文——详情页的只读字段
+        读的就是原文。
+        """
+        snapshot = self._tasks.get(task_id)
+        if snapshot is None:
+            return
+        known = {key: value for key, value in changes.items() if key in _SNAPSHOT_FIELDS}
+        if known:
+            self._tasks[task_id] = replace(snapshot, **known)
+        self._raw[task_id] = {**self._raw.get(task_id, {}), **changes}
+
     def views(self) -> tuple[ViewRow, ...]:
         """自定义视图行（#36 的本地库那一样；替身里是 :meth:`add_view` 摆的）。"""
         return tuple(self._views.values())
@@ -299,6 +324,20 @@ class FakeBackend:
 
         self.deleted: list[str] = []
         """``delete(task_id)`` 收到的任务 id，按调用顺序（t16 的删除）。"""
+
+        self.writes: list[tuple[str, dict[str, Any]]] = []
+        """``write(task_id, changes=)`` 收到的每一笔（任务 id + 改动的字段），按调用顺序。
+
+        详细页逐字段编辑（#43）与挑选型字段（#45）断的就是「改完一个字段立刻写出去、而且
+        只带这一个字段」——描述与备注互不覆盖那件事，在这一层看得最清楚。
+        """
+
+        self.write_error: Exception | None = None
+        """摆一个异常进去，``write`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。
+
+        与 ``reschedule_error`` / ``delete_error`` 同一形状：引擎当场拒绝（#25 的
+        ``UnknownTaskError``）时界面要说出**具体**原因。
+        """
 
         self.delete_error: Exception | None = None
         """摆一个异常进去，``delete`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。"""
@@ -436,6 +475,24 @@ class FakeBackend:
         self.deleted.append(task_id)
         if self.delete_error is not None:
             raise self.delete_error
+
+    def write(
+        self,
+        task_id: str,
+        *,
+        changes: Mapping[str, Any] | None = None,
+        kind: WriteKind = WriteKind.UPDATE,
+    ) -> None:
+        """写：记下这一笔，**并且真的把改动落进内存缓存**（#43 的逐字段编辑）。
+
+        与 ``create`` 同一条口径（那里也是「真的摆进缓存」）：只记录的话，「改完一个字段屏幕
+        上就变了」这句话在接缝一根本测不到——而逐个字段改、两个字段互不覆盖正是这一票要断的
+        事。摆了 ``write_error`` 就记完这一笔再抛，试 TUI 拿到结构化错误时说不说得清。
+        """
+        self.writes.append((task_id, dict(changes or {})))
+        if self.write_error is not None:
+            raise self.write_error
+        self.source.apply_changes(task_id, dict(changes or {}))
     def cycle_priority(self, task_id: str) -> None:
         """写：只记录（与 ``complete`` / ``defer`` 一样，替身不动缓存）。
 

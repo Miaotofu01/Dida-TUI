@@ -233,6 +233,21 @@ class Engine(Protocol):
         """写：拉一次已完成流（按完成时间游标拉窗口）。**要 await**。"""
         ...
 
+    def write(
+        self,
+        task_id: str,
+        *,
+        changes: Mapping[str, Any] | None = None,
+        kind: WriteKind = WriteKind.UPDATE,
+    ) -> None:
+        """写：把 ``changes`` 里那几个字段盖上去（本地当场生效 + 立刻推送）。
+
+        改一个字段（详细页 #43 的标题 / 描述 / 备注）与完成、删除走的是同一条乐观写路径；
+        本地没有这条任务的底稿时当场抛 :class:`~dida.sync.writes.UnknownTaskError`——界面
+        据此说出**具体**原因，而不是一个笼统的「保存失败」（用户故事 81）。
+        """
+        ...
+
     def complete(self, task_id: str) -> None:
         """写：完成并立即推送。"""
         ...

@@ -1,26 +1,30 @@
-"""层三：任务详细页——**这一票只留接缝，#43 接手扩展**。
+"""层三：任务详细页——字段列表、逐字段编辑、只读的那几段（工单 #43）。
 
-spec 的三层状态机里，任务列表页 ``enter`` 进这一页、``esc`` 退回任务列表页。字段列表
-（标题、描述、备注、所属清单、截止时间、优先级、标签、只读的子任务/提醒/重复）与「按
-``enter`` 进某个字段编辑」是 #43 的工单；这里先把这一层立起来并如实显示**已经读得到的**
-那些字段（``Engine.task_detail`` 在 #33 就返回了它们的成品读法），好让用户按得进来、
-退得回去，也让 #43 有一个自己的文件可改。
+spec 的三层状态机里，任务列表页 ``enter`` 进这一页、``esc`` 退回任务列表页。这一页上：
+``j``/``k`` 在**字段之间**走（永远不停在折行块内部）、``enter`` 进当前字段的编辑、编辑中
+``esc`` **结束这次编辑并回到字段列表**（改动已经生效，没有「取消」）。
 
 **两个字段不许标反**（``GLOSSARY.md``：描述 = ``content``、备注 = ``desc``；v1 标反了，
 这份 spec 纠正它）：这一页按术语表写，``TaskDetail.content`` 画在「描述」那一行。
 
-空的那一行不画（v1 的结论，工单 #20）：标签、描述、备注、子任务、重复、提醒没有内容时
-整个不出现，而不是留一个空标签行——判断依据是引擎给的空串/空元组，不是这一层去问。
+**这一页折行**（ADR-0007 的「截断与折行按页分工」：列表页截断、详细页换行）：一个长描述
+占好几屏行，于是「第几个字段」与「第几屏行」分家——光标与滚动一律按**屏幕行偏移表**算
+（:meth:`DetailPage._row_lines`，折点用 Textual 自己那个 ``divide_line``）。
+
+可编辑的三个字段是**自由文本**（标题单行、描述与备注多行）；所属清单、截止时间、优先级、
+标签今天只读显示——改它们要打另外三个形状的端点，归 #44（截止）与 #45（清单/优先级/标签）。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
 
-from rich.text import Text
-from textual.message import Message
-
 from rich._wrap import divide_line
+from rich.text import Text
+from textual.app import ComposeResult
+from textual.containers import Vertical
+from textual.message import Message
+from textual.widgets import Input, Static, TextArea
 
 from dida.sync.engine import TaskDetail
 from dida.tui import messages, theme
@@ -204,6 +208,22 @@ class DetailPage(CursorPage):
         self._task_id: str | None = None
         self._detail: TaskDetail | None = None
         self._fields: tuple[Field, ...] = ()
+        self._editing: Field | None = None
+        """正在编辑哪个字段；``None`` = 光标停在字段列表上（这一页的常态）。"""
+
+    def compose(self) -> ComposeResult:
+        """正文 + 装饰光标条（页面的那两块），加上这一页自己的两块：底部那一行 + 编辑器。
+
+        编辑器（单行 / 多行两个框）**预先摆好、平时藏着**（``display: none``）：进编辑就是把
+        正文藏起来、把它亮出来，退出反过来。挂载与卸载留到按键那一刻做的话，一次 ``esc``
+        要跨两次布局，用户看到的是闪一下。
+        """
+        yield from super().compose()
+        yield Static(id="detail-save")
+        with Vertical(id="detail-edit"):
+            yield Static(id="detail-edit-label")
+            yield Input(id="detail-input")
+            yield TextArea(id="detail-text", show_line_numbers=False)
 
     @property
     def task_id(self) -> str | None:
@@ -217,12 +237,25 @@ class DetailPage(CursorPage):
         self._detail = detail
         if detail is None:
             self._fields = ()
+            self._end_edit()
             self.set_rows((empty_row(self.EMPTY_TEXT),))
             return
         self._fields = fields_of(detail)
+        if self._editing is not None:
+            # 正在编辑时**不重铺**：用户手里那段文字是他的，后台刷新（周期泵）不该把它换掉。
+            # 这一次编辑结束后由 app 再刷新一遍，字段列表拿到的是最新那一份。
+            return
         # 换了一条任务就从**标题**开始（前一条任务停在第几个字段与这一条无关）；同一条任务
         # 再铺一遍（后台刷新回来）则按行 id 认回原来那个字段。
         self.set_rows(self._field_rows(), keep_cursor=detail.task_id == previous)
+
+    def show_save(self, text: str) -> None:
+        """页面底部那一行常驻的话（「已保存」/「待推送（N）」/保存失败的具体原因）。
+
+        它不随正文滚动（``dock: bottom``，钉在这一页自己的底边）：正在改描述的用户要能一眼
+        看见刚才那一下到底出去没有（用户故事 65）。
+        """
+        self.query_one("#detail-save", Static).update(theme.styled(text, theme.MUTED))
 
     def _field_rows(self) -> tuple[Row, ...]:
         """字段列表那一页的行：顶上一线，然后七个字段，最后是只读的那几段。
@@ -254,11 +287,100 @@ class DetailPage(CursorPage):
     def on_resize(self) -> None:
         """宽度变了：折行块的行数跟着变，光标条与滚动的位置都要按新表重算。"""
         super().on_resize()
-        if self._rows:
+        if self._rows and self._editing is None:
             self._land_bar()
             self.scroll_cursor_into_view()
 
+    # ---------------------------------------------------------------- 编辑
+
+    def action_enter(self) -> None:
+        """``enter``：进当前字段的编辑（验收标准 3）。
+
+        只有三个自由文本字段有编辑器（:attr:`Field.wire`）；截止时间与那三个挑选型字段今天
+        什么都不做——**接缝留给 #44 / #45**：它们给 ``Field.wire`` 填上值、在这里接一个编辑
+        器，光标、折行、保存行都不必再动。编辑态下这个键归编辑器自己（多行框里它是换行）。
+        """
+        if self._editing is not None:
+            return
+        field = self._current_field()
+        if field is None or field.wire is None:
+            return
+        self._begin_edit(field)
+
+    def _current_field(self) -> Field | None:
+        """光标停在哪个字段上（字段列表那一份，不是 Row）。"""
+        return next((field for field in self._fields if field.key == self.selected_id), None)
+
+    def _begin_edit(self, field: Field) -> None:
+        """把正文藏起来、把编辑器亮出来，光标交给它。"""
+        self._editing = field
+        self.query_one("#detail-edit-label", Static).update(
+            theme.styled(f"编辑{field.label}", theme.HEADING)
+        )
+        single = self.query_one("#detail-input", Input)
+        multi = self.query_one("#detail-text", TextArea)
+        single.display = not field.multiline
+        multi.display = field.multiline
+        if field.multiline:
+            multi.text = field.value
+            # 光标停在**末尾**：改动通常是接着写。多行框的落点是 (行, 列)，最后一行就是
+            # ``value`` 里最后那一段——Textual 没有「全选」，光标丢在开头会让人一按退格
+            # 什么都没发生（原型里那条 30 列的实测就是这么来的）。
+            lines = field.value.split("\n")
+            multi.move_cursor((len(lines) - 1, len(lines[-1])))
+            multi.focus()
+        else:
+            single.value = field.value
+            # 单行框同理：光标停在末尾，改动接着写。
+            single.cursor_position = len(field.value)
+            single.focus()
+        self._body().styles.display = "none"
+        self._bar().styles.visibility = "hidden"
+        self.query_one("#detail-edit").styles.display = "block"
+
+    def _editor_value(self) -> str:
+        """编辑器里当前那段文字。"""
+        field = self._editing
+        if field is not None and field.multiline:
+            return self.query_one("#detail-text", TextArea).text
+        return self.query_one("#detail-input", Input).value
+
+    def _end_edit(self) -> None:
+        """收起编辑器，把这一页还给字段列表。"""
+        if self._editing is None:
+            return
+        self._editing = None
+        self.query_one("#detail-edit").styles.display = "none"
+        self._body().styles.display = "block"
+        self._redraw()
+        self.focus(scroll_visible=False)
+
+    def _finish_edit(self) -> None:
+        """``esc``（编辑中）：**结束这次编辑，改动已经生效**（验收标准 4）。
+
+        没有「取消」这条路——所以这里只有两种结局：写得出去（发消息给 app，交给引擎乐观写 +
+        立刻推送），或者**根本没改**（原样收起）。标题被清空是唯一一种「不能写」的输入：
+        空标题不被接受，旧标题原样留着，下面那一行说清是哪一条规矩（不是一个「保存失败」）。
+        """
+        field = self._editing
+        value = self._editor_value()
+        self._end_edit()
+        if field is None or self._task_id is None or value == field.value:
+            return
+        if field.key == "title" and not value.strip():
+            self.show_save(messages.NO_TITLE_EDIT_MESSAGE)
+            return
+        self.post_message(self.FieldEdited(self._task_id, field.wire or field.key, value))
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        """单行输入里按 ``enter`` ＝ 提交（键位表：``enter`` 是「进入下一层 / 提交输入」）。"""
+        if self._editing is not None and not self._editing.multiline:
+            self._finish_edit()
+
     def action_back(self) -> None:
-        """``esc``：退回任务列表页。"""
+        """``esc``：编辑中结束这次编辑，字段列表上退回任务列表页（验收标准 4 + 5）。"""
+        if self._editing is not None:
+            self._finish_edit()
+            return
         self.post_message(self.Back())
 

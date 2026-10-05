@@ -90,6 +90,11 @@ def row_with(text: str, needle: str) -> str:
     raise AssertionError(f"屏幕上没有「{needle}」这一行：\n{text}")
 
 
+def has_field(text: str, label: str) -> bool:
+    """屏幕上有没有 ``label`` 那个字段行（编辑态里字段列表是收起来的）。"""
+    return any(line[2:].startswith(label) for line in text.splitlines())
+
+
 def field_row(text: str, label: str) -> str:
     """字段列表里 ``label`` 那一行：行首那两格是光标记号，所以从第三格认起。
 
@@ -366,3 +371,101 @@ async def test_the_travelling_cursor_bar_flies_to_the_wrapped_blocks_own_line():
     assert field_row(text, "备注").startswith(theme.CURSOR_MARK), f"记号不在备注那一行：\n{text}"
     block = "".join(part.strip() for part in wrapped_block(text, "描述", "备注"))
     assert block.removeprefix("描述") == LONG_CONTENT, f"折行块被条子吃掉了几个字：{block!r}"
+
+
+# ------------------------------------------------------------------ 逐字段编辑
+
+
+def clear(length: int) -> list[str]:
+    """清掉输入框里那 ``length`` 个字（没有「全选」，所以一下一下退）。"""
+    return ["backspace"] * length
+
+
+async def test_enter_edits_the_title_and_esc_finishes_the_edit():
+    """``enter`` 进当前字段的编辑，编辑中 ``esc`` 结束并回到字段列表（验收标准 3 + 4）。
+
+    「改动已经生效、没有取消」：``esc`` 之后屏幕上就是新标题，而不是问一句要不要保存。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await pilot.press("enter")  # 光标在标题上：进编辑
+        await pilot.pause()
+        editing = screen_text(app)
+        await pilot.press(*clear(len(TITLE)))
+        await pilot.press(*"新的标题")
+        await pilot.press("escape")  # 结束这次编辑
+        await pilot.pause()
+        finished = screen_text(app)
+
+    assert "编辑标题" in editing, f"编辑态没有说清在改哪个字段：\n{editing}"
+    assert not has_field(editing, "描述"), f"编辑态还画着字段列表：\n{editing}"
+    assert field_row(finished, "标题").startswith(theme.CURSOR_MARK), (
+        f"``esc`` 之后光标没有回到字段列表上：\n{finished}"
+    )
+    assert "新的标题" in field_row(finished, "标题"), f"改动没有生效：\n{finished}"
+
+
+async def test_an_empty_title_is_not_accepted_and_the_old_one_stays():
+    """空标题不被接受（验收标准 6）：旧标题原样还在，下面那一行说清是哪条规矩。
+
+    「没有取消」不等于「退不出去」：清空标题再按 ``esc`` 时这次编辑照样结束，只是那一下
+    **没有改**——否则用户会卡在一个按什么都出不去的编辑态里。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await pilot.press("enter")
+        await pilot.press(*clear(len(TITLE)))
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert has_field(text, "标题"), f"编辑没有结束：\n{text}"
+    assert TITLE in field_row(text, "标题"), f"旧标题该原样留着：\n{text}"
+    assert messages.NO_TITLE_EDIT_MESSAGE in text, f"没说清为什么没改成：\n{text}"
+    assert fake.writes == [], "空标题不该写出去"
+
+
+async def test_description_and_note_are_edited_independently():
+    """描述与备注各自可改、互不覆盖（验收标准 6）：一笔写只带一个字段。
+
+    两笔写各带各的服务端字段名（``content`` / ``desc``）——这就是「改一个不会覆盖另一个」
+    在接口上的样子；屏幕那一头是两行各显示各的。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+    # 只用汉字：``pilot.press`` 会把单字符的**标点**当成键名去查（``：`` → ``colon``），
+    # 那是测试驱动的脾气，不是真实输入那条路（真终端送的是 UTF-8 字节）。
+    new_content = "换过的描述三件结论"
+    new_desc = "换过的备注先问财务"
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await pilot.press("j")  # 描述
+        await pilot.press("enter")
+        await pilot.press(*clear(len(CONTENT)))
+        await pilot.press(*new_content)
+        await pilot.press("escape")
+        await pilot.pause()
+        await pilot.press("j")  # 备注
+        await pilot.press("enter")
+        await pilot.press(*clear(len(DESC)))
+        await pilot.press(*new_desc)
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert fake.writes == [("t1", {"content": new_content}), ("t1", {"desc": new_desc})], (
+        f"两笔写没有各带各的字段：{fake.writes}"
+    )
+    assert new_content in field_row(text, "描述"), f"描述没改成：\n{text}"
+    assert new_content not in field_row(text, "备注"), "改描述把备注盖掉了"
+    assert new_desc in field_row(text, "备注"), f"备注没改成：\n{text}"
+    assert new_desc not in field_row(text, "描述"), "改备注把描述盖掉了"
