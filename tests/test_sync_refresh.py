@@ -88,6 +88,75 @@ def urls(transport: FakeTransport) -> list[str]:
     return [str(request.url) for request in transport.requests]
 
 
+class PagedProjectServer:
+    """**会真的分页**的假服务端（#41）。
+
+    与 :class:`~dida.testing.FakeTransport` 的差别正是这个假服务端的全部意义：那个按队列
+    回放，给什么就是什么，翻不翻页它都照给；这一个照文档办事——``offset``/``limit`` 切片，
+    而**不给分页参数就按 200 的默认上限截断**（真实服务端的默认，见 notes/openapi-dida365.md
+    的 ``GET /open/v1/project``）。一条不翻页的读路径因此真的会拿丢第 201 条起的东西。
+
+    收集箱不在 ``GET /open/v1/project`` 里（ADR-0001）：索引没给过的清单，它的 data 就只回
+    ``tasks``，不回 ``project``。
+    """
+
+    DEFAULT_LIMIT = 200
+    """不给分页参数时服务端的默认上限（文档：给了任一参数才默认 200，这里照真实行为建模）。"""
+
+    def __init__(self, projects: list[dict], tasks: dict[str, list[dict]] | None = None) -> None:
+        self.projects = list(projects)
+        self.tasks = dict(tasks or {})
+        self.index_requests: list[httpx.Request] = []
+        """收到过的清单索引请求，按顺序（翻页几页就有几条）。"""
+
+        self.data_requests: list[str] = []
+        """收到过的 ``.../data`` 请求的清单 id，按顺序。"""
+
+    @property
+    def index_pages(self) -> int:
+        """清单索引被请求了几页。"""
+        return len(self.index_requests)
+
+    async def send(self, request: httpx.Request) -> httpx.Response:
+        url = request.url
+        if url.path == "/open/v1/project":
+            self.index_requests.append(request)
+            offset = int(url.params.get("offset") or 0)
+            limit = int(url.params.get("limit") or self.DEFAULT_LIMIT)
+            return httpx.Response(200, json=self.projects[offset : offset + limit])
+        project_id = url.path.split("/")[4]
+        self.data_requests.append(project_id)
+        payload: dict = {"tasks": self.tasks.get(project_id, [])}
+        known = next((item for item in self.projects if item["id"] == project_id), None)
+        if known is not None:
+            payload["project"] = known
+        return httpx.Response(200, json=payload)
+
+
+async def test_the_project_index_is_paged_until_a_short_page(store):
+    """清单索引超过服务端一页的上限时要翻页拿全（#41 的第一条验收标准）。
+
+    250 个清单、服务端一页 200 条：不翻页的读路径只会拿到前 200 个，第 201 个起**永远
+    看不见**，而且不报错。响应是一个没有 total 的裸数组，所以「还有没有下一页」只能靠
+    「这一页拿满了没有」推断。
+    """
+    server = PagedProjectServer(
+        projects=[
+            project(id=f"p{n}", name=f"清单{n}", sort_order=n + 1) for n in range(250)
+        ],
+        tasks={"p249": [task(id="deep", title="第 250 个清单里的任务", project_id="p249")]},
+    )
+    engine = make_engine(store, server)
+
+    await engine.refresh()
+
+    assert len(store.lists()) == 250, "第 201 个清单起不许被截断"
+    assert [item.name for item in engine.view().lists][-1] == "清单249"
+    assert store.task_payload("deep") is not None, "翻页才看得见的那个清单里的任务也要在"
+    assert server.index_pages == 2
+    assert server.index_requests[0].url.params.get("limit") == "200"
+
+
 async def test_refresh_fetches_every_list_and_writes_the_first_payload(store):
     transport = FakeTransport()
     serve(
@@ -100,7 +169,7 @@ async def test_refresh_fetches_every_list_and_writes_the_first_payload(store):
     report = await engine.refresh()
 
     assert urls(transport) == [
-        "https://api.dida365.com/open/v1/project",
+        "https://api.dida365.com/open/v1/project?offset=0&limit=200",
         "https://api.dida365.com/open/v1/project/inbox/data",
         "https://api.dida365.com/open/v1/project/work/data",
     ]
@@ -148,7 +217,8 @@ async def test_refresh_never_uses_a_date_window_for_unfinished_tasks(store):
 
     ``task/undone``、``task/filter`` 这类日期窗口会**静默**漏掉「日期在很久以后、但刚被
     改过」的任务；漏了不报错，只会在某天表现为「我的任务不见了」。所以这里钉死请求集合：
-    只有列清单 + 每个清单恰好一次 data，没有别的路径，也没有任何查询串。
+    只有列清单 + 每个清单恰好一次 data，没有别的路径。列清单那一次带的是**翻页参数**
+    （#41 的第一条，取全清单索引用的），逐清单的 data 一次不带任何查询串。
     """
     transport = FakeTransport()
     serve(
@@ -161,7 +231,7 @@ async def test_refresh_never_uses_a_date_window_for_unfinished_tasks(store):
     await engine.refresh()
 
     assert [(request.method, str(request.url)) for request in transport.requests] == [
-        ("GET", "https://api.dida365.com/open/v1/project"),
+        ("GET", "https://api.dida365.com/open/v1/project?offset=0&limit=200"),
         ("GET", "https://api.dida365.com/open/v1/project/inbox/data"),
         ("GET", "https://api.dida365.com/open/v1/project/work/data"),
     ]
@@ -395,7 +465,7 @@ async def test_the_inbox_is_fetched_even_when_the_project_index_omits_it(store):
     report = await engine.refresh()
 
     assert urls(transport) == [
-        "https://api.dida365.com/open/v1/project",
+        "https://api.dida365.com/open/v1/project?offset=0&limit=200",
         "https://api.dida365.com/open/v1/project/work/data",
         "https://api.dida365.com/open/v1/project/inbox/data",
     ]

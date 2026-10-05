@@ -26,8 +26,14 @@ class ProjectReader(Protocol):
     故意只有两个方法：刷新路径不需要客户端的写操作，也不需要它认识领域概念。
     """
 
-    async def list_projects(self) -> list[dict[str, Any]]:
-        """``GET /open/v1/project``：清单索引（服务端说了算，不是本地缓存）。"""
+    async def list_projects(
+        self, *, offset: int | None = None, limit: int | None = None
+    ) -> list[dict[str, Any]]:
+        """``GET /open/v1/project``：清单索引（服务端说了算，不是本地缓存）。
+
+        分页参数是给刷新翻页用的（#41）：服务端一页最多 ``limit`` 条，而响应里没有
+        total，所以「还有没有下一页」只能由调用方自己按「这一页拿满了没有」推断。
+        """
         ...
 
     async def get_project_data(self, project_id: str) -> dict[str, Any]:
@@ -94,7 +100,7 @@ class RefreshMixin:
         target = self._refresh_target()
         reader = self._reader()
 
-        index = _project_index(await reader.list_projects())
+        index = await _project_index(reader)
         known = {str(item["id"]) for item in index}
         fetched = [str(item["id"]) for item in index]
         if INBOX_ID not in known:
@@ -142,8 +148,40 @@ class RefreshMixin:
         return self._client
 
 
-def _project_index(payload: Any) -> list[Mapping[str, Any]]:
-    """``GET /open/v1/project`` 的响应体 → 清单索引。
+PROJECT_PAGE_SIZE = 200
+"""清单索引一页要多少条（#41）。
+
+200 是文档写着的默认值：给了任一分页参数时，``limit`` 的缺省就是 200。文档**没有**写
+上限，所以这里不试探更大的页——要一个文档没写过的数，可能被服务端静默截断，而截断在这里
+恰恰是不可见的（响应里没有 total）。按文档的默认值要，服务端一定会照办。
+"""
+
+
+async def _project_index(reader: ProjectReader) -> list[Mapping[str, Any]]:
+    """``GET /open/v1/project``：清单索引，**翻页翻到底**（#41）。
+
+    服务端一页最多 :data:`PROJECT_PAGE_SIZE` 条，而响应是一个**没有 total 的裸数组**，
+    所以「拿全了没有」只能这样推断：**拿满一整页就说明可能还有**，接着要下一页；拿到短页
+    或空页才是到底了。这条推断是这里唯一的完整性信号——任何时候都不许看到第一页就当成
+    拿全了，那正是「第 201 个清单起永远看不见」还不报错的由来。
+
+    中途任何一页失败都照旧往上抛 :class:`~dida.api.errors.DidaError`：取数没取全就绝不
+    落库（ADR-0001 的全有全无），因此一次没翻完的索引也不会被当成完整的索引去剪枝。
+    """
+    pages: list[Mapping[str, Any]] = []
+    offset = 0
+    while True:
+        page = _project_index_page(
+            await reader.list_projects(offset=offset, limit=PROJECT_PAGE_SIZE)
+        )
+        pages.extend(page)
+        if len(page) < PROJECT_PAGE_SIZE:
+            return pages
+        offset += len(page)
+
+
+def _project_index_page(payload: Any) -> list[Mapping[str, Any]]:
+    """``GET /open/v1/project`` 的一页响应体 → 清单索引。
 
     **空数组是合法的**（就是没有清单），不是失败。形状不对则结构化报错：把 ``{}`` 当成
     「没有清单」会静默地什么都不刷新，那正是 ADR-0001 要挡的那类安静。
