@@ -148,6 +148,27 @@ async def test_n_asks_whether_it_is_a_list_or_a_view_first():
     assert "颜色" in list_form and "清单范围" not in list_form, "选清单照旧是 #42 那张表单"
 
 
+async def test_escape_on_the_question_writes_nothing_at_all():
+    """在「清单还是视图」那一句上按 ``esc``：什么都不发生（一个字节都不写）。
+
+    问一句是多一次按键，那一次就得能反悔——否则用户按错 ``n`` 之后只能建点什么才能走开。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("n")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert fake.created_lists == [] and fake.created_views == []
+    assert "名字" not in after and "清单范围" not in after, "两张表单都没开"
+    assert CUSTOM_MARK not in after and LIST_MARK in row_of(after, "工作"), "回到清单列表页"
+
+
 async def test_choosing_list_still_builds_a_list():
     """选了「清单」那条路照旧能用（#42 的验收标准不许被这一票弄坏）。"""
     fake = backend()
