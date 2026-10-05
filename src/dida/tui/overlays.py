@@ -46,6 +46,22 @@ __all__ = [
 # 抬起来的面（槽 0）、那条 ascii 细边框、以及「不做遮罩压暗」的理由都写在主题里；
 # 每个类各自向主题要一份壳子（theme.overlay_css(<类名>) / theme.form_css(<类名>)）。
 
+FORM_QUIT_BINDINGS = [
+    Binding(key, f"app.{QUIT_ACTION}", "退出", priority=True, show=False)
+    for key in QUIT_KEYS
+    if not (len(key) == 1 and key.isalpha())
+]
+"""表单上的退出键：**只取** :data:`~dida.tui.keys.QUIT_KEYS` 里不是字母的那些（工单 #42）。
+
+与 :data:`QUIT_BINDINGS`（上面那两张只读浮层用的那一份）差两处，两处都是故意的：
+
+- **字母不绑**：表单里 ``q`` 必须是一个字母（清单可以叫 ``quizzes``），而字母属于那一格。
+  出口是 ``Esc``。真按 ``q`` 的地方（选择框上）如果突然退出，用户填了一半的东西就没了。
+- **``priority=True``**：``Screen.BINDINGS`` 上那条 ``ctrl+c`` = ``screen.copy_text`` 在绑定
+  链里更靠前，没选中东西时它抛 ``SkipAction``、有选中就复制——不压过它，同一个键就会看
+  「用户有没有选中文字」行事。表单里 Ctrl+C 因此**永远是退出**，代价是没有 Ctrl+C 复制。
+"""
+
 FORM_HINT = "Tab 换一格 / 选择框用左右方向键 / Enter 确认 / Esc 取消 / Ctrl+C 退出"
 """表单底部那行提示：写的都是终端一定传得上来的键（spec 的键位表）。
 
@@ -178,11 +194,12 @@ class FormOverlay(ModalScreen[dict[str, str] | None]):
 
     这一条与 Textual 的默认取舍相反：它把 ``ctrl+c`` 绑给 ``copy``（``Screen.BINDINGS``
     上那条 ``screen.copy_text``，在绑定链里**更靠前**——没选中东西时它抛 ``SkipAction``，
-    于是才轮得到后面那条），理由正是「文本框里的 Ctrl+C 不要杀 app」。``priority=True``
-    让这一层不参与那条竞争：**表单里 Ctrl+C 永远是退出**，既不随焦点走，也不随「用户有没有
-    选中东西」走（两种状态都测：``tests/test_list_overlay.py``）。代价是表单里没有
-    ``Ctrl+C`` 复制——一个键在整个程序里只有一个意思，比在表单里多一个复制功能值钱。
-    这里选的是反过来的那一半，所以它**必须**写下来——#36 复用这张壳子时，默认就是这一条。
+    于是才轮得到后面那条），理由正是「文本框里的 Ctrl+C 不要杀 app」。:data:`FORM_QUIT_BINDINGS`
+    的 ``priority=True`` 让这一层不参与那条竞争：**表单里 Ctrl+C 永远是退出**，既不随焦点走，
+    也不随「用户有没有选中东西」走（两种状态都测：``tests/test_list_overlay.py``，其中一态
+    就是 ``e`` 打开时那一格的 ``select_on_focus`` 全选）。代价是表单里没有 ``Ctrl+C`` 复制
+    ——一个键在整个程序里只有一个意思，比在表单里多一个复制功能值钱。这里选的是反过来的
+    那一半，所以它**必须**写下来——#36 复用这张壳子时，默认就是这一条。
 
     ``q`` **不绑**：表单里 ``q`` 必须是一个字母（清单可以叫 ``quizzes``），而字母属于那一格。
     表单自己的出口是 ``Esc``（底部那行提示写着它）：``Input`` 的绑定里没有 ``escape``，
@@ -192,13 +209,11 @@ class FormOverlay(ModalScreen[dict[str, str] | None]):
     DEFAULT_CSS = theme.form_css("FormOverlay")
 
     BINDINGS = [
+        # 退出键必须**绑在这一层**：浮层的键位解析截断在最后一个浮层控件上，app 的绑定在
+        # 浮层开着时够不着（#47 实测）。表单只取其中不是字母的那些，理由见 FORM_QUIT_BINDINGS。
+        *FORM_QUIT_BINDINGS,
         Binding("escape", "cancel", "取消", show=False),
         Binding("enter", "confirm", "确认"),
-        # 退出键必须**绑在这一层**：浮层的键位解析截断在最后一个浮层控件上，app 的绑定在
-        # 浮层开着时够不着（#47 实测）。`priority=True` 是承重的：`Screen.BINDINGS` 上那条
-        # `screen.copy_text`（ctrl+c = 复制）在链里更靠前，没选中东西时它 SkipAction、
-        # 有选中就赢——不压过它，同一个键就会看「用户有没有选中文字」行事。
-        Binding("ctrl+c", "app.quit", "退出", priority=True, show=False),
     ]
 
     def __init__(
