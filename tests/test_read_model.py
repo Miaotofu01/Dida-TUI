@@ -9,7 +9,7 @@
   GLOSSARY（收集箱那一行的身份、三种行的身份、条数），不是照抄实现。
 
 **收集箱的身份是这一组的核心**（spec 已实测事实 #2）：服务端的清单索引里没有收集箱，
-它的 projectId 是**每账户不同的一串**（形如 ``inbox`` 加数字，实测 ``inbox1025205395``），
+它的 projectId 是**每账户不同的一串**（形如 ``inbox`` 加一截数字，下面示例用合成值 ``inbox1234567890``），
 ``"inbox"`` 只是请求侧别名。归类、分组、计数一律用服务端返回的那个 id。
 """
 
@@ -23,7 +23,7 @@ from dida.testing import FakeBackend, ManualClock
 TZ = timezone(timedelta(hours=8))
 T0 = datetime(2026, 3, 14, 12, 3, tzinfo=TZ)
 
-INBOX_SERVER_ID = "inbox1025205395"
+INBOX_SERVER_ID = "inbox1234567890"
 """实测的那个形状：``inbox`` 加一截数字（spec 的已实测 API 事实 #2）。"""
 
 

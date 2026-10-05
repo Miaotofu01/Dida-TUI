@@ -89,7 +89,7 @@ def test_task_url_substitutes_the_literal_inbox_for_the_inbox_itself():
     )
 
 
-@pytest.mark.parametrize("project_id", ["inbox", "INBOX", "inbox1025205395"])
+@pytest.mark.parametrize("project_id", ["inbox", "INBOX", "inbox1234567890"])
 def test_task_url_treats_the_accounts_inbox_id_as_the_literal(project_id):
     """收集箱的两种形状都算：请求侧别名，以及服务端返回的那一串（``inbox`` 加一截数字）。"""
     assert task_url(project_id, "t9") == "https://dida365.com/webapp/#p/inbox/tasks/t9"

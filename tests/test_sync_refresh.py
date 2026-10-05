@@ -371,25 +371,25 @@ async def test_the_client_added_inbox_row_survives_a_prune_that_cannot_re_add_it
     """
     server = PagedProjectServer(
         projects=[project()],
-        tasks={"inbox": [task(id="t9", project_id="inbox1025205395", title="随手记")]},
+        tasks={"inbox": [task(id="t9", project_id="inbox1234567890", title="随手记")]},
     )
     engine = make_engine(store, server)
 
     first = await engine.refresh()
 
     records = {row.id: row for row in store.list_records()}
-    assert records["inbox1025205395"].is_inbox is True, "补出来的那一行要落库、要标成收集箱"
+    assert records["inbox1234567890"].is_inbox is True, "补出来的那一行要落库、要标成收集箱"
     assert first.pruned_lists == 0, "自己刚补出来的那一行不是「远端已删」"
 
     server.tasks["inbox"] = []
     second = await engine.refresh()
 
-    assert "inbox1025205395" in {row.id for row in store.list_records()}, (
+    assert "inbox1234567890" in {row.id for row in store.list_records()}, (
         "索引里没有它、这一趟也补不出它——只有 is_inbox 这条豁免挡得住剪枝"
     )
     assert second.pruned_lists == 0
     assert second.pruned_tasks == 1, "剪枝确实跑了（收集箱里那条未完成的任务没了）"
-    assert engine.list_index()[0].id == "inbox1025205395"
+    assert engine.list_index()[0].id == "inbox1234567890"
     assert engine.list_index()[0].is_inbox is True
 
 
@@ -404,7 +404,7 @@ async def test_a_second_identical_refresh_with_the_learned_inbox_row_writes_and_
     """
     server = PagedProjectServer(
         projects=[project()],
-        tasks={"inbox": [task(id="t9", project_id="inbox1025205395", title="随手记")]},
+        tasks={"inbox": [task(id="t9", project_id="inbox1234567890", title="随手记")]},
     )
     engine = make_engine(store, server)
 
@@ -414,7 +414,7 @@ async def test_a_second_identical_refresh_with_the_learned_inbox_row_writes_and_
     assert (first.written_lists, first.pruned_lists) == (2, 0), "第一趟：工作清单 + 补出来的收集箱"
     assert (second.written_lists, second.written_tasks) == (0, 0)
     assert (second.pruned_lists, second.pruned_tasks) == (0, 0)
-    assert engine.list_index()[0].id == "inbox1025205395"
+    assert engine.list_index()[0].id == "inbox1234567890"
 
 
 async def test_a_task_deleted_remotely_disappears_from_the_local_library(store):
@@ -788,7 +788,7 @@ async def test_refresh_learns_the_inbox_id_from_the_payload_and_adds_that_row_it
         index=[project()],
         data=[
             data(project(), []),
-            {"tasks": [task(id="t9", project_id="inbox1025205395", title="随手记")]},
+            {"tasks": [task(id="t9", project_id="inbox1234567890", title="随手记")]},
         ],
     )
     engine = make_engine(store, transport)
@@ -797,12 +797,12 @@ async def test_refresh_learns_the_inbox_id_from_the_payload_and_adds_that_row_it
 
     rows = engine.list_index()
     assert rows[0].is_inbox is True, "收集箱置顶"
-    assert rows[0].id == "inbox1025205395"
+    assert rows[0].id == "inbox1234567890"
     assert rows[0].name == "收集箱"
     assert rows[0].unfinished == 1
     assert "inbox" not in {row.id for row in rows}
-    assert [item.title for item in engine.tasks_in("inbox1025205395").items] == ["随手记"]
-    assert {row.id: row for row in store.list_records()}["inbox1025205395"].is_inbox is True, (
+    assert [item.title for item in engine.tasks_in("inbox1234567890").items] == ["随手记"]
+    assert {row.id: row for row in store.list_records()}["inbox1234567890"].is_inbox is True, (
         "这一行要落库：下次启动（还没刷新时）也认得出收集箱"
     )
 
@@ -820,7 +820,7 @@ async def test_a_missing_project_id_is_filled_with_the_server_id_not_the_literal
             data(project(), []),
             {
                 "tasks": [
-                    task(id="t9", project_id="inbox1025205395", title="随手记"),
+                    task(id="t9", project_id="inbox1234567890", title="随手记"),
                     {"id": "t10", "title": "服务端漏了 projectId", "status": 0},
                 ]
             },
@@ -830,8 +830,8 @@ async def test_a_missing_project_id_is_filled_with_the_server_id_not_the_literal
 
     await engine.refresh()
 
-    assert store.task_payload("t10")["projectId"] == "inbox1025205395"
-    assert {item.title for item in engine.tasks_in("inbox1025205395").items} == {
+    assert store.task_payload("t10")["projectId"] == "inbox1234567890"
+    assert {item.title for item in engine.tasks_in("inbox1234567890").items} == {
         "随手记",
         "服务端漏了 projectId",
     }
@@ -874,8 +874,8 @@ async def test_the_inbox_row_from_a_project_object_is_marked_as_the_inbox(store)
         data=[
             data(project(), []),
             data(
-                project(id="inbox1025205395", name="收集箱"),
-                [task(id="t9", project_id="inbox1025205395", title="随手记")],
+                project(id="inbox1234567890", name="收集箱"),
+                [task(id="t9", project_id="inbox1234567890", title="随手记")],
             ),
         ],
     )
@@ -884,8 +884,8 @@ async def test_the_inbox_row_from_a_project_object_is_marked_as_the_inbox(store)
     await engine.refresh()
 
     records = {row.id: row for row in store.list_records()}
-    assert records["inbox1025205395"].is_inbox is True
-    assert engine.list_index()[0].id == "inbox1025205395"
+    assert records["inbox1234567890"].is_inbox is True
+    assert engine.list_index()[0].id == "inbox1234567890"
 
 
 async def test_refresh_without_a_wired_cache_or_client_fails_loudly(store):

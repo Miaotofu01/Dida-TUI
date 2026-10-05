@@ -44,11 +44,11 @@ def test_task_url_substitutes_the_literal_inbox_for_the_inbox_itself():
     assert task_url("inbox", "t1") == "https://dida365.com/webapp/#p/inbox/tasks/t1"
 
 
-@pytest.mark.parametrize("project_id", ["inbox", "INBOX", "inbox1025205395"])
+@pytest.mark.parametrize("project_id", ["inbox", "INBOX", "inbox1234567890"])
 def test_task_url_treats_the_accounts_inbox_id_as_the_literal(project_id):
     """收集箱的两种形状都算：请求侧别名，以及服务端返回的那一串（``inbox`` 加一截数字）。
 
-    ``inbox1025205395`` 是实测的那个形状（spec 的已实测 API 事实 #2）：收集箱里的任务带着
+    ``inbox1234567890`` 是实测的那个形状（spec 的已实测 API 事实 #2）：收集箱里的任务带着
     它，而厂商模板要的是字面量 ``inbox``。
     """
     assert task_url(project_id, "t9") == "https://dida365.com/webapp/#p/inbox/tasks/t9"
