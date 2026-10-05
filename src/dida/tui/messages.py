@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from dida.sync.engine import AuthError, DidaError, UnknownListError
+from dida.sync.engine import AuthError, DidaError, UnknownListError, UnknownTaskError
 
 UNKNOWN_TASK_MESSAGE = "没有改成：这条任务已经不在本地缓存里了，刷新之后再试一次"
 """引擎拒绝写入（本地没有这条任务的底稿，工单 #25）时的话：如实说没改成。"""
@@ -62,6 +62,36 @@ INBOX_LIST_MESSAGE = "收集箱不在这里改：它是客户端补出来的默�
 
 VIEW_ROW_MESSAGE = "这是视图，不是清单：视图的建 / 改 / 删还没接上"
 """``e`` / ``d`` 落在视图行上时的话（#42 只管清单；视图那三条归 #36）。"""
+
+
+def completed_message(title: str) -> str:
+    """按下 ``space`` 把一条任务标成完成时的回声（工单 #38，用户故事 41、43）。
+
+    说的是**本地已经生效**（乐观写，ADR-0002），不是「服务端已经收到了」：推不上去时那条
+    改动还在队列里，状态栏那个「待推送 N」一直说着这件事——两句话各说各的那一半。
+    """
+    return f"已完成「{title}」"
+
+
+def uncompleted_message(title: str) -> str:
+    """按下 ``space`` 把一条已完成的任务改回未完成时的回声（工单 #38，用户故事 42、43）。
+
+    与 :func:`completed_message` 同一条口径。措辞里认下的是「本地不再是已完成」：
+    完成时间戳可能还在（实测取消完成不会清掉它），而「还算不算已完成」只看 ``status``。
+    """
+    return f"已取消完成「{title}」"
+
+
+def toggle_complete_failed_message(error: DidaError) -> str:
+    """完成 / 取消完成**当场**失败时状态栏里的话（工单 #38）。
+
+    与别的写路径同一条口径：引擎当场拒绝的（本地已经没有这条任务的底稿）与别的失败分开说，
+    因为用户该做的事不一样——前者刷新一下再看，后者是网络或权限。按下去什么都不说，
+    用户会以为它成了（ADR-0002 要消灭的正是这个）。
+    """
+    if isinstance(error, UnknownTaskError):
+        return UNKNOWN_TASK_MESSAGE
+    return f"没改成：{error}"
 
 
 def readonly_list_message(row: object) -> str:

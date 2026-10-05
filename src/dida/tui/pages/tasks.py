@@ -53,7 +53,7 @@ COMPLETED_STYLE = theme.DONE
 """已完成的行：暗灰 + 删除线（用户故事 54）。
 
 删除线是「这条已经做完了」的读法，而它**还在列表里**——用户才有机会对它的取消完成
-（那是 #38 的 ``space``，本页先把它们摆出来并让光标越过：已完成的行不参与光标移动）。
+（那是 #38 的 ``space``；已完成的行**可以**停光标，不然那个键永远送不到它身上）。
 """
 
 TITLE_GAP = 2
@@ -187,6 +187,21 @@ class TasksPage(CursorPage):
     class Back(Message):
         """用户按了 ``esc``：退回清单列表页（光标还原到进来的那一行）。"""
 
+    class ToggleComplete(Message):
+        """用户按了 ``space``：把这一条在「完成」与「未完成」之间翻过来（工单 #38）。
+
+        ``completed`` 是**按下这一刻**读模型里这条任务的状态（判据是服务端的 ``status``）：
+        ``True`` 就是这一下要取消完成。方向由读模型说，这一页不自己记「刚才完成过谁」——
+        另立一份「取消过完成」的状态，只会在下一次刷新时跟服务端权威打架。
+        """
+
+        def __init__(self, task_id: str, *, title: str, completed: bool) -> None:
+            self.task_id = task_id
+            self.title = title
+            """这一行的标题：外层用它拼那句短暂的反馈，不必再去读一遍引擎。"""
+            self.completed = completed
+            super().__init__()
+
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(id=id)
         self._heading = ""
@@ -244,7 +259,7 @@ class TasksPage(CursorPage):
             for item in task_list.items
         ]
         rows += [
-            Row(id=None, text=completed_line(item, width=width))
+            Row(id=item.task_id, text=completed_line(item, width=width))
             for item in task_list.completed.items
         ]
         if len(rows) == 3:
@@ -278,6 +293,39 @@ class TasksPage(CursorPage):
         """``enter``：进光标下那条任务的详细页。"""
         if self.selected_id is not None:
             self.post_message(self.Entered(self.selected_id))
+
+    def action_toggle_complete(self) -> None:
+        """``space``：完成 ↔ 取消完成（工单 #38）。
+
+        往哪个方向翻由**读模型**回答：光标那一条在已完成那一段里就是「取消完成」，否则是
+        「完成」。这一页不推一份并行状态——服务端的 ``status`` 说了算，本地只负责把这一下
+        交出去（乐观写与推送是引擎的事，ADR-0002）。
+        """
+        task_id = self.selected_id
+        if task_id is None:
+            return
+        row = self._row(task_id)
+        if row is None:
+            return
+        title, completed = row
+        self.post_message(self.ToggleComplete(task_id, title=title, completed=completed))
+
+    def _row(self, task_id: str) -> tuple[str, bool] | None:
+        """这一行的标题，以及它**现在**算不算已完成；读模型里没有这一条就是 ``None``。
+
+        已完成那一段是**唯一**能说明「这条已完成」的地方：本地判定只看 ``status``
+        （spec：2 是完成、0 是正常、-1 是已放弃），而这一段就是按它分出来的。
+        """
+        task_list = self._task_list
+        if task_list is None:
+            return None
+        for item in task_list.completed.items:
+            if item.task_id == task_id:
+                return item.title, True
+        for item in task_list.items:
+            if item.task_id == task_id:
+                return item.title, False
+        return None
 
     def action_back(self) -> None:
         """``esc``：退回清单列表页。"""
