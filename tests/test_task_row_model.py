@@ -194,3 +194,102 @@ def test_the_completed_section_keeps_only_the_last_seven_days():
     )
 
     assert [item.title for item in section.items] == ["刚刚做完的", "六天前做完的"]
+
+
+# ------------------------------------------------------------------ 已完成流：按状态过滤
+
+
+def completed_payload(id: str, title: str, *, status: int, completed_time: str = "2026-03-14T12:05:00+0800") -> dict:
+    """一份 ``POST /open/v1/task/completed`` 那样的任务原文。"""
+    return {
+        "id": id,
+        "projectId": "work",
+        "title": title,
+        "status": status,
+        "completedTime": completed_time,
+    }
+
+
+async def test_a_task_that_was_uncompleted_does_not_come_back_in_the_completed_stream(store):
+    """取消完成之后 ``completedTime`` **不会被清空**，所以只按时间筛会把它又捞回来。
+
+    服务端只按完成时间窗回话（那个端点没有 ``status`` 参数），「已完成」这一半只能由客户端
+    拿**响应里的** ``status`` 筛掉：``2`` 是完成、``0`` 是正常、``-1`` 是已放弃。
+    """
+    reader = StubCompletedReader(
+        [
+            completed_payload("t1", "手机上做完的", status=2),
+            completed_payload("t2", "取消完成过的", status=0),
+            completed_payload("t3", "放弃过的", status=-1),
+        ]
+    )
+    engine = SyncEngine(clock=ManualClock(T0), source=store, client=reader)
+
+    report = await engine.refresh_completed()
+
+    assert report.written_tasks == 1
+    assert [snapshot.id for snapshot in store.tasks()] == ["t1"], "取消完成的那条一条都不许落库"
+    assert [item.title for item in engine.view().completed.items] == ["手机上做完的"]
+
+
+async def test_a_payload_without_a_status_is_not_treated_as_completed(store):
+    """没有 ``status`` 就不是「已完成」——本地判定一律看状态，缺字段不是「默认完成」。
+
+    宽松处理（缺字段也算完成）会把一条已经取消完成的任务当完成写进本地库：它随后既在
+    已完成区里、又不在未完成清单里，用户看到的是「这条任务凭空消失了」。
+    """
+    reader = StubCompletedReader([completed_payload("t1", "状态缺失的", status=None)])  # type: ignore[arg-type]
+    engine = SyncEngine(clock=ManualClock(T0), source=store, client=reader)
+
+    await engine.refresh_completed()
+
+    assert store.tasks() == ()
+
+
+async def test_the_cap_is_read_from_the_response_not_from_what_survived_filtering(store):
+    """满 200 条时不许声称这一窗拿全了——**数的是响应**，不是筛完之后剩下的。
+
+    筛掉的那些也是这一窗里的任务：按筛完的条数判「没满」，游标就会推到 ``now``，而服务端
+    已经截断的那一段从此再也不会被拉第二次。
+    """
+    crowd = [
+        completed_payload(f"t{index:03d}", f"第 {index} 条", status=2, completed_time=f"2026-03-14T10:{index % 60:02d}:00+0800")
+        for index in range(199)
+    ]
+    crowd.append(
+        completed_payload("tx", "取消完成过的", status=0, completed_time="2026-03-14T11:30:00+0800")
+    )
+    reader = StubCompletedReader(crowd)
+    engine = SyncEngine(clock=ManualClock(T0), source=store, client=reader)
+
+    report = await engine.refresh_completed()
+
+    assert len(crowd) == 200
+    assert report.truncated is True, "响应是满的，就不许说这一窗拿全了"
+    assert report.written_tasks == 199
+    assert store.stored_sync_state().completed_cursor == at(14, 11, 30).isoformat()
+
+
+def test_a_completed_timestamp_alone_does_not_make_a_task_completed(store):
+    """本地判定「已完成」只看 ``status``，不看有没有完成时间戳。
+
+    这条今天就是对的（``Store._snapshot`` 一直按 ``status`` 判）——钉住它是因为 #38 的
+    「取消完成」写路径正好走在这条边上：取消完成不清 ``completedTime``，谁把判据换成
+    「有没有完成时间」，一条取消完成的任务就会一直显示成做完了。
+    """
+    store.apply_refresh(
+        tasks=[
+            {
+                "id": "t1",
+                "projectId": "work",
+                "title": "取消完成过的",
+                "status": 0,
+                "completedTime": "2026-03-14T12:05:00+0800",
+            }
+        ]
+    )
+
+    snapshot = next(item for item in store.tasks() if item.id == "t1")
+
+    assert snapshot.completed is False
+    assert snapshot.completed_at == at(14, 12, 5), "完成时刻原样留着：那是服务端的事实，不是判据"

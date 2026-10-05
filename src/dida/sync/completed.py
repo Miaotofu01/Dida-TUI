@@ -16,7 +16,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_chec
 
 from dida.api.errors import MalformedResponseError
 from dida.api.guards import api_date
-from dida.sync.rows import completed_window_start
+from dida.sync.rows import completed_window_start, task_is_completed
 
 if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能在这里 import
     from dida.storage.store import StoredSyncState
@@ -110,12 +110,18 @@ class CompletedStreamMixin:
             start_date=api_date(start, field="startDate"),
             end_date=api_date(now, field="endDate"),
         )
-        tasks = _completed_tasks(payload)
+        received = _completed_tasks(payload)
+        # 双条件过滤的另一半在**客户端**：这个端点没有 ``status`` 参数（只有 projectIds /
+        # startDate / endDate，而日期筛的是 completedTime），所以服务端只按时间回话。
+        # 取消完成**不会清空** completedTime（实测），只按时间筛会把取消完成的任务又捞回来
+        # ——它随后会以「未完成」的样子出现在清单里（本地判定看 status）。筛掉的照样算
+        # 这一窗的账：截断与游标都数**收到的**那批（下面 received），不是筛完剩下的。
+        tasks = [task for task in received if task_is_completed(task.get("status"))]
         # 与全量刷新同一套落库路径：只写变化，服务端权威，待推送改动豁免（t08）。
         report = target.apply_refresh(tasks=tasks)
         # 游标只在成功之后前进；上次刷新时间与逻辑日原样带回去（None 是清空）。
         target.set_sync_state(
-            completed_cursor=self._completed_cursor(now, tasks),
+            completed_cursor=self._completed_cursor(now, received),
             last_refresh_at=state.last_refresh_at,
             logical_day=state.logical_day,
         )
@@ -123,7 +129,7 @@ class CompletedStreamMixin:
             start=start,
             end=now,
             written_tasks=report.written_tasks,
-            truncated=len(tasks) >= COMPLETED_PAGE_LIMIT,
+            truncated=len(received) >= COMPLETED_PAGE_LIMIT,
         )
 
     def _completed_window_start(self, now: datetime, cursor: str | None) -> datetime:
@@ -133,7 +139,7 @@ class CompletedStreamMixin:
         return resumed if resumed is not None and resumed > start else start
 
     def _completed_cursor(self, now: datetime, tasks: Sequence[Mapping[str, Any]]) -> str:
-        """拉完之后游标推到哪一刻。
+        """拉完之后游标推到哪一刻（``tasks`` 是**收到的那一批**，含被 status 筛掉的）。
 
         正常情况就是 ``now``：``[上次的 now, 这次的 now]`` 首尾相接，不重不漏。**满 200 条
         时例外**：文档把 200 写成上限，而没有任何分页或游标参数可续，所以「一次拿全了」

@@ -62,3 +62,25 @@ def completed_window_start(now: datetime, window_hours: int) -> datetime:
     **同一个算式**是「屏幕上只显示最近 7 天」与「请求只拉最近 7 天」不会各说各话的原因。
     """
     return now - timedelta(hours=window_hours)
+
+
+def task_is_completed(status: object) -> bool:
+    """这条任务的 ``status`` 是不是「已完成」——**只看状态，不看有没有完成时间戳**。
+
+    ``2`` 是完成、``0`` 是正常、``-1`` 是已放弃（``api-contracts.md``）。认不出来的一律
+    当作**没有完成**：缺失的字段是「不知道」，而这里宽松处理会把一条已经取消完成的任务
+    当成完成写进本地库（它随后既在已完成区里、又不在未完成清单里，看起来像凭空消失）。
+
+    取消完成**不会清空** ``completedTime``（实测），所以「有没有完成时间」判不出完成与否
+    ——那正是这条规矩存在的原因（spec 的「已完成」两处必须写清之一）。
+
+    ``COMPLETED_STATUS`` 从存储层取（函数内 import，与 :func:`dida.sync.push._completed_status`
+    同一条路）：同一份 API 事实只留一处，而 storage 反过来 import :mod:`dida.sync.view`，
+    模块级 import 会绕成环。
+    """
+    from dida.storage.store import COMPLETED_STATUS
+
+    try:
+        return int(status) == COMPLETED_STATUS  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return False
