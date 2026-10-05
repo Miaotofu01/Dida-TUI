@@ -6,23 +6,46 @@
 
 分层是 v2 的要求（用户故事 119）：``?`` 列的是**当前这一层**可用的键，不是一张混杂了所有
 层的大表。所以表按层存，帮助按层取。
+
+**#48 加的两类守卫**（这一层原本没有）：
+
+- **收不到的键**（``test_the_keymap_binds_no_key_the_terminal_cannot_deliver``）：断的是
+  「表里**没有** ``ctrl+enter`` / ``alt+enter`` / ``ctrl+shift+*`` / ``alt+方向键`` 这类键」，
+  不是「它有处理器」——``Binding("ctrl+enter", …)`` 构造得出来、派发事件时也真的会触发，
+  所以「绑定存在」这条断言在真终端里永远绿（``notes/terminal-input-evidence.md`` §2 的 C 段）。
+- **帮助的行宽**（``test_the_help_body_is_exactly_as_wide_as_the_terminal_will_draw_it``）：
+  ``?`` 那块浮层是 ``width: auto``，宽度由 rich 量出来的最宽那行决定，而终端按自己的宽度表
+  画——两边差一格，多出来的格就把右边框挤掉。
 """
 
 from __future__ import annotations
 
 import unicodedata
+from datetime import datetime, timedelta, timezone
 
 from rich.cells import cell_len
 
+from dida.testing import FakeBackend, ManualClock
+from dida.tui.app import DidaApp
 from dida.tui.keys import (
     BINDINGS,
     GLOBAL,
+    LAYER_DETAIL,
+    LAYER_INDEX,
+    LAYER_TITLES,
     LAYERS,
     bindings_for,
     help_body,
     help_rows,
     unreliable_reason,
 )
+from support import screen_text
+
+TZ = timezone(timedelta(hours=8))
+T0 = datetime(2026, 3, 14, 12, 3, tzinfo=TZ)
+
+WIDE = (100, 30)
+"""一层三层都走得进去的普通终端尺寸。"""
 
 
 def drawn_width(text: str) -> int:
@@ -186,3 +209,63 @@ def test_the_help_lists_no_key_that_depends_on_the_kitty_push():
                 assert unreliable_reason(key) is None, (
                     f"{layer} 的帮助里列了 {key!r}：{unreliable_reason(key)}"
                 )
+
+
+# ------------------------------------------------------------------ 按 `?` 看下一屏
+
+
+def backend() -> FakeBackend:
+    """够走进三层的一份缓存：收集箱里一条任务。"""
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_task("写周报", list_name="inbox1", id="t1")
+    return fake
+
+
+async def open_help(pilot, app: DidaApp) -> str:
+    """按 ``?``、把那一屏读下来、再收起浮层。"""
+    await pilot.press("question_mark")
+    await pilot.pause()
+    text = screen_text(app)
+    await pilot.press("escape")
+    await pilot.pause()
+    return text
+
+
+async def test_the_question_mark_help_shows_only_the_keys_of_the_layer_you_are_on():
+    """``?`` 只列**当前这一层**的键：别的层自己的键一个都不出现（用户故事 119）。
+
+    走的是外部行为：真的按键、真的看下一屏。抬头先说清这是哪一层，然后拿同一张表里那三层
+    的行对账——帮助跟着表走，「别的层自己的键」就是从表里减出来的那一份。第一层没有
+    ``esc`` 那一行（它无处可退，spec 的状态机里清单列表页只有 ``enter`` 向下）。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+
+        for layer in LAYERS:
+            screen = await open_help(pilot, app)
+
+            assert LAYER_TITLES[layer] in screen, f"帮助的抬头不是「{LAYER_TITLES[layer]}」"
+            # 抬头那一行写的就是层名，而层名可能与某条说明同名（详细页的层名与任务列表页
+            # ``enter`` 的说明都是「任务详细页」）——对账只用**行**，所以先把抬头摘掉。
+            rows_text = "\n".join(
+                line for line in screen.splitlines() if LAYER_TITLES[layer] not in line
+            )
+            mine = {row.label for row in help_rows(layer)}
+            for label in mine:
+                assert label in rows_text, f"{layer} 的帮助里少了「{label}」"
+
+            others = set().union(
+                *({row.label for row in help_rows(other)} for other in LAYERS if other != layer)
+            ) - mine
+            for label in others:
+                assert label not in rows_text, f"{layer} 的帮助里出现了别的层的键：「{label}」"
+
+            if layer == LAYER_INDEX:
+                assert "退回" not in rows_text, "第一层无处可退，帮助不该列一个退回键"
+            else:
+                assert "退回" in rows_text, f"{layer} 得有一条退回上一层的键"
+            if layer != LAYER_DETAIL:
+                await pilot.press("enter")  # 清单列表页 → 任务列表页 → 详细页
+                await pilot.pause()
