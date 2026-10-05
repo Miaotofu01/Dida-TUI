@@ -269,11 +269,19 @@ class InMemorySource:
         与 ``Store`` 同一条口径：本地当场生效（乐观写），服务端随后到。认得出的字段（标题、
         描述、备注、优先级、状态）盖进快照，其余原样并进那份服务端原文——详情页的只读字段
         读的就是原文。
+
+        **``projectId`` 那一条是搬运**（#45）：快照上「在哪个清单」那一位叫 ``list_id``，
+        与 ``Store._write_task`` 同一条口径（它也是从 ``projectId`` 算出 ``list_id`` 那一列）。
+        不翻这一下的话，「搬完在读路径上人在新清单里」这句话在接缝一根本测不到。
         """
         snapshot = self._tasks.get(task_id)
         if snapshot is None:
             return
         known = {key: value for key, value in changes.items() if key in _SNAPSHOT_FIELDS}
+        if changes.get("projectId"):
+            known["list_id"] = str(changes["projectId"])
+        if "tags" in known:
+            known["tags"] = tuple(known["tags"])
         if known:
             self._tasks[task_id] = replace(snapshot, **known)
         self._raw[task_id] = {**self._raw.get(task_id, {}), **changes}
@@ -353,6 +361,11 @@ class FakeBackend:
 
         self.deleted: list[str] = []
         """``delete(task_id)`` 收到的任务 id，按调用顺序（t16 的删除）。"""
+
+        self.moved: list[tuple[str, str]] = []
+        """``move_task(task_id, to_list_id=)`` 收到的每一笔（任务 id + 目标清单 id），按顺序
+        （#45 的搬运）。与 ``writes`` 分开记：搬运**不是**一次普通字段更新，混在一起就看不出
+        它到底走了哪条路。"""
 
         self.writes: list[tuple[str, dict[str, Any]]] = []
         """``write(task_id, changes=)`` 收到的每一笔（任务 id + 改动的字段），按调用顺序。
@@ -453,6 +466,15 @@ class FakeBackend:
         """读：委托给真引擎（某个容器的全部未完成任务 + 该显示的那部分已完成）。"""
         return self._engine.tasks_in(container_id)
 
+    def move_targets(self) -> tuple[ListRow, ...]:
+        """读：委托给真引擎（真实清单、进得去、服务端已经见过的那些，#45）。
+
+        「服务端见过没有」的判据在真引擎里读的是**队列**（``pending_lists``），而内存替身
+        没有队列，所以它这一路不过滤——接缝一测的是「挑选器给的正好是引擎说的那一份」，
+        过滤本身归接缝二（真库那一条）。
+        """
+        return self._engine.move_targets()
+
     def task_detail(self, task_id: str) -> TaskDetail | None:
         """读：委托给真引擎（详情页的字段，含原文里我们不认识的那些）。"""
         return self._engine.task_detail(task_id)
@@ -516,6 +538,19 @@ class FakeBackend:
         self.deleted.append(task_id)
         if self.delete_error is not None:
             raise self.delete_error
+
+    def move_task(self, task_id: str, *, to_list_id: str) -> None:
+        """写：记下这一笔，**并且真的把任务挪进目标清单**（#45 的搬运）。
+
+        与 ``write`` / ``create`` 同一条口径（那两处也是「真的摆进缓存」）：只记录的话，
+        「搬完那条任务出现在新清单里、原清单里没有了」这句话在接缝一根本测不到——而它正是
+        这一票的验收标准。摆了 ``write_error`` 就记完这一笔再抛（与 ``write`` 同一个口子：
+        引擎当场拒绝时界面要说得出具体原因）。
+        """
+        self.moved.append((task_id, to_list_id))
+        if self.write_error is not None:
+            raise self.write_error
+        self.source.apply_changes(task_id, {"projectId": to_list_id})
 
     def write(
         self,
