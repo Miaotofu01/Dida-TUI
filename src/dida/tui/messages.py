@@ -59,6 +59,28 @@ SYNCING_MESSAGE = "同步中…"
 只给**手动**同步用：用户主动按了键，得先有个「它动了」的信号；启动时那次后台刷新不写它，
 否则每次开屏都会闪一下这句。"""
 
+EMPTY_INDEX_MESSAGE = "（还没有清单）"
+"""清单列表页一行都没有时的话（缓存是空的、第一次运行还没刷新）。"""
+
+EMPTY_TASKS_MESSAGE = "（这个清单里还没有任务）"
+"""空清单那一句明确的空态文案（用户故事 53）——不是一片什么都没有的黑。"""
+
+EMPTY_DETAIL_MESSAGE = "（这条任务已经不在本地缓存里了）"
+"""详细页指向的任务刷新之后没了（远端删掉了）时的话。"""
+
+
+def blocked_list_message(row: object) -> str:
+    """``enter`` 一个进不去的清单时状态栏里的话（用户故事 23 / 24）。
+
+    两种进不去的原因分开说：``kind`` 是 NOTE 的清单装不了任务，``permission`` 不是 write
+    的改不动。行上那个记号只说「不可进入」，进不去的时候得说清是哪一种——否则用户会去
+    别处找原因。
+    """
+    name = getattr(row, "name", "")
+    if getattr(row, "project_kind", None) == "NOTE":
+        return f"「{name}」进不去：备注清单装不了任务"
+    return f"「{name}」进不去：这个清单没有写权限"
+
 
 def overwritten_message(count: int) -> str:
     """服务端盖掉本地改动时的话（工单 #21，用户故事 59）。
