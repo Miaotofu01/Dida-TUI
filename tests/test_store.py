@@ -131,9 +131,10 @@ def test_a_refresh_carries_desc_content_and_tags_onto_the_snapshot(store):
     深模块的那条路是：``TaskSnapshot``（缓存里的事实）→ ``TaskItem``（引擎算好的成品）→
     右栏。这一条钉的是头一段——期望的**字段名**来自 ``api-contracts.md`` 的 ``Task`` 字段表。
 
-    它刻意不碰中文标签（「描述」「备注」各对应哪一个字段）：v1 把两者标反了，#43 负责
-    把它翻过来（``GLOSSARY.md`` 说 描述=``content``、备注=``desc``）。哪一边是哪一边与
-    「服务端给的东西有没有原样落进快照」是两件事，这一条只管后者。原本钉在
+    它刻意不碰中文标签（「描述」「备注」各对应哪一个字段）：v1 把两者标反了，翻过来的地方
+    在详情页那一层（``GLOSSARY.md`` 说 描述=``content``、备注=``desc``；#43 已落地，见
+    ``tests/test_detail_page.py`` 那条描述/备注各画各的）。哪一边是哪一边与「服务端给的
+    东西有没有原样落进快照」是两件事，这一条只管后者。原本钉在
     ``test_detail_description.py`` 里（#32 搬出来的）。
     """
     store.apply_refresh(
