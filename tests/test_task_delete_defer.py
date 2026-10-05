@@ -94,3 +94,31 @@ async def test_d_asks_once_and_only_y_deletes_the_task():
     assert "写周报" in after_cancel, "``n`` 之后什么都没发生"
     assert "删掉就找不回来了" not in after_yes, "``y`` 之后确认框自己收掉，回到任务列表页"
     assert fake.deleted == ["t1"], "只有 y 那一次真的删了"
+
+
+# ------------------------------------------------------------------ g / G：顺延
+
+
+async def test_g_defers_by_one_logical_day_and_G_by_a_week():
+    """``g`` 顺延一个逻辑日、``G`` 顺延一周（验收标准 4、5）。
+
+    接缝一断的是「哪一条任务、几个**逻辑日**」：落点怎么算是引擎的算术，
+    ``tests/test_sync_defer.py`` 钉着它（含 ``04:00`` 边界上凌晨两点那一档）。这一页只说
+    「往后几个逻辑日」，不自己算日期——它连时钟都没有。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_work(app, pilot)
+        assert app.tasks_page().selected_id == "t1", "光标在第一条任务上"
+
+        await pilot.press("g")
+        await pilot.pause()
+        await pilot.press("G")
+        await pilot.pause()
+
+    assert fake.deferred == ["t1", "t1"], "两次都落在光标那条任务上"
+    assert fake.deferred_days == [1, 7], "g 是一个逻辑日、G 是一周"
+
