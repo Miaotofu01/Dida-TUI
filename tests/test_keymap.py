@@ -21,6 +21,7 @@ from dida.tui.keys import (
     bindings_for,
     help_body,
     help_rows,
+    unreliable_reason,
 )
 
 
@@ -110,3 +111,78 @@ def test_every_page_binds_its_own_layer_from_the_one_table():
     for page in (IndexPage, TasksPage, DetailPage):
         assert page.LAYER in LAYERS, f"{page.__name__} 的层名不在表里"
         assert page.BINDINGS == bindings_for(page.LAYER), f"{page.__name__} 的绑定不是从表里来的"
+
+
+# ------------------------------------------------------------------ 终端收不到的键
+
+
+def every_binding_the_app_installs() -> dict[str, set[str]]:
+    """这个 app 真装上的每一条绑定：谁装的 → 它绑了哪些键。
+
+    不只查 :data:`BINDINGS` 那张表，也查页面、app 与两个浮层**真的**装上的绑定——票面的
+    守卫是防回归的：「加一个好听但收不到的键」最可能的落点是某个浮层的提交键，而那种绑定
+    不在表里。
+    """
+    from dida.tui.app import DidaApp
+    from dida.tui.overlays import ConfirmOverlay, MessageOverlay
+    from dida.tui.pages import DetailPage, IndexPage, TasksPage
+
+    owners = (DidaApp, IndexPage, TasksPage, DetailPage, MessageOverlay, ConfirmOverlay)
+    installed: dict[str, set[str]] = {}
+    for owner in owners:
+        for binding in owner.BINDINGS:
+            installed.setdefault(owner.__name__, set()).update(binding.key.split(","))
+    return installed
+
+
+def test_the_keymap_binds_no_key_the_terminal_cannot_deliver():
+    """**这条断的是「不存在」**：没有一个绑定用终端收不到的键。
+
+    为什么不能断「handler 在不在」：``Binding("ctrl+enter", …)`` 构造得出来、派发一个
+    ``ctrl+enter`` 事件时也真的会触发（``terminal-input-evidence.md`` §2 的 C 段）。所以
+    「绑定存在」这条断言在真终端里**永远绿**，而用户按下去什么都不会发生——守卫必须是
+    「这张表里没有它」，而不是「它有处理器」。
+    """
+    installed = every_binding_the_app_installs()
+
+    assert installed, "一条绑定都没找到，这条测试失去意义了"
+    for owner, keys in installed.items():
+        for key in sorted(keys):
+            reason = unreliable_reason(key)
+            assert reason is None, f"{owner} 绑了 {key!r}，而终端送不上来：{reason}"
+
+
+def test_the_guard_catches_every_unreliable_key_the_ticket_names():
+    """守卫自己的自检：票面点名的四类键一条都不许漏。
+
+    没有这一条，把规则表清空就会让上面那条测试永远绿——守卫烂掉的方式恰恰是**变得没有意见**。
+    """
+    for key in ("ctrl+enter", "alt+enter", "ctrl+shift+a", "alt+left"):
+        assert unreliable_reason(key), f"{key!r} 没被守卫拦下——这条守卫是装饰"
+
+
+def test_the_keys_the_terminal_does_deliver_are_not_flagged():
+    """反过来也要准：守卫不许误伤终端一定送得上来的键。
+
+    这些是验收标准 114 的「万能键面」：字母、数字、F1–F10、``space``、``enter``、``esc``、
+    方向键，加上 ``ctrl`` / ``shift`` 这两个修饰符。
+    """
+    for key in ("j", "k", "g", "G", "q", "o", "r", "n", "e", "d", "f5", "f10",
+                "space", "enter", "escape", "up", "down", "left", "right",
+                "ctrl+a", "shift+tab"):
+        assert unreliable_reason(key) is None, f"{key!r} 被误伤了：{unreliable_reason(key)}"
+
+
+def test_the_help_lists_no_key_that_depends_on_the_kitty_push():
+    """ADR-0006 关掉 kitty 推送的代价就是 ``ctrl+enter`` 收不到——帮助里一个都不许有。
+
+    那条推送开不开由 ``dida.bootstrap`` 一处决定（``tests/test_bootstrap.py`` 在干净子进程里
+    钉着它），这里钉的是另一半：**帮助列出来的每一个键，在没有那条推送的终端上照样收得到**。
+    两半缺一条，ADR-0006 与这张表就会各自漂移。
+    """
+    for layer in LAYERS:
+        for row in help_rows(layer):
+            for key in row.keys:
+                assert unreliable_reason(key) is None, (
+                    f"{layer} 的帮助里列了 {key!r}：{unreliable_reason(key)}"
+                )
