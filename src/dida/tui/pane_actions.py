@@ -27,7 +27,6 @@ from dida.tui.panes import (
     FilterInput,
     HelpScreen,
     ListsScreen,
-    StatusBar,
     SubtaskPane,
     TaskPane,
     detail_body,
@@ -40,8 +39,9 @@ class PaneActionsMixin:
     """右栏、浮层与焦点（t18 / t20）。
 
     mixin 不是完整的 app：它用 ``self.engine`` / ``self.query_one`` / ``self.refresh_view``
-    / ``self._query`` / ``self._tier`` / ``self._detail_open``——都由
-    :class:`~dida.tui.app.DidaApp` 提供。
+    / ``self.update_status`` / ``self._write_status`` / ``self._query`` / ``self._tier`` /
+    ``self._detail_open``——都由 :class:`~dida.tui.app.DidaApp` 提供。状态栏那句一律走
+    ``self._write_status``：``t`` 这一条 ``await`` 回来时屏幕可能已经拆了（见 app.py）。
     """
 
     # ---------------------------------------------------------------- 模糊过滤（t17）
@@ -132,19 +132,19 @@ class PaneActionsMixin:
         try:
             report = await self.engine.toggle_subtask(event.task_id, event.subtask_id)
         except UnknownTaskError:
-            self.query_one(StatusBar).update(UNKNOWN_SUBTASK_MESSAGE)
+            self._write_status(UNKNOWN_SUBTASK_MESSAGE)
             return
         except DidaError:
             # 重读那一步失败（网络断了、凭据被拒、服务端拒绝）：引擎的失败一律是结构化
             # 错误，这里如实说一句，不让一个断网的机器把整个界面带走。
-            self.query_one(StatusBar).update(SUBTASK_READ_FAILED_MESSAGE)
+            self._write_status(SUBTASK_READ_FAILED_MESSAGE)
             return
         self._subtask_pane().show(report.task_id, report.items)
         self.update_status()
         if not report.written:
-            self.query_one(StatusBar).update(SUBTASK_GONE_MESSAGE)
+            self._write_status(SUBTASK_GONE_MESSAGE)
         elif report.changed_elsewhere:
-            self.query_one(StatusBar).update(SUBTASK_ELSEWHERE_MESSAGE)
+            self._write_status(SUBTASK_ELSEWHERE_MESSAGE)
 
     def on_subtask_pane_dismissed(self) -> None:
         """子任务列表按了 ``Esc``：焦点回任务列。"""
