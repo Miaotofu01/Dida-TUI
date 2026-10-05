@@ -18,12 +18,15 @@
 
 只用终端一定会传上来的键：字母、``enter``、``esc``、方向键。``ctrl+enter`` / ``ctrl+shift+*``
 / ``alt+方向键`` 一个都不绑——它们要么收不到，要么会静默塌缩成不加修饰的键（spec 的键位表
-「明确不绑」那一节）。
+「明确不绑」那一节）。这条规矩由 :func:`unreliable_reason` 一处判定，
+``tests/test_keymap.py`` 拿它断「表里**没有**这种键」——不是「它有处理器」（#48：「绑定存在」
+在真终端里永远绿，而用户按下去什么都不会发生）。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Final
 
 from rich.cells import cell_len
 from textual.binding import Binding
@@ -45,6 +48,7 @@ __all__ = [
     "help_body",
     "help_rows",
     "key_text",
+    "unreliable_reason",
 ]
 
 GLOBAL = "global"
@@ -113,6 +117,51 @@ rich 量出来的最宽那行决定；而 ``↓``（U+2193）与 ``↑``（U+219
 方向键在 Textual 里的键名本来就是 ASCII 的 ``down`` / ``up``，所以它们**没有**条目：查不到就
 原样显示键名，那正好是两边都算 1 格的拼法。
 """
+
+
+_UNRELIABLE_KEYS: Final[dict[str, str]] = {
+    "ctrl+enter": (
+        "多数终端把它发成和 enter 同一个字节 0x0D，与 enter 分不开；kitty 协议的 CSI 13;5u 才"
+        "送得到它，而那条推送正是 ADR-0006 关掉的（实测：xterm 的 modifyOtherKeys 送来的是 "
+        "ctrl+\\r，不是 ctrl+enter）"
+    ),
+    "ctrl+return": "同 ctrl+enter：多一个拼法，一样收不到",
+    "shift+enter": "kitty 协议专属（terminal-input-evidence.md §2 实测：只有 CSI-u 送得到）",
+    "shift+space": "kitty 协议专属（同上）",
+    "shift+backspace": "在不报告独立修饰符的终端上无效（textual#6612）",
+}
+"""点名的那几个收不到的键：键名 → 为什么收不到。"""
+
+_UNRELIABLE_PREFIXES: Final[tuple[tuple[str, str], ...]] = (
+    (
+        "alt+",
+        "Alt 组合要终端把 ESC 前缀单独报上来：实测 alt+enter 塌缩成 enter（textual#6663，"
+        "按下会触发**另一个**动作），alt+方向键只有 kitty 协议送得到（spec 的「明确不绑」）",
+    ),
+    (
+        "ctrl+shift+",
+        "要终端把 Ctrl 与 Shift 两个修饰符分开报（CSI-u / kitty）；ADR-0006 关掉那条路之后"
+        "它根本到不了这里",
+    ),
+)
+"""整类收不到的键：键名前缀 → 为什么整类都收不到。"""
+
+
+def unreliable_reason(key: str) -> str | None:
+    """这个键终端一定送得上来的吗？送不上来就给出**理由**，可靠则 ``None``。
+
+    规格里那句「终端能力守卫：一处集中决定哪些键可以用」就是这里：键位表与帮助都只许用
+    可靠键，判据集中在这一个函数。理由是**量出来的**（``notes/terminal-input-evidence.md``
+    §2、ADR-0006、textual#6612 / #6663 / #6721），不是「感觉有些终端不支持」——将来终端
+    能力变了，改这里就得先把那几条实测重跑一遍。
+    """
+    name = key.strip().lower()
+    if name in _UNRELIABLE_KEYS:
+        return _UNRELIABLE_KEYS[name]
+    for prefix, reason in _UNRELIABLE_PREFIXES:
+        if name.startswith(prefix):
+            return reason
+    return None
 
 
 def key_text(key: str) -> str:
