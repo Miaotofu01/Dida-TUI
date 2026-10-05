@@ -7,6 +7,11 @@
 - 待推送改动（Pending Change）：创建时间、尝试次数、下次重试时间、最后一次错误，
 - 同步状态：已完成流游标、上次刷新完成时间、上次算出的逻辑日。
 
+待推送改动有**两张表**：``pending_changes`` 是任务改动（一行一条任务），
+``pending_list_changes`` 是清单改动（建 / 改 / 删一个清单，#42）。分成两张是因为它们改的
+根本不是同一种东西——把 ``list_id`` 塞进 ``task_id`` 那一列，一个字段两个意思，
+读的人第一步就错。状态栏那个「待推送 N」两张一起数（``pending_count()``）。
+
 「增量」是这一层的概念：全量拉回来的数据在这里比对，只写变化（ADR 0001）。服务端已经没有
 的东西也在这里删掉（剪枝，#41）：清单与未完成任务只在「这一路这次取全了」的断言下才剪，
 断言就是 ``apply_refresh`` 的 ``prune_*`` 参数。冲突裁决也在这里：服务端权威胜出，但待推送
@@ -28,7 +33,10 @@
 - 读（完整记录）：``list_records()`` / ``task_payload(task_id)`` / ``stored_sync_state()``；
 - 写：``apply_refresh(lists=, tasks=, prune_lists=, prune_unfinished_tasks=)``（只写变化、
   顺手剪枝，返回 ``RefreshReport``）、``enqueue(...)`` / ``pending()`` / ``pending_count()`` /
-  ``record_attempt(...)`` / ``resolve(change_id)`` / ``set_sync_state(...)``。
+  ``record_attempt(...)`` / ``resolve(change_id)`` / ``set_sync_state(...)``；
+- 写（清单，#42）：``save_list(...)`` / ``drop_list(list_id)`` / ``list_payload(list_id)`` /
+  ``new_local_list_id()`` / ``enqueue_list(...)`` / ``pending_lists()`` /
+  ``record_list_attempt(...)`` / ``resolve_list(change_id)`` / ``adopt_created_list(...)``。
 
 ``task_payload()`` 是给 t07 的 ``update_task(snapshot=)`` 用的那一份：**字典形状**，
 不是领域 dataclass，客户端不认识的字段一个都不丢。
@@ -43,6 +51,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from dida.sync.lists import ListLocalEffect, ListWriteKind
 from dida.sync.view import INBOX_ID, ListSnapshot, SyncState, TaskSnapshot
 from dida.sync.writes import LocalEffect, WriteKind
 
@@ -57,6 +66,13 @@ ChangeKind = WriteKind
 
 COMPLETED_STATUS = 2
 """任务「已完成」的 ``status`` 值（api-contracts.md：Completed 是 2，不是 1）。"""
+
+LOCAL_LIST_PREFIX = "local-list-"
+"""本地临时清单 id 的前缀（#42）：新建的清单在服务端给出真 id 之前先用它占位。
+
+它**不是**收集箱那种「形如 ``inbox`` 加数字」的 id（``sync.read.is_inbox_id`` 认的是那个），
+所以本地新建的清单不会被误认成收集箱。
+"""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS lists (
@@ -79,6 +95,17 @@ CREATE TABLE IF NOT EXISTS tasks (
 CREATE TABLE IF NOT EXISTS pending_changes (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
     task_id       TEXT NOT NULL,
+    list_id       TEXT NOT NULL,
+    kind          TEXT NOT NULL,
+    payload       TEXT NOT NULL,
+    created_at    TEXT NOT NULL,
+    attempts      INTEGER NOT NULL DEFAULT 0,
+    next_retry_at TEXT,
+    last_error    TEXT
+);
+
+CREATE TABLE IF NOT EXISTS pending_list_changes (
+    id            INTEGER PRIMARY KEY AUTOINCREMENT,
     list_id       TEXT NOT NULL,
     kind          TEXT NOT NULL,
     payload       TEXT NOT NULL,
@@ -137,6 +164,32 @@ class PendingChange:
 
 
 @dataclass(frozen=True)
+class PendingListChange:
+    """一条还没推到服务端的**清单**改动（工单 #42）。
+
+    与 :class:`PendingChange` 长得像但不共用：清单改动没有任务 id，也不是作用在任务快照
+    上的字段合并。``payload`` 对建 / 改是要发出去的请求体（只有真的要写的字段），对删除是
+    空的——推送要 echo 回去的东西（``sortOrder``）不在队列里，而在 ``lists`` 那一行的
+    原文里（:meth:`Store.list_payload`），因为那才是用户看到的那一份。
+    """
+
+    id: int
+    """本地行号；推送成功时用它 :meth:`Store.resolve_list`。"""
+
+    list_id: str
+    """这一笔改的是哪个清单（新建时是本地那个临时 id）。"""
+
+    kind: ListWriteKind
+    payload: dict[str, Any]
+    """要发出去的请求体（删除是空的）。"""
+
+    created_at: datetime
+    attempts: int = 0
+    next_retry_at: datetime | None = None
+    last_error: str | None = None
+
+
+@dataclass(frozen=True)
 class StoredSyncState:
     """缓存里的同步状态（spec 的同步状态 schema）。
 
@@ -159,6 +212,10 @@ class FieldOverride:
 
     ``field`` 是 ``"*"`` 时表示**整条任务**：本地有一条还没推成功的删除，服务端那份
     整个不许写回来，否则用户删掉的任务会在下一次刷新时复活。
+
+    ``task_id`` 在清单那一行上装的是**清单 id**（#42）：清单的整行豁免（本地有一笔还没推
+    成功的建 / 改 / 删）与任务是同一条规矩，报告的读者要的就是那个 id 加「整行」这个事实。
+    沿用 ``task_id`` 这个名字是因为这一处是清单侧唯一用到它的地方，为它另起一个类型不值当。
     """
 
     task_id: str
@@ -257,6 +314,13 @@ class Store:
         # 整次刷新一个事务：成功才提交，中途出岔子就整份回滚。半份刷新比旧数据更难查。
         with self._db:
             for payload in lists:
+                list_id = str(payload["id"])
+                if self._has_pending_list_change(list_id):
+                    # 这条清单上有一笔还没推成功的改动（#42）：服务端这份原文整个不许写回来，
+                    # 否则用户刚改的名字/颜色会在下一次刷新时悄悄变回去（ADR-0002 的豁免，
+                    # 与任务那条 whole_row 同一条规矩）。改动推成功之后由后来的刷新裁决。
+                    suppressed.append(FieldOverride(list_id, "*", None, dict(payload)))
+                    continue
                 written_lists += int(self._write_list(payload))
             for payload in tasks:
                 task_id = str(payload["id"])
@@ -418,8 +482,17 @@ class Store:
         return tuple(_change(row) for row in rows)
 
     def pending_count(self) -> int:
-        """待推送数量；状态栏常驻显示这个数（ADR 0002 的豁免代价）。"""
-        row = self._db.execute("SELECT COUNT(*) AS n FROM pending_changes").fetchone()
+        """待推送数量；状态栏常驻显示这个数（ADR 0002 的豁免代价）。
+
+        **两张表一起数**（#42）：清单的建 / 改 / 删与任务的改动一样是「本地比服务端新」，
+        分开数的话删掉一个清单之后状态栏还是 0——用户读到的是「发出去了」。
+        """
+        row = self._db.execute(
+            """
+            SELECT (SELECT COUNT(*) FROM pending_changes)
+                 + (SELECT COUNT(*) FROM pending_list_changes) AS n
+            """
+        ).fetchone()
         return int(row["n"])
 
     def record_attempt(
@@ -447,6 +520,139 @@ class Store:
         """这条改动已经推到服务端了，出队。"""
         with self._db:
             self._db.execute("DELETE FROM pending_changes WHERE id = ?", (change_id,))
+
+    # ---------------------------------------------------------------- 写：清单的乐观写（#42）
+
+    def list_payload(self, list_id: str) -> dict[str, Any] | None:
+        """一条清单的原文（**字典形状**，与 :meth:`task_payload` 同一条口径）。
+
+        这是喂给 ``update_project(snapshot=)`` 的那一份：改名时不打算改的字段靠它 echo
+        回去（``sortOrder`` 最要紧——文档写着 "default 0"，省略它可能把清单顺序重置）。
+        ``groupId`` / ``permission`` 也在这里，但**不会**进请求体：那份白名单在
+        :func:`dida.api.guards.prepare_project_body`。
+
+        本地没有这一行就是 ``None``：不猜一个空清单出来（猜出来的请求会打到一个不存在的
+        清单上）。
+        """
+        row = self._db.execute("SELECT * FROM lists WHERE id = ?", (list_id,)).fetchone()
+        return None if row is None else _list_payload(row)
+
+    def save_list(self, payload: Mapping[str, Any]) -> None:
+        """写下一行清单（乐观写的那一份）。内容没变就不写（ADR 0001 的「只写变化」）。"""
+        with self._db:
+            self._write_list(payload)
+
+    def drop_list(self, list_id: str) -> None:
+        """本地摘掉一行清单（删除的本地效果：不是「等推送成功再摘」）。"""
+        with self._db:
+            self._db.execute("DELETE FROM lists WHERE id = ?", (list_id,))
+
+    def new_local_list_id(self) -> str:
+        """一个还没被占用的本地临时清单 id（新建清单时先占位）。
+
+        服务端建好之后才给真 id，而「建完立刻出现在清单列表页」是 ADR-0002 的手感要求。
+        取最小的空号而不是计数器：上一次没推成功的那一行还占着它的号，重开也不会撞上它
+        （撞上就是两条清单合成一条，用户刚建的那条不见了）。
+        """
+        rows = self._db.execute(
+            "SELECT id FROM lists WHERE id LIKE ?", (f"{LOCAL_LIST_PREFIX}%",)
+        ).fetchall()
+        used = {
+            int(str(row["id"])[len(LOCAL_LIST_PREFIX) :])
+            for row in rows
+            if str(row["id"])[len(LOCAL_LIST_PREFIX) :].isdigit()
+        }
+        number = 1
+        while number in used:
+            number += 1
+        return f"{LOCAL_LIST_PREFIX}{number}"
+
+    def enqueue_list(
+        self,
+        *,
+        list_id: str,
+        kind: ListWriteKind,
+        payload: Mapping[str, Any],
+        now: datetime,
+        local: Mapping[str, Any] | None = None,
+    ) -> PendingListChange:
+        """入队一条待推送的**清单**改动，并让它在本地立刻生效（乐观写）。
+
+        ``payload`` 是**要发出去的请求体**；``local`` 是本地那一行要写的字段——两者在
+        新建时不一样（本地那行多一个临时 id），改名与删除时一样（删除干脆没有）。
+        本地效果读词表（``kind.local``），不在这里点名成员。
+
+        ``now`` 由调用方给：这一层没有时钟。本地生效与入队**同一个事务**：不会出现
+        「生效了但没进队列」这种下次刷新就丢的状态（与 :meth:`enqueue` 同一条规矩）。
+        """
+        with self._db:
+            if kind.local is ListLocalEffect.DROP:
+                self._db.execute("DELETE FROM lists WHERE id = ?", (list_id,))
+            else:
+                self._write_list(dict(local if local is not None else payload))
+            cursor = self._db.execute(
+                """
+                INSERT INTO pending_list_changes
+                    (list_id, kind, payload, created_at, attempts, next_retry_at, last_error)
+                VALUES (?, ?, ?, ?, 0, NULL, NULL)
+                """,
+                (list_id, kind.value, _dumps(payload), now.isoformat()),
+            )
+            change = self._list_change_row(int(cursor.lastrowid or 0))
+        assert change is not None
+        return change
+
+    def adopt_created_list(self, local_id: str, payload: Mapping[str, Any]) -> None:
+        """新建清单推成功：把本地那行临时 id 的清单挪到服务端给的 id 上。
+
+        与任务的 :meth:`adopt_created` 同一件事与同一个理由：不挪的话，真 id 那条会被下一次
+        全量刷新拉回来，而临时 id 这条要等那一次刷新的剪枝才消失——中间这段时间同一条清单在
+        屏幕上出现两遍。两步在同一个事务里。
+
+        服务端给的 id 与临时 id 相同时只写、不删（删了就是把刚写的那一行删掉）。
+
+        **这条清单后面还排着几笔改动时，它们也跟着挪到真 id 上**：建好之后又改了名
+        （断网时先建后改，很正常）会留下一条 ``list_id`` 指向本地临时 id 的改动，而服务端
+        没有那个清单——不挪的话它永远推不出去，状态栏那个数一直非零，用户读到的是
+        「等一下就好」（与 :class:`~dida.sync.writes.UnknownTaskError` 挡的是同一类安静错误）。
+        """
+        target = str(payload["id"])
+        with self._db:
+            self._write_list(payload)
+            if target != local_id:
+                self._db.execute("DELETE FROM lists WHERE id = ?", (local_id,))
+                self._db.execute(
+                    "UPDATE pending_list_changes SET list_id = ? WHERE list_id = ?",
+                    (target, local_id),
+                )
+
+    def pending_lists(self) -> tuple[PendingListChange, ...]:
+        """还没推成功的清单改动，按发生顺序（与 :meth:`pending` 同一条口径）。"""
+        rows = self._db.execute("SELECT * FROM pending_list_changes ORDER BY id").fetchall()
+        return tuple(_list_change(row) for row in rows)
+
+    def record_list_attempt(
+        self,
+        change_id: int,
+        *,
+        error: str | None = None,
+        next_retry_at: datetime | None = None,
+    ) -> None:
+        """记一次清单改动的推送失败（尝试次数 +1、最后一次错误、下次重试时刻）。"""
+        with self._db:
+            self._db.execute(
+                """
+                UPDATE pending_list_changes
+                   SET attempts = attempts + 1, last_error = ?, next_retry_at = ?
+                 WHERE id = ?
+                """,
+                (error, next_retry_at.isoformat() if next_retry_at else None, change_id),
+            )
+
+    def resolve_list(self, change_id: int) -> None:
+        """这条清单改动已经推到服务端了，出队。"""
+        with self._db:
+            self._db.execute("DELETE FROM pending_list_changes WHERE id = ?", (change_id,))
 
     # ---------------------------------------------------------------- 同步状态
 
@@ -564,12 +770,18 @@ class Store:
         不存在：它是默认清单，剪掉它的表现是左栏少一格、随手记的任务无处可去。收集箱那一行
         的 ``is_inbox`` 写进去就是 1（``_write_list`` 的口径），所以这一条也挡住了字面量
         ``inbox`` 那一行。
+
+        第二条例外（#42）：本地还有**没推成功的清单改动**——刚刚建好、还没推上去的清单不在
+        服务端的索引里只有一个原因，就是那一笔改动还没出去。剪掉它的表现是「用户刚建的清单
+        刷新一次就没了」，与「删掉的清单刷新之后又回来」是同一个 bug 的两个方向。
         """
         rows = self._db.execute("SELECT id, is_inbox FROM lists").fetchall()
         gone = [
             str(row["id"])
             for row in rows
-            if str(row["id"]) not in remote_ids and not row["is_inbox"]
+            if str(row["id"]) not in remote_ids
+            and not row["is_inbox"]
+            and not self._has_pending_list_change(str(row["id"]))
         ]
         for list_id in gone:
             self._db.execute("DELETE FROM lists WHERE id = ?", (list_id,))
@@ -607,6 +819,24 @@ class Store:
             "SELECT 1 FROM pending_changes WHERE task_id = ? LIMIT 1", (task_id,)
         ).fetchone()
         return row is not None
+
+    def _has_pending_list_change(self, list_id: str) -> bool:
+        """这条清单上还有没有没推成功的改动（#42）。
+
+        两种地方都读它：剪枝（还没推上去的新建清单**不是**「远端已删」）与刷新时的冲突
+        裁决（服务端那份原文盖不掉用户刚做的改名）。与 :meth:`_has_pending_change` 同一条
+        规矩——ADR-0002 的豁免。
+        """
+        row = self._db.execute(
+            "SELECT 1 FROM pending_list_changes WHERE list_id = ? LIMIT 1", (list_id,)
+        ).fetchone()
+        return row is not None
+
+    def _list_change_row(self, change_id: int) -> PendingListChange | None:
+        row = self._db.execute(
+            "SELECT * FROM pending_list_changes WHERE id = ?", (change_id,)
+        ).fetchone()
+        return None if row is None else _list_change(row)
 
     def _write_list(self, payload: Mapping[str, Any]) -> bool:
         """写一条清单；内容没变就不写（ADR 0001 的「只写变化」）。"""
@@ -665,6 +895,41 @@ class Store:
 def _dumps(payload: Mapping[str, Any]) -> str:
     """任务原文的规范序列化：键排序，保证同一份内容只有一个字符串形式。"""
     return json.dumps(payload, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+
+
+def _list_payload(row: sqlite3.Row) -> dict[str, Any]:
+    """``lists`` 那一行 → 服务端 ``Project`` 那样的字典（#42）。
+
+    字段名按文档用驼峰：这一份是要 echo 回请求体、也是要跟服务端原文比对的，
+    换个名字就得在两处翻译。``isInbox`` 不在文档里——那是**客户端自己**给收集箱那一行
+    加的记号（服务端的 ``Project`` 定义里没有这种字段），所以 ``_write_list`` 认它。
+    """
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "color": row["color"],
+        "sortOrder": row["sort_order"],
+        "groupId": row["group_id"],
+        "isInbox": bool(row["is_inbox"]),
+        "kind": row["kind"],
+        "permission": row["permission"],
+    }
+
+
+def _list_change(row: sqlite3.Row) -> PendingListChange:
+    """``pending_list_changes`` 那一行 → :class:`PendingListChange`。"""
+    return PendingListChange(
+        id=int(row["id"]),
+        list_id=str(row["list_id"]),
+        kind=ListWriteKind(row["kind"]),
+        payload=json.loads(row["payload"]),
+        created_at=datetime.fromisoformat(row["created_at"]),
+        attempts=int(row["attempts"]),
+        next_retry_at=(
+            datetime.fromisoformat(row["next_retry_at"]) if row["next_retry_at"] else None
+        ),
+        last_error=row["last_error"],
+    )
 
 
 def _list_id_of(payload: Mapping[str, Any]) -> str:

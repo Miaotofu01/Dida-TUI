@@ -20,20 +20,27 @@ from typing import Sequence
 from rich.text import Text
 from textual.message import Message
 
-from dida.sync.engine import ListKind, ListRow
+from dida.sync.engine import LIST_COLORS, ListKind, ListRow
 from dida.tui import messages, theme
 from dida.tui.keys import LAYER_INDEX, bindings_for
+from dida.tui.overlays import FormField, FormOption
 from dida.tui.pages.base import EMPTY_STYLE, CursorPage, Row, empty_row, rule_row
 
 __all__ = [
     "BUILTIN_MARK",
     "BLOCKED_MARK",
     "CUSTOM_MARK",
+    "DEFAULT_COLOR_OPTION",
     "INBOX_MARK",
+    "LIST_COLOR_FIELD",
     "LIST_MARK",
+    "LIST_NAME_FIELD",
     "IndexPage",
     "group_by_project",
+    "list_color_options",
+    "list_form_fields",
     "list_line",
+    "list_write_refusal",
     "mark_of",
     "project_heading",
 ]
@@ -125,6 +132,69 @@ def group_by_project(
     return tuple(out)
 
 
+LIST_NAME_FIELD = "name"
+"""清单表单里「名字」那一格的名字（表单浮层按字段名把值交回来，#42）。"""
+
+LIST_COLOR_FIELD = "color"
+"""清单表单里「颜色」那一格的名字。"""
+
+DEFAULT_COLOR_OPTION = FormOption("", "默认")
+"""颜色那一格的第一档：**不挑**颜色。
+
+它的值是空串，于是请求体里根本不出现 ``color``（服务端自己挑一档默认色）——与「把颜色
+清空」不是一回事，文档没写清空该发什么。
+"""
+
+
+def list_color_options() -> tuple[FormOption, ...]:
+    """颜色那几档：值原样发给服务端，屏幕上只写它的名字。
+
+    终端**不画**这些颜色（颜色跟随用户自己的主题，ADR-0007 一）；这一档表是 API 数据，
+    所以它住在 :mod:`dida.sync.lists`，不在 :mod:`dida.tui.theme`。
+    """
+    return tuple(FormOption(color.value, color.label) for color in LIST_COLORS)
+
+
+def list_form_fields(row: ListRow | None = None) -> tuple[FormField, ...]:
+    """清单表单的字段：名字 + 颜色（新建时 ``row`` 是 ``None``）。
+
+    改的时候两格都填上**当前值**：颜色尤其要紧——清单上那个颜色可能是手机端挑的，
+    客户端这一档里没有它，而「只想改个名字」不该顺手把颜色换掉（字段层会把认不出来的值
+    自己加成一档，照原样交回来）。
+    """
+    return (
+        FormField(
+            name=LIST_NAME_FIELD,
+            label="名字",
+            value="" if row is None else row.name,
+        ),
+        FormField(
+            name=LIST_COLOR_FIELD,
+            label="颜色",
+            options=(DEFAULT_COLOR_OPTION, *list_color_options()),
+            value="" if row is None else (row.color or ""),
+        ),
+    )
+
+
+def list_write_refusal(row: ListRow) -> str | None:
+    """这一行能不能改 / 删；不能的话是**哪一句**话，能的话是 ``None``。
+
+    三种行里只有「改得动的真实清单」能动：
+
+    - 视图不是清单（视图那三条归 #36），
+    - 收集箱那一行是本机补的默认落点（改了下次刷新就变回去），
+    - ``permission`` 不是 ``write`` 的清单改不动（用户故事 24）。
+    """
+    if row.kind is not ListKind.LIST:
+        return messages.VIEW_ROW_MESSAGE
+    if row.is_inbox:
+        return messages.INBOX_LIST_MESSAGE
+    if row.permission not in (None, "write"):
+        return messages.readonly_list_message(row)
+    return None
+
+
 class IndexPage(CursorPage):
     """清单列表页：内置视图、自建视图、真实清单、项目组小标题。"""
 
@@ -146,9 +216,30 @@ class IndexPage(CursorPage):
             self.message = message
             super().__init__()
 
+    class NewList(Message):
+        """用户按了 ``n``：建一个清单（#42）。"""
+
+    class EditList(Message):
+        """用户按了 ``e``：改这一行的名字与颜色（#42）。"""
+
+        def __init__(self, row_id: str) -> None:
+            self.row_id = row_id
+            super().__init__()
+
+    class DeleteList(Message):
+        """用户按了 ``d``：删这一行（#42，外层先问一句）。"""
+
+        def __init__(self, row_id: str) -> None:
+            self.row_id = row_id
+            super().__init__()
+
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(id=id)
         self._rows_by_id: dict[str, ListRow] = {}
+
+    def row(self, row_id: str) -> ListRow | None:
+        """这一行是谁（光标停在哪一行、要改哪一行，外层都从这里问）。"""
+        return self._rows_by_id.get(row_id)
 
     def show_lists(self, rows: Sequence[ListRow]) -> None:
         """把引擎给的清单索引铺成一页（收集箱、视图、真实清单、项目组小标题）。"""
@@ -180,3 +271,17 @@ class IndexPage(CursorPage):
             self.post_message(self.Refused(messages.blocked_list_message(row)))
             return
         self.post_message(self.Entered(row.id))
+
+    def action_new_list(self) -> None:
+        """``n``：建一个清单（浮层与写路径都在外层，这一页只转发）。"""
+        self.post_message(self.NewList())
+
+    def action_edit_list(self) -> None:
+        """``e``：改光标这一行；没有可停的行时什么都不做。"""
+        if self.selected_id is not None:
+            self.post_message(self.EditList(self.selected_id))
+
+    def action_delete_list(self) -> None:
+        """``d``：删光标这一行（外层先问一句，这里只转发）。"""
+        if self.selected_id is not None:
+            self.post_message(self.DeleteList(self.selected_id))

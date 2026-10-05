@@ -48,6 +48,16 @@ COMPLETED_WINDOW_DATE_FIELDS = ("startDate", "endDate")
 #: 写它们等于什么都没写：服务端静默忽略，用户以为完成了，其实没有（ADR 0002）。
 NON_WRITABLE_FIELDS = ("status",)
 
+#: 清单（``Project``）的写请求体接受的字段（openapi-dida365.md:1184–1188 建、:1235–1239 改）。
+#:
+#: ``groupId`` **不在里面**：它在整份文档里只出现在 Project 的**响应**与定义上
+#: （:1011 / :1052 / :1095 / :2302），没有任何一个请求体表收它。所以客户端做不到把清单
+#: 放进项目组、也改不了它的归属——这是接口的能力上限，不是实现疏漏（工单 #42 的验收标准 9）。
+#:
+#: ``closed`` / ``permission`` / ``id`` 同理：它们是响应上的字段，写回去只会多带一笔
+#: 服务端不认识的东西。
+PROJECT_WRITABLE_FIELDS: tuple[str, ...] = ("name", "color", "sortOrder", "viewMode", "kind")
+
 
 def api_date(value: Any, *, field: str) -> str:
     """校验一个日期字段，返回要写进请求体的字符串。
@@ -167,6 +177,38 @@ def guard_writable(changes: Mapping[str, Any]) -> None:
                 "完成任务请走 complete_task",
                 field=field,
             )
+
+
+def prepare_project_body(
+    snapshot: Mapping[str, Any] | None, changes: Mapping[str, Any]
+) -> dict[str, Any]:
+    """清单的写请求体：**只**带 :data:`PROJECT_WRITABLE_FIELDS` 里那些字段。
+
+    与任务的 :func:`merge_snapshot` 是同一件事，只是字段表不同、而且是**白名单**而不是
+    「原文减掉黑名单」：任务的底稿要带未知字段（手机端设的东西不能丢），清单的原文里却
+    带着 ``groupId`` / ``closed`` / ``permission`` 这些请求体压根不接受的字段——照单全收
+    就是把「接口不接受」的东西发出去。
+
+    底稿里那些**不改也要原样带回**的字段（``sortOrder`` 最要紧）就在这里 echo 回去：
+    文档给 ``sortOrder`` 写了 "default 0"，而省略字段到底是替换还是合并**文档没说**，
+    所以「改名顺手把用户的清单顺序重置成 0」是真实可能的（api-shapes §B10）。
+
+    ``None`` 值的改动**丢掉不写**：``color=None`` 到底是「别动」还是「清空」文档没写，
+    而这两个意思在请求体里长得一样。宁可少发一个字段，也不发一个猜来的。
+    """
+    body = {
+        field: snapshot[field]
+        for field in PROJECT_WRITABLE_FIELDS
+        if isinstance(snapshot, Mapping) and snapshot.get(field) is not None
+    }
+    body.update(
+        {
+            field: value
+            for field, value in changes.items()
+            if field in PROJECT_WRITABLE_FIELDS and value is not None
+        }
+    )
+    return body
 
 
 def merge_snapshot(
