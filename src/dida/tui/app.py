@@ -42,6 +42,7 @@ from dida.sync.engine import (
     ListRow,
     SyncStatus,
     TaskDetail,
+    UnknownTaskError,
 )
 from dida.tui import messages, theme
 from dida.tui.escape import open_in_browser, task_url
@@ -484,11 +485,18 @@ class DidaApp(App[None]):
         两次推送不会重复发），它回来之后底部那一行才知道该写「已保存」还是「待推送（N）」。
 
         写失败分两种，两种都说出**具体**原因（用户故事 81）：引擎当场拒绝（本地没有这条任务
-        的底稿）在这里接住；推不出去（断网、服务端拒绝）由引擎记在队列上，下一次
-        :meth:`update_status` 会把它读出来。
+        的底稿）在这里接住，用 ``messages`` 里那一句现成的话；推不出去（断网、服务端拒绝）
+        由引擎记在队列上，下一次 :meth:`update_status` 会把它读出来。
         """
         try:
             self.engine.write(event.task_id, changes={event.field: event.value})
+        except UnknownTaskError:
+            # 「这条任务已经不在本地缓存里了，刷新之后再试一次」——本地没有底稿是一种**说得出
+            # 名字**的拒绝，不该混进「保存失败」那一类里（那条留给服务端与网络说的话）。
+            self.refresh_view()
+            if self.is_running:
+                self.detail_page().show_save(messages.UNKNOWN_TASK_MESSAGE)
+            return
         except DidaError as exc:
             self.refresh_view()
             if not self.is_running:

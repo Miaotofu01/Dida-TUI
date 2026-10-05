@@ -102,13 +102,15 @@ class TaskSnapshot:
     """完成时刻（服务端的 ``completedTime``）；本地刚完成、服务端还没认过的那些是 ``None``。"""
 
     desc: str = ""
-    """服务端的 ``desc``：这条任务的**描述**（工单 #20 的右栏要常驻显示它）。"""
+    """服务端的 ``desc``：GLOSSARY 里它是**备注**（详情页「备注」那一行画的就是它）。"""
 
     content: str = ""
-    """服务端的 ``content``：这条任务的**备注/正文**。
+    """服务端的 ``content``：GLOSSARY 里它是**描述**。
 
-    ``api-contracts.md`` 的 ``Task`` 字段表里 ``desc`` 与 ``content`` 是两个字面不同的字段：
-    描述归描述、备注归备注，这里不合并、也不互相兜底——详情栏两行各画各的。
+    ``desc`` 与 ``content`` 是两个字面不同的字段，这里不合并、也不互相兜底——详情页两行
+    各画各的，改一个不会覆盖另一个。**v1 把这两个标反了**（描述当成 ``desc``），这份
+    spec 纠正它：描述 = ``content``、备注 = ``desc``（``GLOSSARY.md`` 的「任务」一节，
+    翻转的落点在 :func:`dida.tui.pages.detail.fields_of`）。
     """
 
     tags: tuple[str, ...] = ()
@@ -163,10 +165,10 @@ class TaskItem:
     due_text: str
 
     desc: str = ""
-    """描述，原样来自快照（TUI 不解析它）。"""
+    """**备注**，原样来自快照（TUI 不解析它；术语表：备注 = ``desc``）。"""
 
     content: str = ""
-    """备注/正文，原样来自快照。"""
+    """**描述**，原样来自快照（术语表：描述 = ``content``）。"""
 
     tags_text: str = ""
     """标签的成品读法（``#工作 #季度``，见 :func:`format_tags`）。

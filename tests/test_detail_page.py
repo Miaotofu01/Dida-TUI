@@ -20,7 +20,7 @@ from textual._xterm_parser import XTermParser
 
 from dida.api.client import DidaApiClient
 from dida.storage.store import Store
-from dida.sync.engine import NO_DUE_TEXT
+from dida.sync.engine import NO_DUE_TEXT, DidaError, UnknownTaskError
 from dida.sync.engine import SyncEngine
 
 from rich.cells import cell_len
@@ -97,6 +97,11 @@ def row_with(text: str, needle: str) -> str:
         if needle in line:
             return line
     raise AssertionError(f"屏幕上没有「{needle}」这一行：\n{text}")
+
+
+def lines_with(text: str, needle: str) -> int:
+    """屏幕上写着 ``needle`` 的行数（同一句话在两处出现时数得出来）。"""
+    return sum(1 for line in text.splitlines() if needle in line)
 
 
 def has_field(text: str, label: str) -> bool:
@@ -503,6 +508,12 @@ async def test_the_bottom_line_always_says_saved_or_pending():
 
     assert messages.saved_message() in saved, f"队列空着时要写「已保存」：\n{saved}"
     assert messages.pending_message(2) in pending, f"有没推上去的改动时要写出来：\n{pending}"
+    # 底部现在有**两行**贴在一起（这一页自己的一行 + app 的状态栏）。ADR-0007 实测过一次
+    # 「两个 dock: bottom 挨着会吃掉汉字格」（「待推送」变成「待推 」），所以两行都要完整。
+    assert lines_with(saved, messages.saved_message()) == 1, f"「已保存」只该有一处：\n{saved}"
+    assert "待推送 0" in saved, f"状态栏那一份要在：\n{saved}"
+    assert lines_with(pending, messages.pending_message(2)) == 1, f"这一页那一行只该有一处：\n{pending}"
+    assert "待推送 2" in pending, f"状态栏那一份被吃掉了：\n{pending}"
 
 
 async def test_the_bottom_line_is_still_there_when_the_page_is_long():
@@ -863,3 +874,49 @@ async def test_a_long_cjk_commit_lands_in_the_field_verbatim():
     assert fake.writes == [("t1", {"title": COMMIT})], f"落进字段的不是原文：{fake.writes}"
     assert COMMIT in field_row(text, "标题"), f"屏幕上不是那一段原文：\n{text}"
     assert "[32;;" not in text and ":30028u" not in text, f"字段里留了转义序列：\n{text}"
+
+
+async def test_a_refused_save_says_which_refusal_it_was():
+    """引擎当场拒绝时说的是一句**说得出名字**的话（验收标准 9）。
+
+    「本地已经没有这条任务的底稿」是四种失败里的一种，与断网、凭据失效、服务端拒绝要做的
+    下一步完全不同（用户故事 81）。它不写成「保存失败」，写的是 ``messages`` 里那一句现成的
+    话；而且这一下**确实没有改成**——屏幕上的标题原样还在。
+    """
+    fake = backend()
+    fake.write_error = UnknownTaskError("t1")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await pilot.press("enter")
+        await pilot.press(*clear(len(TITLE)))
+        await pilot.press(*"新标题")
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert messages.UNKNOWN_TASK_MESSAGE in text, f"拒绝的原因没有说出来：\n{text}"
+    assert TITLE in field_row(text, "标题"), f"没有改成的东西不该在屏上变成改成了：\n{text}"
+
+
+async def test_a_save_failure_that_is_not_the_known_one_still_names_the_reason():
+    """别的写失败也带上具体那一句（验收标准 9）：前缀之后是原因，不是一个句号。"""
+    fake = backend()
+    fake.write_error = DidaError("服务端说这个字段不行")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await pilot.press("enter")
+        await pilot.press(*clear(len(TITLE)))
+        await pilot.press(*"新标题")
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert messages.field_save_failed_message("服务端说这个字段不行") in text, (
+        f"保存失败没有带上具体原因：\n{text}"
+    )
