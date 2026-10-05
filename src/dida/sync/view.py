@@ -178,6 +178,14 @@ class TaskItem:
     all_day: bool
     due_text: str
 
+    overdue: bool = False
+    """逾期了没有（逻辑日判定，见 :func:`is_overdue`）。
+
+    日期判断全在引擎这一层（架构规则：TUI 拿到的是已经判断好的成品），所以「标红」这件事
+    的颜色由 TUI 决定、**位**由这里给：TUI 自己拿截止时间去比会写出第二份日期比较，那正是
+    全天任务与 ``04:00`` 边界上会各错一次的地方。
+    """
+
     desc: str = ""
     """描述，原样来自快照（TUI 不解析它）。"""
 
@@ -195,14 +203,6 @@ class TaskItem:
 
     reminders: tuple[str, ...] = ()
     """服务端的 ``reminders``：非空就是有提醒（行里画一个提醒标记）。"""
-
-    overdue: bool = False
-    """这条任务逾期了（截止时间早于当前逻辑日）。
-
-    判定在引擎里（TUI 不许自己判日期——架构的允许表里没有 ``dida.logical_day``），
-    行只负责把这一位读成颜色（:data:`dida.tui.theme.OVERDUE`）。已完成的不是逾期：
-    它已经做完了，划掉沉底才是它该有的样子。
-    """
 
     completed: bool = False
     """这条任务已完成。
@@ -311,17 +311,6 @@ def format_tags(tags: Sequence[str]) -> str:
     return " ".join(f"#{tag}" for tag in tags)
 
 
-def is_overdue(snapshot: TaskSnapshot, *, now: datetime, day_end: str) -> bool:
-    """这条任务逾期了吗：有截止时间、且它属于**早于**当前逻辑日的那一天。
-
-    逻辑日判定与分组、与「今天」视图用的是同一份（:func:`due_day`）：``day_end = "04:00"``
-    时凌晨两点看到的昨天 23:00 截止**不算逾期**，它是今天的事（用户故事 83）。
-    """
-    if snapshot.completed or snapshot.due is None:
-        return False
-    return due_day(snapshot.due, all_day=snapshot.all_day, day_end=day_end) < logical_day(now, day_end).label
-
-
 def task_item(snapshot: TaskSnapshot, names: dict[str, str], *, now: datetime, day_end: str) -> TaskItem:
     """一条任务快照 → 一行成品。"""
     return TaskItem(
@@ -334,12 +323,12 @@ def task_item(snapshot: TaskSnapshot, names: dict[str, str], *, now: datetime, d
         due=snapshot.due,
         all_day=snapshot.all_day,
         due_text=format_due(snapshot.due, all_day=snapshot.all_day, now=now, day_end=day_end),
+        overdue=is_overdue(snapshot, today=logical_day(now, day_end).label, day_end=day_end),
         desc=snapshot.desc,
         content=snapshot.content,
         tags_text=format_tags(snapshot.tags),
         repeat_flag=snapshot.repeat_flag,
         reminders=snapshot.reminders,
-        overdue=is_overdue(snapshot, now=now, day_end=day_end),
         completed=snapshot.completed,
     )
 
@@ -400,6 +389,21 @@ def due_day(due: datetime, *, all_day: bool, day_end: str) -> date:
     按 00:00 这个时刻去套偏移会把它整天挪到前一个逻辑日。
     """
     return due.date() if all_day else logical_day(due, day_end).label
+
+
+def is_overdue(snapshot: TaskSnapshot, *, today: date, day_end: str) -> bool:
+    """这条任务逾期了没有：有截止时间、且落在当前逻辑日**之前**（用户故事 25 / 87）。
+
+    判据是逻辑日（:func:`due_day`），不是裸的时刻比较：``day_end = "04:00"`` 时当天
+    03:00 属于昨天，它逾期；而当天 00:00 那个全天标记属于今天，它不逾期。全天任务因此
+    不会因为边界配在半夜就被算成逾期（那是 ``due_day`` 已经分好的事，这里不重写第二份）。
+
+    已完成的不算逾期：一条做完的任务不该在「今天」里被标红（它压根不该在那个视图里——
+    三个内置视图都只收未完成的）。
+    """
+    if snapshot.completed or snapshot.due is None:
+        return False
+    return due_day(snapshot.due, all_day=snapshot.all_day, day_end=day_end) < today
 
 
 def format_due(due: datetime | None, *, all_day: bool, now: datetime, day_end: str) -> str:

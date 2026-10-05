@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import dataclasses
 import re
 import unicodedata
 from datetime import datetime, timedelta, timezone
@@ -107,22 +108,21 @@ def test_every_css_colour_is_spelled_ansi():
         )
 
 
-def test_the_overdue_token_is_a_token_the_row_can_read():
-    """逾期 = 一个语义 token（``theme.OVERDUE``）**加**引擎给的那一位（``TaskItem.overdue``）。
+def test_the_overdue_token_is_a_token_and_nothing_more():
+    """逾期只是一个**语义 token**：位由读模型给，颜色由这里给，TUI 拿到的是成品。
 
-    #51 只放得下 token——那时 ``TaskItem`` 还没有这一位，而 TUI 不许自己判日期（架构的
-    允许表里没有 ``dida.logical_day``）。#37 把位补上，行只负责把它读成颜色。
+    #51 落地时这条兼着一个范围守卫——「本票只提供 token，不实现标红」，所以断的是
+    ``TaskItem`` 上**还没有** ``overdue`` 位。#35 把「逾期置顶」做进视图求值（验收标准
+    第二条）时那个位就必须存在了，这条断言因此过期。留下来的是它真正守着的两件事：
+    token 是个 ANSI 名（真彩色会把终端主题顶掉），以及**判断不在 TUI 里**——日期判断全在
+    引擎那一层（``dida.logical_day`` 不在 TUI 的允许表里，``test_architecture`` 守着）。
     """
-    import dataclasses
-
     from dida.sync.engine import TaskItem
 
-    assert theme.OVERDUE, "逾期得有个语义 token"
-    assert "OVERDUE" in theme.RICH_ROLES, (
-        "它得留在颜色角色表里——那张表是「每个角色都是 ANSI 槽位」那条断言的输入"
-    )
+    assert "OVERDUE" in theme.RICH_ROLES, "逾期得有个语义 token，而且走 Rich 那一半（ANSI 名）"
     assert "overdue" in {field.name for field in dataclasses.fields(TaskItem)}, (
-        "TaskItem 得有一位现成的 overdue：没有它，行要标红就只能自己去判日期——那是不许的"
+        "读模型上没有 overdue 位：那样 TUI 要标红就只能自己拿截止时间去比，"
+        "而那会写出第二份日期比较——逻辑日与全天任务会各错一次"
     )
 
 

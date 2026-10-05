@@ -8,7 +8,8 @@ v1 的读入口只有一个 :meth:`~dida.sync.engine.SyncEngine.view`，返回�
 - :func:`list_index` —— **清单索引**：内置视图、自定义视图、真实清单三种行（:class:`ListKind`），
   每行带未完成条数；真实清单还带颜色、项目组、``kind``、``permission``。
 - :func:`container_tasks` —— **某个容器的任务列表**：这个清单的**全部**未完成任务（未来的也在），
-  外加这个容器里该显示的那部分已完成任务。
+  外加这个容器里该显示的那部分已完成任务；视图那个容器的成员与顺序由**视图求值**给
+  （:mod:`dida.sync.views`，#35），它不是一个容器。
 - :func:`task_detail` —— **单条任务的详情**：标题、描述、备注、清单、截止、优先级、标签，
   以及只读的重复规则、提醒、子任务与原文里我们不认识的字段。
 
@@ -24,7 +25,7 @@ v1 的读入口只有一个 :meth:`~dida.sync.engine.SyncEngine.view`，返回�
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from datetime import date, datetime, timedelta
+from datetime import datetime
 from enum import Enum
 from typing import Any, Collection, Mapping, Protocol, Sequence, runtime_checkable
 
@@ -39,7 +40,6 @@ from dida.sync.view import (
     TaskSnapshot,
     by_due,
     completed_section,
-    due_day,
     format_due,
     format_tags,
     list_names,
@@ -47,6 +47,7 @@ from dida.sync.view import (
     subtask_items,
     task_item,
 )
+from dida.sync.views import builtin_view_definitions, evaluate_view
 
 __all__ = [
     "BUILTIN_VIEW_IDS",
@@ -83,21 +84,15 @@ class ListKind(Enum):
     """内置视图：今天 / 最近七天 / 所有。"""
 
 
-BUILTIN_VIEW_IDS: tuple[str, ...] = ("today", "next7", "all")
+BUILTIN_VIEW_IDS: tuple[str, ...] = tuple(
+    definition.id for definition in builtin_view_definitions()
+)
 """三个内置视图的 id，按清单索引里的顺序（spec：今天 / 最近七天 / 所有）。
 
-它们是**写死的视图定义**（#35 会把求值长全：逾期置顶标红、排序、行里显示所属清单）；
-这一层只用它们的身份与成员——行上的条数与进去看到的列表因此不可能对不上。
+定义本身（过滤条件与名字）在 :mod:`dida.sync.views`：它们是**写死的视图定义**，和自定义
+视图走同一条求值路径（#35）。这一层只用它们的身份与成员——行上的条数与进去看到的列表
+因此不可能对不上。
 """
-
-_BUILTIN_VIEW_NAMES: dict[str, str] = {
-    "today": "今天",
-    "next7": "最近七天",
-    "all": "所有",
-}
-
-BUILTIN_VIEW_DAYS = 7
-"""「最近七天」的窗口：从当前逻辑日起的七个逻辑日（spec）。"""
 
 
 def is_inbox_id(value: str) -> bool:
@@ -184,17 +179,21 @@ class TaskList:
 
     container_id: str
     items: tuple[TaskItem, ...] = ()
-    """这个容器的**全部**未完成任务，包括截止时间在未来的那些（v1 把它们整条丢掉了）。"""
+    """这个容器的**全部**未完成任务，包括截止时间在未来的那些（v1 把它们整条丢掉了）。
+
+    视图里这一份的顺序由**视图求值**给（#35）：逾期置顶那份顺序是求值算出来的，这里不再
+    重排一遍。
+    """
 
     completed: CompletedSection = CompletedSection()
     """这个容器里窗口内完成的任务（真实清单才有；视图的成员由视图求值决定）。"""
 
     shows_list_name: bool = False
-    """这一屏的行里要不要写所属清单名：**视图要、真实清单不要**（工单 #37 的验收标准）。
+    """这一屏要不要在每条任务上写出所属清单名。
 
-    清单是容器，行里重复一百遍同一个名字是噪音；视图不是容器，行里的清单名是真信息。
-    **读模型说了算**（``row.kind is not ListKind.LIST``），界面不自己推。认不出来的容器
-    （清单被删了）给 ``False``——那一屏本来就没有行。
+    **视图不是容器**，同一个清单名在这里重复出现是必要信息（用户故事 34 / 58）；真实清单
+    里那个名字一整屏都写着，重复一百遍只是噪音。判断归读模型——页面自己去猜「这个容器
+    是不是视图」就又多了一份会漂移的判断。
     """
 
 
@@ -421,18 +420,21 @@ def container_tasks(
             day_end=day_end,
             window_hours=window_hours,
         )
+        shows_list_name = False
+        items = tuple(
+            by_due([task_item(snapshot, names, now=now, day_end=day_end) for snapshot in members])
+        )
     else:
-        # 视图不是容器：成员由视图求值给（#35 的内置视图 / #36 的自定义视图）。
+        # 视图不是容器：成员与顺序都由视图求值给（#35 的内置视图 / #36 的自定义视图）。
         members = _view_members(container_id, tasks, now=now, day_end=day_end, views=views)
         completed = CompletedSection()
-    items = tuple(
-        by_due([task_item(snapshot, names, now=now, day_end=day_end) for snapshot in members])
-    )
+        shows_list_name = True
+        items = tuple(task_item(snapshot, names, now=now, day_end=day_end) for snapshot in members)
     return TaskList(
         container_id=container_id,
         items=items,
         completed=completed,
-        shows_list_name=row.kind is not ListKind.LIST,
+        shows_list_name=shows_list_name,
     )
 
 
@@ -470,41 +472,27 @@ def task_detail(
 def builtin_view_rows(
     tasks: Sequence[TaskSnapshot], *, now: datetime, day_end: str
 ) -> tuple[ViewRow, ...]:
-    """三个内置视图的行：今天（逾期 ∪ 今天到期）/ 最近七天 / 所有。
+    """三个内置视图的行：今天（逾期 ∪ 今天到期）/ 最近七天 / 所有（#35 把求值长全）。
 
-    只算**成员**（谁在这个视图里）；行里的排序、逾期置顶标红、所属清单名是 #35 的求值。
+    它们就是**三个写死的视图定义**，走的是和自定义视图**同一条**求值路径
+    （:func:`dida.sync.views.evaluate_view`）——这里没有 ``if view_id == ...`` 那种分支，
+    所以「今天 = 逾期 ∪ 今天到期」「最近七天 = 七个逻辑日」这些判断只有定义那一处。
+
+    ``task_ids`` 是求值给的**顺序**（#35）：行上的条数与进去看到的列表来自同一次求值，
+    逾期置顶这件事也因此在索引与列表里是同一个答案。
     """
-    label = logical_day(now, day_end).label
-    members: dict[str, list[str]] = {view_id: [] for view_id in BUILTIN_VIEW_IDS}
-    for snapshot in tasks:
-        if snapshot.completed:
-            continue
-        for view_id in BUILTIN_VIEW_IDS:
-            if _in_builtin_view(view_id, snapshot, label=label, day_end=day_end):
-                members[view_id].append(snapshot.id)
     return tuple(
         ViewRow(
-            id=view_id,
-            name=_BUILTIN_VIEW_NAMES[view_id],
-            task_ids=tuple(members[view_id]),
+            id=definition.id,
+            name=definition.name,
+            task_ids=tuple(
+                item.snapshot.id
+                for item in evaluate_view(definition, tasks, now=now, day_end=day_end)
+            ),
             builtin=True,
         )
-        for view_id in BUILTIN_VIEW_IDS
+        for definition in builtin_view_definitions()
     )
-
-
-def _in_builtin_view(
-    view_id: str, snapshot: TaskSnapshot, *, label: date, day_end: str
-) -> bool:
-    """这条任务在不在这个内置视图里（逻辑日判定走 :func:`dida.sync.view.due_day`）。"""
-    if view_id == "all":
-        return True
-    if snapshot.due is None:
-        return False
-    day = due_day(snapshot.due, all_day=snapshot.all_day, day_end=day_end)
-    if view_id == "today":
-        return day <= label  # 逾期 ∪ 截止于当前逻辑日
-    return label <= day < label + timedelta(days=BUILTIN_VIEW_DAYS)
 
 
 def _unfinished_counts(tasks: Sequence[TaskSnapshot]) -> dict[str, int]:
@@ -524,7 +512,10 @@ def _view_members(
     day_end: str,
     views: Sequence[ViewRow],
 ) -> list[TaskSnapshot]:
-    """视图的成员：求值结果给的那些任务 id（求值里已经不在缓存里的 id 跳过）。"""
+    """视图的成员：求值结果给的那些任务 id，**按求值给的顺序**（已经不在缓存里的 id 跳过）。
+
+    顺序是承重的：视图的排序（逾期置顶）由求值决定，这里再排一遍就把它盖掉了。
+    """
     rows = builtin_view_rows(tasks, now=now, day_end=day_end) + tuple(views)
     row = next((item for item in rows if item.id == view_id), None)
     if row is None:
