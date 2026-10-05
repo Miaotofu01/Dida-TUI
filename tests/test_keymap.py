@@ -10,13 +10,31 @@
 
 from __future__ import annotations
 
+import unicodedata
+
+from rich.cells import cell_len
+
 from dida.tui.keys import (
     BINDINGS,
     GLOBAL,
     LAYERS,
     bindings_for,
+    help_body,
     help_rows,
 )
+
+
+def drawn_width(text: str) -> int:
+    """这段文字在「歧义宽度画双格」的 CJK 终端上占几格。
+
+    与 rich 的 ``cell_len`` 只差东亚**歧义**宽度那一档：rich 按 1 格排版，CJK 字体下终端
+    可能画 2 格（ADR-0007 的「字形宽度是承重项」）。全角/半角（W/F）两边都是 2 格、中性
+    （N/Na/H）两边都是 1 格，都不算差别——所以两边不等的只有歧义宽度。
+    """
+    return sum(
+        2 if unicodedata.east_asian_width(char) in ("A", "W", "F") else cell_len(char)
+        for char in text
+    )
 
 
 def keys_of_bindings(layer: str) -> set[str]:
@@ -61,6 +79,25 @@ def test_the_table_is_keyed_by_layer_not_one_flat_list():
     assert set(BINDINGS) == {GLOBAL, *LAYERS}
     for layer, keys in BINDINGS.items():
         assert keys, f"{layer} 是空的"
+
+
+def test_the_help_body_is_exactly_as_wide_as_the_terminal_will_draw_it():
+    """帮助的每一行都得「说多宽就多宽」。
+
+    ``?`` 那块浮层是 ``width: auto``（``theme.py`` 的 ``overlay_css``）：宽度由 **rich** 量出来
+    的最宽那一行决定，而终端按**自己的**宽度表画。两者只要差一格，多出来的那几格就把右边框
+    挤掉（工单 #48 的抬头 ``── X ──`` 正是这个反例：四个 ``─`` 都是歧义宽度，四个字符合起来
+    让那一行比 rich 的量法宽 4 格）。
+
+    这条量与 rich 的账的是同一件事的两面：rich 说这一行几格，CJK 终端就画几格。允许的只有
+    「两边都算 2 格」（汉字）与「两边都算 1 格」（ASCII）这两种字形。
+    """
+    for layer in LAYERS:
+        for line in help_body(layer).splitlines():
+            assert drawn_width(line) == cell_len(line), (
+                f"{layer} 这一层的帮助里有一行宽度说得不准：rich 说 {cell_len(line)} 格，"
+                f"CJK 终端画 {drawn_width(line)} 格——多出来的格会把浮层的右边框挤掉：\n{line!r}"
+            )
 
 
 def test_every_page_binds_its_own_layer_from_the_one_table():
