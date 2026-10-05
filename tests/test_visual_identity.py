@@ -238,8 +238,15 @@ async def test_a_rule_spans_the_page_and_never_ends_in_an_ellipsis(width: int):
         index = screen_text(app)
         await enter_work(pilot, app)
         tasks = screen_text(app)
+        await pilot.press("enter")  # 层三标题下面也有一条细线
+        await pilot.pause()
+        detail = screen_text(app)
 
-    for page, text in (("清单列表页", index), ("任务列表页", tasks)):
+    for page, text in (
+        ("清单列表页", index),
+        ("任务列表页", tasks),
+        ("任务详细页", detail),
+    ):
         found = rule_lines(text)
         assert found, f"{page}@{width} 上一条细线都没有：\n{text}"
         for line in found:
