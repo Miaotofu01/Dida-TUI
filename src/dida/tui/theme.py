@@ -79,6 +79,7 @@ __all__ = [
     "animations_setting",
     "app_css",
     "clip",
+    "form_css",
     "overlay_css",
     "pad",
     "rpad",
@@ -464,6 +465,56 @@ def app_css() -> str:
     那是主题里的真彩色值，不覆盖的话通知会以真彩色出现，破坏「跟随终端主题」。
     """
     return _fill(_APP_CSS)
+
+
+_FORM_CSS = """
+{name} .overlay-box {
+    width: 80%;
+}
+{name} .overlay-label {
+    width: 100%;
+    height: 1;
+    text-style: dim;
+}
+{name} .overlay-hint {
+    width: 100%;
+    height: auto;
+    margin-top: 1;
+    text-style: dim;
+}
+{name} Input {
+    width: 100%;
+    border: ascii {edge};
+    background: {surface};
+    color: {page};
+}
+{name} Input:focus {
+    border: ascii {accent};
+}
+{name} ChoiceField {
+    width: 100%;
+    height: 1;
+}
+"""
+
+
+def form_css(name: str) -> str:
+    """表单浮层的样式表（``FormOverlay`` 的 ``DEFAULT_CSS``，工单 #42）。
+
+    在 :func:`overlay_css` 那层壳子之上只加四件：
+
+    - **输入框**：Textual 自带的 ``Input`` 用 ``$surface`` / ``$primary`` 那些主题变量上色，
+      出去是真彩色（ADR-0007 一）。所以这里按浮层的面（槽 0）重画一遍，边框沿用那条
+      ``ascii`` 细边——聚焦时换成强调色（槽 6），与「光标那一行才亮」同一条口径。
+    - **字段名**与**底部那行提示**：``dim``（层级靠字重与明暗，不靠更亮的颜色）。
+    - **选择框**一行高（它自己那两个 ``< >`` 是 ASCII，宽度不含糊）。
+
+    ``width: 80%`` 是给输入框的：``overlay_css`` 的 ``width: auto`` 配一个 ``width: 100%``
+    的子控件量不出宽度来（百分比要有个有宽度的容器参照）。80% 而不是更窄，是为了底部那行
+    提示在一屏 100 格里排得下——排不下它会折行，折行本身不算坏，但两行的提示看起来像
+    出了错。窄终端上折行是正常的（40 格时折成三行，仍然读得完）。
+    """
+    return overlay_css(name) + _fill(_FORM_CSS).replace("{name}", name)
 
 
 _OVERLAY_CSS = """

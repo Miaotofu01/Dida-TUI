@@ -29,6 +29,7 @@ TUI 只通过 :class:`~dida.sync.engine.Engine` 读写；分组、计数、逾�
 from __future__ import annotations
 
 import os
+from functools import partial
 from typing import TYPE_CHECKING, Callable, Sequence
 
 from rich.text import Text
@@ -54,8 +55,14 @@ from dida.tui.keys import (
     bindings_for,
     help_body,
 )
-from dida.tui.overlays import ConfirmOverlay, MessageOverlay
+from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay
 from dida.tui.pages import DetailPage, IndexPage, TasksPage
+from dida.tui.pages.index import (
+    LIST_COLOR_FIELD,
+    LIST_NAME_FIELD,
+    list_form_fields,
+    list_write_refusal,
+)
 
 if TYPE_CHECKING:  # 只为了标注周期泵那个句柄，运行时用不到
     from textual.timer import Timer
@@ -224,6 +231,8 @@ class DidaApp(App[None]):
         ``TypeError: 'bool' object is not callable``——报错点在 Textual 的 ``app.py`` 里，离
         现场很远。页面那一半同名的坑见 :class:`dida.tui.pages.base.CursorPage` 的 ``_motion``。
         """
+        self._editing_list: str | None = None
+        """正在改的是哪条清单（表单关掉时要用它；``None`` = 那一次是新建）。"""
         self._announce_sync = False
         """这一轮同步要不要用 toast 报完成——``r`` 要，启动刷新不要（那会每次开屏都弹一下）。"""
         self._spinning = False
@@ -444,6 +453,93 @@ class DidaApp(App[None]):
     def on_detail_page_back(self, event: DetailPage.Back) -> None:
         """详细页上按了 ``esc``：回任务列表页。"""
         self.back_to_tasks()
+
+    # ---------------------------------------------------------------- 清单的建 / 改 / 删（#42）
+
+    def on_index_page_new_list(self, event: IndexPage.NewList) -> None:
+        """``n``：开建清单的表单（字段由选中行的类型决定，见 :mod:`dida.tui.overlays`）。"""
+        self._open_list_form(None)
+
+    def on_index_page_edit_list(self, event: IndexPage.EditList) -> None:
+        """``e``：改光标那一行的名字与颜色。"""
+        self._open_list_form(event.row_id)
+
+    def on_index_page_delete_list(self, event: IndexPage.DeleteList) -> None:
+        """``d``：删光标那一行——**先如实问一句**，``y`` 才真的删（验收标准 3、4、5）。
+
+        确认文案在 :func:`dida.tui.messages.delete_list_prompt`：它说的两件事都核实过
+        ——删掉一个清单时里面的任务会怎样文档没写，而回收站与撤销删除的接口都不存在。
+        """
+        row = self.index_page().row(event.row_id)
+        if row is None:
+            return
+        refusal = list_write_refusal(row)
+        if refusal is not None:
+            self._write_status(refusal)
+            return
+        self.push_screen(
+            ConfirmOverlay(messages.delete_list_prompt(row.name), title="删除清单"),
+            partial(self._finish_delete_list, row.id),
+        )
+
+    def _open_list_form(self, row_id: str | None) -> None:
+        """开清单表单：``row_id`` 是 ``None`` 就是新建，否则是改那一行。
+
+        改不动的行（视图、收集箱、没有写权限的清单）在这里就挡住并说清是哪一种——表单
+        开出来再拒绝，用户会以为自己填错了什么。
+        """
+        row = None if row_id is None else self.index_page().row(row_id)
+        if row_id is not None:
+            if row is None:
+                return
+            refusal = list_write_refusal(row)
+            if refusal is not None:
+                self._write_status(refusal)
+                return
+        self._editing_list = None if row is None else row.id
+        self.push_screen(
+            FormOverlay(
+                title="新建清单" if row is None else f"改「{row.name}」",
+                fields=list_form_fields(row),
+            ),
+            self._finish_list_form,
+        )
+
+    def _finish_list_form(self, values: dict[str, str] | None) -> None:
+        """表单关掉了：``None`` 是取消（一个字节都不写），否则按填的那一份建 / 改。
+
+        颜色是空串就**不发** ``color`` 字段（那是「默认」，不是「清空」）；名字空着则
+        什么都不做，只如实说一句。
+        """
+        if values is None:
+            return
+        name = values.get(LIST_NAME_FIELD, "").strip()
+        if not name:
+            self._write_status(messages.EMPTY_LIST_NAME_MESSAGE)
+            return
+        color = values.get(LIST_COLOR_FIELD) or None
+        editing = self._editing_list
+        self._editing_list = None
+        try:
+            if editing is None:
+                self.engine.create_list(name, color=color)
+            else:
+                self.engine.update_list(editing, name=name, color=color)
+        except DidaError as exc:
+            self._write_status(messages.list_write_failed_message(exc))
+            return
+        self.refresh_view()
+
+    def _finish_delete_list(self, list_id: str, confirmed: bool | None) -> None:
+        """删除确认关掉了：只有 ``True`` 才真的删（``n`` / ``Esc`` 与 ``None`` 都不动）。"""
+        if not confirmed:
+            return
+        try:
+            self.engine.delete_list(list_id)
+        except DidaError as exc:
+            self._write_status(messages.list_write_failed_message(exc))
+            return
+        self.refresh_view()
 
     # ---------------------------------------------------------------- 当前任务 / 浏览器（工单 #19）
 
