@@ -344,6 +344,21 @@ def due_day(due: datetime, *, all_day: bool, day_end: str) -> date:
     return due.date() if all_day else logical_day(due, day_end).label
 
 
+def is_overdue(snapshot: TaskSnapshot, *, today: date, day_end: str) -> bool:
+    """这条任务逾期了没有：有截止时间、且落在当前逻辑日**之前**（用户故事 25 / 87）。
+
+    判据是逻辑日（:func:`due_day`），不是裸的时刻比较：``day_end = "04:00"`` 时当天
+    03:00 属于昨天，它逾期；而当天 00:00 那个全天标记属于今天，它不逾期。全天任务因此
+    不会因为边界配在半夜就被算成逾期（那是 ``due_day`` 已经分好的事，这里不重写第二份）。
+
+    已完成的不算逾期：一条做完的任务不该在「今天」里被标红（它压根不该在那个视图里——
+    三个内置视图都只收未完成的）。
+    """
+    if snapshot.completed or snapshot.due is None:
+        return False
+    return due_day(snapshot.due, all_day=snapshot.all_day, day_end=day_end) < today
+
+
 def format_due(due: datetime | None, *, all_day: bool, now: datetime, day_end: str) -> str:
     """截止时间的人类读法：「今天 18:00」「昨天 09:00」「3 天前」；没有截止时间给「—」。
 
