@@ -30,6 +30,7 @@ from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
 from dida.tui import theme
+from dida.tui.keys import QUIT_ACTION, QUIT_KEYS
 
 __all__ = [
     "FORM_HINT",
@@ -240,9 +241,25 @@ class FormOverlay(ModalScreen[dict[str, str] | None]):
         """``Esc``：取消，交回 ``None``（一个字节都不写）。"""
         self.dismiss(None)
 
+QUIT_BINDINGS = [Binding(key, f"app.{QUIT_ACTION}", "退出", show=False) for key in QUIT_KEYS]
+"""浮层上的退出键（工单 #47）——转发到 **app 上那一个** :meth:`~dida.tui.app.DidaApp.action_quit`。
+
+**为什么浮层要自己绑这一遍**：浮层是模态的，Textual 按键解析只走
+``_modal_binding_chain``，而那条链在**最后一个模态控件**处截断——``app._bindings`` 因此
+进不来。``q`` 在浮层上按不出来（它只绑在页面与 ``Screen`` 上），``Ctrl+C`` 更绕：Textual
+把 ``ctrl+c`` 绑在 ``Screen.BINDINGS`` 的 ``screen.copy_text`` 上，而 ``Screen`` 恰好不在
+模态链里——于是同一个键在清单列表页上能退出、在 ``?`` 帮助浮层上只是「复制一段文字」。
+**那正是本票要关掉的第二条退出路径**：按了退出键，什么都没发生。
+
+``app.`` 前缀是 Textual 的动作命名空间（``App._action_targets`` 里的 ``app`` 指向 app
+自己），所以这一条与页面上的 ``q`` / ``Ctrl+C`` 落到**同一个方法**上——不是第二个判断。
+只写动作名（``"quit"``）不行：那会解析到浮层自己头上，而浮层没有 ``action_quit``，于是
+这条绑定「命中但什么也不做」——按键被吃掉，app 反而再也收不到它。
+"""
+
 
 class MessageOverlay(ModalScreen[None]):
-    """一块只读正文的浮层：``Esc`` / ``Enter`` 关掉。
+    """一块只读正文的浮层：``Esc`` / ``Enter`` 关掉，退出键照旧交回 app。
 
     正文由调用方拼好原样交给它（``?`` 那一屏是 :func:`dida.tui.keys.help_body`），所以
     控件不认识键位表、也不认识任务——换一块正文不必动它。
@@ -253,6 +270,7 @@ class MessageOverlay(ModalScreen[None]):
     DEFAULT_CSS = theme.overlay_css("MessageOverlay")
 
     BINDINGS = [
+        *QUIT_BINDINGS,
         Binding("escape", "close", "关闭", show=False),
         Binding("enter", "close", "关闭"),
     ]
@@ -287,6 +305,7 @@ class ConfirmOverlay(ModalScreen[bool]):
     DEFAULT_CSS = theme.overlay_css("ConfirmOverlay")
 
     BINDINGS = [
+        *QUIT_BINDINGS,
         Binding("y", "confirm", "确认"),
         Binding("n", "cancel", "取消"),
         Binding("escape", "cancel", "取消", show=False),

@@ -63,6 +63,8 @@ __all__ = [
     "PAN_MS",
     "PENDING",
     "PLAIN",
+    "REMINDER_MARK",
+    "REPEAT_MARK",
     "RICH_ROLES",
     "RULE",
     "SELECTED",
@@ -95,8 +97,8 @@ SELECTED = "cyan bold"
 """光标那一行的正文：颜色 + 字重。终端画不出半格，所以「选中」只能靠这两个信号。"""
 
 OVERDUE = "red"
-"""逾期 = 槽 1。**只是一个语义 token**：``TaskItem`` 没有 overdue 位、TUI 也不许判日期，
-所以本票不实现标红（位归 #37，接线归 #52）。"""
+"""逾期 = 槽 1。**只是一个语义 token**：谁逾期由读模型判（``TaskItem.overdue``，#35 接上
+视图求值），颜色由这里给——TUI 不许自己拿截止时间去比（架构规则：日期判断全在引擎里）。"""
 
 SURFACE = "black"
 """抬起来的面 = 槽 0（他那一格是 ``#45475A`` 石板）。它比页面底色**亮**，所以只用于浮层。"""
@@ -192,6 +194,18 @@ LIST_MARK = "⋮"
 DONE_MARK = "☑"
 """已完成的行。"""
 
+REPEAT_MARK = "↻"
+"""重复任务（服务端给了 ``repeatFlag``）。
+
+U+21BB，东亚宽度**中性**、rich 量 1 格：它进的是任务行里那一列注解，宽度含糊就会歪。
+"""
+
+REMINDER_MARK = "⚑"
+"""有提醒的任务（服务端的 ``reminders`` 非空）。
+
+U+2691，东亚宽度中性、rich 量 1 格。提醒只读（v2 不改它），所以这里只需要「有没有」。
+"""
+
 SUBTASK_DONE_MARK = "☑"
 SUBTASK_TODO_MARK = "☐"
 """子任务的两种状态标记（只读显示：v2 不在客户端里勾子任务）。"""
@@ -245,6 +259,8 @@ STRUCTURAL_GLYPHS: Final = (
     CUSTOM_MARK,
     LIST_MARK,
     DONE_MARK,
+    REPEAT_MARK,
+    REMINDER_MARK,
     SUBTASK_DONE_MARK,
     SUBTASK_TODO_MARK,
     BLOCKED_GLYPH,

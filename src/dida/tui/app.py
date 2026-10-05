@@ -734,26 +734,53 @@ class DidaApp(App[None]):
     # ---------------------------------------------------------------- 退出流（t21 / #47）
 
     async def action_quit(self) -> None:
-        """``q``：还有待推送改动时先拦一下（用户故事 101）。
+        """``q`` 与 ``Ctrl+C``：还有待推送改动时先拦一下（用户故事 101 / 工单 #47）。
 
-        用户按 ``q`` 的意图通常是「我干完了」，而屏幕底下那个数可能是「我按了 x，但网断了」
+        用户按退出键的意图通常是「我干完了」，而屏幕底下那个数可能是「我按了 x，但网断了」
         ——待推送改动只存在本地（ADR-0002 的豁免代价），进程一结束这一屏就没了，而服务端
         并不知道用户做过什么。所以这里**多问一句**，并且把「有几处」写在浮层上。
 
-        浮层已经开着时什么都不做：连按 ``q`` 不该叠出一摞确认框。没有待推送改动就照旧直接退
-        （``q`` 即结束，spec 的单进程规矩）。
+        **两个键走同一个判断**：它们绑在同一个动作上（``keys.py`` 全局那一层的 :class:`Key`），
+        所以这里分不出、也不该分出 ``q`` 与 ``Ctrl+C``。这一条在本票之前不成立：Textual 8.2.8
+        把 ``Ctrl+C`` 绑在它自己的 ``help_quit`` 上（弹一句「按 q 退出」，**不退出**）——那是
+        框架的另一条退出路径，谁也不保证它永远只是弹一句话。两条路合成一条之后，这个分歧
+        没有了，而「按了退出键却没被拦」这条静默丢改动的后门也一并关掉。
+
+        **这里不需要 ``is_running`` 守卫，理由要写下来**（不是「忘了加」）：本方法跨过
+        ``push_screen`` 之后**没有任何一行再碰 DOM**，而 ``push_screen`` 自己是同步的、
+        ``App.exit()`` 也是同步的。真正的 ``await`` 在调用方（``_dispatch_action`` 的
+        ``await invoke(...)``），那时这一帧已经做完了。:meth:`_finish_quit` 同理，见它自己的
+        说明。
         """
         pending = self.engine.status().pending_count
         if not pending:
+            # 没有待推送改动就照旧直接退（``q`` 即结束，spec 的单进程规矩）。
             self.exit()
             return
-        if isinstance(self.screen, ConfirmOverlay):
+        if self._confirming_quit():
+            # 连按退出键不该叠出一摞确认框——已经问过就不必再问。
             return
         self.push_screen(
             ConfirmOverlay(messages.quit_prompt(pending), title="仍然退出"), self._finish_quit
         )
 
+    def _confirming_quit(self) -> bool:
+        """退出浮层已经开着了吗。
+
+        看**整摞** screen，不是只看顶上那一块：确认框上面还能再盖一层（``?`` 的帮助浮层
+        就盖得住它），而那时 ``self.screen`` 是**最上面**那一块——只比它一块就会再叠一个
+        确认框出来。这个口子是真的：浮层是模态的，键位解析在它那儿就截断了，
+        :meth:`action_quit` 照样会跑到。
+        """
+        return any(isinstance(screen, ConfirmOverlay) for screen in self.screen_stack)
+
     def _finish_quit(self, confirmed: bool | None) -> None:
-        """退出浮层关掉了：只有 ``True`` 才真的退（``n`` / ``Esc`` 与 ``None`` 都留下）。"""
-        if confirmed:
+        """退出浮层关掉了：只有 ``True`` 才真的退（``n`` / ``Esc`` 与 ``None`` 都留下）。
+
+        本方法**一行 DOM 都不碰**（``exit()`` 是同步的，它只是排一条 ``ExitApp``），所以它
+        不需要「``await`` 之后先问 ``is_running``」那道守卫——那条规矩管的是**碰 DOM** 的
+        地方。这一句是写给下一个来改它的人的：往这里加任何 ``query_one`` / ``update`` 之
+        前，先把守卫补上。
+        """
+        if confirmed and self.is_running:
             self.exit()

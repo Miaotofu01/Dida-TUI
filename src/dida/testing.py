@@ -181,6 +181,8 @@ class InMemorySource:
         desc: str = "",
         content: str = "",
         tags: tuple[str, ...] = (),
+        repeat_flag: str = "",
+        reminders: tuple[str, ...] = (),
         raw: Mapping[str, Any] | None = None,
     ) -> TaskSnapshot:
         """加一条任务快照；``id`` 默认 ``t1``、``t2``……（按加入顺序）。
@@ -206,6 +208,8 @@ class InMemorySource:
             desc=desc,
             content=content,
             tags=tags,
+            repeat_flag=repeat_flag,
+            reminders=reminders,
         )
         self._lists.setdefault(snapshot.list_id, ListSnapshot(id=snapshot.list_id, name=list_name))
         self._tasks[snapshot.id] = snapshot
@@ -240,6 +244,10 @@ class InMemorySource:
             payload["content"] = snapshot.content
         if snapshot.tags:
             payload["tags"] = list(snapshot.tags)
+        if snapshot.repeat_flag:
+            payload["repeatFlag"] = snapshot.repeat_flag
+        if snapshot.reminders:
+            payload["reminders"] = list(snapshot.reminders)
         return payload
 
     def lists(self) -> tuple[ListSnapshot, ...]:
