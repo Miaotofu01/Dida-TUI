@@ -508,7 +508,7 @@ DetailPage #page-body {
 /* 截止时间那两格 + 「全天」那一行（工单 #44）：与自由文本框同一块编辑区、同一套覆盖。
 
    覆盖必须逐条重来，不能靠「父容器已经改过了」：Textual 那两个输入框的颜色来自**组件
-   自己的** DEFAULT_CSS（`$surface` / `$input-cursor-*` 这些主题变量＝真彩色），父级那条
+   自己的** DEFAULT_CSS（surface / input-cursor 那几个主题变量＝真彩色），父级那条
    `background` 盖不住它们的内层类名。所以 `#due-date` / `#due-time` 与 `#detail-input`
    一样逐条写成 ansi_*；漏一条的表现是真终端里出现 `38;2;`（ADR-0007 要消灭的正是它），
    而且**静默**——只有真 pty 抓取才看得见。 */
