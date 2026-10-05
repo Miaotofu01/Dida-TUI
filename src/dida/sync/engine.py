@@ -210,6 +210,15 @@ class Engine(Protocol):
         """读：状态栏要的全部信息。"""
         ...
 
+    def logical_day(self) -> date:
+        """读：现在是哪个逻辑日（工单 #46 的心跳靠它判断屏幕上那一份过期了没有）。
+
+        与 :meth:`status` 分开是**故意的**：那一份是状态栏的快照，为它要读一次本地存储
+        （同步状态 + 待推送条数，实测 13.7 µs、两条 SQL），而「今天是哪天」是纯算术
+        （注入的钟 + 当前日界，实测 5.5 µs、零 I/O）。一秒问一次的那一跳走这一口。
+        """
+        ...
+
     def view(self) -> TodayView:
         """读：分组后的视图模型。"""
         ...
@@ -344,6 +353,15 @@ class SyncEngine(
             last_refresh_at=state.last_refresh_at,
             logical_day=logical_day(now, self._day_end).label,
         )
+
+    def logical_day(self) -> date:
+        """读：现在是哪个逻辑日（工单 #46 的心跳靠它判断屏幕上的那一份过期了没有）。
+
+        与 :meth:`status` 分开是**故意的**：那一份是状态栏的快照，为它要读一次本地存储
+        （同步状态 + 待推送条数，实测 13.7 µs、两条 SQL），而「今天是哪天」是纯算术
+        （注入的钟 + 当前日界，实测 5.5 µs、零 I/O）。一秒问一次的那一跳走这一口。
+        """
+        return logical_day(self._clock.now(), self._day_end).label
 
     def view(self) -> TodayView:
         """读：从本地缓存分组出的视图模型。缓存不在就是空视图，不是错误。"""

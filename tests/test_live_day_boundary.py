@@ -22,7 +22,8 @@ from pathlib import Path
 import pytest
 
 from dida.config import Config, DayEndReader, load_config, save_config
-from dida.storage.store import Store
+from dida.api.errors import NetworkError
+from dida.storage.store import RefreshReport, Store
 from dida.sync.engine import GroupKind, SyncEngine
 from dida.testing import FakeBackend, FakeTransport, InMemorySource, ManualClock
 from dida.tui.app import DidaApp
@@ -164,6 +165,27 @@ def test_the_today_view_is_evaluated_against_the_current_boundary():
     assert engine.tasks_in("today").container_id == "today"
 
 
+def test_the_current_logical_day_follows_both_the_clock_and_the_boundary():
+    """引擎那口**便宜**的问法：现在是哪个逻辑日（工单 #46 的心跳靠它判断屏幕过期了没有）。
+
+    它只有注入的钟与当前日界，**不碰本地存储**——状态栏要的那一份（``status()``）顺带还要读
+    同步状态，而这一句一秒问一次。两个输入各钉一次：钟走过边界、日界被换掉。
+    """
+    clock = ManualClock(at(14, 3, 59))
+    engine = SyncEngine(
+        clock=clock, day_end="04:00", source=source_with(("今天上午", at(14, 10, 0)))
+    )
+
+    assert engine.logical_day() == date(2026, 3, 13), "03:59 还没到 04:00：还是前一天"
+
+    clock.set(at(14, 4, 1))
+    assert engine.logical_day() == date(2026, 3, 14), "钟自己走过了日界"
+
+    clock.set(at(14, 3, 59))
+    engine.set_day_end("00:00")
+    assert engine.logical_day() == date(2026, 3, 14), "同一个 03:59，日界换成 00:00 就是 03-14"
+
+
 @pytest.fixture
 def store(tmp_path):
     """指向临时文件的库；关掉时不留句柄。"""
@@ -217,16 +239,19 @@ def stocked(fake: FakeBackend) -> FakeBackend:
     return fake
 
 
-def live_app(tmp_path: Path) -> tuple[DidaApp, Path]:
+def live_app(
+    tmp_path: Path, *, day_end: str = "24:00", clock: ManualClock | None = None
+) -> tuple[DidaApp, Path]:
     """接缝一上的 app：临时目录里的配置文件 + 内存缓存 + 手动时钟。
 
     启动时那个日界与之后的重读读的是**同一个文件**——生产里 bootstrap 就是这么接的
-    （配置交给引擎，文件交给读手）。返回 app 与那个文件，好让测试自己动手改它。
+    （配置交给引擎，文件交给读手）。返回 app 与那个文件，好让测试自己动手改它；钟可以让
+    调用方递进来，好让测试自己摆布「现在」（工单 #46 的另一半：钟走过边界）。
     """
     path = tmp_path / "config.toml"
-    save_config(Config(day_end="24:00"), path)
+    save_config(Config(day_end=day_end), path)
     reader = DayEndReader(path)
-    fake = stocked(FakeBackend(clock=ManualClock(T0), day_end=reader.current()))
+    fake = stocked(FakeBackend(clock=ManualClock(T0) if clock is None else clock, day_end=reader.current()))
     return DidaApp(fake, day_boundary=reader.current), path
 
 
@@ -445,3 +470,114 @@ def test_the_command_hands_the_app_the_config_file_it_just_read(monkeypatch, tmp
     assert app.reload_day_boundary() is True, "改完文件，重读要真的拿到新值"
     assert app.engine.status().logical_day == date(2026, 3, 13), "凌晨两点 + 04:00 是前一天"
     assert app.reload_day_boundary() is False, "没变就不算变过"
+
+
+async def test_the_index_counts_follow_the_clock_across_the_day_boundary(tmp_path):
+    """钟自己走过日界也要重画（工单 #46 的另一半）：不必按键，也不是配置事件。
+
+    终端里挂一夜就是这条路：03:59 那一屏按 03-13 算，04:01 之后状态栏那一格早就是 03-14 了
+    （它每一跳都按活钟重算），行却还停在昨天——屏幕自己跟自己矛盾。钟用 ``ManualClock`` 推，
+    不等真实时间、不用 pty。
+    """
+    clock = ManualClock(at(14, 3, 59))
+    app, _ = live_app(tmp_path, day_end="04:00", clock=clock)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        before = screen_text(app)
+
+        clock.advance(timedelta(minutes=2))  # 03:59 → 04:01：跨过 04:00 那个边界
+        await app.push_tick()
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert row_of(before, "今天").split()[-1] == "2", "03-13 那天：两条逾期的在里面"
+    assert row_of(after, "今天").split()[-1] == "3", "钟走过日界，没按键，属于新的一天那条进来了"
+
+
+async def test_the_today_view_follows_the_clock_even_with_no_reader_wired():
+    """没建读手的 app 照样得发现滚过：**它不是配置事件**（``day_boundary=None`` 是构造 app 的默认）。
+
+    这条钉的就是「滚过的判定不许待在 ``if self._day_boundary is None`` 后面」。
+    """
+    clock = ManualClock(at(14, 3, 59))
+    fake = stocked(FakeBackend(clock=clock, day_end="04:00"))
+    app = DidaApp(fake)  # 一个读手都没有：配置那条路根本不存在
+
+    async with app.run_test(size=WIDE) as pilot:
+        await open_the_today_view(pilot, app)
+        before = screen_text(app)
+
+        clock.advance(timedelta(minutes=2))
+        await app.push_tick()
+        await pilot.pause()
+        after = screen_text(app)
+        cursor = app.tasks_page().selected_id
+
+    assert "昨天 23:00" not in before and "今天上午" not in before
+    assert "今天上午" in after, "钟走过日界，没按任何键，属于今天的那条自己要上屏"
+    assert cursor == "early", "这次重画照样按行 id 把光标认回来"
+
+
+class FailingRefresh(FakeBackend):
+    """这一轮刷新一定失败（断网）。
+
+    工单 #46 的第二个缺口正是「按了 ``r`` 但没同步成」：``_sync()`` 里的重画在 ``else:``
+    成功分支里，刷新抛 ``DidaError`` 时一次都不跑，而收尾的 ``update_status()`` 照样按新逻辑日
+    写状态栏。这里把那一轮摆出来。
+    """
+
+    async def refresh(self) -> RefreshReport:
+        self.refreshes += 1
+        raise NetworkError("连不上服务端")
+
+
+async def test_r_follows_the_clock_even_when_that_refresh_fails():
+    """``r`` 那一轮**失败**时也要按现在的逻辑日重画（工单 #46）。
+
+    这条是「滚过的判定要挂在两个键最前面」的硬理由：没网的时候按一下 ``r``，同步什么都没做，
+    但用户已经主动按了键——那一屏不该停在昨天。判定挂在 ``reload_day_boundary()`` 上，它在
+    ``action_refresh`` 的最前面、任何网络调用之前跑，所以成不成功都不影响它。
+    """
+    clock = ManualClock(at(14, 3, 59))
+    fake = FailingRefresh(clock=clock, day_end="04:00")
+    app = DidaApp(stocked(fake))
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        before = screen_text(app)
+
+        clock.advance(timedelta(minutes=2))
+        await pilot.press("r")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert fake.refreshes == 1, "那一轮真的跑了，而且真的失败了（不是被静默跳过）"
+    assert row_of(before, "今天").split()[-1] == "2"
+    assert row_of(after, "今天").split()[-1] == "3", "同步失败不该让这一屏停在昨天"
+
+
+async def test_a_tick_inside_the_same_logical_day_redraws_nothing():
+    """反向：钟在同一个逻辑日里往前走，这一跳**不许**重画。
+
+    没有这条，这次修法很容易写成「每一跳都全量重画」——那是拿一个 bug 换一个性能洞。
+    「没重画」得靠点手段才看得见：往缓存里塞一条新任务，它只进缓存、谁也没通知界面；这一跳
+    要是重画了，它当场就会上屏。所以「它没上屏」就是「这一跳没重画」。
+    """
+    clock = ManualClock(at(14, 4, 1))
+    fake = stocked(FakeBackend(clock=clock, day_end="04:00"))
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        before = screen_text(app)
+
+        fake.add_task("偷偷加的一条", list_name="work", id="sneaky", due=at(14, 20, 0))
+        clock.advance(timedelta(hours=6))  # 04:01 → 10:01：同一个逻辑日（04:00–次日 04:00）
+        await app.push_tick()
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert "逻辑日 03-14" in after, "同一天里，状态栏那一格本来就不动"
+    assert "偷偷加的一条" not in after, "这一跳重画了的话它就冒出来了"
+    assert after == before, "同一逻辑日里的一跳：屏幕一个字符都不该变"

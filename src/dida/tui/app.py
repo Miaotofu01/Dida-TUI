@@ -29,6 +29,7 @@ TUI 只通过 :class:`~dida.sync.engine.Engine` 读写；分组、计数、逾�
 from __future__ import annotations
 
 import os
+from datetime import date
 from typing import TYPE_CHECKING, Callable, Sequence
 
 from rich.text import Text
@@ -208,6 +209,11 @@ class DidaApp(App[None]):
         self._push_tick_seconds = push_tick_seconds
         self._day_boundary = day_boundary
         """重读当前日界的那只手（工单 #46）；``None`` = 没人能告诉它新的日界。"""
+        self._view_day: date | None = None
+        """屏幕上那些行是按**哪一个逻辑日**算出来的（工单 #46）。
+
+        它是「这一屏过期了没有」的凭据：钟自己走过边界时配置一个字节都没变，只有把这一屏
+        是哪一天记下来，心跳才分得清「还是同一天」与「已经翻篇了」。``None`` = 还没画过。"""
         self._push_timer: Timer | None = None
         """周期泵的定时器句柄（工单 #21）：``on_unmount`` 里拿它把泵停掉。
 
@@ -357,21 +363,34 @@ class DidaApp(App[None]):
     # ---------------------------------------------------------------- 重画
 
     def reload_day_boundary(self) -> bool:
-        """重新问一次当前日界；真的变了就交给引擎并按新的逻辑日重画（工单 #46）。
+        """重新问一次当前日界；屏幕跟不上了就按新的逻辑日重画（工单 #46）。返回「重画过没有」。
 
-        「配置里改完边界值立刻生效」的那条路。配置文件是**外部**事件（用户在另一个窗口里改
-        它），所以重读挂在两处：周期泵那一秒一次的心跳（零操作，最多一秒），以及用户按下的
-        ``r``（泵可以不挂——那是组合根的策略，这台机器上没人重读就说不过去了）。
+        「逻辑日改了立刻生效」有**两条**路，两条都在这里收口，因为它们要挂的是同一个时机：
 
-        读不到（``None``）时什么都不做：沿用引擎里那个日界。界面不崩，也不替用户按默认值来。
+        - 配置里改了边界值——外部事件（用户在另一个窗口里改），没人通知得了这个进程；
+        - 钟自己走过了边界——终端里挂一夜，早上那一屏就是按昨天算的。
+
+        那个时机是**两个键的最前面**：:meth:`push_tick`（周期泵那一秒一次的心跳）与
+        :meth:`action_refresh`（``r``），都在任何网络调用之前。第二条尤其靠这一点——
+        ``_sync()`` 里的重画在 ``else:``（同步成功）那一支里，刷新抛 :class:`DidaError` 时
+        一次都不跑，而收尾的 ``update_status()`` 照样按新逻辑日写状态栏。于是「没网的时候按了
+        一下 ``r``」得到的正是那个自相矛盾的屏幕：状态栏是新日子，列表还是旧成员。
+
+        **滚过那条不在下面那个 ``None`` 判断后面**：它不是配置事件，一个没建读手的 app
+        （``day_boundary=None``）照样得发现它。
+
+        配置读不到（``None``）时沿用引擎里那个日界：界面不崩，也不替用户按默认值来。
 
         **光标不归这次重画管**：各页按行 id 把它认回原来那一行（``CursorPage.set_rows``），
         所以重算不会把人踢回第一行（验收标准 3）。
         """
-        if self._day_boundary is None:
-            return False
-        day_end = self._day_boundary()
-        if day_end is None or not self.engine.set_day_end(day_end):
+        boundary_moved = False
+        if self._day_boundary is not None:
+            day_end = self._day_boundary()
+            if day_end is not None:
+                boundary_moved = self.engine.set_day_end(day_end)
+        rolled_over = self._view_day is not None and self.engine.logical_day() != self._view_day
+        if not (boundary_moved or rolled_over):
             return False
         self.refresh_view()
         return True
@@ -387,6 +406,10 @@ class DidaApp(App[None]):
         """
         if not self.is_running:
             return
+        # 先记下「这一屏是哪一天的」，再画行：反过来的话，边界正好在这几句里跨过去时，会记下
+        # 一个比行更新的日子，那一屏就永远没人认领了（心跳以为它是最新的，见
+        # :meth:`reload_day_boundary`）。记早了最多多画一次，记晚了就是一屏昨天的东西。
+        self._view_day = self.engine.logical_day()
         rows = self.engine.list_index()
         self.index_page().show_lists(rows)
         self._container_title = (

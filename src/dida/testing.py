@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from collections import deque
 from dataclasses import replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Mapping, Sequence
 
 import httpx
@@ -387,6 +387,10 @@ class FakeBackend:
 
     def status(self) -> SyncStatus:
         return self._engine.status()
+
+    def logical_day(self) -> date:
+        """读：现在是哪个逻辑日（工单 #46 的心跳）——同样委托真引擎，替身不自己算一份。"""
+        return self._engine.logical_day()
 
     def complete(self, task_id: str) -> None:
         self.completed.append(task_id)
