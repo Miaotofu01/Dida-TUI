@@ -367,6 +367,15 @@ class FakeBackend:
         （#45 的搬运）。与 ``writes`` 分开记：搬运**不是**一次普通字段更新，混在一起就看不出
         它到底走了哪条路。"""
 
+        self.tag_loads = 0
+        """``load_tags()`` 被调用的次数（#45：打开挑标签那一格才拉一次）。"""
+
+        self.tag_error: Exception | None = None
+        """摆一个异常进去，``load_tags`` 就抛它（试界面拉不到标签列表时的反应）。"""
+
+        self._tags: tuple[str, ...] = ()
+        """摆进来的那一份「服务端有的标签」（:meth:`set_tags`）。"""
+
         self.writes: list[tuple[str, dict[str, Any]]] = []
         """``write(task_id, changes=)`` 收到的每一笔（任务 id + 改动的字段），按调用顺序。
 
@@ -474,6 +483,29 @@ class FakeBackend:
         过滤本身归接缝二（真库那一条）。
         """
         return self._engine.move_targets()
+
+    def set_tags(self, *names: str) -> None:
+        """摆一份「服务端有的标签」（#45）：下一次 :meth:`load_tags` 就交回这一份。
+
+        替身不自己编标签——编出来的东西会让「挑得到哪些标签」这句话变成空话（与
+        ``set_subtasks`` 收成品行同一条口径）。
+        """
+        self._tags = tuple(names)
+
+    async def load_tags(self) -> tuple[str, ...]:
+        """读：把摆进来的那一份交回去（#45），并记下拉过几次。
+
+        摆了 ``tag_error`` 就抛它：模拟拉不到标签列表（断网、服务端拒绝），好试界面
+        「说出来 + 照旧让用户挑本地已知的」那两半。
+        """
+        self.tag_loads += 1
+        if self.tag_error is not None:
+            raise self.tag_error
+        return self._tags
+
+    def tags(self) -> tuple[str, ...]:
+        """读：摆进来的那一份 ∪ 本地任务上出现过的那些（与真引擎同一条口径）。"""
+        return tuple(dict.fromkeys((*self._tags, *self._engine.tags())))
 
     def task_detail(self, task_id: str) -> TaskDetail | None:
         """读：委托给真引擎（详情页的字段，含原文里我们不认识的那些）。"""

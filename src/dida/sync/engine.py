@@ -94,6 +94,7 @@ from dida.sync.read import (
 from dida.sync.refresh import ProjectReader, RefreshMixin, RefreshTarget
 from dida.sync.schedule import ScheduleMixin
 from dida.sync.subtasks import SubtaskMixin, SubtaskWrite, TaskReader
+from dida.sync.tags import TagMixin, TagReader
 from dida.sync.view import (
     INBOX_ID,
     NO_DUE_TEXT,
@@ -174,6 +175,7 @@ __all__ = [
     "TaskList",
     "TaskReader",
     "ProjectWriter",
+    "TagReader",
     "TaskSnapshot",
     "TodayView",
     "UnknownListError",
@@ -285,6 +287,14 @@ class Engine(Protocol):
         """读：单条任务的详情；本地没有这条任务时 ``None``。"""
         ...
 
+    def tags(self) -> tuple[str, ...]:
+        """读：现在能挑的那些标签名（服务端给过的那一份 ∪ 本地任务上出现过的，#45）。"""
+        ...
+
+    async def load_tags(self) -> tuple[str, ...]:
+        """读：拉一次标签列表（``GET /open/v1/tag``）——**要 await**（#45）。"""
+        ...
+
     async def refresh(self) -> RefreshReport:
         """写：全量刷新。**要 await**：它不是一次纯本地操作。"""
         ...
@@ -385,6 +395,7 @@ class SyncEngine(
     CreateMixin,
     PriorityMixin,
     SubtaskMixin,
+    TagMixin,
 ):
     """通用客户端的数据与写入入口（组装各片；读路径在本模块）。
 
@@ -399,7 +410,7 @@ class SyncEngine(
         clock: Clock,
         day_end: str = DEFAULT_DAY_END,
         source: ViewSource | None = None,
-        client: ProjectReader | TaskWriter | CompletedReader | None = None,
+        client: ProjectReader | TaskWriter | CompletedReader | TagReader | None = None,
         completed_window_hours: int = DEFAULT_COMPLETED_WINDOW_HOURS,
         push_on_change: bool = True,
     ) -> None:
@@ -408,6 +419,8 @@ class SyncEngine(
         self._source = source
         self._client = client
         self._completed_window_hours = completed_window_hours
+        # 标签列表：用户打开挑标签那一格时拉一次，只活在内存里（见 dida.sync.tags 的模块文档）。
+        self._tags: tuple[str, ...] = ()
         # 「界面上的改动立即推送」（配置键 push_on_change，spec 的配置 schema）。关掉它只是
         # 不排那一轮**立刻**的推送：改动照样入队、照样在本地生效，等下一次 push_pending
         # （手动同步 r，或 t21 的周期泵）再出去。默认开着，ADR-0002 要的就是立刻推。

@@ -19,7 +19,7 @@ import httpx
 import pytest
 
 from dida.api.client import DidaApiClient
-from dida.api.errors import MalformedResponseError
+from dida.api.errors import DidaError, MalformedResponseError
 from dida.storage.store import Store
 from dida.sync.engine import SyncEngine
 from dida.testing import FakeBackend, FakeTransport, ManualClock
@@ -191,3 +191,58 @@ async def test_a_list_the_server_has_not_seen_is_never_offered_as_a_move_target(
     offered = {row.id for row in engine.move_targets()}
     assert local_id not in offered
     assert "srv-1" in offered, "服务端认过的清单该能当搬运目标"
+
+
+# ------------------------------------------------------------------ 接缝二：标签列表从哪儿来
+
+
+async def test_the_tag_picker_loads_the_names_from_the_tag_endpoint(tmp_path):
+    """标签列表来自 ``GET /open/v1/tag``——``list_tags`` 从此有了生产调用方（工单 #45）。
+
+    ``OpenTag`` 的 ``name`` 是标识符（小写、trimmed），任务上 ``tags`` 数组里装的也是名字，
+    所以挑选用的是它；``label`` 只是显示形式（文档要求它小写之后必须等于 ``name``）。
+    """
+    transport = FakeTransport(
+        json=[
+            {"name": "work", "label": "Work", "sortOrder": 0},
+            {"name": "urgent", "label": "urgent", "sortOrder": 1},
+        ]
+    )
+    engine = real_engine(tmp_path, transport)
+
+    names = await engine.load_tags()
+
+    request = transport.last_request
+    assert request.method == "GET"
+    assert str(request.url) == "https://api.dida365.com/open/v1/tag"
+    assert names == ("work", "urgent")
+    assert engine.tags() == ("work", "urgent")
+
+
+async def test_a_tag_already_on_a_cached_task_stays_pickable_when_the_list_cannot_be_fetched(tmp_path):
+    """拉不到标签列表时，本地任务上已经打着的标签**照样挑得动**（断网也不能卡住取消）。
+
+    拉不到是**说出来**的（结构化错误照旧往外抛，调用方去说），不是假装「你没有标签」：
+    一条任务上已经有的标签必须留在可挑的那一份里，否则断网时「取消一个标签」无路可走。
+    """
+    transport = FakeTransport()
+    transport.enqueue(httpx.ConnectError("连不上服务器"))
+    engine = real_engine(
+        tmp_path,
+        transport,
+        tasks=[
+            {
+                "id": "t1",
+                "projectId": "work",
+                "title": TITLE,
+                "status": 0,
+                "tags": ["季度"],
+            }
+        ],
+    )
+
+    with pytest.raises(DidaError) as caught:
+        await engine.load_tags()
+
+    assert "连不上服务器" in str(caught.value)
+    assert engine.tags() == ("季度",)
