@@ -174,6 +174,34 @@ async def test_the_breadcrumb_is_the_navigation_path_you_walked():
     assert "写周报" not in back
 
 
+# ------------------------------------------------------------------ 一行就是一行
+
+
+async def test_a_long_title_is_clipped_with_an_ellipsis_and_never_wraps():
+    """60 列下一条长中文标题：**裁断**，不折行（ADR-0007 的「截断与折行按页分工」）。
+
+    折行的三个后果都是坏的：光标字形被挤到单独一行、一行占三个屏幕行、以及
+    ``scroll_cursor_into_view()`` 把「第几个 Row」当成「第几屏行」之后算错位置。
+    这条量的是前两个，也顺带证明行数与行数仍是 1:1。
+    """
+    fake = backend()
+    fake.add_task("一条非常长的任务标题用来看看这一栏在窄终端里到底会不会被截断或者折行显示", list_name="work", id="t9")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=(60, 20)) as pilot:
+        await pilot.pause()
+        await enter_work(pilot, app)
+        await pilot.press("j")  # 走到那条长标题上（它排在最后）
+        await pilot.pause()
+        text = screen_text(app)
+        rows = [line for line in lines(text) if "一条非常长" in line]
+
+    assert len(rows) == 1, f"长标题折行了——它占了 {len(rows)} 个屏幕行：\n{text}"
+    assert rows[0].lstrip().startswith("❯"), f"光标字形被挤到别处去了：{rows[0]!r}"
+    assert rows[0].rstrip().endswith(theme.ELLIPSIS), f"裁断要留一个省略号：{rows[0]!r}"
+    assert len(rows[0]) <= 60, "这一行不许超出终端宽度"
+
+
 # ------------------------------------------------------------------ 平移与开关
 
 

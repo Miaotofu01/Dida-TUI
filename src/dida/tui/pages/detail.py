@@ -21,7 +21,7 @@ from textual.message import Message
 from dida.sync.engine import TaskDetail
 from dida.tui import messages, theme
 from dida.tui.keys import LAYER_DETAIL, bindings_for
-from dida.tui.pages.base import EMPTY_STYLE, CursorPage, Row, empty_row
+from dida.tui.pages.base import EMPTY_STYLE, CursorPage, Row, empty_row, rule_row
 
 __all__ = ["DetailPage", "field_line", "field_lines"]
 
@@ -102,7 +102,8 @@ class DetailPage(CursorPage):
         if detail is None:
             self.set_rows((empty_row(self.EMPTY_TEXT),))
             return
-        rows = [Row(id=None, text=theme.styled(detail.title, theme.HEADING))]
+        # 标题下面一条通栏细线，然后才是字段（ADR-0007 的「分区标题下面一条线」）。
+        rows = [Row(id=None, text=theme.styled(detail.title, theme.HEADING)), rule_row()]
         rows += [Row(id=None, text=line) for line in field_lines(detail)]
         self.set_rows(rows)
 
