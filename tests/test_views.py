@@ -173,3 +173,126 @@ def test_an_all_day_deadline_is_a_date_marker_not_an_instant():
 
     assert titles(evaluated) == ["昨天的全天", "今天的全天", "今天的 09 点"]
     assert [item.overdue for item in evaluated] == [True, False, False]
+
+
+# ---------------------------------------------------------------- 「最近七天」
+
+
+def test_next_seven_days_covers_seven_logical_days_from_today():
+    """「最近七天」= 截止时间落在从今天起的**七个**逻辑日内（用户故事 26）。
+
+    今天算第一天，所以窗口是 ``[今天, 今天+6]``（``BUILTIN_VIEW_DAYS = 7``）；第八天不在
+    里面。逾期的不在——「最近七天」不是「最近七天加上以前欠的」，逾期的属于「今天」。
+    没有日期的不在（``undated`` 那一维默认关着）。
+    """
+    tasks = (
+        task("昨天到期", due=T0 - timedelta(days=1)),
+        task("今天到期", due=T0.replace(hour=20)),
+        task("第六天后", due=T0 + timedelta(days=6)),
+        task("第七天后", due=T0 + timedelta(days=7)),
+        task("没日期"),
+    )
+
+    assert titles(evaluate("next7", tasks)) == ["今天到期", "第六天后"]
+
+
+def test_next_seven_days_walks_the_logical_day_at_the_boundary():
+    """同一个边界下「七天」也跟着逻辑日走：凌晨两点时今天其实是 13 号。
+
+    03-14 05:00 那一刻属于**下一个**逻辑日（它是第二天），而 03-19 那个逻辑日仍是窗口里
+    的最后一天——按自然日算，这两条都会各错一天。
+    """
+    tasks = (
+        task("昨晚 23 点", due=at(13, 23)),
+        task("明天 05 点", due=at(14, 5)),
+        task("第七个逻辑日", due=at(19, 23)),
+        task("第八个逻辑日", due=at(20, 5)),
+    )
+
+    assert titles(evaluate("next7", tasks, now=at(14, 2), day_end="04:00")) == [
+        "昨晚 23 点",
+        "明天 05 点",
+        "第七个逻辑日",
+    ]
+
+
+# ---------------------------------------------------------------- 排序与确定性
+
+
+def test_ties_on_the_same_deadline_break_by_priority_high_first():
+    """同一条截止时间上按优先级**降序**（spec 的「排序」一节），四个档位都排一遍。
+
+    平局必须被断开到确定为止：终端里列表的顺序就是用户看到的顺序，两次刷新换个先后
+    看起来像丢了一条又重新出现。
+    """
+    tasks = (
+        task("低", due=at(14, 10), priority=1),
+        task("高", due=at(14, 10), priority=5),
+        task("无", due=at(14, 10)),
+        task("中", due=at(14, 10), priority=3),
+    )
+
+    assert titles(evaluate("today", tasks)) == ["高", "中", "低", "无"]
+
+
+def test_evaluation_is_deterministic_for_a_fixed_definition_cache_and_logical_day():
+    """给定（定义、缓存、逻辑日），求值给**确定**的排好序的列表——与输入顺序无关。
+
+    缓存是从 sqlite 里读出来的，行的先后不是承诺；求值不能因此给两份不同的列表
+    （验收标准：「输出确定的、排好序的任务列表」）。所以这里把同一份缓存倒过来再求一次。
+    """
+    tasks = (
+        task("同样的截止 A", due=at(14, 10), priority=3),
+        task("同样的截止 B", due=at(14, 10), priority=3),
+        task("没日期的 A"),
+        task("没日期的 B"),
+        task("逾期", due=at(13, 10)),
+    )
+
+    forwards = titles(evaluate("all", tasks))
+    backwards = titles(evaluate("all", list(reversed(tasks))))
+
+    assert forwards == backwards == ["逾期", "同样的截止 A", "同样的截止 B", "没日期的 A", "没日期的 B"]
+
+
+# ---------------------------------------------------------------- 一条求值路径
+
+
+def test_a_definition_that_is_not_one_of_the_builtins_evaluates_on_the_same_path():
+    """内置视图与自定义视图共用同一条求值路径（验收标准最后一条）。
+
+    这条测试用的是**不属于内置三个**的定义：「无日期的那些」。求值器认的是定义本身
+    （截止区间 + 完成状态），不是 ``today``/``next7``/``all`` 这三个 id——所以 #36 把用户
+    建的视图读出来、组成同样的 :class:`ViewDefinition` 就从这里接进来，不必另写一条路。
+    """
+    undated = ViewDefinition(
+        id="undated", name="无日期", due=DueWindow(dated=False, undated=True)
+    )
+    tasks = (
+        task("今天到期", due=T0.replace(hour=20)),
+        task("没日期 A"),
+        task("没日期 B"),
+        task("没日期但做完了", completed=True),
+    )
+
+    assert titles(evaluate_view(undated, tasks, now=T0, day_end="24:00")) == ["没日期 A", "没日期 B"]
+    assert titles(evaluate("today", tasks)) == ["今天到期"], "内置那三个不受影响"
+
+
+def test_the_completion_dimension_decides_who_is_a_member():
+    """完成状态是定义里的一维（spec 的过滤维度之一）：「最近完成」那种视图由它表达。
+
+    内置三个都只收未完成的，所以这一维默认是 :attr:`Completion.UNFINISHED`；换成
+    :attr:`Completion.COMPLETED` 收的就是做完的那些——同一个求值器，只换定义。
+    """
+    done = ViewDefinition(id="done", name="最近完成", completion=Completion.COMPLETED)
+    tasks = (
+        task("没做完", due=T0.replace(hour=20)),
+        task("做完了 A", due=T0.replace(hour=20), completed=True),
+        task("做完了 B", completed=True),
+    )
+
+    evaluated = evaluate_view(done, tasks, now=T0, day_end="24:00")
+
+    assert titles(evaluated) == ["做完了 A", "做完了 B"]
+    assert [item.overdue for item in evaluated] == [False, False], "做完的不算逾期"

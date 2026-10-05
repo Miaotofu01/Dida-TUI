@@ -63,22 +63,26 @@ class DueWindow:
     """截止时间落在哪一段，**相对当前逻辑日**表达（spec 的过滤维度之一）。
 
     ``first`` / ``last`` 是相对「今天」的**天数偏移**（``0`` = 今天，``-1`` = 昨天，
-    ``6`` = 六天后），``None`` 表示那一侧没有边界。没有截止时间的任务由 ``undated``
-    单独说了算——它是「无日期」这个独立的区间词，不是任何一侧的边界。
+    ``6`` = 六天后），``None`` 表示那一侧没有边界。``dated`` / ``undated`` 说**有日期的**
+    与**没有日期的**分别收不收——「无日期」是 spec 里独立的一个区间词，不是某一段的边界
+    （所以它没法靠 ``first``/``last`` 表达：任何一段偏移都是「有日期」的一段）。
 
-    于是三个内置视图的截止条件各是一句话：「今天」= ``DueWindow(last=0)``（上界今天、
-    下界不设 ⇒ 逾期全在）；「最近七天」= ``DueWindow(first=0, last=6)``；「所有」= 不设
-    （``None``），所以没有日期的任务也在。
+    于是三个内置视图的截止条件各是一句话：「今天」= ``DueWindow(first=None, last=0)``
+    （上界今天、下界不设 ⇒ 逾期全在）；「最近七天」= ``DueWindow(first=0, last=6)``；
+    「所有」= 不设（``None``），所以没有日期的任务也在。
     """
 
     first: int | None = 0
     last: int | None = 0
+    dated: bool = True
     undated: bool = False
 
     def covers(self, day: date | None, *, today: date) -> bool:
         """这个逻辑日（``None`` = 没有截止时间）落不落在这一段里。"""
         if day is None:
             return self.undated
+        if not self.dated:
+            return False
         if self.first is not None and day < today + timedelta(days=self.first):
             return False
         if self.last is not None and day > today + timedelta(days=self.last):
