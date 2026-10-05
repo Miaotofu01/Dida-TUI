@@ -365,6 +365,27 @@ async def test_s_does_nothing_when_the_task_under_the_cursor_has_no_subtasks():
         assert app.query_one(TaskPane).has_focus, "没有子任务可勾，焦点就不动"
 
 
+async def test_a_toggle_that_lands_after_the_ui_is_gone_does_not_raise():
+    """关窗时正在飞的那一次勾选回来时，右栏已经拆了——它不能再往详情栏里挂东西。
+
+    ``t`` 这一条是**先重读再写回**（工单 #20），中间隔着一次网络等待：用户按完就退出时，
+    那一次回来得比拆屏晚。屏没了就不该再动 DOM（``query_one(DetailPane)`` 会 NoMatches），
+    但**那一笔写要照旧落地**——界面没了不代表这次勾选不算数。
+    """
+    backend = subtask_backend()
+    app = DidaApp(backend)
+
+    async with app.run_test(size=(120, 30)) as pilot:
+        await pilot.press("s")
+        await pilot.pause()
+
+    assert app.is_running is False, "出来时屏幕已经拆了"
+
+    await app.on_subtask_pane_toggled(SubtaskPane.Toggled(task_id="t1", subtask_id="i1"))
+
+    assert backend.toggled_subtasks == [("t1", "i1")], "屏没了，这一笔照旧落库"
+
+
 async def test_the_server_overwrite_is_visible_when_the_task_changed_elsewhere():
     """验收标准 #4（接缝一）：重读发现别处改过时，用户**在屏幕上看得见**。"""
     backend = subtask_backend()
