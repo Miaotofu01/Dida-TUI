@@ -358,3 +358,30 @@ async def test_a_delete_the_engine_refuses_says_so_instead_of_pretending():
         after = screen_text(app)
 
     assert UNKNOWN_DELETE_MESSAGE in after
+
+
+async def test_cancelling_the_delete_repaints_nothing_at_all():
+    """``n`` 之后连一次重画都没有：探针任务不进屏幕，屏幕逐字符与操作前相同（验收标准 3）。
+
+    「什么都不该发生」用**探针**断，比数「某个内部方法被调了几次」结实——它是外部行为：种一条
+    **只进缓存、谁都没通知界面**的新任务，取消之后它不该出现在屏幕上；屏幕上那一份要是被重画
+    过，它就会冒出来。同一件事在接缝二上还有第二个证据（零请求 + 本地快照逐字段没变）。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_work(app, pilot)
+        before = screen_text(app)
+        fake.add_task("探针", list_name="work", id="probe")  # 只进缓存，没人通知界面
+
+        await pilot.press("d")
+        await pilot.pause()
+        await pilot.press("n")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert "探针" not in after, "取消触发了重画——它该什么都没做"
+    assert after == before, "屏幕逐字符与操作前相同"
+    assert fake.deleted == []
