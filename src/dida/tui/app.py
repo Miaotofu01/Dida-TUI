@@ -29,6 +29,7 @@ TUI 只通过 :class:`~dida.sync.engine.Engine` 读写；分组、计数、逾�
 from __future__ import annotations
 
 import os
+from functools import partial
 from typing import TYPE_CHECKING, Callable, Sequence
 
 from rich.text import Text
@@ -55,8 +56,14 @@ from dida.tui.keys import (
     bindings_for,
     help_body,
 )
-from dida.tui.overlays import ConfirmOverlay, MessageOverlay
+from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay
 from dida.tui.pages import DetailPage, IndexPage, TasksPage
+from dida.tui.pages.index import (
+    LIST_COLOR_FIELD,
+    LIST_NAME_FIELD,
+    list_form_fields,
+    list_write_refusal,
+)
 
 if TYPE_CHECKING:  # 只为了标注周期泵那个句柄，运行时用不到
     from textual.timer import Timer
@@ -239,6 +246,8 @@ class DidaApp(App[None]):
         ``TypeError: 'bool' object is not callable``——报错点在 Textual 的 ``app.py`` 里，离
         现场很远。页面那一半同名的坑见 :class:`dida.tui.pages.base.CursorPage` 的 ``_motion``。
         """
+        self._editing_list: str | None = None
+        """正在改的是哪条清单（表单关掉时要用它；``None`` = 那一次是新建）。"""
         self._announce_sync = False
         """这一轮同步要不要用 toast 报完成——``r`` 要，启动刷新不要（那会每次开屏都弹一下）。"""
         self._spinning = False
@@ -508,6 +517,93 @@ class DidaApp(App[None]):
             return
         self.refresh_view()
 
+    # ---------------------------------------------------------------- 清单的建 / 改 / 删（#42）
+
+    def on_index_page_new_list(self, event: IndexPage.NewList) -> None:
+        """``n``：开建清单的表单（字段由选中行的类型决定，见 :mod:`dida.tui.overlays`）。"""
+        self._open_list_form(None)
+
+    def on_index_page_edit_list(self, event: IndexPage.EditList) -> None:
+        """``e``：改光标那一行的名字与颜色。"""
+        self._open_list_form(event.row_id)
+
+    def on_index_page_delete_list(self, event: IndexPage.DeleteList) -> None:
+        """``d``：删光标那一行——**先如实问一句**，``y`` 才真的删（验收标准 3、4、5）。
+
+        确认文案在 :func:`dida.tui.messages.delete_list_prompt`：它说的两件事都核实过
+        ——删掉一个清单时里面的任务会怎样文档没写，而回收站与撤销删除的接口都不存在。
+        """
+        row = self.index_page().row(event.row_id)
+        if row is None:
+            return
+        refusal = list_write_refusal(row)
+        if refusal is not None:
+            self._write_status(refusal)
+            return
+        self.push_screen(
+            ConfirmOverlay(messages.delete_list_prompt(row.name), title="删除清单"),
+            partial(self._finish_delete_list, row.id),
+        )
+
+    def _open_list_form(self, row_id: str | None) -> None:
+        """开清单表单：``row_id`` 是 ``None`` 就是新建，否则是改那一行。
+
+        改不动的行（视图、收集箱、没有写权限的清单）在这里就挡住并说清是哪一种——表单
+        开出来再拒绝，用户会以为自己填错了什么。
+        """
+        row = None if row_id is None else self.index_page().row(row_id)
+        if row_id is not None:
+            if row is None:
+                return
+            refusal = list_write_refusal(row)
+            if refusal is not None:
+                self._write_status(refusal)
+                return
+        self._editing_list = None if row is None else row.id
+        self.push_screen(
+            FormOverlay(
+                title="新建清单" if row is None else f"改「{row.name}」",
+                fields=list_form_fields(row),
+            ),
+            self._finish_list_form,
+        )
+
+    def _finish_list_form(self, values: dict[str, str] | None) -> None:
+        """表单关掉了：``None`` 是取消（一个字节都不写），否则按填的那一份建 / 改。
+
+        颜色是空串就**不发** ``color`` 字段（那是「默认」，不是「清空」）；名字空着则
+        什么都不做，只如实说一句。
+        """
+        if values is None:
+            return
+        name = values.get(LIST_NAME_FIELD, "").strip()
+        if not name:
+            self._write_status(messages.EMPTY_LIST_NAME_MESSAGE)
+            return
+        color = values.get(LIST_COLOR_FIELD) or None
+        editing = self._editing_list
+        self._editing_list = None
+        try:
+            if editing is None:
+                self.engine.create_list(name, color=color)
+            else:
+                self.engine.update_list(editing, name=name, color=color)
+        except DidaError as exc:
+            self._write_status(messages.list_write_failed_message(exc))
+            return
+        self.refresh_view()
+
+    def _finish_delete_list(self, list_id: str, confirmed: bool | None) -> None:
+        """删除确认关掉了：只有 ``True`` 才真的删（``n`` / ``Esc`` 与 ``None`` 都不动）。"""
+        if not confirmed:
+            return
+        try:
+            self.engine.delete_list(list_id)
+        except DidaError as exc:
+            self._write_status(messages.list_write_failed_message(exc))
+            return
+        self.refresh_view()
+
     # ---------------------------------------------------------------- 当前任务 / 浏览器（工单 #19）
 
     def current_task_id(self) -> str | None:
@@ -701,26 +797,53 @@ class DidaApp(App[None]):
     # ---------------------------------------------------------------- 退出流（t21 / #47）
 
     async def action_quit(self) -> None:
-        """``q``：还有待推送改动时先拦一下（用户故事 101）。
+        """``q`` 与 ``Ctrl+C``：还有待推送改动时先拦一下（用户故事 101 / 工单 #47）。
 
-        用户按 ``q`` 的意图通常是「我干完了」，而屏幕底下那个数可能是「我按了 x，但网断了」
+        用户按退出键的意图通常是「我干完了」，而屏幕底下那个数可能是「我按了 x，但网断了」
         ——待推送改动只存在本地（ADR-0002 的豁免代价），进程一结束这一屏就没了，而服务端
         并不知道用户做过什么。所以这里**多问一句**，并且把「有几处」写在浮层上。
 
-        浮层已经开着时什么都不做：连按 ``q`` 不该叠出一摞确认框。没有待推送改动就照旧直接退
-        （``q`` 即结束，spec 的单进程规矩）。
+        **两个键走同一个判断**：它们绑在同一个动作上（``keys.py`` 全局那一层的 :class:`Key`），
+        所以这里分不出、也不该分出 ``q`` 与 ``Ctrl+C``。这一条在本票之前不成立：Textual 8.2.8
+        把 ``Ctrl+C`` 绑在它自己的 ``help_quit`` 上（弹一句「按 q 退出」，**不退出**）——那是
+        框架的另一条退出路径，谁也不保证它永远只是弹一句话。两条路合成一条之后，这个分歧
+        没有了，而「按了退出键却没被拦」这条静默丢改动的后门也一并关掉。
+
+        **这里不需要 ``is_running`` 守卫，理由要写下来**（不是「忘了加」）：本方法跨过
+        ``push_screen`` 之后**没有任何一行再碰 DOM**，而 ``push_screen`` 自己是同步的、
+        ``App.exit()`` 也是同步的。真正的 ``await`` 在调用方（``_dispatch_action`` 的
+        ``await invoke(...)``），那时这一帧已经做完了。:meth:`_finish_quit` 同理，见它自己的
+        说明。
         """
         pending = self.engine.status().pending_count
         if not pending:
+            # 没有待推送改动就照旧直接退（``q`` 即结束，spec 的单进程规矩）。
             self.exit()
             return
-        if isinstance(self.screen, ConfirmOverlay):
+        if self._confirming_quit():
+            # 连按退出键不该叠出一摞确认框——已经问过就不必再问。
             return
         self.push_screen(
             ConfirmOverlay(messages.quit_prompt(pending), title="仍然退出"), self._finish_quit
         )
 
+    def _confirming_quit(self) -> bool:
+        """退出浮层已经开着了吗。
+
+        看**整摞** screen，不是只看顶上那一块：确认框上面还能再盖一层（``?`` 的帮助浮层
+        就盖得住它），而那时 ``self.screen`` 是**最上面**那一块——只比它一块就会再叠一个
+        确认框出来。这个口子是真的：浮层是模态的，键位解析在它那儿就截断了，
+        :meth:`action_quit` 照样会跑到。
+        """
+        return any(isinstance(screen, ConfirmOverlay) for screen in self.screen_stack)
+
     def _finish_quit(self, confirmed: bool | None) -> None:
-        """退出浮层关掉了：只有 ``True`` 才真的退（``n`` / ``Esc`` 与 ``None`` 都留下）。"""
-        if confirmed:
+        """退出浮层关掉了：只有 ``True`` 才真的退（``n`` / ``Esc`` 与 ``None`` 都留下）。
+
+        本方法**一行 DOM 都不碰**（``exit()`` 是同步的，它只是排一条 ``ExitApp``），所以它
+        不需要「``await`` 之后先问 ``is_running``」那道守卫——那条规矩管的是**碰 DOM** 的
+        地方。这一句是写给下一个来改它的人的：往这里加任何 ``query_one`` / ``update`` 之
+        前，先把守卫补上。
+        """
+        if confirmed and self.is_running:
             self.exit()

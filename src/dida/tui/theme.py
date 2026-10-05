@@ -55,6 +55,7 @@ __all__ = [
     "DONE_MARK",
     "ELLIPSIS",
     "HEADING",
+    "HEADING_RULE",
     "INBOX_MARK",
     "LIST_MARK",
     "MUTED",
@@ -63,6 +64,8 @@ __all__ = [
     "PAN_MS",
     "PENDING",
     "PLAIN",
+    "REMINDER_MARK",
+    "REPEAT_MARK",
     "RICH_ROLES",
     "RULE",
     "SELECTED",
@@ -77,6 +80,7 @@ __all__ = [
     "animations_setting",
     "app_css",
     "clip",
+    "form_css",
     "overlay_css",
     "pad",
     "rpad",
@@ -94,8 +98,8 @@ SELECTED = "cyan bold"
 """光标那一行的正文：颜色 + 字重。终端画不出半格，所以「选中」只能靠这两个信号。"""
 
 OVERDUE = "red"
-"""逾期 = 槽 1。**只是一个语义 token**：``TaskItem`` 没有 overdue 位、TUI 也不许判日期，
-所以本票不实现标红（位归 #37，接线归 #52）。"""
+"""逾期 = 槽 1。**只是一个语义 token**：谁逾期由读模型判（``TaskItem.overdue``，#35 接上
+视图求值），颜色由这里给——TUI 不许自己拿截止时间去比（架构规则：日期判断全在引擎里）。"""
 
 SURFACE = "black"
 """抬起来的面 = 槽 0（他那一格是 ``#45475A`` 石板）。它比页面底色**亮**，所以只用于浮层。"""
@@ -191,6 +195,18 @@ LIST_MARK = "⋮"
 DONE_MARK = "☑"
 """已完成的行。"""
 
+REPEAT_MARK = "↻"
+"""重复任务（服务端给了 ``repeatFlag``）。
+
+U+21BB，东亚宽度**中性**、rich 量 1 格：它进的是任务行里那一列注解，宽度含糊就会歪。
+"""
+
+REMINDER_MARK = "⚑"
+"""有提醒的任务（服务端的 ``reminders`` 非空）。
+
+U+2691，东亚宽度中性、rich 量 1 格。提醒只读（v2 不改它），所以这里只需要「有没有」。
+"""
+
 SUBTASK_DONE_MARK = "☑"
 SUBTASK_TODO_MARK = "☐"
 """子任务的两种状态标记（只读显示：v2 不在客户端里勾子任务）。"""
@@ -205,6 +221,18 @@ RULE = "_"
 Unicode 里根本没有宽度不含糊的制表符（原型 README 的结论），而通栏线一旦每格画 2 格就会
 把整行挤出屏幕（多折一行）。ASCII 的 ``_`` 在每种 locale 里都是 1 格，而且等宽字体下
 上下相连，看起来是一条连续的线。
+"""
+
+HEADING_RULE = "-"
+"""行内抬头两侧那一段横线（U+002D，ASCII）。
+
+**为什么不是 ``─``**：与 :data:`RULE` 同一条理由——U+2500 是东亚**歧义**宽度，rich 量它 1 格，
+CJK 字体下终端画 2 格。抬头是**行内**的、不是列，所以这一格差在列里看不出来；它坏的是另一件事：
+``── X ──`` 里四个 ``─`` 让这一行比 rich 的量法宽 4 格，而 ``?`` 那块浮层是 ``width: auto``
+——宽度正由 rich 量出来的最宽那行决定。**抬头一旦就是最宽那行**，它就比框的内容区宽 4 格、
+从右边框上溢出去（#48 复现：body 只放一个旧抬头时，框内 16 格、抬头画 20 格，多出来的 2 格压过
+右边框）。今天浮层里还有更宽的 CJK 说明行，所以这道差被余量盖住了；它是一笔**随时会显形的假账**，
+而 ASCII 的 ``-`` 在任何 locale 里都是 1 格，两边永远一致。
 """
 
 ELLIPSIS = "…"
@@ -240,16 +268,22 @@ STRUCTURAL_GLYPHS: Final = (
     CUSTOM_MARK,
     LIST_MARK,
     DONE_MARK,
+    REPEAT_MARK,
+    REMINDER_MARK,
     SUBTASK_DONE_MARK,
     SUBTASK_TODO_MARK,
     BLOCKED_GLYPH,
     RULE,
+    HEADING_RULE,
     *SPINNER_FRAMES,
 )
-"""会进入**列结构**的每一个字形：守卫照着它逐个查宽度。
+"""会进入**列结构或宽度算式**的每一个字形：守卫照着它逐个查宽度。
 
 两个方向都会错，所以两个方向都要查（``tests/test_theme.py``）：``☰`` 是 rich 量 2 格而
 Unicode 说中性；``▣ ★ · ─ ╭╮╰╯ ↑↓`` 是 rich 量 1 格而 Unicode 说是**歧义**宽度。
+
+「宽度算式」这一半是 #48 加的：抬头不在列里，但 ``width: auto`` 的浮层宽度**就是**由最宽那行
+算出来的，所以行内抬头里的字形与列里的字形一样承重。
 """
 
 DECORATION_GLYPHS: Final = (ELLIPSIS, WORDMARK_ICON)
@@ -522,6 +556,56 @@ def app_css() -> str:
     那是主题里的真彩色值，不覆盖的话通知会以真彩色出现，破坏「跟随终端主题」。
     """
     return _fill(_APP_CSS)
+
+
+_FORM_CSS = """
+{name} .overlay-box {
+    width: 80%;
+}
+{name} .overlay-label {
+    width: 100%;
+    height: 1;
+    text-style: dim;
+}
+{name} .overlay-hint {
+    width: 100%;
+    height: auto;
+    margin-top: 1;
+    text-style: dim;
+}
+{name} Input {
+    width: 100%;
+    border: ascii {edge};
+    background: {surface};
+    color: {page};
+}
+{name} Input:focus {
+    border: ascii {accent};
+}
+{name} ChoiceField {
+    width: 100%;
+    height: 1;
+}
+"""
+
+
+def form_css(name: str) -> str:
+    """表单浮层的样式表（``FormOverlay`` 的 ``DEFAULT_CSS``，工单 #42）。
+
+    在 :func:`overlay_css` 那层壳子之上只加四件：
+
+    - **输入框**：Textual 自带的 ``Input`` 用 ``$surface`` / ``$primary`` 那些主题变量上色，
+      出去是真彩色（ADR-0007 一）。所以这里按浮层的面（槽 0）重画一遍，边框沿用那条
+      ``ascii`` 细边——聚焦时换成强调色（槽 6），与「光标那一行才亮」同一条口径。
+    - **字段名**与**底部那行提示**：``dim``（层级靠字重与明暗，不靠更亮的颜色）。
+    - **选择框**一行高（它自己那两个 ``< >`` 是 ASCII，宽度不含糊）。
+
+    ``width: 80%`` 是给输入框的：``overlay_css`` 的 ``width: auto`` 配一个 ``width: 100%``
+    的子控件量不出宽度来（百分比要有个有宽度的容器参照）。80% 而不是更窄，是为了底部那行
+    提示在一屏 100 格里排得下——排不下它会折行，折行本身不算坏，但两行的提示看起来像
+    出了错。窄终端上折行是正常的（40 格时折成三行，仍然读得完）。
+    """
+    return overlay_css(name) + _fill(_FORM_CSS).replace("{name}", name)
 
 
 _OVERLAY_CSS = """

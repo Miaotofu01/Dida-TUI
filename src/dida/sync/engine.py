@@ -12,6 +12,8 @@ TUI 读写一切只能走本模块；分组、排序、逾期判定、冲突裁�
 - ``refresh_completed() -> CompletedReport`` —— 写：已完成流，**async**（:mod:`dida.sync.completed`）。
 - ``defer(task_id)`` / ``reschedule(...)`` —— 写：顺延与改期（:mod:`dida.sync.schedule`）。
 - ``create(title, ...)`` —— 写：新建，落在收集箱（:mod:`dida.sync.create`）。
+- ``create_list(name, color=)`` / ``update_list(id, name=, color=)`` / ``delete_list(id)`` ——
+  写：清单的建 / 改 / 删，乐观写 + 立即推送 + 失败进重试队列（:mod:`dida.sync.lists`，#42）。
 - ``cycle_priority(task_id)`` —— 写：优先级推进一档（:mod:`dida.sync.priority`）。
 - ``subtasks(task_id)`` / ``toggle_subtask(...)`` —— 读 / 写：子任务（:mod:`dida.sync.subtasks`）。
 
@@ -63,6 +65,15 @@ from dida.sync.completed import (
     CompletedStreamMixin,
 )
 from dida.sync.create import CreateMixin
+from dida.sync.lists import (
+    LIST_COLORS,
+    ListColor,
+    ListMixin,
+    ListWriteKind,
+    ListWriteTarget,
+    ProjectWriter,
+    UnknownListError,
+)
 from dida.sync.priority import PriorityMixin
 from dida.sync.push import PushMixin, TaskWriter, backoff_delay
 from dida.sync.read import (
@@ -111,6 +122,16 @@ from dida.sync.view import (
     summarize_lists,
 )
 from dida.sync.writes import LocalEffect, UnknownTaskError, WireCall, WriteKind, WriteTarget
+from dida.sync.views import (
+    BUILTIN_VIEW_DAYS,
+    Completion,
+    DueWindow,
+    ViewDefinition,
+    ViewTask,
+    builtin_view_definitions,
+    evaluate_view,
+    order_key,
+)
 
 if TYPE_CHECKING:  # 只为了标注：storage 反过来 import dida.sync.view，运行时不能在这里 import
     from dida.storage.store import RefreshReport
@@ -119,17 +140,24 @@ __all__ = [
     "INBOX_ID",
     "NO_DUE_TEXT",
     "AuthError",
+    "BUILTIN_VIEW_DAYS",
     "CompletedItem",
     "CompletedReader",
     "CompletedReport",
     "CompletedSection",
+    "Completion",
     "DidaError",
+    "DueWindow",
     "Engine",
     "GroupKind",
+    "LIST_COLORS",
+    "ListColor",
     "ListKind",
     "ListRow",
     "ListSnapshot",
     "ListSummary",
+    "ListWriteKind",
+    "ListWriteTarget",
     "LocalEffect",
     "PayloadReader",
     "ProjectReader",
@@ -145,19 +173,25 @@ __all__ = [
     "TaskItem",
     "TaskList",
     "TaskReader",
+    "ProjectWriter",
     "TaskSnapshot",
     "TodayView",
+    "UnknownListError",
     "UnknownTaskError",
+    "ViewDefinition",
     "ViewReader",
     "ViewRow",
     "ViewSource",
+    "ViewTask",
     "WireCall",
     "WriteKind",
     "WriteTarget",
     "backoff_delay",
+    "builtin_view_definitions",
     "builtin_view_rows",
     "completed_section",
     "container_tasks",
+    "evaluate_view",
     "filter_groups",
     "format_due",
     "fuzzy_match",
@@ -165,6 +199,7 @@ __all__ = [
     "is_inbox_id",
     "list_index",
     "next_priority",
+    "order_key",
     "pending_error",
     "priority_mark",
     "resolve_lists",
@@ -299,6 +334,20 @@ class Engine(Protocol):
         tags: Sequence[str] = (),
     ) -> str:
         """写：新建一条任务到收集箱（``a``），返回本地那条的 id（t15）。"""
+    def create_list(self, name: str, *, color: str | None = None) -> str:
+        """写：新建一个清单（``n``），返回本地那一行的 id（#42）。"""
+        ...
+
+    def update_list(
+        self, list_id: str, *, name: str | None = None, color: str | None = None
+    ) -> None:
+        """写：改清单的名字与颜色（``e``）——没给的字段不动（#42）。"""
+        ...
+
+    def delete_list(self, list_id: str) -> None:
+        """写：删一个清单（``d``，TUI 已经问过一句）。服务端没有撤销（#42）。"""
+        ...
+
     def cycle_priority(self, task_id: str) -> None:
         """写：优先级推进一档（``p``）——无 → 低 → 中 → 高 → 无。"""
         ...
@@ -316,6 +365,7 @@ class Engine(Protocol):
 
 
 class SyncEngine(
+    ListMixin,
     RefreshMixin,
     PushMixin,
     CompletedStreamMixin,
@@ -324,7 +374,12 @@ class SyncEngine(
     PriorityMixin,
     SubtaskMixin,
 ):
-    """今日执行台的数据与写入入口（组装各片；读路径在本模块）。"""
+    """通用客户端的数据与写入入口（组装各片；读路径在本模块）。
+
+    :class:`~dida.sync.lists.ListMixin` 排在第一位，所以引擎的 ``push_pending()`` 是它那一份
+    （先推清单改动，再把任务那一份交给 :class:`~dida.sync.push.PushMixin`）；其余方法照旧
+    按名字解析，各自的 ``self._…`` 都落在同一个实例上。
+    """
 
     def __init__(
         self,

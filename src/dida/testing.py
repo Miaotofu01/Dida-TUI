@@ -146,6 +146,27 @@ class InMemorySource:
         self._lists[snapshot.id] = snapshot
         return snapshot
 
+    def save_list(self, payload: Mapping[str, Any]) -> None:
+        """按一行清单的**原文**写进内存缓存（#42 的乐观写那一份）。
+
+        与 ``Store.save_list`` 同一口径：字段名用服务端的驼峰（``groupId`` / ``isInbox``……），
+        没提的字段当「不知道」（``None``）——替身不自己编，编出来的东西会让「改完之后
+        那一行长什么样」变成空话。
+        """
+        self._lists[str(payload["id"])] = ListSnapshot(
+            id=str(payload["id"]),
+            name=str(payload.get("name") or ""),
+            color=payload.get("color"),
+            group_id=payload.get("groupId"),
+            kind=payload.get("kind"),
+            permission=payload.get("permission"),
+            is_inbox=bool(payload.get("isInbox")),
+        )
+
+    def drop_list(self, list_id: str) -> None:
+        """本地摘掉一行清单（#42 删除的本地效果）。"""
+        self._lists.pop(list_id, None)
+
     def add_view(self, name: str, *, id: str | None = None, task_ids: Sequence[str] = ()) -> ViewRow:
         """加一条自定义视图行（#36）：``task_ids`` 是这一层算好的求值结果。
 
@@ -170,6 +191,8 @@ class InMemorySource:
         desc: str = "",
         content: str = "",
         tags: tuple[str, ...] = (),
+        repeat_flag: str = "",
+        reminders: tuple[str, ...] = (),
         raw: Mapping[str, Any] | None = None,
     ) -> TaskSnapshot:
         """加一条任务快照；``id`` 默认 ``t1``、``t2``……（按加入顺序）。
@@ -195,6 +218,8 @@ class InMemorySource:
             desc=desc,
             content=content,
             tags=tags,
+            repeat_flag=repeat_flag,
+            reminders=reminders,
         )
         self._lists.setdefault(snapshot.list_id, ListSnapshot(id=snapshot.list_id, name=list_name))
         self._tasks[snapshot.id] = snapshot
@@ -229,6 +254,10 @@ class InMemorySource:
             payload["content"] = snapshot.content
         if snapshot.tags:
             payload["tags"] = list(snapshot.tags)
+        if snapshot.repeat_flag:
+            payload["repeatFlag"] = snapshot.repeat_flag
+        if snapshot.reminders:
+            payload["reminders"] = list(snapshot.reminders)
         return payload
 
     def lists(self) -> tuple[ListSnapshot, ...]:
@@ -343,6 +372,18 @@ class FakeBackend:
         """摆一个异常进去，``delete`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。"""
         self.cycled: list[str] = []
         """``cycle_priority(task_id)`` 收到的任务 id，按调用顺序（t17 的 ``p``）。"""
+
+        self.created_lists: list[tuple[str, str | None]] = []
+        """``create_list(name, color=)`` 收到的每一笔，按顺序（#42）。"""
+
+        self.updated_lists: list[tuple[str, str | None]] = []
+        """``update_list(list_id, name=, color=)`` 收到的每一笔，按顺序（#42）。"""
+
+        self.deleted_lists: list[str] = []
+        """``delete_list(list_id)`` 收到的清单 id，按顺序（#42）。"""
+
+        self.list_error: Exception | None = None
+        """摆一个异常进去，清单的三种写就抛它（试 TUI 拿到结构化错误时的反应）。"""
 
         self._subtasks: dict[str, tuple[SubtaskItem, ...]] = {}
         """摆进来的子任务，按任务 id 索引（t20）；:meth:`set_subtasks` 摆，读路径照给。"""
@@ -500,6 +541,51 @@ class FakeBackend:
         替身不自己再抄一份——抄了就会跟真货说不一样的话。
         """
         self.cycled.append(task_id)
+
+    def create_list(self, name: str, *, color: str | None = None) -> str:
+        """写：记下这一笔，**并且真的把它摆进内存缓存**（#42 的新建）。
+
+        与 :meth:`create` 同一条口径：清单列表页上「建完立刻多出一行」正是这张工单的验收
+        标准，只记录的话接缝一根本测不到那句话。本地临时 id 也照真引擎的样子给
+        （服务端建好之后才给真 id），界面因此不必认识「哪条还没推上去」。
+        """
+        self.created_lists.append((name, color))
+        self._raise_list_error()
+        return self.source.add_list(
+            name, id=f"local-list-{len(self.created_lists)}", color=color
+        ).id
+
+    def update_list(
+        self, list_id: str, *, name: str | None = None, color: str | None = None
+    ) -> None:
+        """写：记下这一笔，并改内存缓存里那一行（没给的字段照旧不动）。"""
+        self.updated_lists.append((list_id, name, color))
+        self._raise_list_error()
+        current = next((row for row in self.source.lists() if row.id == list_id), None)
+        if current is None:
+            return
+        self.source.save_list(
+            {
+                "id": list_id,
+                "name": current.name if name is None else name,
+                "color": current.color if color is None else color,
+                "groupId": current.group_id,
+                "kind": current.kind,
+                "permission": current.permission,
+                "isInbox": current.is_inbox,
+            }
+        )
+
+    def delete_list(self, list_id: str) -> None:
+        """写：记下这一笔，并从内存缓存里摘掉那一行（#42 的删除）。"""
+        self.deleted_lists.append(list_id)
+        self._raise_list_error()
+        self.source.drop_list(list_id)
+
+    def _raise_list_error(self) -> None:
+        """摆了 ``list_error`` 就在记完这一笔之后抛它（引擎当场拒绝的那条路）。"""
+        if self.list_error is not None:
+            raise self.list_error
 
     def set_subtasks(self, task_id: str, *items: SubtaskItem) -> None:
         """摆一条任务的子任务（t20）：右栏渲染与勾选测试的输入。

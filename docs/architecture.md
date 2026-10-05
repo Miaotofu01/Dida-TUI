@@ -9,9 +9,9 @@
 | # | 模块 | 路径 | 公开接口 | 工单 |
 |---|---|---|---|---|
 | 1 | 配置与凭据 | `dida/config.py` | `Config`（`token` / `day_end` / `refresh_on_start` / `push_on_change` / `completed_window_hours`）、`config_path()`、`load_config()`、`save_config()`、`needs_token()`、`Credentials(transport=, path=).verify_and_store(token)`；失败是 `ConfigError` / `CredentialsError` | t03 已实现 |
-| 2 | 滴答 API 客户端 | `dida/api/` | `DidaApiClient(token=, transport=, base_url=)`：`list_projects(offset=, limit=)`、`get_project_data(project_id)`、`get_task(project_id, task_id)`、`list_tags()`、`list_completed(project_ids=, start_date=, end_date=)`、`create_task(body)`、`update_task(project_id, task_id, changes, snapshot=)`、`complete_task(project_id, task_id)`、`delete_task(project_id, task_id)`；失败一律是 `dida.api.errors.DidaError` 的子类（`NetworkError` / `AuthError` / `ServerRejectionError` / `FieldIgnoredError`，守卫另有 `InvalidDateError` / `DatelessRepeatError` / `MalformedResponseError`） | t07 已实现 |
+| 2 | 滴答 API 客户端 | `dida/api/` | `DidaApiClient(token=, transport=, base_url=)`：`list_projects(offset=, limit=)`、`get_project_data(project_id)`、`get_task(project_id, task_id)`、`list_tags()`、`list_completed(project_ids=, start_date=, end_date=)`、`create_task(body)`、`update_task(project_id, task_id, changes, snapshot=)`、`complete_task(project_id, task_id)`、`delete_task(project_id, task_id)`、**清单的建 / 改 / 删**（#42）：`create_project(body)`、`update_project(project_id, changes, snapshot=)`、`delete_project(project_id)`——三条都有 `200 → Project` 与 `201 No Content` 两种成功形状，所以后两者返回「那一份清单，或者 `None`」；失败一律是 `dida.api.errors.DidaError` 的子类（`NetworkError` / `AuthError` / `ServerRejectionError` / `FieldIgnoredError`，守卫另有 `InvalidDateError` / `DatelessRepeatError` / `MalformedResponseError`） | t07 已实现 |
 | 3 | 本地存储 | `dida/storage/store.py` | `Store`：清单、任务快照、待推送改动、同步状态 | t08 已实现 |
-| 4 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` + `dida/sync/read.py` | `SyncEngine(clock=, day_end=, source=, client=)`、`status() -> SyncStatus`、`view() -> TodayView`、**三种读形状**（#33）：`list_index() -> tuple[ListRow, ...]`、`tasks_in(container_id) -> TaskList`、`task_detail(task_id) -> TaskDetail \| None`、`refresh() -> RefreshReport`（**async**）、`complete(task_id)`、`defer(task_id)`、`push_pending()`；视图模型与分组纯函数在 `dida/sync/view.py`，读模型在 `dida/sync/read.py` | t05 / t09 / t10 已实现；读形状 #33 |
+| 4 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` + `dida/sync/read.py` + `dida/sync/views.py` + `dida/sync/lists.py` | `SyncEngine(clock=, day_end=, source=, client=)`、`status() -> SyncStatus`、`view() -> TodayView`、**三种读形状**（#33）：`list_index() -> tuple[ListRow, ...]`、`tasks_in(container_id) -> TaskList`、`task_detail(task_id) -> TaskDetail \| None`、`refresh() -> RefreshReport`（**async**）、`complete(task_id)`、`defer(task_id)`、`push_pending()`、**清单的建 / 改 / 删**（#42）：`create_list(name, color=)`、`update_list(list_id, name=, color=)`、`delete_list(list_id)`；视图模型与分组纯函数在 `dida/sync/view.py`，读模型在 `dida/sync/read.py`，视图求值在 `dida/sync/views.py`（#35），清单的写路径与颜色档在 `dida/sync/lists.py`（#42） | t05 / t09 / t10 已实现；读形状 #33；视图求值 #35；清单写 #42 |
 | 5 | 逻辑日 | `dida/logical_day.py` | `parse_day_end(text) -> timedelta`、`logical_day(now, day_end) -> LogicalDay`（`label` / `start` / `end`，半开区间） | t04 已实现 |
 | 6 | TUI | `dida/tui/` | `DidaApp(engine)`；三层页面 `dida/tui/pages/`（`index` / `tasks` / `detail`）、按层的键位表 `dida/tui/keys.py`、浮层 `dida/tui/overlays.py`、**视觉常量唯一出处 `dida/tui/theme.py`**（颜色 / 字形 / 间距 / 动效）、顶栏 `#top-bar`（`top_line()`，词标 + 导航路径）、状态栏 `#status-bar`（`status_line()` / `format_status()`） | v1 t05 / t18；一栏三层 #34；视觉地基 #51 |
 
@@ -90,6 +90,8 @@ v1 的读入口只有一个为「今日」硬编码的 `view()`（v1 的三栏�
   进不去（用户故事 23 / 24）。
 - `tasks_in(container_id) -> TaskList` —— 某个容器的任务列表：这个容器的**全部**未完成任务
   （截止时间在未来的也在，v1 把它们整条丢掉了）+ `completed`（这个容器里窗口内完成的）。
+  视图那个容器的行由**视图求值**决定顺序（#35），并带 `shows_list_name=True`；真实清单的行
+  照旧 `by_due` 排、不重复写清单名。
 - `task_detail(task_id) -> TaskDetail | None` —— 单条任务的详情：标题/描述/备注/清单/截止/
   优先级/标签，外加只读的 `repeat_flag` / `reminders` / `subtasks`，以及原文里我们不认识的
   字段（`unknown`，`raw` 整份带着，回写不丢字段）。
@@ -102,8 +104,32 @@ v1 的读入口只有一个为「今日」硬编码的 `view()`（v1 的三栏�
 请求侧别名，或服务端那一串；id 里恰好带 `inbox` 的真实清单不再被改写。
 
 自定义视图的行由源上的可选能力 `ViewReader.views()` 给（#36 把视图定义落库并求值）；
-内置视图由 `builtin_view_rows()` 算（#35 会把求值长全：逾期置顶标红、行里显示所属清单）。
-视图行里的 `task_ids` 是求值结果，行上的条数与进去看到的列表因此来自同一次求值。
+内置视图由 `builtin_view_rows()` 算（#35：三个写死的 `ViewDefinition` 走
+`dida/sync/views.py` 的**同一条** `evaluate_view`，逾期置顶、排序、视图里的所属清单名都在
+那一次求值里定下来）。视图行里的 `task_ids` 是求值结果，行上的条数与进去看到的列表因此
+来自同一次求值。
+
+### 视图求值（#35）
+
+`dida/sync/views.py` 是**视图求值**那一层：一组纯函数，`定义 + 全量任务缓存 + 当前逻辑日`
+→ 一份排好序的任务列表。不碰网络、不碰存储、不 import Textual，所以可以直接测。
+
+- `ViewDefinition` 是一个视图的**过滤条件 + 名字**（截止区间 `DueWindow` 与完成状态
+  `Completion` 两维，#36 往这里加清单范围 / 优先级 / 标签，不另写一条求值路径）。
+- `builtin_view_definitions()` 给三个**写死的定义**：「今天」= `DueWindow(first=None, last=0)`
+  （上界今天、下界不设 ⇒ **逾期 ∪ 今天到期**，这正是它不是一个干净区间的地方）、
+  「最近七天」= `DueWindow(first=0, last=6)`、「所有」= 不设截止条件（未完成的全都要）。
+- `evaluate_view(definition, tasks, now=, day_end=)` 走**同一条路径**求值——内置与自定义
+  没有分支，`builtin_view_rows()` 只是「三个定义各调一次」。
+- `order_key()` 是客户端统一的那份顺序：逾期置顶 → 截止时间升序 → 优先级降序 → 无日期靠后
+  → 已完成沉底。逾期置顶用的是逻辑日判断（`is_overdue`），所以「今天 03:00」在
+  `day_end = "04:00"` 下会被置顶，而它按时刻比当天那个全天标记更晚。
+- 求值结果 `ViewTask` 带着 `overdue` 位；读模型把它落到 `TaskItem.overdue`（TUI 拿到的是
+  成品，日期判断全在引擎里）。`TaskList.shows_list_name` 则区分「视图」与「清单」：视图里的
+  行要写出所属清单名，清单里不重复写。
+
+日期判断只有一份：`due_day()`（全天任务的截止是日期标记）与 `is_overdue()` 在
+`dida/sync/view.py`，视图求值复用它们。
 
 ## 读路径：视图模型与内存假后端（t05 定稿）
 
@@ -122,16 +148,20 @@ TodayView(lists, groups, completed: CompletedSection)   # 已完成区在中栏�
 ListSummary(id, name, unfinished)            # 左栏的未完成条数徽标
 TaskGroup(kind: GroupKind, items)            # kind 是 OVERDUE / TODAY / INBOX_UNDATED；title 与 count 由 kind 推出
 TaskItem(task_id, title, list_id, list_name, priority, priority_mark, due, all_day, due_text,
-         desc, content, tags_text)           # 后三个是右栏常驻的「描述 / 备注 / 标签」
+         overdue, desc, content, tags_text, repeat_flag, reminders, completed)
+# desc/content/tags_text 是右栏常驻的「描述 / 备注 / 标签」；overdue 是求值给的逾期判定
+# （TUI 不许自己判日期）；repeat_flag/reminders 是行上的重复与提醒标记；completed 决定沉底
 CompletedSection(items: tuple[CompletedItem, ...])
 ```
 
-分组、排序、逾期判定、截止时间读法（「今天 18:00」「昨天 09:00」「3 天前」「—」）全在
-`dida.sync.view` 的纯函数里，TUI 只画字符串。两个已经踩过的坑：
+分组、排序、逾期判定、截止时间读法（「今天 18:00」「昨天 09:00」「3 天前」「-」）全在
+`dida.sync.view` 的纯函数里（**排序键**在 `dida/sync/rows.py`，`by_due` 只是转发，#37），
+TUI 只画字符串。截止时间读法的字形必须是**宽度无歧义**的：没有截止时间读作 ASCII 的 `-`，
+不是 `—`（U+2014，东亚歧义宽度，进了对齐列整列会歪，#37）。两个已经踩过的坑：
 
 - 全天任务的 `due` 是**日期标记**（当天 00:00），不是时刻：`due_day()` 对它按日期算，
   否则 `day_end = "04:00"` 时一个「今天」的全天任务会被算成昨天。
-- 没有截止时间的任务单独成区「收集箱无日期」（读作「—」）：它按「有没有日期」分，不看这条
+- 没有截止时间的任务单独成区「收集箱无日期」（读作「-」）：它按「有没有日期」分，不看这条
   任务在哪个清单（`GroupKind.INBOX_UNDATED`）。
 
 接缝一的假后端在 `dida.testing.FakeBackend`：读委托给真引擎（分组行为跟生产同一份实现），

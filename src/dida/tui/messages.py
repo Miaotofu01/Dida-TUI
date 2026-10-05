@@ -17,7 +17,7 @@
 
 from __future__ import annotations
 
-from dida.sync.engine import AuthError, DidaError
+from dida.sync.engine import AuthError, DidaError, UnknownListError
 
 UNKNOWN_TASK_MESSAGE = "没有改成：这条任务已经不在本地缓存里了，刷新之后再试一次"
 """引擎拒绝写入（本地没有这条任务的底稿，工单 #25）时的话：如实说没改成。"""
@@ -108,6 +108,62 @@ def field_save_failed_message(reason: object) -> str:
 def priority_name(priority: int) -> str:
     """优先级那一格的读法（``0/1/3/5`` → 无 / 低 / 中 / 高）。"""
     return PRIORITY_NAMES.get(priority, PRIORITY_NAMES[0])
+
+EMPTY_LIST_NAME_MESSAGE = "没写名字：清单得有个名字"
+"""建清单时名字一格是空的（#42）。与任务的 ``NO_TITLE_MESSAGE`` 同一条口径。"""
+
+UNKNOWN_LIST_MESSAGE = "没有改成：这个清单已经不在本地缓存里了，刷新之后再试一次"
+"""引擎拒绝清单写入（本地没有这一行的原文，#42）时的话：如实说没改成。"""
+
+INBOX_LIST_MESSAGE = "收集箱不在这里改：它是客户端补出来的默认落点，改了下次刷新就变回去"
+"""``e`` / ``d`` 落在收集箱那一行时的话（#42）。
+
+措辞不许说成「接口不支持」——服务端拿字面量 ``inbox`` 当 projectId 是收的。做不到的是
+**这个客户端**：收集箱那一行是本机补出来的（服务端的清单索引里没有它），它的名字与颜色
+每次刷新都由服务端那一份说了算，所以在这里改它只会看起来成功、下一次刷新就变回去。
+"""
+
+VIEW_ROW_MESSAGE = "这是视图，不是清单：视图的建 / 改 / 删还没接上"
+"""``e`` / ``d`` 落在视图行上时的话（#42 只管清单；视图那三条归 #36）。"""
+
+
+def readonly_list_message(row: object) -> str:
+    """``e`` / ``d`` 落在没有写权限的清单上时的话（用户故事 24）。
+
+    与 :func:`blocked_list_message` 分开写：那一句说的是「进不去」，这一句说的是「改不动」
+    ——两件事，用户要看到的也是两种原因。
+    """
+    return f"「{getattr(row, 'name', '')}」改不动：这个清单没有写权限"
+
+
+def list_write_failed_message(error: DidaError) -> str:
+    """清单的建 / 改 / 删当场失败时的话（#42）。
+
+    与任务的写路径同一条口径：引擎当场拒绝的（本地已经没有那行清单了）与别的失败分开说，
+    因为用户该做的事不一样——前者刷新一下再看，后者是网络或权限。
+    """
+    if isinstance(error, UnknownListError):
+        return UNKNOWN_LIST_MESSAGE
+    return f"清单没改成：{error}"
+
+
+def delete_list_prompt(name: str) -> str:
+    """**删清单**的确认文案（#42）。
+
+    措辞是这一屏最要紧的一行字，两条都核实过（api-shapes §B11）：
+
+    - 删掉一个清单时它里面的任务在服务端会发生什么，**文档一个字都没写**（:1278–1302
+      通篇只有路径、参数、响应表与一个请求示例），我们也没有实测过。所以只能如实说
+      「不知道」，绝不许升级成「一起删掉」或「会移到收集箱」——那两句都是编的。
+    - 没有回收站、没有撤销删除的接口（§A6：整份文档里搜不到 undelete / restore /
+      已删除列表），所以**不许承诺任何恢复手段**。
+    """
+    return (
+        f"删除清单「{name}」？\n"
+        "它里面的任务会怎样，官方文档没写，我们也没有实测过。\n"
+        "滴答清单没有回收站，也没有撤销删除的接口：删了就找不回来。\n\n"
+        "y 确认删除 · n / Esc 取消"
+    )
 
 
 def blocked_list_message(row: object) -> str:

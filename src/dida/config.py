@@ -98,7 +98,7 @@ class Config:
     day_end: str = "24:00"
     refresh_on_start: bool = True
     push_on_change: bool = True
-    completed_window_hours: int = 24
+    completed_window_hours: int = 168
 
     def __post_init__(self) -> None:
         _check_field_types(self)
