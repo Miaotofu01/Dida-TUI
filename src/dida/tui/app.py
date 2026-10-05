@@ -513,6 +513,9 @@ class DidaApp(App[None]):
                 return
             self.detail_page().show_save(messages.field_save_failed_message(exc))
             return
+        if not wrote:
+            # 挑回原来那一档：没有改动就没有「立刻推送」这回事（队列里本来也不该多出一笔）。
+            return
         await self.engine.push_pending()
         if not self.is_running:
             return
@@ -569,7 +572,7 @@ class DidaApp(App[None]):
         if values is None:
             return
         try:
-            self._apply_pick(task_id, field, values)
+            wrote = self._apply_pick(task_id, field, values)
         except UnknownTaskError:
             self.refresh_view()
             if self.is_running:
@@ -581,26 +584,50 @@ class DidaApp(App[None]):
                 return
             self.detail_page().show_save(messages.field_save_failed_message(exc))
             return
+        if not wrote:
+            # 挑回原来那一档：没有改动就没有「立刻推送」这回事（队列里本来也不该多出一笔）。
+            return
         await self.engine.push_pending()
         if not self.is_running:
             return
         self.refresh_view()
 
-    def _apply_pick(self, task_id: str, field: str, values: dict[str, str]) -> None:
+    def _apply_pick(self, task_id: str, field: str, values: dict[str, str]) -> bool:
         """挑完的那一份怎么变成一次写（三条路各自的形状只在这一个地方）。
 
-        ``int(...)`` 那一下是**线上编码**：选项的值是 ``0/1/3/5``，标签是用户语言
+        **挑回原来那一档 = 没改**（与逐字段编辑那条规矩同一条）：一笔都不写。写一笔没发生的
+        改动会进待推送队列，离线时状态栏那个数就为一个空操作亮着。清单那一路的「同一个清单」
+        由引擎自己挡（``move_task``），这里挡的是优先级与标签。
+
+        ``int(...)`` 那一下是**线上编码**：选项的值是 ``0/1/3/5``、标签是用户语言
         （``messages.PRIORITY_NAMES``，唯一一张表）。表外的值不该出现（选项就是从那张表
         生成的），认不出来就当没挑——不替服务端猜一个档位。
+
+        返回「真的写了一笔吗」：没改的那一条路连推送都不排（队列里不该多出一笔）。
         """
+        detail = self.engine.task_detail(task_id)
+        if detail is None:
+            raise UnknownTaskError(task_id)
         if field == LIST_FIELD:
+            if values[LIST_FIELD] == detail.list_id:
+                return False
             self.engine.move_task(task_id, to_list_id=values[LIST_FIELD])
-        elif field == PRIORITY_FIELD:
+            return True
+        if field == PRIORITY_FIELD:
             picked = values[PRIORITY_FIELD]
-            if picked.isdigit():
-                self.engine.write(task_id, changes={"priority": int(picked)})
-        elif field == TAGS_FIELD:
-            self.engine.write(task_id, changes={"tags": list(multi_values(values[TAGS_FIELD]))})
+            if not picked.isdigit() or int(picked) == detail.priority:
+                return False
+            self.engine.write(task_id, changes={"priority": int(picked)})
+            return True
+        if field == TAGS_FIELD:
+            # 按**集合**比：选项顺序与任务上那一串的顺序不一定一样，而「改了没有」说的是
+            # 挑中的那几个标签变没变，不是它们排在第几个。
+            picked = multi_values(values[TAGS_FIELD])
+            if set(picked) == set(detail.tags):
+                return False
+            self.engine.write(task_id, changes={"tags": list(picked)})
+            return True
+        return False
 
     # ---------------------------------------------------------------- 清单的建 / 改 / 删（#42）
 

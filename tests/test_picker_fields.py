@@ -187,6 +187,22 @@ async def test_a_task_moves_both_ways_between_the_inbox_and_a_real_list(tmp_path
     ], "两次搬运的请求体不是文档那个数组形状"
 
 
+async def test_moving_a_task_to_the_list_it_is_already_in_writes_nothing(tmp_path):
+    """搬去它已经在的那个清单 = **没改**：请求一个都不发，队列也不多一笔。
+
+    凭空入队一笔「同一个清单之间搬」只会让状态栏那个数多一个没有意义的数；服务端那边
+    更没人知道该怎么理解它。
+    """
+    transport = FakeTransport(json=[{"id": "t1", "etag": "e1"}])
+    engine = real_engine(tmp_path, transport)
+
+    engine.move_task("t1", to_list_id="work")
+    await engine.push_pending()
+
+    assert transport.requests == [], f"已经在那个清单里，不该发请求：{transport.requests}"
+    assert engine.status().pending_count == 0, "队列里多了一笔永远不需要的改动"
+
+
 async def test_a_list_the_server_has_not_seen_is_never_offered_as_a_move_target(tmp_path):
     """本地刚建、还没推上去的清单**不**当搬运目标（#53/#54 是同一类）。
 
@@ -731,3 +747,28 @@ def test_the_picker_copy_uses_no_ambiguous_width_glyphs():
         if unicodedata.east_asian_width(char) == "A"
     ]
     assert offenders == [], f"挑选浮层的字里出现了歧义宽度的字形：{offenders}"
+
+
+async def test_a_pick_that_changes_nothing_writes_nothing():
+    """挑回原来那一档 = **没改**：一笔都不写（与逐字段编辑那条规矩同一条）。
+
+    写一笔没发生的改动不是「多带了一笔」：它会进待推送队列（ADR-0002 的豁免代价），
+    离线时状态栏那个数会为一个空操作亮着——用户读到的是「我改了什么还没上去」。
+    """
+    fake = backend()
+    fake.set_tags("工作", "季度", "紧急")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        for key in ("list", "priority", "tags"):
+            await walk_to(pilot, app, key)
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("enter")  # 什么都不挑，直接确认
+            await pilot.pause()
+
+    assert fake.moved == [], f"挑回原清单也搬了一次：{fake.moved}"
+    assert fake.writes == [], f"挑回原来那一档也写了一笔：{fake.writes}"
+    assert fake.pushes == 0, f"没改却推了一轮：{fake.pushes}"

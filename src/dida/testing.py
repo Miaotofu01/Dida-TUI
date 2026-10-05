@@ -585,6 +585,11 @@ class FakeBackend:
         这一票的验收标准。摆了 ``write_error`` 就记完这一笔再抛（与 ``write`` 同一个口子：
         引擎当场拒绝时界面要说得出具体原因）。
         """
+        current = next((task.list_id for task in self.source.tasks() if task.id == task_id), None)
+        if current == to_list_id:
+            # 与真引擎同一条口径（``PushMixin.move_task``）：已经在那个清单里 = 什么都不写。
+            # 不照做的话，替身会记下一笔「搬了」而生产那一条根本没写——接缝一断的就是这句话。
+            return
         self.moved.append((task_id, to_list_id))
         if self.write_error is not None:
             raise self.write_error
