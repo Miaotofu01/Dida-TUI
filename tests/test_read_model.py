@@ -244,8 +244,8 @@ def test_the_detail_reads_repeat_reminders_subtasks_and_unknown_fields():
     """单条任务的详情：标题/描述/备注/清单/截止/优先级/标签 + 只读的重复、提醒、子任务，
     以及原文里**我们不认识**的字段（#33 验收 #8）。
 
-    ``desc`` / ``content`` 只按服务端字段名读，不在这一层下「哪个是描述」的判断：
-    v1 把两者标反了，翻过来是 #43 的事（``GLOSSARY.md`` 说 描述=``content``、备注=``desc``）。
+    ``desc`` / ``content`` 只按服务端字段名读，不在这一层下「哪个是描述」的判断（翻过来是
+    详情页那一层的事，``GLOSSARY.md`` 说 描述=``content``、备注=``desc``；#43 已落地）。
     """
     backend = make_backend()
     backend.add_list("工作", id="work")

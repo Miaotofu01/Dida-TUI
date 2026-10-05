@@ -59,6 +59,7 @@ __all__ = [
     "INBOX_MARK",
     "LIST_MARK",
     "MUTED",
+    "NO_VALUE",
     "OVERDUE",
     "PAN_MS",
     "PENDING",
@@ -241,6 +242,14 @@ ELLIPSIS = "…"
 （词标、状态栏、行尾记号）是宽度风险唯一可以接受的落点。
 """
 
+NO_VALUE = "无"
+"""「这一格没有值」的读法（U+65E0，CJK，两边都量 2 格）。
+
+引擎那边的 ``sync.view.NO_DUE_TEXT`` 是 ``—``（U+2014，东亚**歧义**宽度）：rich 量它 1 格，
+CJK 字体下终端可能画 2 格。详细页是按**屏幕行**算光标与滚动的（``#43``：那一页折行），
+一格之差就是一行之差，所以那一页把没有截止时间的读法换成这个不含糊的汉字。
+"""
+
 SPINNER_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
 """转圈的那些帧（盲文点，全部 EAW=Neutral、1 格）。"""
 
@@ -409,10 +418,92 @@ CursorPage {
     text-wrap: nowrap;
     text-overflow: ellipsis;
 }
+/* 截断与折行**按页分工**（ADR-0007）：上面那条是列表页（裁断），这一条是详细页（换行）。
+   ``fold`` 不是可有可无的：Textual 在换行分支里按 ``text-overflow: fold`` 决定 ``divide_line``
+   的 ``fold`` 参数，而详细页的光标与滚动是按**屏幕行**算的（#43）——留着一个 ``ellipsis``
+   的话，一个比页宽还长的词会被裁掉而不是折下来，量出来的行数与画出来的就不是一回事。 */
+DetailPage #page-body {
+    text-wrap: wrap;
+    text-overflow: fold;
+}
 #cursor-bar {
     width: 100%;
     height: 1;
     visibility: hidden;
+}
+/* 详细页底部那一行：钉在这一页自己的底边上（不是第三个 chrome 行——它跟着这一页走）。
+
+   ``dock: bottom`` 落在**这一页**里，与钉在屏幕底部的状态栏不是同一个容器，所以
+   ADR-0007 里那条「两个 dock: bottom 会互相盖掉、吃掉汉字格」的教训在这里不适用。 */
+#detail-save {
+    dock: bottom;
+    height: 1;
+    width: 100%;
+    background: {page};
+}
+/* 编辑器：平时藏着（进编辑才亮出来），颜色一律走 ANSI 槽位。
+
+   Textual 那两个输入框自带的样式用的是主题变量（surface / boost / border 这几个名字），
+   它们是**真彩色**——不覆盖就等于把「跟随终端主题」在编辑态里丢掉，而且屏幕上看不出来
+   （只有读 SGR 才发现）。所以边框、底色、光标块、选中块全部在这里改写成 ansi_*，
+   内层那几个类名（input--* / text-area--*）也逐一盖掉。 */
+#detail-edit {
+    display: none;
+    height: 1fr;
+    width: 100%;
+    background: {page};
+}
+#detail-edit-label {
+    height: 1;
+    width: 100%;
+    background: {page};
+}
+#detail-input, #detail-text {
+    background: {page};
+    color: ansi_default;
+    border: none;
+    padding: 0;
+    height: 1fr;
+}
+#detail-input {
+    height: 1;
+}
+#detail-input:focus, #detail-text:focus {
+    border: none;
+}
+#detail-input .input--cursor {
+    background: {accent};
+    color: {page};
+    text-style: bold;
+}
+#detail-input .input--selection {
+    background: {accent};
+    color: {page};
+}
+#detail-input .input--placeholder, #detail-input .input--suggestion {
+    color: ansi_default;
+    text-style: dim;
+}
+#detail-text .text-area--cursor {
+    background: {accent};
+    color: {page};
+    text-style: bold;
+}
+#detail-text .text-area--cursor-line {
+    background: {page};
+}
+#detail-text .text-area--selection {
+    background: {accent};
+    color: {page};
+}
+#detail-text .text-area--gutter, #detail-text .text-area--cursor-gutter {
+    color: ansi_default;
+    background: {page};
+    text-style: none;
+}
+#detail-text .text-area--matching-bracket, #detail-text .text-area--suggestion {
+    background: {page};
+    color: ansi_default;
 }
 #status-bar {
     dock: bottom;

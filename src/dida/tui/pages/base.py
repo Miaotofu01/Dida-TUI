@@ -218,36 +218,66 @@ class CursorPage(VerticalScroll):
         if not self._rows:
             self._body().update(theme.styled(self.EMPTY_TEXT, EMPTY_STYLE))
             return
-        width = self._row_width()
         body = Text()
         for index, row in enumerate(self._rows):
             if index:
                 body.append("\n")
-            if row.rule:
-                # 细线**自己铺满整幅页面、齐左**：它不可停光标，所以不参与行首那两格的
-                # 光标空档。带上空档这一行就是 ``width + 2`` 格，正文的 ``nowrap`` +
-                # ``ellipsis`` 会裁掉一格再补一个 ``…``——屏幕上看到的是「缩进两格、以
-                # 省略号收尾的一条线」（实测，每一行细线都是）。
-                body.append(theme.RULE * max(0, width), style=EMPTY_STYLE)
-                continue
-            line = Text()
-            line.append(f"{CURSOR_MARK if self._is_cursor(row) else BLANK_MARK} ")
-            line.append_text(row.text)
-            if self._is_cursor(row):
-                # 光标行 = 强调色 + 字重。层级不靠亮度：用户的槽位 8–15 与 1–6 同值，
-                # 「更亮」买不到任何对比（环境审计 §1a）。
-                line.stylize(theme.SELECTED)
-            body.append_text(line)
+            body.append_text(self._line_text(row))
         self._body().update(body)
+
+    def _line_text(self, row: Row) -> Text:
+        """一个 Row 画在正文里的那一行（正文与「它占几屏行」用的是同一份文字）。
+
+        ``#43`` 之后这件事有了第二个读者：详细页按这一行算出它折成几屏行（:meth:`_row_lines`）。
+        两处各拼一遍的话，量出来的行数迟早与画出来的不一样——而那正是光标与滚动要用的数。
+        """
+        if row.rule:
+            # 细线**自己铺满整幅页面、齐左**：它不可停光标，所以不参与行首那两格的
+            # 光标空档。带上空档这一行就是 ``width + 2`` 格，正文的 ``nowrap`` +
+            # ``ellipsis`` 会裁掉一格再补一个 ``…``——屏幕上看到的是「缩进两格、以
+            # 省略号收尾的一条线」（实测，每一行细线都是）。
+            return theme.styled(theme.RULE * max(0, self._row_width()), EMPTY_STYLE)
+        line = Text()
+        line.append(f"{CURSOR_MARK if self._is_cursor(row) else BLANK_MARK} ")
+        line.append_text(row.text)
+        if self._is_cursor(row):
+            # 光标行 = 强调色 + 字重。层级不靠亮度：用户的槽位 8–15 与 1–6 同值，
+            # 「更亮」买不到任何对比（环境审计 §1a）。
+            line.stylize(theme.SELECTED)
+        return line
 
     def _is_cursor(self, row: Row) -> bool:
         return row.id is not None and row.id == self._selected_id
 
-    def _line_of_cursor(self) -> int:
-        """光标那一行画在这一块文本的第几行上。"""
+    def _row_lines(self) -> tuple[int, ...]:
+        """每个 Row 占几**屏行**。
+
+        列表页恒为 1：那里的行裁断不折行（:attr:`CLIP_ROWS`），所以「第几个 Row」就是「第几
+        屏行」。**详细页是另一半**：它的字段行是折行块，所以它盖掉这一个钩子，按 rich 的
+        ``divide_line`` 现算（#43）。
+        """
+        return (1,) * len(self._rows)
+
+    def _total_lines(self) -> int:
+        """正文一共几屏行——装饰条就排在它下面（:meth:`watch_bar_pos`）。"""
+        return sum(self._row_lines())
+
+    def _cursor_lines(self) -> int:
+        """光标那个 Row 占几屏行（一张折行块可能有五六行）。"""
+        lines = self._row_lines()
         for index, row in enumerate(self._rows):
             if self._is_cursor(row):
-                return index
+                return lines[index]
+        return 1
+
+    def _line_of_cursor(self) -> int:
+        """光标那一行画在这一块文本的第几**屏行**上（前缀和，不是行号）。"""
+        line = 0
+        lines = self._row_lines()
+        for index, row in enumerate(self._rows):
+            if self._is_cursor(row):
+                return line
+            line += lines[index]
         return 0
 
     def on_resize(self) -> None:
@@ -258,8 +288,12 @@ class CursorPage(VerticalScroll):
     # ---------------------------------------------------------------- 会追赶的装饰光标条
 
     def watch_bar_pos(self, value: float) -> None:
-        """装饰条的位置变了（滑动期间是小数）：把它挪到那一屏行上。"""
-        self._bar().styles.offset = Offset(0, int(round(value)) - len(self._rows))
+        """装饰条的位置变了（滑动期间是小数）：把它挪到那一**屏行**上。
+
+        条子排在正文**后面**（DOM 顺序），所以它的落位本来就是「正文有多高」——正文折行之后
+        那是 ``_total_lines()``，不是 ``len(self._rows)``。
+        """
+        self._bar().styles.offset = Offset(0, int(round(value)) - self._total_lines())
 
     def _flash_bar(self, from_line: int) -> None:
         """选中已经落地，装饰条**从旧位置**追上来（追到了就自己退场）。
@@ -294,21 +328,38 @@ class CursorPage(VerticalScroll):
         bar.update(Text(""))
 
     def scroll_cursor_into_view(self) -> None:
-        """让光标行留在可见区里（清单比一屏长时这一步就是「能滚动」）。
+        """让光标那一段留在可见区里（清单比一屏长时这一步就是「能滚动」）。
 
         不在屏上的那一页与还没量过尺寸的那一帧都跳过：那时 ``size`` 是 0，按它算出来的
         偏移毫无意义，还会在切回来的时候留下一屏错位。``esc`` 回来时由外层再叫一次
         （:meth:`dida.tui.app.DidaApp._show`）——光标不只是「还在那一行」，还得看得见。
 
-        「一行 = 一屏一行」是这里算得准的前提：列表页的行不折行（:attr:`CLIP_ROWS`），
-        所以第几个 Row 就是第几屏行。
+        滚的是**屏行**：列表页一行就是一屏行（:attr:`CLIP_ROWS`），详细页一个字段是一张
+        折行块（#43）——那里「第几个字段」与「第几屏行」是两件事，按行号滚会停在半路。
+        一块比一屏还高的（一段很长的描述）两头不能兼顾，那就让它的**头**留在屏上：标签与
+        ``❯`` 比正文最后一行值钱。
         """
         if not self._rows or not self.display or self.size.height <= 0:
             return
-        line = self._line_of_cursor()
+        first = self._line_of_cursor()
+        last = first + self._cursor_lines() - 1
         top = self.scroll_offset.y
-        height = max(1, self.size.height)
-        if line < top:
-            self.scroll_to(y=line, animate=False)
-        elif line >= top + height:
-            self.scroll_to(y=line - height + 1, animate=False)
+        height = self._viewport_height()
+        if first < top:
+            self.scroll_to(y=first, animate=False)
+        elif last >= top + height:
+            self.scroll_to(y=min(first, last - height + 1), animate=False)
+
+    def _viewport_height(self) -> int:
+        """正文真正能占的那几**行**：这一页自己的高度，减去钉在上下两边的那些。
+
+        详细页底部常驻那一行是 ``dock: bottom``（不随正文滚动，见 ``#detail-save``），可它
+        占掉的是一行**看得见**的高度：不减掉它，:meth:`scroll_cursor_into_view` 会把光标那
+        一段滚到那一行背后——屏幕上就是「光标不见了」。
+        """
+        docked = sum(
+            child.size.height
+            for child in self.children
+            if child.styles.dock in ("top", "bottom")
+        )
+        return max(1, self.size.height - docked)
