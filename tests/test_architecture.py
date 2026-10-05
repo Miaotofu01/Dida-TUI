@@ -1,4 +1,4 @@
-"""架构不变量：七个模块的边界，以及 TUI 的依赖方向。
+"""架构不变量：七个模块的边界，TUI 的依赖方向，以及「只用终端 16 色」。
 
 TUI 的规矩写成**允许表**，不是黑名单：``src/dida/tui/**`` 只许 import ``dida.sync.engine``
 （它唯一的读写入出口）与 ``dida.tui.*`` 自己这一支，``dida`` 命名空间里别的任何东西都算越界。
@@ -12,11 +12,15 @@ TUI 的规矩写成**允许表**，不是黑名单：``src/dida/tui/**`` 只许 
 
 import ast
 import importlib
+import re
 from pathlib import Path
 
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
+
+HEX_COLOUR = re.compile(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{8}|[0-9a-fA-F]{3})(?![0-9a-fA-F])")
+"""颜色字面量：``#rrggbb`` / ``#rrggbbaa`` / ``#rgb``（不是照抄实现——这是终端那条规矩的形状）。"""
 
 SEVEN_MODULES = [
     "dida.config",  # 配置与凭据
@@ -24,7 +28,7 @@ SEVEN_MODULES = [
     "dida.storage.store",  # 本地存储
     "dida.sync.engine",  # 同步引擎
     "dida.logical_day",  # 逻辑日
-    "dida.date_parser",  # 日期解析器
+    "dida.date_parser",  # 日期解析器：#34 删它的时候这一行也要一起删（见 #32 的收尾说明）
     "dida.tui.app",  # TUI
 ]
 
@@ -173,3 +177,19 @@ def test_the_guard_lets_the_engine_and_the_tui_itself_through():
 def test_the_guard_catches_every_way_into_a_module_outside_the_table(source):
     """表外的一切都算违规——包括同一支下面那些没被点名的模块（``dida.sync.view``）。"""
     assert _violations(source, package="dida.tui")
+
+
+def test_the_tui_never_hardcodes_a_hex_colour():
+    """只用终端 16 色：源码里不许出现 ``#rrggbb`` 之类的颜色字面量。
+
+    颜色字面量写死之后，浅色主题、``NO_COLOR``、以及不是 24 位的终端上那一行就糊了。
+    这条规矩扫的是**源码文本**，与渲染出来的屏幕无关，所以它和上面那些边界测试住在一起
+    （原本钉在 ``test_app_view.py`` 里，#32 搬出来的——那是纯模块边界的房客）。
+    """
+    offenders = [
+        str(path.relative_to(ROOT))
+        for path in sorted((ROOT / "src" / "dida" / "tui").rglob("*.py"))
+        if HEX_COLOUR.search(path.read_text(encoding="utf-8"))
+    ]
+
+    assert offenders == []
