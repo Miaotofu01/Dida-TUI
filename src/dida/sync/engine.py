@@ -32,7 +32,6 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
-from enum import Enum
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_checkable
 from uuid import uuid4
 
@@ -69,10 +68,10 @@ from dida.sync.view import (
     subtask_items,
     summarize_lists,
 )
+from dida.sync.writes import WriteKind  # 与存储共用一份词表（t32）；这里只是转出去给 TUI
 
 if TYPE_CHECKING:  # 只为了标注：storage 反过来 import dida.sync.view，运行时不能在这里 import
     from dida.storage.store import (
-        ChangeKind,
         PendingChange,
         RefreshReport,
         StoredSyncState,
@@ -166,29 +165,6 @@ class SyncStatus:
 
     logical_day: date | None = None
     """当前逻辑日（t04 提供纯函数，t09 接入）。"""
-
-
-class WriteKind(Enum):
-    """一次乐观写的种类；值与存储层的 ``ChangeKind`` 一一对应（见 :func:`_storage_kind`）。
-
-    引擎有自己的这一份词汇，是因为 TUI 只 import ``dida.sync.engine``，而 ``ChangeKind``
-    住在存储层；至于为什么不在模块顶层直接 import 它，:func:`_storage_kind` 里写了。
-    :meth:`SyncEngine.write` 只服务**已有任务**的改 / 完成 / 删；新建走
-    :meth:`SyncEngine.create`，它的本地效果是「凭空多出一条任务」，与那三条盖字段的路径
-    不是一回事。
-    """
-
-    CREATE = "create"
-    """新建：本地先造一条（临时 id），推送走 ``POST /open/v1/task``（t15）。"""
-
-    UPDATE = "update"
-    """改字段：把 ``changes`` 推给 ``POST /open/v1/task/{taskId}``。"""
-
-    COMPLETE = "complete"
-    """完成：本地立刻标记完成，推送走 ``POST .../task/{taskId}/complete``（无请求体）。"""
-
-    DELETE = "delete"
-    """删除：本地立刻摘掉快照，推送走 ``DELETE .../task/{taskId}``。"""
 
 
 @runtime_checkable
@@ -374,7 +350,7 @@ class WriteTarget(ViewSource, Protocol):
         self,
         *,
         task_id: str,
-        kind: ChangeKind,
+        kind: WriteKind,
         payload: Mapping[str, Any],
         now: datetime,
         list_id: str | None = None,
@@ -586,7 +562,7 @@ class SyncEngine:
             raise UnknownTaskError(task_id)
         target.enqueue(
             task_id=task_id,
-            kind=_storage_kind(kind),
+            kind=kind,
             payload=self._local_effect(kind, changes),
             now=self._clock.now(),
         )
@@ -666,10 +642,12 @@ class SyncEngine:
         task.add_done_callback(self._inflight.discard)
 
     async def _send(self, writer: TaskWriter, target: WriteTarget, change: PendingChange) -> None:
-        """把一条待推送改动交给客户端。失败是结构化错误，照旧往外抛（由调用方退避）。"""
-        from dida.storage.store import ChangeKind  # 延迟 import，理由见 _storage_kind
+        """把一条待推送改动交给客户端。失败是结构化错误，照旧往外抛（由调用方退避）。
 
-        if change.kind is ChangeKind.UPDATE:
+        ``kind`` 是引擎与存储共用的那一套词汇（:mod:`dida.sync.writes`），所以这里不需要
+        再 import 存储层：判断用哪一个端点，与「改动存在哪里」无关。
+        """
+        if change.kind is WriteKind.UPDATE:
             await writer.update_task(
                 change.list_id,
                 change.task_id,
@@ -677,11 +655,11 @@ class SyncEngine:
                 # 底稿是本地那份完整原文：不认识的字段靠它才能一个不丢地回写。
                 snapshot=target.task_payload(change.task_id),
             )
-        elif change.kind is ChangeKind.COMPLETE:
+        elif change.kind is WriteKind.COMPLETE:
             await writer.complete_task(change.list_id, change.task_id)
-        elif change.kind is ChangeKind.DELETE:
+        elif change.kind is WriteKind.DELETE:
             await writer.delete_task(change.list_id, change.task_id)
-        elif change.kind is ChangeKind.CREATE:
+        elif change.kind is WriteKind.CREATE:
             # 新建才知道服务端给的 id，所以这一条推成功之后要顺手认领它（t15）。
             self._adopt_created(target, change, await writer.create_task(change.payload))
         else:
@@ -904,7 +882,7 @@ class SyncEngine:
         local_id = _local_task_id()
         target.enqueue(
             task_id=local_id,
-            kind=_storage_kind(WriteKind.CREATE),
+            kind=WriteKind.CREATE,
             payload=_create_payload(
                 title,
                 due=due,
@@ -1028,18 +1006,6 @@ def _is_due(change: PendingChange, now: datetime) -> bool:
     「到点」是 ``<=``：注入的钟刚好走到 ``next_retry_at`` 时就算到期。
     """
     return change.next_retry_at is None or change.next_retry_at <= now
-
-
-def _storage_kind(kind: WriteKind) -> ChangeKind:
-    """引擎的写词汇 → 存储层的改动种类。
-
-    **必须延迟 import**：``dida.storage.store`` 在模块级 import 了 ``dida.sync.view``，
-    而 import 子模块会先跑父包的 ``__init__``（那里 import 了本模块）——顶层互相 import
-    时总有一方拿到半成品模块，先 import 存储的那条路径直接 ImportError。
-    """
-    from dida.storage.store import ChangeKind
-
-    return ChangeKind(kind.value)
 
 
 def _completed_status() -> int:

@@ -38,11 +38,19 @@ import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime
-from enum import Enum
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
 from dida.sync.view import INBOX_ID, ListSnapshot, SyncState, TaskSnapshot
+from dida.sync.writes import WriteKind
+
+ChangeKind = WriteKind
+"""改动种类：对应 API 的四个写操作（新建 / 更新 / 完成 / 删除）。
+
+**别名，不是第二份定义**（t32）：词表住在 :mod:`dida.sync.writes`，引擎的 ``WriteKind`` 与
+这里的 ``ChangeKind`` 是同一个枚举。以前这里另写了一份成员一字不差的枚举，于是新增一种写
+要在两处各改一次——两层现在只剩一个来源。``ChangeKind`` 这个名字留着是因为「待推送改动的
+种类」在存储层读起来顺，指的还是同一个对象。"""
 
 COMPLETED_STATUS = 2
 """任务「已完成」的 ``status`` 值（api-contracts.md：Completed 是 2，不是 1）。"""
@@ -82,15 +90,6 @@ CREATE TABLE IF NOT EXISTS sync_state (
     logical_day      TEXT
 );
 """
-
-
-class ChangeKind(Enum):
-    """改动种类：对应 API 的四个写操作（新建 / 更新 / 完成 / 删除）。"""
-
-    CREATE = "create"
-    UPDATE = "update"
-    COMPLETE = "complete"
-    DELETE = "delete"
 
 
 @dataclass(frozen=True)
