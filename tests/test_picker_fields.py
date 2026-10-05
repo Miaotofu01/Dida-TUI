@@ -23,12 +23,17 @@ from dida.api.errors import DidaError, MalformedResponseError
 from dida.storage.store import Store
 from dida.sync.engine import SyncEngine
 from dida.testing import FakeBackend, FakeTransport, ManualClock
+from dida.tui import messages, theme
+from dida.tui.app import DidaApp
+from support import screen_sgr, screen_text
 
 TZ = timezone(timedelta(hours=8))
 T0 = datetime(2026, 3, 14, 12, 3, tzinfo=TZ)
 WIDE = (100, 30)
 
 TITLE = "交季度报告"
+CONTENT = "记得附上上周的对比数据"
+DESC = "先问一下财务再发"
 
 
 # ------------------------------------------------------------------ 接缝二：搬运的请求形状
@@ -246,3 +251,137 @@ async def test_a_tag_already_on_a_cached_task_stays_pickable_when_the_list_canno
 
     assert "连不上服务器" in str(caught.value)
     assert engine.tags() == ("季度",)
+
+
+# ------------------------------------------------------------------ 接缝一：三个挑选浮层
+
+
+def backend() -> FakeBackend:
+    """一份够用的缓存：两个清单、一条在「工作」里、带优先级与两个标签的任务。"""
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_list("生活", id="life")
+    fake.add_task(
+        TITLE,
+        list_name="work",
+        id="t1",
+        due=T0.replace(hour=18, minute=0),
+        priority=5,
+        content=CONTENT,
+        desc=DESC,
+        tags=("工作", "季度"),
+    )
+    return fake
+
+
+def field_row(text: str, label: str) -> str:
+    """字段列表里 ``label`` 那一行（行首那两格是光标记号，所以从第三格认起）。"""
+    for line in text.splitlines():
+        if line[2:].startswith(label):
+            return line
+    raise AssertionError(f"字段列表里没有「{label}」那一行：\n{text}")
+
+
+async def enter_detail(pilot, app: DidaApp) -> None:
+    """走进「工作」清单的第一条任务的详细页，光标停在标题那一格上。"""
+    for _ in range(20):
+        if app.index_page().selected_id == "work":
+            break
+        await pilot.press("j")
+    await pilot.press("enter")
+    await pilot.pause()
+    await pilot.press("enter")
+    await pilot.pause()
+
+
+async def walk_to(pilot, app: DidaApp, key: str) -> None:
+    """把详细页的光标走到某一格上（``j`` 一次一个字段）。"""
+    for _ in range(20):
+        if app.detail_page().selected_id == key:
+            return
+        await pilot.press("j")
+    raise AssertionError(f"光标没能走到 {key} 上，停在 {app.detail_page().selected_id}")
+
+
+async def test_the_list_field_offers_my_lists_and_moving_really_moves_the_task():
+    """``enter`` 落在「清单」上开挑选浮层，挑一个 → 任务**真的搬过去**（验收标准 1）。
+
+    屏幕上两头都断：字段列表里那一行换成了新清单名，而写出去的是**搬运**（``fake.moved``），
+    不是一次普通字段更新（``fake.writes`` 里一笔都不该有）。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "list")
+        await pilot.press("enter")
+        await pilot.pause()
+        picker = screen_text(app)
+        await pilot.press("right")  # 工作 → 生活（选项顺序就是引擎给的清单索引）
+        await pilot.pause()
+        picked = screen_text(app)
+        await pilot.press("enter")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert "搬到哪个清单" in picker, f"开出来的不是挑选浮层：\n{picker}"
+    assert "< 工作 >" in picker, f"挑选器没有停在当前清单上：\n{picker}"
+    assert "< 生活 >" in picked, f"右方向键没有换到另一个清单：\n{picked}"
+    assert fake.moved == [("t1", "life")], f"任务没有搬过去：{fake.moved}"
+    assert fake.writes == [], f"搬运不该走普通字段更新：{fake.writes}"
+    assert "生活" in field_row(after, "清单"), f"搬完那一格还写着原清单：\n{after}"
+
+
+async def test_the_inbox_is_offered_as_a_move_target_too():
+    """收集箱也在可选里（验收标准 3 的一半：真实清单 → 收集箱）。
+
+    收集箱那一行是客户端自己补的，它的 id 是服务端返回的那一串（不是字面量 ``inbox``）；
+    挑选器给的就是引擎 ``move_targets()`` 那一份，所以这里搬过去发的是那个 id。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "list")
+        await pilot.press("enter")
+        await pilot.pause()
+        picker = screen_text(app)
+        await pilot.press("left")  # 工作 → 收集箱（收集箱置顶）
+        await pilot.pause()
+        picked = screen_text(app)
+        await pilot.press("enter")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert "< 工作 >" in picker, f"挑选器没有停在当前清单上：\n{picker}"
+    assert "< 收集箱 >" in picked, f"左方向键没有换到收集箱：\n{picked}"
+    assert fake.moved == [("t1", "inbox")], f"没有搬进收集箱：{fake.moved}"
+    assert "收集箱" in field_row(after, "清单"), f"搬完那一格没变：\n{after}"
+
+
+async def test_escape_closes_the_picker_without_writing_anything():
+    """``esc`` 关掉挑选浮层：一个字节都不写（与表单那条规矩同一条）。
+
+    出口必须是 ``Esc``：这一层没有文本框，``q`` 在表单里本来就不绑（#42 的决定，继承不重定）。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "list")
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("right")
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert fake.moved == [] and fake.writes == [], "取消不该写任何东西"
+    assert "搬到哪个清单" not in text, f"浮层没有关掉：\n{text}"
+    assert field_row(text, "清单").startswith(theme.CURSOR_MARK), f"没有回到字段列表：\n{text}"

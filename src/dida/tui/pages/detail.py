@@ -18,6 +18,7 @@ spec 的三层状态机里，任务列表页 ``enter`` 进这一页、``esc`` �
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Sequence
 
 from rich._wrap import divide_line
 from rich.text import Text
@@ -26,12 +27,22 @@ from textual.containers import Vertical
 from textual.message import Message
 from textual.widgets import Input, Static, TextArea
 
-from dida.sync.engine import TaskDetail
+from dida.sync.engine import ListRow, TaskDetail
 from dida.tui import messages, theme
 from dida.tui.keys import LAYER_DETAIL, bindings_for
+from dida.tui.overlays import FORM_HINT, FormField, FormOption
 from dida.tui.pages.base import EMPTY_STYLE, CursorPage, Row, empty_row, rule_row
 
-__all__ = ["DetailPage", "Field", "field_line", "fields_of", "read_only_rows"]
+__all__ = [
+    "DetailPage",
+    "Field",
+    "Picker",
+    "field_line",
+    "fields_of",
+    "list_picker",
+    "picker_spec",
+    "read_only_rows",
+]
 
 SUBTASK_DONE_MARK = theme.SUBTASK_DONE_MARK
 SUBTASK_TODO_MARK = theme.SUBTASK_TODO_MARK
@@ -64,6 +75,14 @@ class Field:
     wire: str | None = None
     multiline: bool = False
     """编辑它时用多行输入（描述与备注是多行文本，标题是单行）。"""
+
+    picker: bool = False
+    """这一格是**挑选型**的（工单 #45）：``enter`` 开一个挑选浮层，不是进文本编辑器。
+
+    三个挑选型字段（清单 / 优先级 / 标签）的选项要引擎的数据才拼得出来，所以这一页不自己
+    开浮层——它只把「哪条任务、哪一格」说出去（:class:`DetailPage.PickRequested`），由 app
+    把选项凑齐再开那张共用的 :class:`~dida.tui.overlays.FormOverlay`。
+    """
 
 
 def field_line(label: str, value: str, *, style: str = "") -> Text:
@@ -104,7 +123,7 @@ def fields_of(detail: TaskDetail) -> tuple[Field, ...]:
         _free_text("title", "标题", detail.title, wire="title", multiline=False),
         _free_text("content", "描述", detail.content, wire="content", multiline=True),
         _free_text("desc", "备注", detail.desc, wire="desc", multiline=True),
-        Field("list", "清单", value=detail.list_name, display=detail.list_name),
+        Field("list", "清单", value=detail.list_name, display=detail.list_name, picker=True),
         Field(
             "due",
             "截止",
@@ -120,6 +139,67 @@ def fields_of(detail: TaskDetail) -> tuple[Field, ...]:
         ),
         Field("tags", "标签", value=detail.tags_text, display=detail.tags_text or messages.EMPTY_FIELD_TEXT),
     )
+
+
+LIST_FIELD = "list"
+PRIORITY_FIELD = "priority"
+TAGS_FIELD = "tags"
+"""三个挑选型字段在 ``{字段名: 值}`` 里的键（就是字段注册表里那几个 ``key``）。"""
+
+
+@dataclass(frozen=True)
+class Picker:
+    """一张挑选浮层要开成什么样（工单 #45）：顶上那一行、几格、底下那行提示。
+
+    字段与提示由这一页给（它才知道「清单」这一格该画什么），开浮层与写回去由 app 管
+    （那一层才认识引擎）。所以这里传的是一份**成品**，app 拿去直接 ``push_screen``。
+    """
+
+    title: str
+    fields: tuple[FormField, ...]
+    hint: str = FORM_HINT
+
+
+def list_picker(detail: TaskDetail, lists: Sequence[ListRow]) -> tuple[FormField, ...]:
+    """「清单」那一格：从**能搬进去**的清单里挑一个（工单 #45）。
+
+    ``lists`` 是引擎的 ``move_targets()``：真实清单、进得去、**服务端已经见过**的那些
+    （本地刚建还没推上去的清单不能当搬运目标，理由写在那一处）。选项的值是清单 id、
+    标签是清单名——写回去的是 id，屏幕上看到的是名字。
+
+    当前所在的那一行如果不在这一份里（只读清单、备注清单、或者远端刚删掉），**补在最前面**：
+    不补的话 ``ChoiceField`` 会把那个认不出来的值原样加成一档，用户看到的是自己现在在哪
+    都认不出来（那一档的标签就是清单 id）。补上之后「挑它自己」是一次空操作（引擎不写），
+    所以它不会把任务搬去一个搬不进去的地方。
+    """
+    options = [FormOption(row.id, row.name) for row in lists]
+    if not any(option.value == detail.list_id for option in options):
+        options.insert(0, FormOption(detail.list_id, detail.list_name))
+    return (
+        FormField(
+            name=LIST_FIELD,
+            label="清单",
+            options=tuple(options),
+            value=detail.list_id,
+        ),
+    )
+
+
+def picker_spec(
+    key: str,
+    detail: TaskDetail,
+    *,
+    lists: Sequence[ListRow] = (),
+    tags: Sequence[str] = (),
+) -> Picker | None:
+    """哪一格开哪一张挑选浮层（``key`` 是字段注册表里的 ``key``）。
+
+    认不出来的 ``key`` 给 ``None``（什么都不开）：这一页只认识自己那几格，别人传错名字时
+    静默什么都不做，比开一张空浮层好。
+    """
+    if key == "list":
+        return Picker("搬到哪个清单", list_picker(detail, lists))
+    return None
 
 
 def _screen_lines(text: str, width: int) -> int:
@@ -201,6 +281,19 @@ class DetailPage(CursorPage):
             self.task_id = task_id
             self.field = field
             self.value = value
+            super().__init__()
+
+    class PickRequested(Message):
+        """用户按了 ``enter``（挑选型字段上）：要挑一个新的值（工单 #45）。
+
+        这一页**不开浮层**：清单要引擎的清单索引、标签要引擎那份名单，页面不认识引擎。
+        它只把「哪条任务、哪一格」说清楚，由 app 把选项凑齐再开那张共用的表单浮层
+        （与 ``FieldEdited`` 同一条分工：页面说事实，认识引擎的是 app）。
+        """
+
+        def __init__(self, task_id: str, field: str) -> None:
+            self.task_id = task_id
+            self.field = field
             super().__init__()
 
     def __init__(self, *, id: str | None = None) -> None:
@@ -296,14 +389,21 @@ class DetailPage(CursorPage):
     def action_enter(self) -> None:
         """``enter``：进当前字段的编辑（验收标准 3）。
 
-        只有三个自由文本字段有编辑器（:attr:`Field.wire`）；截止时间与那三个挑选型字段今天
-        什么都不做——**接缝留给 #44 / #45**：它们给 ``Field.wire`` 填上值、在这里接一个编辑
-        器，光标、折行、保存行都不必再动。编辑态下这个键归编辑器自己（多行框里它是换行）。
+        两种字段两种走法：**挑选型**的三格（清单 / 优先级 / 标签，工单 #45）把「要挑」说给
+        app（它才认识引擎），三个**自由文本**字段（:attr:`Field.wire`）进这一页自己的编辑器；
+        剩下 ``wire`` 与 ``picker`` 都没有的（截止时间，归 #44）今天什么都不做。
+        编辑态下这个键归编辑器自己（多行框里它是换行）。
         """
         if self._editing is not None:
             return
         field = self._current_field()
-        if field is None or field.wire is None:
+        if field is None:
+            return
+        if field.picker:
+            if self._task_id is not None:
+                self.post_message(self.PickRequested(self._task_id, field.key))
+            return
+        if field.wire is None:
             return
         self._begin_edit(field)
 

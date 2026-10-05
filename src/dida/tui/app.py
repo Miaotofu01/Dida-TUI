@@ -58,6 +58,7 @@ from dida.tui.keys import (
 )
 from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay
 from dida.tui.pages import DetailPage, IndexPage, TasksPage
+from dida.tui.pages.detail import LIST_FIELD, picker_spec
 from dida.tui.pages.index import (
     LIST_COLOR_FIELD,
     LIST_NAME_FIELD,
@@ -516,6 +517,73 @@ class DidaApp(App[None]):
         if not self.is_running:
             return
         self.refresh_view()
+
+    # ---------------------------------------------------------------- 挑选型字段（#45）
+
+    async def on_detail_page_pick_requested(self, event: DetailPage.PickRequested) -> None:
+        """``enter`` 落在挑选型字段上：把选项凑齐，开那张**共用的**表单浮层（工单 #45）。
+
+        三格的选项各有各的来源，都在引擎那一侧：清单是 ``move_targets()``（真实清单、
+        进得去、服务端已经见过的那些），优先级是 ``messages.PRIORITY_NAMES`` 那张表，
+        标签是 ``tags()``。标签那一份还要**拉一次**（``load_tags``，``GET /open/v1/tag``）
+        ——那是这一格里唯一一次网络调用，所以拉不到时照旧开浮层（本地已知的那些照样挑得动），
+        只把「没拉到」如实写在状态栏上。
+        """
+        detail = self.engine.task_detail(event.task_id)
+        if detail is None:
+            return
+        spec = picker_spec(
+            event.field,
+            detail,
+            lists=self.engine.move_targets(),
+            tags=self.engine.tags(),
+        )
+        if spec is None:
+            return
+        self.push_screen(
+            FormOverlay(title=spec.title, fields=spec.fields, hint=spec.hint),
+            partial(self._finish_pick, event.task_id, event.field),
+        )
+
+    async def _finish_pick(
+        self, task_id: str, field: str, values: dict[str, str] | None
+    ) -> None:
+        """挑选浮层关掉了：``None`` 是取消（一个字节都不写），否则按挑的那一份写出去。
+
+        三条路各自走该走的端点——**搬运不是一次普通字段更新**（``move_task``），优先级与
+        标签是普通更新（整份底稿带回去那件事由 ``update_task`` 的 ``snapshot=`` 管，
+        ``merge_snapshot`` 的既有策略）。写完照旧立刻推一轮、重画、把结果留在底部那一行：
+        与逐字段编辑（``on_detail_page_field_edited``）同一条规矩（验收标准 7）。
+        """
+        if values is None:
+            return
+        try:
+            self._apply_pick(task_id, field, values)
+        except UnknownTaskError:
+            self.refresh_view()
+            if self.is_running:
+                self.detail_page().show_save(messages.UNKNOWN_TASK_MESSAGE)
+            return
+        except DidaError as exc:
+            self.refresh_view()
+            if not self.is_running:
+                return
+            self.detail_page().show_save(messages.field_save_failed_message(exc))
+            return
+        await self.engine.push_pending()
+        if not self.is_running:
+            return
+        self.refresh_view()
+
+    def _apply_pick(self, task_id: str, field: str, values: dict[str, str]) -> None:
+        """挑完的那一份怎么变成一次写（三条路各自的形状只在这一个地方）。
+
+        ``int(...)`` 那一下是**线上编码**：选项的值是 ``0/1/3/5``，标签是用户语言
+        （``messages.PRIORITY_NAMES``，唯一一张表）。表外的值不该出现（选项就是从那张表
+        生成的），认不出来就当没挑——不替服务端猜一个档位。
+        """
+        if field == LIST_FIELD:
+            self.engine.move_task(task_id, to_list_id=values[LIST_FIELD])
 
     # ---------------------------------------------------------------- 清单的建 / 改 / 删（#42）
 
