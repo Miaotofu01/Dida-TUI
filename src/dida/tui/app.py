@@ -28,6 +28,7 @@ TUI 只通过 :class:`~dida.sync.engine.Engine` 读写；分组、计数、逾�
 
 from __future__ import annotations
 
+import os
 from typing import TYPE_CHECKING, Callable, Sequence
 
 from rich.text import Text
@@ -173,7 +174,7 @@ class DidaApp(App[None]):
         open_url: Callable[[str], bool] = open_in_browser,
         refresh_on_start: bool = False,
         push_tick_seconds: float | None = None,
-        animations: str = "auto",
+        animations: str | None = None,
     ) -> None:
         """``open_url`` 是**注入**的浏览器开手（工单 #19）。
 
@@ -190,8 +191,9 @@ class DidaApp(App[None]):
         会把每个 ``ansi_*`` 改写成 Monokai 的真彩色（``ansi_cyan`` → ``#58D1EB``），用户的
         调色板一眼都用不上；打开之后同一条 CSS 发出的是 ``\\x1b[36m``，由终端说了算。
 
-        ``animations`` 是 ``auto|on|off`` 开关（ADR-0007 三），默认 ``auto``：ssh 与低能力
-        终端上自动关掉。关掉时换层不滑、光标条不飞，屏幕一步到位。
+        ``animations`` 是 ``auto|on|off`` 开关（ADR-0007 三）。不给就走 ``DIDA_ANIM``，
+        再不给就是 ``auto``：ssh 与低能力终端上自动关掉。关掉时换层不滑、光标条不飞，
+        屏幕一步到位。
         """
         super().__init__(ansi_color=True)
         self.engine = engine
@@ -213,7 +215,7 @@ class DidaApp(App[None]):
         """当前容器（清单或视图）的**名字**——顶栏那段路径要写它。"""
         self._detail_title: str | None = None
         """详细页那条任务的标题——路径的最后一段写它。"""
-        self._animations = animations
+        self._animations = animations or theme.animations_setting(os.environ)
         self._animate = False
         """这一台机器上到底动不动（``on_mount`` 里按开关与环境定一次）。"""
         self._announce_sync = False

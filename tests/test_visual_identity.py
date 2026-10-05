@@ -271,6 +271,42 @@ async def test_animations_off_switches_layers_in_one_frame():
     assert settled == 0, "换层之后直接对齐在那一页上"
 
 
+async def test_the_animations_switch_is_reachable_from_the_environment(monkeypatch):
+    """``DIDA_ANIM=on|off``：用户按得动这一个开关（默认 ``auto``）。
+
+    两个 app 只差这一个环境变量，其余一模一样——一个中途有一帧没对齐（它真的在滑），
+    另一个每一帧都对齐（它一步到位）。
+    """
+    monkeypatch.setenv("TERM", "xterm-kitty")
+    monkeypatch.delenv("SSH_CONNECTION", raising=False)
+
+    async def frames_for(mode: str) -> list:
+        monkeypatch.setenv("DIDA_ANIM", mode)
+        app = DidaApp(backend())
+
+        def offset(text: str) -> int | None:
+            for line in lines(text):
+                if "写周报" in line:
+                    return len(line) - len(line.lstrip())
+            return None
+
+        async with app.run_test(size=WIDE) as pilot:
+            await pilot.pause()
+            for _ in range(20):
+                if app.index_page().selected_id == "work":
+                    break
+                await pilot.press("j")
+            return await sample_while(
+                lambda: pilot.press("enter"), lambda: offset(screen_text(app))
+            )
+
+    moving = await frames_for("on")
+    still = await frames_for("off")
+
+    assert any(one and one > 0 for one in moving), f"DIDA_ANIM=on 应该真的在滑：{moving}"
+    assert all(one in (None, 0) for one in still), f"DIDA_ANIM=off 不该有中间帧：{still}"
+
+
 def test_the_switch_resolves_auto_off_for_remote_and_dumb_terminals():
     """``auto``：ssh / 低能力终端上不动（动效在慢链路上只是延迟）。"""
     assert theme.animations_enabled("auto", {"TERM": "xterm-kitty"}) is True

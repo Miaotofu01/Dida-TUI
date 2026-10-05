@@ -73,6 +73,7 @@ __all__ = [
     "SURFACE",
     "WORDMARK_ICON",
     "animations_enabled",
+    "animations_setting",
     "app_css",
     "clip",
     "overlay_css",
@@ -265,6 +266,17 @@ SPINNER_DELAY_MS = 300
 
 ANIMATIONS_MODES: Final = ("auto", "on", "off")
 """``animations`` 开关的三个档；默认 ``auto``。"""
+
+
+def animations_setting(env: Mapping[str, str] | None = None) -> str:
+    """``DIDA_ANIM`` 里那个档位（原型用的就是这个环境变量）；不认识的值一律当 ``auto``。
+
+    用户**按得动**的开关就是它：``DIDA_ANIM=off dida`` 在 ssh 里一点都不动。
+    （落进 ``config.toml`` 是另一件事：那个文件放着 token，谁动它谁负责——本票不碰。）
+    """
+    environ = os.environ if env is None else env
+    value = (environ.get("DIDA_ANIM") or "auto").strip().lower()
+    return value if value in ANIMATIONS_MODES else "auto"
 
 
 def animations_enabled(mode: str, env: Mapping[str, str] | None = None) -> bool:
