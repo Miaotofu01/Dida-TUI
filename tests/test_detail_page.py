@@ -33,6 +33,12 @@ DESC = "先问一下财务再发"
 
 TITLE = "交季度报告"
 
+LONG_CONTENT = (
+    "这一段是要读完整的那种正文：上周的对比数据、这一周的三个结论、以及下个季度要盯的两件事，"
+    "全都得在这一个字段里说完。"
+)
+"""一段会折好几行的描述：详细页的字段行**不是**一屏一行（工单评论的实现后果）。"""
+
 
 @pytest.fixture(autouse=True)
 def a_colour_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -118,3 +124,39 @@ async def test_描述_shows_content_and_备注_shows_desc():
     assert CONTENT not in noted, f"描述的内容跑到备注那一行上去了：{noted!r}"
     assert DESC in noted, f"备注那一行画的不是 ``desc``：{noted!r}"
     assert DESC not in described, f"备注的内容跑到描述那一行上去了：{described!r}"
+
+
+async def test_j_and_k_move_the_cursor_field_to_field_over_a_wrapped_block():
+    """``j``/``k`` 一次跳**一个字段**，永远不停在折行块内部（验收标准 3）。
+
+    描述长到占好几屏行，而字段只有七个：六下 ``j`` 从标题走到标签，一下都不能落在描述那块
+    折行里的第二行上。光标**停在哪一行**在屏幕上只能从 ``❯`` 那一列读出来，所以两头都断：
+    页面给外层的口子（``selected_id``）与屏幕上的记号。
+    """
+    app = DidaApp(backend(content=LONG_CONTENT))
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        walked = [app.detail_page().selected_id]
+        for _ in range(6):
+            await pilot.press("j")
+            walked.append(app.detail_page().selected_id)
+        bottom = screen_text(app)
+        await pilot.press("k", "k")
+        back = app.detail_page().selected_id
+        text = screen_text(app)
+
+    assert walked == ["title", "content", "desc", "list", "due", "priority", "tags"], (
+        f"j 的落点不是「一个字段一行」：{walked}"
+    )
+    assert back == "due", "k 也要一次退一个字段"
+    assert row_with(bottom, "标签").lstrip().startswith(theme.CURSOR_MARK), (
+        f"光标走到头时不在标签那一行上：\n{bottom}"
+    )
+    assert row_with(text, "截止").lstrip().startswith(theme.CURSOR_MARK), (
+        f"退回两下之后光标不在截止那一行上：\n{text}"
+    )
+    assert not row_with(text, "备注").lstrip().startswith(theme.CURSOR_MARK), (
+        "光标不该停在折行块（描述/备注）里面"
+    )
