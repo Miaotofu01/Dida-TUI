@@ -208,4 +208,3 @@ def delete_failed_message(error: DidaError) -> str:
     if isinstance(error, UnknownTaskError):
         return UNKNOWN_DELETE_MESSAGE
     return f"没有删：{error}"
-
