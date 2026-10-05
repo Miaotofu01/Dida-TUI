@@ -223,12 +223,16 @@ class CursorPage(VerticalScroll):
         for index, row in enumerate(self._rows):
             if index:
                 body.append("\n")
+            if row.rule:
+                # 细线**自己铺满整幅页面、齐左**：它不可停光标，所以不参与行首那两格的
+                # 光标空档。带上空档这一行就是 ``width + 2`` 格，正文的 ``nowrap`` +
+                # ``ellipsis`` 会裁掉一格再补一个 ``…``——屏幕上看到的是「缩进两格、以
+                # 省略号收尾的一条线」（实测，每一行细线都是）。
+                body.append(theme.RULE * max(0, width), style=EMPTY_STYLE)
+                continue
             line = Text()
             line.append(f"{CURSOR_MARK if self._is_cursor(row) else BLANK_MARK} ")
-            if row.rule:
-                line.append(theme.RULE * max(0, width), style=EMPTY_STYLE)
-            else:
-                line.append_text(row.text)
+            line.append_text(row.text)
             if self._is_cursor(row):
                 # 光标行 = 强调色 + 字重。层级不靠亮度：用户的槽位 8–15 与 1–6 同值，
                 # 「更亮」买不到任何对比（环境审计 §1a）。

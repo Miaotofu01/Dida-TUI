@@ -216,8 +216,14 @@ class DidaApp(App[None]):
         self._detail_title: str | None = None
         """详细页那条任务的标题——路径的最后一段写它。"""
         self._animations = animations or theme.animations_setting(os.environ)
-        self._animate = False
-        """这一台机器上到底动不动（``on_mount`` 里按开关与环境定一次）。"""
+        self._motion = False
+        """这一台机器上到底动不动（``on_mount`` 里按开关与环境定一次）。
+
+        ⚠ 名字**不能**是 ``_animate``：``App._animate`` 是 Textual 自己那个绑好的 animator
+        （``App.animate()`` 调的就是它），盖掉之后 ``app.animate(...)`` 会抛
+        ``TypeError: 'bool' object is not callable``——报错点在 Textual 的 ``app.py`` 里，离
+        现场很远。页面那一半同名的坑见 :class:`dida.tui.pages.base.CursorPage` 的 ``_motion``。
+        """
         self._announce_sync = False
         """这一轮同步要不要用 toast 报完成——``r`` 要，启动刷新不要（那会每次开屏都弹一下）。"""
         self._spinning = False
@@ -241,11 +247,11 @@ class DidaApp(App[None]):
         外观的开关只在这里定一次：动效档位（``auto|on|off``）落到每张页面上——页面自己
         不知道 ``auto`` 是什么意思，它只知道「动不动」。
         """
-        self._animate = theme.animations_enabled(self._animations)
-        if not self._animate:
+        self._motion = theme.animations_enabled(self._animations)
+        if not self._motion:
             self.animation_level = "none"
         for page in self._pages().values():
-            page.set_animate(self._animate)
+            page.set_animate(self._motion)
         self._show(LAYER_INDEX)
         self.refresh_view()
         if self._refresh_on_start:
@@ -302,7 +308,7 @@ class DidaApp(App[None]):
         self._layer = layer
         page = self._pages()[layer]
         self._write_top()
-        self._stage().show(self._layer_index(layer), animate=self._animate and layer != previous)
+        self._stage().show(self._layer_index(layer), animate=self._motion and layer != previous)
         # ``scroll_visible=False``：Textual 交焦点时默认会把那个控件**立刻**滚进可见区，
         # 而这一页正好是整个舞台（平移就是把它滑过来）——那一下会把动画当场抹平（实测：
         # 默认交焦点时 ``scroll_x`` 一步到 100，动画一帧都看不到）。
