@@ -13,23 +13,27 @@ from __future__ import annotations
 
 import webbrowser
 
+from dida.sync.engine import INBOX_ID, is_inbox_id
+
 __all__ = ["open_in_browser", "task_url"]
 
 URL_TEMPLATE = "https://dida365.com/webapp/#p/{project_id}/tasks/{task_id}"
 """厂商自己在「复制任务链接」里生成的那条网页版路由（ADR-0002 已核实）。"""
 
-INBOX_ID = "inbox"
-"""收集箱在 API 里的 projectId 别名；URL 里要用字面量，不能拿本地那份清单名去顶。"""
-
 
 def task_url(project_id: str, task_id: str) -> str:
     """一条任务的网页版 URL（厂商「复制任务链接」的模板，一字不改）。
 
-    ``project_id`` **含** ``"inbox"`` 时替换成字面量 ``inbox``：``GET /open/v1/project/
-    {id}/data`` 接受 ``"inbox"`` 当清单 id（``api-contracts.md``），而厂商模板对收集箱
-    写的就是这个字面量。比较不区分大小写——本地那份 id 是什么形状不由我们定。
+    ``project_id`` **是收集箱**时替换成字面量 ``inbox``：``GET /open/v1/project/{id}/data``
+    接受 ``"inbox"`` 当清单 id（``api-contracts.md``），而厂商模板对收集箱写的就是这个字面量。
+    收集箱的身份认两种形状（``is_inbox_id``）：请求侧别名 ``inbox``，以及服务端返回的那一串
+    （形如 ``inbox`` 加一截数字——收集箱里的任务带的就是它，实测）。
+
+    v1 认的是「**含** inbox」这种子串匹配，于是一个 id 里恰好带 inbox 的真实清单
+    （``my-inbox-list``）会被拼成收集箱的链接——点开是错的页面。#33 收掉了那条猜法，
+    只留「真的是收集箱」这一条；比较不区分大小写。
     """
-    if INBOX_ID in project_id.lower():
+    if is_inbox_id(project_id):
         project_id = INBOX_ID
     return URL_TEMPLATE.format(project_id=project_id, task_id=task_id)
 

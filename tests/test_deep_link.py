@@ -34,20 +34,34 @@ def test_task_url_follows_the_vendors_copy_task_link_template():
     )
 
 
-def test_task_url_substitutes_the_literal_inbox_when_the_project_id_contains_inbox():
-    """``projectId`` 含 ``"inbox"`` 时用字面量 ``inbox``——厂商模板就是这么生成的。
+def test_task_url_substitutes_the_literal_inbox_for_the_inbox_itself():
+    """收集箱那条任务的 URL 用字面量 ``inbox``——厂商模板就是这么生成的。
 
     ⚠ 这一条与 #33 的「缺失的 projectId 不许再猜成字面量 ``inbox``」是两件事：这里说的是
-    **服务端确实给了**一个含 ``inbox`` 的清单 id 时 URL 怎么写。#33 改的是缺失那种情况，
-    改的时候别顺手把这一条也改了。
+    **服务端确实给了**一个收集箱 id 时 URL 怎么写（收集箱的真实 id 是每账户不同的一串，
+    请求侧只认字面量 ``inbox`` 这个别名）。#33 收掉的是子串匹配那一条，见下面两条。
     """
     assert task_url("inbox", "t1") == "https://dida365.com/webapp/#p/inbox/tasks/t1"
 
 
-@pytest.mark.parametrize("project_id", ["inbox", "INBOX", "inbox-123", "my-inbox-list"])
-def test_task_url_treats_any_inbox_containing_project_id_as_the_literal(project_id):
-    """「含 inbox」是字面包含，不分大小写：本地那份 id 可能是任何形状。"""
+@pytest.mark.parametrize("project_id", ["inbox", "INBOX", "inbox1025205395"])
+def test_task_url_treats_the_accounts_inbox_id_as_the_literal(project_id):
+    """收集箱的两种形状都算：请求侧别名，以及服务端返回的那一串（``inbox`` 加一截数字）。
+
+    ``inbox1025205395`` 是实测的那个形状（spec 的已实测 API 事实 #2）：收集箱里的任务带着
+    它，而厂商模板要的是字面量 ``inbox``。
+    """
     assert task_url(project_id, "t9") == "https://dida365.com/webapp/#p/inbox/tasks/t9"
+
+
+@pytest.mark.parametrize("project_id", ["inbox-123", "my-inbox-list", "inboxing"])
+def test_task_url_leaves_a_list_whose_id_merely_contains_inbox_alone(project_id):
+    """id 里恰好带 ``inbox`` 的真实清单**不是**收集箱：拼成收集箱的链接会点开错的页面。
+
+    v1 用的是「含 ``inbox``」这种子串匹配（#33 收掉的那一条）。清单 id 是服务端生成的，
+    一个真实清单完全可能叫 ``my-inbox-list``，那时该开的是它自己那一页。
+    """
+    assert task_url(project_id, "t9") == f"https://dida365.com/webapp/#p/{project_id}/tasks/t9"
 
 
 # ---------------------------------------------------------------- 默认开手：交给 webbrowser
