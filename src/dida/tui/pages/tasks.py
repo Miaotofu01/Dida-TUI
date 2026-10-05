@@ -202,7 +202,7 @@ class TasksPage(CursorPage):
         self._task_list: TaskList | None = None
         """最近一次铺开的那份数据：宽度变了要按新的宽度重画同一批行（见 :meth:`on_resize`）。"""
         self._show_list_name = False
-        """这一页要不要在行里写所属清单名（视图要、清单不要，由读模型给的 kind 决定）。"""
+        """这一页要不要在行里写所属清单名（视图要、清单不要，由读模型的 ``shows_list_name`` 定）。"""
 
     @property
     def container_name(self) -> str:
@@ -237,7 +237,10 @@ class TasksPage(CursorPage):
             return tuple(rows)
         width = self._line_width()
         rows += [
-            Row(id=item.task_id, text=task_line(item, width=width, show_list_name=self._show_list_name))
+            Row(
+                id=item.task_id,
+                text=task_line(item, width=width, show_list_name=self._show_list_name),
+            )
             for item in task_list.items
         ]
         rows += [

@@ -29,7 +29,6 @@ from datetime import datetime
 from enum import Enum
 from typing import Any, Collection, Mapping, Protocol, Sequence, runtime_checkable
 
-from dida.logical_day import logical_day
 from dida.sync.view import (
     INBOX_ID,
     INBOX_NAME,

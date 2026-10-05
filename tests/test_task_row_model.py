@@ -25,6 +25,7 @@ from dida.sync.engine import (
     SyncEngine,
     TaskItem,
     completed_section,
+    format_due,
     priority_mark,
 )
 from dida.sync.rows import completed_window_start, row_sort_key
@@ -533,3 +534,45 @@ def test_a_completed_row_keeps_its_title_and_drops_its_time_when_narrow():
 
     assert completed_line(item, width=24).plain == "☑ 回邮件给产品经理"
     assert completed_line(item, width=40).plain.endswith("今天 11:00")
+
+
+# ------------------------------------------------------------------ 重复与提醒：原文进快照
+
+
+def test_the_store_carries_the_repeat_rule_and_the_reminders_into_the_snapshot(store):
+    """重复规则与提醒来自**服务端原文**：快照带出「有没有」，行才画得出那两个标记。
+
+    行里只读「有没有」（非空就是有）；规则与触发器原文整份留在 ``raw`` 里——它们只读，
+    回写时一个字都不许动。
+    """
+    store.apply_refresh(
+        tasks=[
+            {
+                "id": "t1",
+                "projectId": "work",
+                "title": "每周交周报",
+                "status": 0,
+                "repeatFlag": "RRULE:FREQ=WEEKLY",
+                "reminders": ["TRIGGER:P0DT9H0M0S"],
+            },
+            # 脏数据：reminders 不是数组。一条脏字段不该把整次刷新带崩。
+            {"id": "t2", "projectId": "work", "title": "脏的", "status": 0, "reminders": "TRIGGER"},
+        ]
+    )
+
+    snapshots = {item.id: item for item in store.tasks()}
+
+    assert snapshots["t1"].repeat_flag == "RRULE:FREQ=WEEKLY"
+    assert snapshots["t1"].reminders == ("TRIGGER:P0DT9H0M0S",)
+    assert store.task_payload("t1")["repeatFlag"] == "RRULE:FREQ=WEEKLY", "原文整份留着"
+    assert snapshots["t2"].reminders == ()
+
+
+def test_an_all_day_task_due_today_stays_today_at_the_0400_boundary():
+    """日界 ``04:00``、凌晨两点：**当天到期**的全天任务读作「今天」，不是「昨天」。
+
+    全天任务的截止是日期标记（当天 00:00）：按时刻去套逻辑日偏移，它会被整天挪到前一个
+    逻辑日——用户故事 83 的反面。
+    """
+    assert format_due(at(14, 0, 0), all_day=True, now=at(15, 2, 0), day_end="04:00") == "今天"
+    assert format_due(at(14, 23, 0), all_day=False, now=at(15, 2, 0), day_end="04:00") == "今天 23:00"

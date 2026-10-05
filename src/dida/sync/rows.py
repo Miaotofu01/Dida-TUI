@@ -4,8 +4,17 @@
 :mod:`dida.sync.view`，那边反过来用这里的函数——所以这里只认「有这些字段的东西」，
 :class:`RowFacts` 把那份形状写下来）。
 
-排序是**客户端统一重排**，不看服务端的 ``sortOrder``（spec 的「一个已知的、故意的取舍」）：
-截止时间升序 → 优先级从高到低 → 没有截止时间的排在有截止时间的后面 → 已完成的一律沉到最底。
+三件事：
+
+- :func:`row_sort_key` —— 整份列表的顺序。**客户端统一重排**，不看服务端的 ``sortOrder``
+  （spec 的「一个已知的、故意的取舍」）：截止时间升序 → 优先级从高到低 → 没有截止时间的
+  排在有截止时间的后面 → 已完成的一律沉到最底。
+- :func:`completed_window_start` —— 已完成区/已完成流往回看多久（7 天）的那条左端。
+- :func:`task_is_completed` —— 本地判定「已完成」只看 ``status``，不看完成时间戳。
+
+行的**文字**读法（``format_due`` / ``priority_mark`` / ``NO_DUE_TEXT`` / ``format_tags``）留在
+:mod:`dida.sync.view`：那里是 #33 落地、#35 又大改过的读模型，``read.py`` 与引擎都从那儿取，
+搬一次只会白折腾一圈。行本身（标记、注解、窄屏丢弃顺序）在 :mod:`dida.tui.pages.tasks`。
 """
 
 from __future__ import annotations
