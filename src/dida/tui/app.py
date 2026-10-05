@@ -513,9 +513,6 @@ class DidaApp(App[None]):
                 return
             self.detail_page().show_save(messages.field_save_failed_message(exc))
             return
-        if not wrote:
-            # 挑回原来那一档：没有改动就没有「立刻推送」这回事（队列里本来也不该多出一笔）。
-            return
         await self.engine.push_pending()
         if not self.is_running:
             return
