@@ -155,7 +155,6 @@ _DURATION = re.compile(
 """
 
 _UNITS: tuple[tuple[str, str], ...] = (
-    ("weeks", "周"),
     ("days", "天"),
     ("hours", "小时"),
     ("minutes", "分钟"),
@@ -163,10 +162,13 @@ _UNITS: tuple[tuple[str, str], ...] = (
 )
 """时长各段与它们的中文读法，按从大到小。零的段不念出来。"""
 
+_DURATION_GROUPS: tuple[str, ...] = ("weeks", *(group for group, _ in _UNITS))
+"""时长里每一个可以出现的段名（``weeks`` 单独算，它不与别的段同时出现）。"""
+
 
 def _is_duration(match: re.Match[str]) -> bool:
     """这一段是不是**写了**时长的某一段：``P`` / ``PT`` 一个数字都没有，不算时长。"""
-    return any(match.group(group) is not None for group, _ in _UNITS)
+    return any(match.group(group) is not None for group in _DURATION_GROUPS)
 
 
 def _duration_words(match: re.Match[str]) -> str:
@@ -176,7 +178,7 @@ def _duration_words(match: re.Match[str]) -> str:
     if weeks:
         # ISO-8601 里 ``W`` 不能与别的段同时出现，换算成 7 天没有歧义。
         parts.append(f"{weeks * 7} 天")
-    for group, word in _UNITS[1:]:
+    for group, word in _UNITS:
         value = int(match.group(group) or 0)
         if value:
             parts.append(f"{value} {word}")
@@ -188,7 +190,7 @@ def reminder_text(trigger: str) -> str:
 
     这一格是**只读**的，它唯一的职责就是说明白；把 ``TRIGGER:`` 那种编码摊给用户看等于什么
     都没说。三个已知的例子：``P0DT9H0M0S`` → 提前 9 小时、``PT0S`` → 准时、``P1DT2H`` →
-    提前 1 天 2 小时（不collapse 成 26 小时）。
+    提前 1 天 2 小时（不压成 26 小时）。
 
     ⚠ **正负号那一条是没有依据的，这里如实记下来。** 服务端的文档只给了两个**正**时长的例子
     （``openapi-dida365.md:2280``：``["TRIGGER:P0DT9H0M0S", "TRIGGER:PT0S"]``），对负数一个字
