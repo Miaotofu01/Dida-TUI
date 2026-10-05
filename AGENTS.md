@@ -4,9 +4,12 @@
 
 技术栈：Python 3.12 + Textual。安装后以 `dida` 命令启动。
 
-当前状态：**骨架阶段**——`uv run pytest` 可跑，`uv run dida` 起三栏占位界面（`q` 退出）。
-模块边界、依赖方向与两个测试接缝见 [docs/architecture.md](docs/architecture.md)，
-v1 spec 在 [issue #1](https://github.com/Miaotofu01/Dida-TUI/issues/1)。
+当前状态：**v1 已实现**——`uv run pytest` 全绿（500+ 条，约一分钟），`uv run dida` 起的就是
+完整的今日执行台：三栏、键位齐、写操作立即推送、SQLite 缓存与重试队列都在。v1 的代码在
+`feat/v1-today-console` 分支上（PR #28 尚未合并），`main` 目前还只有文档。
+面向使用者的入口是 [README.md](README.md)；模块边界、依赖方向与两个测试接缝见
+[docs/architecture.md](docs/architecture.md)，v1 spec 在
+[issue #1](https://github.com/Miaotofu01/Dida-TUI/issues/1)。
 
 ## Agent skills
 

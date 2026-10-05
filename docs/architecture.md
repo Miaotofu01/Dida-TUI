@@ -1,19 +1,20 @@
 # 架构：七个深模块与两个测试接缝
 
 每个模块都是一个窄接口，行为藏在里面。两条硬规则：「现在」只能来自注入的时钟，
-网络只能走注入的传输层。本工单（t02）立骨架，标注了每个模块的归属工单。
+网络只能走注入的传输层。七个模块在 v1 里都已实现；表里留着工单号是为了回溯，
+它们不再是待办。
 
 ## 模块与公开接口
 
-| # | 模块 | 路径 | 公开接口 | 归属 |
+| # | 模块 | 路径 | 公开接口 | 工单 |
 |---|---|---|---|---|
 | 1 | 配置与凭据 | `dida/config.py` | `Config`（`token` / `day_end` / `refresh_on_start` / `push_on_change` / `completed_window_hours`）、`config_path()`、`load_config()`、`save_config()`、`needs_token()`、`Credentials(transport=, path=).verify_and_store(token)`；失败是 `ConfigError` / `CredentialsError` | t03 已实现 |
 | 2 | 滴答 API 客户端 | `dida/api/` | `DidaApiClient(token=, transport=, base_url=)`：`list_projects(offset=, limit=)`、`get_project_data(project_id)`、`get_task(project_id, task_id)`、`list_tags()`、`list_completed(project_ids=, start_date=, end_date=)`、`create_task(body)`、`update_task(project_id, task_id, changes, snapshot=)`、`complete_task(project_id, task_id)`、`delete_task(project_id, task_id)`；失败一律是 `dida.api.errors.DidaError` 的子类（`NetworkError` / `AuthError` / `ServerRejectionError` / `FieldIgnoredError`，守卫另有 `InvalidDateError` / `DatelessRepeatError` / `MalformedResponseError`） | t07 已实现 |
-| 3 | 本地存储 | `dida/storage/store.py` | `Store`：清单、任务快照、待推送改动、同步状态；签名由 t08 定稿 | t08 |
-| 4 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` | `SyncEngine(clock=, day_end=, source=, client=)`、`status() -> SyncStatus`、`view() -> TodayView`、`refresh() -> RefreshReport`（**async**，t09）、`complete(task_id)`（t11）、`defer(task_id)`（t13）；视图模型与分组纯函数在 `dida/sync/view.py` | t05 定读路径、t09/t10 填数据 |
-| 5 | 逻辑日 | `dida/logical_day.py` | `logical_day(now, day_end) -> date` | t04 |
-| 6 | 日期解析器 | `dida/date_parser.py` | `parse(text) -> ParsedTask` | t06 |
-| 7 | TUI | `dida/tui/` | `DidaApp(engine)`；栏位 `#list-pane` / `#task-pane` / `#detail-pane` / `#status-bar`、`update_status()` | t05/t18 填内容 |
+| 3 | 本地存储 | `dida/storage/store.py` | `Store`：清单、任务快照、待推送改动、同步状态 | t08 已实现 |
+| 4 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` | `SyncEngine(clock=, day_end=, source=, client=)`、`status() -> SyncStatus`、`view() -> TodayView`、`refresh() -> RefreshReport`（**async**）、`complete(task_id)`、`defer(task_id)`、`push_pending()`；视图模型与分组纯函数在 `dida/sync/view.py` | t05 / t09 / t10 已实现 |
+| 5 | 逻辑日 | `dida/logical_day.py` | `parse_day_end(text) -> timedelta`、`logical_day(now, day_end) -> LogicalDay`（`label` / `start` / `end`，半开区间） | t04 已实现 |
+| 6 | 日期解析器 | `dida/date_parser.py` | `parse(text, now, day_end="00:00") -> ParsedTask` | t06 已实现 |
+| 7 | TUI | `dida/tui/` | `DidaApp(engine)`；栏位 `#list-pane` / `#task-pane` / `#detail-pane` / `#status-bar`、`update_status()` | t05 / t18 已实现 |
 
 `SyncStatus` 字段：`checked_at`（来自时钟）、`pending_count`、`last_refresh_at`、`logical_day`。
 状态栏文本由 `dida.tui.panes.format_status()` 生成，措辞按 GLOSSARY（已同步 / 待推送 / 逻辑日）。
@@ -76,10 +77,12 @@ TaskSnapshot(id, title, list_id, due, all_day, priority, completed)
 SyncState(last_refresh_at, pending_count)
 
 # 输出（引擎 → TUI），字段都是可以直接画的成品
-TodayView(lists: tuple[ListSummary, ...], groups: tuple[TaskGroup, ...])
+TodayView(lists, groups, completed: CompletedSection)   # 已完成区在中栏底部，自己不在 groups 里
 ListSummary(id, name, unfinished)            # 左栏的未完成条数徽标
-TaskGroup(kind: GroupKind, items)            # kind 是 OVERDUE / TODAY；title 与 count 由 kind 推出
-TaskItem(task_id, title, list_id, list_name, priority, priority_mark, due, all_day, due_text)
+TaskGroup(kind: GroupKind, items)            # kind 是 OVERDUE / TODAY / INBOX_UNDATED；title 与 count 由 kind 推出
+TaskItem(task_id, title, list_id, list_name, priority, priority_mark, due, all_day, due_text,
+         desc, content, tags_text)           # 后三个是右栏常驻的「描述 / 备注 / 标签」
+CompletedSection(items: tuple[CompletedItem, ...])
 ```
 
 分组、排序、逾期判定、截止时间读法（「今天 18:00」「昨天 09:00」「3 天前」「—」）全在
@@ -87,7 +90,8 @@ TaskItem(task_id, title, list_id, list_name, priority, priority_mark, due, all_d
 
 - 全天任务的 `due` 是**日期标记**（当天 00:00），不是时刻：`due_day()` 对它按日期算，
   否则 `day_end = "04:00"` 时一个「今天」的全天任务会被算成昨天。
-- 没有截止时间的任务留在「今日」区（读作「—」），收集箱无日期区还没落地。
+- 没有截止时间的任务单独成区「收集箱无日期」（读作「—」）：它按「有没有日期」分，不看这条
+  任务在哪个清单（`GroupKind.INBOX_UNDATED`）。
 
 接缝一的假后端在 `dida.testing.FakeBackend`：读委托给真引擎（分组行为跟生产同一份实现），
 写操作只记录（`refreshes` / `completed` / `deferred`）。TUI 测试一律这样搭：
