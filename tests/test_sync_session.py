@@ -385,28 +385,42 @@ async def test_the_periodic_timer_pumps_the_queue_without_any_keypress(tmp_path)
 # --------------------------------------- 关窗与「回来晚了」的那一次（#41 观察、#34 属地）
 
 
-async def test_a_push_that_lands_after_the_ui_is_gone_does_not_raise(tmp_path):
-    """关窗时正在飞的那一次推送回来时，屏幕已经拆了——它不能再往状态栏写。
+async def test_a_push_in_flight_when_the_screen_tears_down_does_not_raise(tmp_path):
+    """拆屏那一刻正在飞的那次推送回来时，屏幕已经没了——它不能再往状态栏写。
 
-    这一条钉的是「回来晚了的那一次」：``run_test`` 收尾之后 widget 全拆了、``app.is_running``
-    已经是假，而 ``await self.engine.push_pending()`` 恰好在这之后才回来。真实的偶发红就是
-    定时器在 ``_shutdown`` 那段窗口里跳了一下——那一跳与拆屏怎么交错没法从外面摆出来，所以
-    这里直接叫「回来晚了的那一次」，它走的是同一条路。修好之后它什么都不做，也不许抛。
+    偶发红的现场就长这样：定时器跳了一下，``await self.engine.push_pending()`` 还挂在
+    网络上，用户这时关了窗（``run_test`` 收尾拆 widget），那一次才回来。这条把它摆成
+    **确定**的：假服务端挂一道闸门，推送在屏上时被挡住（``in_flight`` 明明白白没跑完），
+    拆完屏才开闸——不用 sleep 去赌交错。修好之后它什么都不做，也不许抛。
+
+    没有这道闸门时，同样的一次「回来晚了」是直接 ``await app.push_tick()``；两者走的
+    是同一条路，这里是更严的那一种（await 真的跨过了拆屏那一刻）。
     """
     store = open_store(tmp_path)
     seed(store, task(id="t1", title="写周报", project_id="inbox"), lists=[inbox()])
+    gate = asyncio.Event()
     server = Server(error=NetworkError("连不上"))
-    app = make_app(store, server, clock=ManualClock(T0))
+    clock = ManualClock(T0)
+    app = make_app(store, server, clock=clock)
 
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
         await pilot.press("p")  # 本地当场生效 + 立刻推一次（断网，失败）
         await app.engine.wait_for_pushes()
         await pilot.pause()
+        assert "待推送 1" in screen_text(app), "先失败一次，改动留在队列里"
+
+        server.error = None  # 网络回来了
+        server.gate = gate  # 但服务端现在慢慢答
+        clock.advance(timedelta(seconds=2))  # 走过退避点，这一推真的会发出去
+        in_flight = asyncio.create_task(app.push_tick())
+        await pilot.pause()
+        assert not in_flight.done(), "这一次推送还挂在网络上——下一句就是拆屏"
 
     assert app.is_running is False, "出来时屏幕已经拆了"
 
-    await app.push_tick()  # 关窗时正在飞的那一次，回来时就是这样
+    gate.set()  # 屏幕拆完，服务端才答
+    await in_flight  # 关窗时正在飞的那一次，回来时就是这样
 
 
 async def test_a_redraw_that_lands_after_the_ui_is_gone_does_not_raise(tmp_path):
