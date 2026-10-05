@@ -505,6 +505,48 @@ DetailPage #page-body {
     background: {page};
     color: ansi_default;
 }
+/* 截止时间那两格 + 「全天」那一行（工单 #44）：与自由文本框同一块编辑区、同一套覆盖。
+
+   覆盖必须逐条重来，不能靠「父容器已经改过了」：Textual 那两个输入框的颜色来自**组件
+   自己的** DEFAULT_CSS（`$surface` / `$input-cursor-*` 这些主题变量＝真彩色），父级那条
+   `background` 盖不住它们的内层类名。所以 `#due-date` / `#due-time` 与 `#detail-input`
+   一样逐条写成 ansi_*；漏一条的表现是真终端里出现 `38;2;`（ADR-0007 要消灭的正是它），
+   而且**静默**——只有真 pty 抓取才看得见。 */
+#due-edit {
+    display: none;
+    height: auto;
+    width: 100%;
+    background: {page};
+}
+#due-hint {
+    height: 1;
+    width: 100%;
+    background: {page};
+}
+#due-date, #due-time {
+    background: {page};
+    color: ansi_default;
+    border: none;
+    padding: 0;
+    height: 1;
+}
+#due-date:focus, #due-time:focus {
+    border: none;
+}
+#due-date .input--cursor, #due-time .input--cursor {
+    background: {accent};
+    color: {page};
+    text-style: bold;
+}
+#due-date .input--selection, #due-time .input--selection {
+    background: {accent};
+    color: {page};
+}
+#due-date .input--placeholder, #due-time .input--placeholder,
+#due-date .input--suggestion, #due-time .input--suggestion {
+    color: ansi_default;
+    text-style: dim;
+}
 #status-bar {
     dock: bottom;
     height: 1;

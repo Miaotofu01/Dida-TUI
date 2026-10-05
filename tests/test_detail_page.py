@@ -11,6 +11,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import re
 from datetime import datetime, timedelta, timezone
 
@@ -574,11 +575,29 @@ class Unreachable:
         raise httpx.ConnectError("连不上服务器")
 
 
+class Recording:
+    """假传输：把请求记下来并回一个 200（试请求体的形状）。
+
+    「一个请求都没发出去」也要能断（#44 的非法日期那一条）：它只记，什么都不回放。
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+
+    async def send(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return httpx.Response(200, json={"id": "t1"})
+
+
 def real_app(tmp_path, transport) -> DidaApp:
     """接缝二：真引擎 + 真库 + 打给假服务端的真客户端。
 
     逐字段编辑的「立刻推送」与「保存失败说具体原因」是**网络这一侧**的事实：替身说了不算，
     所以这一条走真推送路径（这也是 ``test_app_sync.py`` 用的那一套）。
+
+    这条任务的原文里带着**服务端给的、我们不认识的**字段（``focusSummaries``）与一份
+    ``timeZone``：改期要断的「时区原样回写、陌生字段一起带回去」（#44 验收标准 7 / 8）只能
+    在这种底稿上看见——底稿里本来就没有的东西，回写时当然也不会出现。
     """
     store = Store(tmp_path / "dida.sqlite3")
     store.apply_refresh(
@@ -591,6 +610,10 @@ def real_app(tmp_path, transport) -> DidaApp:
                 "status": 0,
                 "content": CONTENT,
                 "desc": DESC,
+                "dueDate": "2026-03-14T18:00:00+0800",
+                "isAllDay": False,
+                "timeZone": "Asia/Shanghai",
+                "focusSummaries": [{"pomoCount": 1}],
             }
         ],
     )
@@ -920,3 +943,267 @@ async def test_a_save_failure_that_is_not_the_known_one_still_names_the_reason()
     assert messages.field_save_failed_message("服务端说这个字段不行") in text, (
         f"保存失败没有带上具体原因：\n{text}"
     )
+
+
+# ------------------------------------------------------------------ 截止时间（#44）
+
+
+async def walk_to_the_due_field(pilot, app: DidaApp) -> None:
+    """把光标走到「截止」那一行（标题 → 描述 → 备注 → 清单 → 截止）。
+
+    不从标题一路 ``j`` 到别处：落点由 ``selected_id`` 认，走错了当场红——这一页的光标位置
+    是 #43 的既有行为，不该由这一票的测试重新解释一遍。
+    """
+    for _ in range(6):
+        if app.detail_page().selected_id == "due":
+            return
+        await pilot.press("j")
+    raise AssertionError(f"光标走不到「截止」那一行：{app.detail_page().selected_id!r}")
+
+
+def due_input(app: DidaApp) -> str:
+    """编辑器里那两格当前的内容（日期 + 时刻）。"""
+    return (
+        app.detail_page().query_one("#due-date").value + " " + app.detail_page().query_one("#due-time").value
+    )
+
+
+async def test_the_due_field_opens_a_structured_date_then_time_editor():
+    """``enter`` 落在「截止」上：进的是**结构化**编辑器，先日期、再时刻（验收标准 1）。
+
+    断的是外部行为：按了 ``enter`` 之后屏幕上出现哪两格、光标先落在哪一格、两格里回填的是
+    这条任务当前那一刻的日期与时刻（用户看着它改，而不是对着一片空白猜格式）。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to_the_due_field(pilot, app)
+        await pilot.press("enter")
+        await pilot.pause()
+        text = screen_text(app)
+        focused = app.focused.id if app.focused is not None else None
+        prefilled = due_input(app)
+
+    assert "2026-03-14" in prefilled, f"日期那一格没有回填当前那一天的日期：{prefilled!r}"
+    assert "18:00" in prefilled, f"时刻那一格没有回填当前那一刻：{prefilled!r}"
+    assert focused == "due-date", f"光标先落在日期那一格上：{focused!r}"
+    assert "2026-03-14" in text, f"日期那一格没画在屏上：\n{text}"
+
+
+async def test_typing_a_date_and_a_time_reschedules_the_task_to_that_moment():
+    """先选日期、再选时刻，``enter`` 提交（验收标准 1）：改的就是那一刻。
+
+    期望值由测试直接给出（``2026-03-15 09:30`` 带 +0800）：用户墙钟上的 09:30 就是写出去的
+    09:30，没有被换算到别的时区。``all_day`` 是 ``False``——有具体时刻就是「不是全天」。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to_the_due_field(pilot, app)
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press(*clear(10))
+        await pilot.press(*"2026-03-15")
+        await pilot.press("enter")  # 日期这一格提交 → 轮到时刻
+        await pilot.press(*clear(5))
+        await pilot.press(*"09:30")
+        await pilot.press("enter")  # 时刻这一格提交 → 这一次改动出去
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert fake.rescheduled == ["t1"], f"改期没有走到引擎：{fake.rescheduled}"
+    assert fake.rescheduled_due == [T0.replace(day=15, hour=9, minute=30)], (
+        f"写出去的时刻不是用户敲的那一刻：{fake.rescheduled_due}"
+    )
+    assert fake.rescheduled_all_day == [False], "有具体时刻就不是全天"
+    # 那一格的读法是引擎给的成品（「明天 09:30」），不是把用户敲的串原样抄上去——TUI 不自己
+    # 拼日期（架构规则：日期判断与读法都在引擎里）。
+    assert "明天 09:30" in field_row(text, "截止"), f"改完那一格没跟着变：\n{text}"
+
+
+async def test_the_all_day_switch_flips_between_a_time_and_a_date_only():
+    """「全天」开关在「有具体时刻」与「只有日期」之间切换（验收标准 2）。
+
+    两条路都走一遍：先 ``x`` 打开全天（时刻那一格空着 → 写的是那一天的 00:00，``isAllDay``
+    是 ``True``），再 ``x`` 关掉它（时刻那一格回来，写的是那一刻）。开关的当前档必须画在
+    屏上——一个按下去看不出状态的开关等于没有开关。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to_the_due_field(pilot, app)
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press(*clear(10))
+        await pilot.press(*"2026-03-15")
+        await pilot.press("x")  # 打开全天
+        await pilot.pause()
+        toggled_on = screen_text(app)
+        time_hidden = not app.detail_page().query_one("#due-time").display
+        await pilot.press("enter")  # 全天：日期一提交就完事，时刻那一格不用填
+        await pilot.pause()
+        after_all_day = screen_text(app)
+        await pilot.press("enter")  # 重新进编辑器
+        await pilot.pause()
+        await pilot.press("x")  # 关掉全天
+        await pilot.pause()
+        toggled_off = screen_text(app)
+        time_shown = app.detail_page().query_one("#due-time").display
+
+    assert fake.rescheduled_due[0] == T0.replace(day=15, hour=0, minute=0), (
+        f"全天写的是那一天 00:00 这个日期标记：{fake.rescheduled_due}"
+    )
+    assert fake.rescheduled_all_day == [True], f"全天那一档没写出去：{fake.rescheduled_all_day}"
+    # 全天任务的读法是「明天」（引擎按 ``due.date()`` 读日期标记，不画 00:00）——那一格确实
+    # 跟着变了，而且没有多出一个「00:00」来。
+    assert "明天" in field_row(after_all_day, "截止"), f"全天那条没落到那一格上：\n{after_all_day}"
+    assert "00:00" not in field_row(after_all_day, "截止"), field_row(after_all_day, "截止")
+    assert time_hidden, "全天时时刻那一格该收起来（只有日期）"
+    assert time_shown, "关掉全天时时刻那一格该回来（有具体时刻）"
+    assert "全天" in toggled_on, f"开关的当前档没画在屏上：\n{toggled_on}"
+    assert toggled_off != toggled_on, "开关按下去屏幕上没有任何变化"
+
+
+async def test_clearing_the_date_turns_the_task_back_into_one_without_a_date():
+    """日期那一格清空 = 清除截止时间（验收标准 3）：那一格回到「没有日期」。
+
+    清除走的是 ``reschedule(due=None)`` 这一条明确的形状，不是一个很早的时刻——后者会在
+    手机上出现一条 1970 年的任务。本地那一份也当场跟着变（乐观写）。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to_the_due_field(pilot, app)
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press(*clear(10))
+        await pilot.press("enter")  # 日期那一格清空之后提交
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert fake.rescheduled_due == [None], f"清除没有走 due=None 这一条：{fake.rescheduled_due}"
+    assert theme.NO_VALUE in field_row(text, "截止"), (
+        f"清除之后那一格该读作「{theme.NO_VALUE}」：{field_row(text, '截止')!r}"
+    )
+
+
+async def test_a_date_that_is_not_a_real_day_is_refused_and_no_request_goes_out(tmp_path):
+    """非法日期在**发出前**被本地拦下，请求根本不出门（验收标准 6）。
+
+    接缝二（真引擎 + 真库 + 假传输）：「零请求」是网络这一侧的事实，替身说了不算。日期那一
+    格写一个日历上不存在的日子（``2026-02-30``），提交之后：一个请求都没有，编辑器留在
+    原地，屏上说出是哪一格不认。
+    """
+    transport = Recording()
+    app = real_app(tmp_path, transport)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to_the_due_field(pilot, app)
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press(*clear(10))
+        await pilot.press(*"2026-02-30")
+        await pilot.press("enter")
+        await pilot.pause()
+        text = screen_text(app)
+        still_editing = app.detail_page().query_one("#due-date").display
+
+    assert transport.requests == [], f"非法日期不该发出任何请求：{transport.requests}"
+    assert "2026-02-30" in text, f"该说清是哪一格不认：\n{text}"
+    assert still_editing, "拦下之后编辑器要留在原地，别把用户敲的东西丢掉"
+
+
+async def test_an_empty_date_field_is_refused_instead_of_clearing_silently():
+    """日期那一格**一个字都没敲过**时按 ``enter``：不放行，也不悄悄当成清除。
+
+    「还没填」与「要清除」在请求体里长得一样（``dueDate: null``），而误按一次就把日期删掉
+    是不可接受的（本地当场生效、立刻推送）。分界只能是「用户动过这一格没有」：这条测试
+    走的是**从来没动过**那一支（一条本来就没有截止时间的任务），下面那条走「删掉里面的
+    日期」那一支。
+    """
+    fake = backend()
+    fake.add_task("没有日期的任务", list_name="work", id="t2")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await pilot.press("escape")  # 回任务列表页
+        await pilot.pause()
+        await pilot.press("j")  # 光标到第二条（没有日期的那一条）
+        await pilot.press("enter")
+        await pilot.pause()
+        await walk_to_the_due_field(pilot, app)
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("enter")  # 日期那一格空着，直接提交
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert fake.rescheduled == [], f"空日期不该当成清除：{fake.rescheduled_due}"
+    assert "没改成" in text, f"拦下之后要说一句为什么：\n{text}"
+
+
+async def test_deleting_the_date_that_was_there_is_a_clear_and_not_a_mistake():
+    """把**已有的**日期删掉再提交 = 清除（与上一条成对）。
+
+    同一个空值，两种意思：上一条是「还没填」（没动过那一格），这一条是「要清除」（用户把
+    里面的日期删了）。这就是 ``_due_date_touched`` 存在的理由。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to_the_due_field(pilot, app)
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press(*clear(10))
+        await pilot.press("enter")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert fake.rescheduled_due == [None], f"删掉已有的日期该是清除：{fake.rescheduled_due}"
+    assert theme.NO_VALUE in field_row(text, "截止"), field_row(text, "截止")
+
+
+async def test_the_due_editor_writes_out_an_explicit_null_shape(tmp_path):
+    """清空日期那一笔请求体的形状：显式 ``dueDate: null``（验收标准 3 + 9，接缝二）。
+
+    与 ``test_engine_writes`` 里那条形状测试是同一个事实的两个入口：那一条从引擎进，这一条
+    从**界面**进（用户清了那一格），两条都要求请求体里写着显式的 null——「省略这个字段」
+    在文档没说的省略语义下可能是「别动它」，那用户按了清除却什么都没发生。
+    """
+    transport = Recording()
+    app = real_app(tmp_path, transport)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to_the_due_field(pilot, app)
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press(*clear(10))
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert len(transport.requests) == 1, f"清除该只发一笔：{transport.requests}"
+    body = json.loads(transport.requests[0].content)
+    assert body["dueDate"] is None, body
+    assert body["isAllDay"] is False, body
+    assert body["timeZone"] == "Asia/Shanghai", "时区字段原样回写（验收标准 7）"
+    assert body["focusSummaries"] == [{"pomoCount": 1}], "服务端给的陌生字段一起回去（验收标准 8）"
