@@ -33,6 +33,7 @@ from dida.api.guards import (
     guard_writable,
     merge_snapshot,
     prepare_completed_window_body,
+    prepare_project_body,
     prepare_write_body,
 )
 from dida.api.transport import Transport
@@ -71,6 +72,54 @@ class DidaApiClient:
             params["limit"] = limit
         response = await self._send(self._request("GET", "/open/v1/project", params=params))
         return self._payload_array(response, endpoint="清单索引", item_keys=("id",))
+
+    async def create_project(self, body: Mapping[str, Any]) -> dict[str, Any] | None:
+        """POST /open/v1/project —— 新建清单（工单 #42）。
+
+        文档给了**两种成功形状**：``200 → Project`` 与 ``201 → No Content``（:1193–1194），
+        而且没说什么时候给哪一种。所以返回类型是「那一份清单，或者 ``None``」——把
+        「201 没有响应体」当成坏数据，会在**成功**那条路上抛 ``MalformedResponseError``，
+        而这条路只有真的连一次服务端才会走到。
+
+        请求体原样透传，形状由调用方按文档给（名字、颜色）：这里不认识领域概念。
+        """
+        response = await self._send(self._request("POST", "/open/v1/project", body=body))
+        return self._payload_object_or_none(response, endpoint="新建清单的响应")
+
+    async def update_project(
+        self,
+        project_id: str,
+        changes: Mapping[str, Any],
+        *,
+        snapshot: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        """POST /open/v1/project/{projectId} —— 改清单（文档里是 POST，不是 PATCH，:1228）。
+
+        ``snapshot`` 是本地那份清单原文：不打算改的字段靠它 echo 回去，
+        :func:`~dida.api.guards.prepare_project_body` 再把请求体收窄到文档接受的字段。
+        ``sortOrder`` 尤其要紧——文档写着 "default 0"，省略它可能把用户的清单顺序重置
+        （api-shapes §B10）。
+
+        成功形状同样有两种：``200 → Project`` / ``201 No Content``。
+        """
+        body = prepare_project_body(snapshot, changes)
+        response = await self._send(
+            self._request("POST", f"/open/v1/project/{project_id}", body=body)
+        )
+        return self._payload_object_or_none(response, endpoint=f"更新清单 {project_id} 的响应")
+
+    async def delete_project(self, project_id: str) -> None:
+        """DELETE /open/v1/project/{projectId} —— 删清单（工单 #42）。
+
+        没有请求体；响应是 ``200 No Content``（401/403/404 也是 No Content，:1291–1294），
+        所以响应体一个字节都不解析——「不可信」在这里就是字面意思。
+
+        **服务端没有回收站、没有撤销删除的接口**：文档通篇搜不到 undelete / restore /
+        已删除列表（api-shapes §A6）。删掉一个清单时它里面的任务会怎样，文档也一个字没说
+        （:1278–1302 通篇只有路径、参数、响应表与一个请求示例），所以确认文案必须如实说
+        「不知道」，并且不承诺任何恢复手段。
+        """
+        await self._send(self._request("DELETE", f"/open/v1/project/{project_id}"))
 
     async def list_tags(self) -> list[dict[str, Any]]:
         """GET /open/v1/tag —— 全部标签（``OpenTag``：name / label / sortOrder / color / type）。"""
@@ -210,6 +259,22 @@ class DidaApiClient:
             raise self._malformed(response, endpoint, "一个对象", payload)
         self._require(response, endpoint, payload, required)
         return payload
+
+    def _payload_object_or_none(
+        self, response: httpx.Response, *, endpoint: str, required: Sequence[str] = ()
+    ) -> dict[str, Any] | None:
+        """同 :meth:`_payload_object`，但**空响应体是合法的**：那种成功形状表示「没有内容」。
+
+        openapi 里 ``POST /open/v1/project`` 与它的更新都写着两种成功：``200 → Project``
+        与 ``201 → No Content``（:1193–1194、:1244–1245）。走 :meth:`_payload` 的实现在
+        第二种上会抛 ``MalformedResponseError``——一次**成功**被报成坏数据。
+
+        判据是**响应体空不空**，不是状态码：204 与 201 都可能不带体，而 200 带空体时
+        「没有内容」同样是它说出来的意思。非空的体照旧按对象解析，形状不对仍然报错。
+        """
+        if not response.content:
+            return None
+        return self._payload_object(response, endpoint=endpoint, required=required)
 
     def _payload_array(
         self, response: httpx.Response, *, endpoint: str, item_keys: Sequence[str] = ()
