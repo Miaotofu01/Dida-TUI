@@ -148,7 +148,9 @@ TodayView(lists, groups, completed: CompletedSection)   # 已完成区在中栏�
 ListSummary(id, name, unfinished)            # 左栏的未完成条数徽标
 TaskGroup(kind: GroupKind, items)            # kind 是 OVERDUE / TODAY / INBOX_UNDATED；title 与 count 由 kind 推出
 TaskItem(task_id, title, list_id, list_name, priority, priority_mark, due, all_day, due_text,
-         desc, content, tags_text)           # 后三个是右栏常驻的「描述 / 备注 / 标签」
+         overdue, desc, content, tags_text, repeat_flag, reminders, completed)
+# desc/content/tags_text 是右栏常驻的「描述 / 备注 / 标签」；overdue 是求值给的逾期判定
+# （TUI 不许自己判日期）；repeat_flag/reminders 是行上的重复与提醒标记；completed 决定沉底
 CompletedSection(items: tuple[CompletedItem, ...])
 ```
 

@@ -22,7 +22,7 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Protocol
 
-__all__ = ["RowFacts", "completed_window_start", "row_sort_key"]
+__all__ = ["RowFacts", "completed_window_start", "row_sort_key", "task_is_completed"]
 
 
 class RowFacts(Protocol):
