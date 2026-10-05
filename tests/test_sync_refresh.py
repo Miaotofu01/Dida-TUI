@@ -406,6 +406,119 @@ async def test_the_inbox_is_fetched_even_when_the_project_index_omits_it(store):
     ]
 
 
+async def test_refresh_learns_the_inbox_id_from_the_payload_and_adds_that_row_itself(store):
+    """收集箱那一行由客户端补，id 是**服务端返回**的那一串（#33，实测事实 #2）。
+
+    实测：``GET /open/v1/project/inbox/data`` 的响应里没有 ``project`` 对象，收集箱的真实 id
+    只在它的任务上（``projectId`` 形如 ``inbox`` 加数字）。所以「客户端补一行」只能这么做：
+    从这批任务里认出那个 id，用它当行 id——字面量 ``"inbox"`` 不是身份，拿它归类一条都对不上。
+    """
+    transport = FakeTransport()
+    serve(
+        transport,
+        index=[project()],
+        data=[
+            data(project(), []),
+            {"tasks": [task(id="t9", project_id="inbox1025205395", title="随手记")]},
+        ],
+    )
+    engine = make_engine(store, transport)
+
+    await engine.refresh()
+
+    rows = engine.list_index()
+    assert rows[0].is_inbox is True, "收集箱置顶"
+    assert rows[0].id == "inbox1025205395"
+    assert rows[0].name == "收集箱"
+    assert rows[0].unfinished == 1
+    assert "inbox" not in {row.id for row in rows}
+    assert [item.title for item in engine.tasks_in("inbox1025205395").items] == ["随手记"]
+    assert {row.id: row for row in store.list_records()}["inbox1025205395"].is_inbox is True, (
+        "这一行要落库：下次启动（还没刷新时）也认得出收集箱"
+    )
+
+
+async def test_a_missing_project_id_is_filled_with_the_server_id_not_the_literal(store):
+    """服务端漏写 ``projectId`` 时，补的是**服务端返回的那个 id**，不是请求侧别名。
+
+    同一批任务里就有那个 id（收集箱的真实 id 只在任务上），用它补，这条任务才归得进收集箱。
+    """
+    transport = FakeTransport()
+    serve(
+        transport,
+        index=[project()],
+        data=[
+            data(project(), []),
+            {
+                "tasks": [
+                    task(id="t9", project_id="inbox1025205395", title="随手记"),
+                    {"id": "t10", "title": "服务端漏了 projectId", "status": 0},
+                ]
+            },
+        ],
+    )
+    engine = make_engine(store, transport)
+
+    await engine.refresh()
+
+    assert store.task_payload("t10")["projectId"] == "inbox1025205395"
+    assert {item.title for item in engine.tasks_in("inbox1025205395").items} == {
+        "随手记",
+        "服务端漏了 projectId",
+    }
+
+
+async def test_a_missing_project_id_is_not_filled_with_the_literal_inbox(store):
+    """整批都没有可认的 id 时，缺失的 ``projectId`` 就**空着**——绝不写字面量 ``inbox``。
+
+    写下去的那个字面量与收集箱的真实 id 一条都对不上（左栏徽标会是 0、清单名也对不上），
+    而且会让深链的兜底分支永远不可达。#33 明说要去掉的就是这个猜。
+    """
+    transport = FakeTransport()
+    serve(
+        transport,
+        index=[project()],
+        data=[
+            data(project(), []),
+            {"tasks": [{"id": "t10", "title": "不知道在哪个清单", "status": 0}]},
+        ],
+    )
+    engine = make_engine(store, transport)
+
+    await engine.refresh()
+
+    assert "projectId" not in (store.task_payload("t10") or {})
+    assert store.tasks()[0].list_id == ""
+
+
+async def test_the_inbox_row_from_a_project_object_is_marked_as_the_inbox(store):
+    """收集箱的 data 里带 ``project`` 对象时照它写一行，并**标成收集箱**。
+
+    ``Project`` 定义里没有「我是收集箱」这种字段（api-contracts.md 的字段表里没有），所以
+    「这一行是收集箱」只有客户端知道——它刚用别名把这个容器取回来。标了它，清单索引才把它
+    置顶、认得出它（用户故事 11）。
+    """
+    transport = FakeTransport()
+    serve(
+        transport,
+        index=[project()],
+        data=[
+            data(project(), []),
+            data(
+                project(id="inbox1025205395", name="收集箱"),
+                [task(id="t9", project_id="inbox1025205395", title="随手记")],
+            ),
+        ],
+    )
+    engine = make_engine(store, transport)
+
+    await engine.refresh()
+
+    records = {row.id: row for row in store.list_records()}
+    assert records["inbox1025205395"].is_inbox is True
+    assert engine.list_index()[0].id == "inbox1025205395"
+
+
 async def test_refresh_without_a_wired_cache_or_client_fails_loudly(store):
     """没接线的引擎不许假装刷过了：缺本地库、缺客户端都大声报错。"""
     with pytest.raises(RuntimeError, match="本地存储"):
