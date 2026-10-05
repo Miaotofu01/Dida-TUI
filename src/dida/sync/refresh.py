@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_chec
 
 from dida.api.errors import MalformedResponseError
 from dida.logical_day import logical_day
-from dida.sync.view import INBOX_ID, ViewSource
+from dida.sync.view import INBOX_ID, INBOX_NAME, ViewSource
 
 if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能在这里 import
     from dida.storage.store import RefreshReport, StoredSyncState
@@ -131,12 +131,13 @@ class RefreshMixin:
         tasks: list[Mapping[str, Any]] = []
         for project_id in fetched:
             payload = await reader.get_project_data(project_id)
-            tasks.extend(_unfinished_tasks(payload, project_id))
+            fetched_tasks = _unfinished_tasks(payload, project_id)
+            tasks.extend(fetched_tasks)
             # 索引没提过的清单，用它自己的原文补一行，左栏才不会漏掉一个装着任务的清单。
             if project_id not in known:
-                project_payload = payload.get("project") if isinstance(payload, Mapping) else None
-                if isinstance(project_payload, Mapping) and project_payload.get("id"):
-                    lists.append(project_payload)
+                row = _missing_project_row(payload, fetched_tasks, project_id)
+                if row is not None:
+                    lists.append(row)
                     known.add(project_id)
 
         # 取数到这里已经取全了（清单索引翻页翻到底、每个清单的未完成都拿到），所以落库时
@@ -228,8 +229,10 @@ def _unfinished_tasks(payload: Any, project_id: str) -> list[Mapping[str, Any]]:
     形状不对才报错——一个形状不对的 ``tasks`` 被当成空数组，用户看到的就是「我的任务
     不见了」，而且不报错。
 
-    服务端漏写 ``projectId`` 时补上取数用的那个清单 id：这条任务是从哪个清单拉回来的，
-    只有引擎知道；不补的话 t08 会把它算进收集箱（左栏徽标与清单名全错，且不报错）。
+    服务端漏写 ``projectId`` 时补上**服务端返回的**容器 id（:func:`_container_id`）：
+    这条任务是从哪个清单拉回来的，只有引擎知道；不补的话 t08 会把它算进「不知道在哪个
+    清单」。**请求侧的字面量别名 ``inbox`` 不是答案**（#33）：收集箱的真实 id 是每账户
+    不同的一串，拿别名补下去，归类一条都对不上；认不出服务端 id 时宁可空着。
     """
     if not isinstance(payload, Mapping):
         raise MalformedResponseError(
@@ -242,4 +245,51 @@ def _unfinished_tasks(payload: Any, project_id: str) -> list[Mapping[str, Any]]:
         raise MalformedResponseError(
             f"清单 {project_id} 的 tasks 不是任务数组：收到 {type(raw).__name__}"
         )
-    return [task if task.get("projectId") else {**task, "projectId": project_id} for task in raw]
+    container_id = _container_id(payload, raw, project_id)
+    if container_id is None:
+        return list(raw)
+    return [task if task.get("projectId") else {**task, "projectId": container_id} for task in raw]
+
+
+def _container_id(payload: Any, tasks: Sequence[Mapping[str, Any]], project_id: str) -> str | None:
+    """这次取回来的这个容器，**服务端认的 id** 是什么。
+
+    优先用 ``payload["project"]["id"]``；否则用这批任务里任意一条带的 ``projectId``——实测
+    （用户账户的缓存）收集箱的 data 里**没有** ``project`` 对象，它那个每账户一串的真实 id
+    只在它的任务上。
+
+    真实清单请求用的 id 本来就来自服务端的清单索引，所以兜底可以用它；请求侧的别名
+    ``inbox`` 不算答案，这时返回 ``None``（认不出就不猜）。
+    """
+    project_payload = payload.get("project") if isinstance(payload, Mapping) else None
+    if isinstance(project_payload, Mapping) and project_payload.get("id"):
+        return str(project_payload["id"])
+    for task in tasks:
+        if task.get("projectId"):
+            return str(task["projectId"])
+    return None if project_id == INBOX_ID else project_id
+
+
+def _missing_project_row(
+    payload: Any, tasks: Sequence[Mapping[str, Any]], project_id: str
+) -> Mapping[str, Any] | None:
+    """索引里没提过的清单 → 客户端自己补的那一行；补不出来就 ``None``。
+
+    正常清单用原文里的 ``project`` 对象。收集箱是特例：实测它的 data 里没有 ``project``
+    对象，那就用这批任务带的 ``projectId`` 造一行（名字用客户端的叫法）——服务端的清单索引
+    里没有收集箱，这一行只能由客户端补（GLOSSARY「收集箱」）。
+
+    这一行还要标成收集箱：``Project`` 定义里没有「我是收集箱」这种字段（api-contracts.md
+    的字段表里没有），而「这个容器是收集箱」只有刚用别名把它取回来的引擎知道。
+    """
+    project_payload = payload.get("project") if isinstance(payload, Mapping) else None
+    if isinstance(project_payload, Mapping) and project_payload.get("id"):
+        row: Mapping[str, Any] = project_payload
+    elif project_id == INBOX_ID:
+        learned = _container_id(payload, tasks, project_id)
+        if learned is None:
+            return None
+        row = {"id": learned, "name": INBOX_NAME}
+    else:
+        return None
+    return {**row, "isInbox": True} if project_id == INBOX_ID else row

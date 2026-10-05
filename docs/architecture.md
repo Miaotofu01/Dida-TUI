@@ -11,7 +11,7 @@
 | 1 | 配置与凭据 | `dida/config.py` | `Config`（`token` / `day_end` / `refresh_on_start` / `push_on_change` / `completed_window_hours`）、`config_path()`、`load_config()`、`save_config()`、`needs_token()`、`Credentials(transport=, path=).verify_and_store(token)`；失败是 `ConfigError` / `CredentialsError` | t03 已实现 |
 | 2 | 滴答 API 客户端 | `dida/api/` | `DidaApiClient(token=, transport=, base_url=)`：`list_projects(offset=, limit=)`、`get_project_data(project_id)`、`get_task(project_id, task_id)`、`list_tags()`、`list_completed(project_ids=, start_date=, end_date=)`、`create_task(body)`、`update_task(project_id, task_id, changes, snapshot=)`、`complete_task(project_id, task_id)`、`delete_task(project_id, task_id)`；失败一律是 `dida.api.errors.DidaError` 的子类（`NetworkError` / `AuthError` / `ServerRejectionError` / `FieldIgnoredError`，守卫另有 `InvalidDateError` / `DatelessRepeatError` / `MalformedResponseError`） | t07 已实现 |
 | 3 | 本地存储 | `dida/storage/store.py` | `Store`：清单、任务快照、待推送改动、同步状态 | t08 已实现 |
-| 4 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` | `SyncEngine(clock=, day_end=, source=, client=)`、`status() -> SyncStatus`、`view() -> TodayView`、`refresh() -> RefreshReport`（**async**）、`complete(task_id)`、`defer(task_id)`、`push_pending()`；视图模型与分组纯函数在 `dida/sync/view.py` | t05 / t09 / t10 已实现 |
+| 4 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` + `dida/sync/read.py` | `SyncEngine(clock=, day_end=, source=, client=)`、`status() -> SyncStatus`、`view() -> TodayView`、**三种读形状**（#33）：`list_index() -> tuple[ListRow, ...]`、`tasks_in(container_id) -> TaskList`、`task_detail(task_id) -> TaskDetail \| None`、`refresh() -> RefreshReport`（**async**）、`complete(task_id)`、`defer(task_id)`、`push_pending()`；视图模型与分组纯函数在 `dida/sync/view.py`，读模型在 `dida/sync/read.py` | t05 / t09 / t10 已实现；读形状 #33 |
 | 5 | 逻辑日 | `dida/logical_day.py` | `parse_day_end(text) -> timedelta`、`logical_day(now, day_end) -> LogicalDay`（`label` / `start` / `end`，半开区间） | t04 已实现 |
 | 6 | 日期解析器 | `dida/date_parser.py` | `parse(text, now, day_end="00:00") -> ParsedTask` | t06 已实现 |
 | 7 | TUI | `dida/tui/` | `DidaApp(engine)`；栏位 `#list-pane` / `#task-pane` / `#detail-pane` / `#status-bar`、`update_status()` | t05 / t18 已实现 |
@@ -63,6 +63,34 @@ assert transport.last_json == {"title": "写周报"}      # 请求体字段
 另外两件事不走报错，走**原样回写**：时区与未知字段一律逐字节带回——写路径把服务端给的
 快照与本次改动合并后再发（`update_task(..., snapshot=)`），所以调用方递进来的那份快照
 越新越好。
+
+## v2 的三种读形状（#33）
+
+v1 的读入口只有一个为「今日」硬编码的 `view()`（#34 删界面时它会跟着走）。v2 的三层页面
+要三种形状，类型与组装纯函数在 `dida/sync/read.py`，引擎把它们再导出（TUI 只 import
+`dida.sync.engine` 这一条不变）：
+
+- `list_index() -> tuple[ListRow, ...]` —— 清单索引：收集箱置顶 → 内置视图（今天 / 最近七天 /
+  所有）→ 自定义视图 → 真实清单。`ListRow.kind`（`ListKind`）是**行的身份**，真实清单那一行
+  还带 `color` / `group_id` / `project_kind`（服务端的 `TASK`/`NOTE`）/ `permission`，
+  每行带 `unfinished`（未完成条数）。`enterable` 说清 NOTE 清单与 permission 非 write 的行
+  进不去（用户故事 23 / 24）。
+- `tasks_in(container_id) -> TaskList` —— 某个容器的任务列表：这个容器的**全部**未完成任务
+  （截止时间在未来的也在，v1 把它们整条丢掉了）+ `completed`（这个容器里窗口内完成的）。
+- `task_detail(task_id) -> TaskDetail | None` —— 单条任务的详情：标题/描述/备注/清单/截止/
+  优先级/标签，外加只读的 `repeat_flag` / `reminders` / `subtasks`，以及原文里我们不认识的
+  字段（`unknown`，`raw` 整份带着，回写不丢字段）。
+
+**收集箱的身份**（spec 已实测 API 事实 #2）：服务端的清单索引里**没有**收集箱，`resolve_lists()`
+自己补上那一行；它的 id 是**服务端返回**的那一串（形如 `inbox` 加数字，实测
+`inbox1025205395`），归类、分组、计数一律按这个 id。缺失的 `projectId` 读作空串
+（「不知道在哪个清单」），**不再**猜成字面量 `inbox`——那既让深链的兜底分支不可达，又让归类
+一条都对不上。深链拼装（`dida.tui.escape.task_url`）同样只认「真的是收集箱」的 id：
+请求侧别名，或服务端那一串；id 里恰好带 `inbox` 的真实清单不再被改写。
+
+自定义视图的行由源上的可选能力 `ViewReader.views()` 给（#36 把视图定义落库并求值）；
+内置视图由 `builtin_view_rows()` 算（#35 会把求值长全：逾期置顶标红、行里显示所属清单）。
+视图行里的 `task_ids` 是求值结果，行上的条数与进去看到的列表因此来自同一次求值。
 
 ## 读路径：视图模型与内存假后端（t05 定稿）
 

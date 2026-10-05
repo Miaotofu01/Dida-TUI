@@ -12,6 +12,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
+from dida.sync.read import PayloadReader
 from dida.sync.view import (
     SUBTASK_COMPLETED_STATUS,
     SUBTASK_NORMAL_STATUS,
@@ -132,9 +133,13 @@ class SubtaskMixin:
         return server.get("items")
 
     def _payload_of(self, task_id: str) -> Mapping[str, Any] | None:
-        """本地那份任务原文；源只满足读接口时当作「没有这条任务」。"""
+        """本地那份任务原文；源读不出原文时当作「没有这条任务」。
+
+        要的是**读**的能力（``PayloadReader``），不是写的能力：详情页与子任务行都只读它
+        （#33 的详情读形状也从这里过），只读的替身存得下原文就该读得到。
+        """
         source = self._source
-        return source.task_payload(task_id) if isinstance(source, WriteTarget) else None
+        return source.task_payload(task_id) if isinstance(source, PayloadReader) else None
 
     def _task_reader(self) -> TaskReader:
         """写前重读要的那个客户端。没接上就大声报错——绝不假装重读过了。"""
