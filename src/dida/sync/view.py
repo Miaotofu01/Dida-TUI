@@ -31,6 +31,7 @@ from enum import Enum
 from typing import Any, Mapping, Protocol, Sequence
 
 from dida.logical_day import logical_day
+from dida.sync.rows import row_sort_key
 
 NO_DUE_TEXT = "—"
 """没有截止时间的读法；与「今天」一眼可分。"""
@@ -174,6 +175,14 @@ class TaskItem:
     没有标签就是空串——「这一行要不要画」由这个空串回答，详情栏不自己判断有没有标签。
     """
 
+    completed: bool = False
+    """这条任务已完成。
+
+    「已完成沉底」要在**读模型**这一层成立，不能只靠界面把两段拼起来：视图的成员是混的
+    （自定义视图的过滤条件里就有完成状态这一维），一个含已完成成员的视图会把做完的任务
+    插在未完成中间。判定只看 ``status``（工单 #37 / spec 的「本地判定已完成」）。
+    """
+
 
 @dataclass(frozen=True)
 class TaskGroup:
@@ -283,6 +292,7 @@ def task_item(snapshot: TaskSnapshot, names: dict[str, str], *, now: datetime, d
         desc=snapshot.desc,
         content=snapshot.content,
         tags_text=format_tags(snapshot.tags),
+        completed=snapshot.completed,
     )
 
 
@@ -369,14 +379,13 @@ def format_due(due: datetime | None, *, all_day: bool, now: datetime, day_end: s
 
 
 def by_due(items: Sequence[TaskItem]) -> list[TaskItem]:
-    """有截止时间的按时间升序在前，没有的按标题排在后面。
+    """按 spec 的排序链排：截止时间升序 → 优先级降序 → 无日期在后 → 已完成沉底。
 
-    读模型（:mod:`dida.sync.read`）也用它：容器里的行与「今天」那一屏的排序规矩是同一份。
-    排序规矩本身归 #37（截止时间 → 优先级 → 无日期在后 → 已完成沉底），这里先照 v1 的。
+    键在 :func:`dida.sync.rows.row_sort_key`（纯函数，直接测）：这一份与「今天」那一屏、
+    某个容器的任务列表、以及视图求值用的是同一个顺序——**客户端统一重排**，服务端的
+    ``sortOrder`` 一律不看（spec 的「一个已知的、故意的取舍」）。
     """
-    dated = sorted((item for item in items if item.due is not None), key=lambda item: (item.due, item.title))
-    undated = sorted((item for item in items if item.due is None), key=lambda item: (item.title, item.task_id))
-    return dated + undated
+    return sorted(items, key=row_sort_key)
 
 
 # ------------------------------------------------------------------ 模糊过滤（t17）
