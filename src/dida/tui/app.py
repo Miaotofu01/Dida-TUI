@@ -56,9 +56,9 @@ from dida.tui.keys import (
     bindings_for,
     help_body,
 )
-from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay
+from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay, multi_values
 from dida.tui.pages import DetailPage, IndexPage, TasksPage
-from dida.tui.pages.detail import LIST_FIELD, PRIORITY_FIELD, picker_spec
+from dida.tui.pages.detail import LIST_FIELD, PRIORITY_FIELD, TAGS_FIELD, picker_spec
 from dida.tui.pages.index import (
     LIST_COLOR_FIELD,
     LIST_NAME_FIELD,
@@ -532,11 +532,22 @@ class DidaApp(App[None]):
         detail = self.engine.task_detail(event.task_id)
         if detail is None:
             return
+        notice = ""
+        if event.field == TAGS_FIELD:
+            try:
+                await self.engine.load_tags()
+            except DidaError as exc:
+                # 拉不到就说出来，而且**照旧开浮层**（本地已经见过的那些照样挑得动）；
+                # 这一句写在浮层的提示里，不是状态栏上——浮层是模态的，状态栏在它底下。
+                notice = messages.tags_load_failed_message(exc)
+            if not self.is_running:
+                return
         spec = picker_spec(
             event.field,
             detail,
             lists=self.engine.move_targets(),
             tags=self.engine.tags(),
+            notice=notice,
         )
         if spec is None:
             return
@@ -588,6 +599,8 @@ class DidaApp(App[None]):
             picked = values[PRIORITY_FIELD]
             if picked.isdigit():
                 self.engine.write(task_id, changes={"priority": int(picked)})
+        elif field == TAGS_FIELD:
+            self.engine.write(task_id, changes={"tags": list(multi_values(values[TAGS_FIELD]))})
 
     # ---------------------------------------------------------------- 清单的建 / 改 / 删（#42）
 

@@ -43,12 +43,18 @@ from dida.sync.view import (
 )
 
 
-_SNAPSHOT_FIELDS = frozenset({"title", "content", "desc", "priority", "completed", "due", "all_day"})
+_SNAPSHOT_FIELDS = frozenset(
+    {"title", "content", "desc", "priority", "completed", "due", "all_day", "tags"}
+)
 """一次写里能直接盖进 :class:`TaskSnapshot` 的那些字段名。
 
 引擎给的是**服务端字段名**（``content`` / ``desc`` / ``title``……），快照上那几位恰好同名；
 其余（``dueDate``、``items``、未知字段）只并进服务端原文。替身不自己翻译字段——那一层
 是 ``Store`` 的事，替身照它的口径做最小的那一份。
+
+``tags`` 在里面（#45）：``Store`` 读快照时是从原文里取 ``tags`` 的（``_snapshot``），所以
+一次改标签在真库里当场就反映到读路径上；替身少了这一条就会「写进去了但屏幕上没变」——
+那正是接缝一要断的那句话。
 """
 
 

@@ -430,3 +430,77 @@ async def test_the_priority_field_offers_the_four_levels_and_writes_the_wire_cod
     assert back == "低", "右方向键换不回去"
     assert fake.writes == [("t1", {"priority": 1})], f"写出去的不是线上编码：{fake.writes}"
     assert "低" in field_row(after, "优先级"), f"改完那一格没变：\n{after}"
+
+
+def tag_marked(text: str, name: str) -> bool:
+    """挑选器里 ``name`` 那个标签现在打上了没有（``☑`` / ``☐`` 那一列）。"""
+    for line in text.splitlines():
+        if name in line and (theme.CHECK_ON in line or theme.CHECK_OFF in line):
+            return theme.CHECK_ON in line
+    raise AssertionError(f"挑选器里没有「{name}」这个标签：\n{text}")
+
+
+async def test_the_tag_field_picks_from_existing_tags_and_says_new_ones_come_from_the_official_client():
+    """标签从**已有的**里多选打上（验收标准 5），并**如实告知**新建标签要回官方客户端（6）。
+
+    断三件事：打开这一格才去拉一次标签列表；``space`` 打上、``↑``/``↓`` 换一个、``Enter``
+    把挑中的那一份写出去；底部那行提示里写着「这个客户端不做新建标签」——**不是**「接口
+    做不到」（``POST /open/v1/tag`` 是文档里有的端点，那是范围决定，不是能力上限）。
+    """
+    fake = backend()  # 任务上已经打着 工作 / 季度
+    fake.set_tags("工作", "季度", "紧急")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "tags")
+        await pilot.press("enter")
+        await pilot.pause()
+        picker = screen_text(app)
+        await pilot.press("space")  # 取消「工作」
+        await pilot.press("down", "down")  # 工作 → 季度 → 紧急
+        await pilot.pause()
+        walked = screen_text(app)
+        await pilot.press("space")  # 打上「紧急」
+        await pilot.pause()
+        toggled = screen_text(app)
+        await pilot.press("enter")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert fake.tag_loads == 1, "打开挑标签那一格时才拉一次标签列表"
+    assert tag_marked(picker, "工作") and tag_marked(picker, "季度"), f"任务上已有的标签没打上：\n{picker}"
+    assert not tag_marked(picker, "紧急"), f"没打过的标签不该是打上的：\n{picker}"
+    assert tag_marked(walked, "季度") and not tag_marked(walked, "紧急"), f"↓ 没有换到下一个：\n{walked}"
+    assert tag_marked(toggled, "紧急"), f"space 没有把「紧急」打上：\n{toggled}"
+    assert fake.writes == [("t1", {"tags": ["季度", "紧急"]})], f"写出去的不是挑中的那一份：{fake.writes}"
+    assert "季度" in field_row(after, "标签") and "紧急" in field_row(after, "标签"), f"改完那一格没变：\n{after}"
+    for line in messages.TAGS_PICKER_HINT.splitlines():
+        assert line in picker, f"提示里少了这一句「{line}」：\n{picker}"
+    assert "这个客户端不做" in picker, f"文案说成了接口做不到：\n{picker}"
+
+
+async def test_a_tag_list_that_cannot_be_fetched_is_said_out_loud_and_local_tags_stay_pickable():
+    """拉不到标签列表时**说出来**，而且本地已经见过的标签照样挑得动（验收标准 5）。
+
+    悄悄换成空列表就是「你没有标签」，那是对用户说假话；而任务上已经打着的标签必须留在
+    可挑的那一份里，否则断网时「取消一个标签」无路可走。
+    """
+    fake = backend()
+    fake.tag_error = DidaError("连不上服务器")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "tags")
+        await pilot.press("enter")
+        await pilot.pause()
+        picker = screen_text(app)
+
+    assert messages.tags_load_failed_message(DidaError("连不上服务器")) in picker, (
+        f"没拉到标签列表没有说出来：\n{picker}"
+    )
+    assert "连不上服务器" in picker, f"没说清是哪一种失败：\n{picker}"
+    assert tag_marked(picker, "工作") and tag_marked(picker, "季度"), f"本地已有的标签挑不动：\n{picker}"

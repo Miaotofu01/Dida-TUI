@@ -30,7 +30,7 @@ from textual.widgets import Input, Static, TextArea
 from dida.sync.engine import ListRow, TaskDetail
 from dida.tui import messages, theme
 from dida.tui.keys import LAYER_DETAIL, bindings_for
-from dida.tui.overlays import FORM_HINT, FormField, FormOption
+from dida.tui.overlays import FORM_HINT, MULTI_SEPARATOR, FormField, FormOption
 from dida.tui.pages.base import EMPTY_STYLE, CursorPage, Row, empty_row, rule_row
 
 __all__ = [
@@ -43,6 +43,7 @@ __all__ = [
     "priority_picker",
     "picker_spec",
     "read_only_rows",
+    "tags_picker",
 ]
 
 SUBTASK_DONE_MARK = theme.SUBTASK_DONE_MARK
@@ -139,7 +140,13 @@ def fields_of(detail: TaskDetail) -> tuple[Field, ...]:
             display=messages.priority_name(detail.priority),
             picker=True,
         ),
-        Field("tags", "标签", value=detail.tags_text, display=detail.tags_text or messages.EMPTY_FIELD_TEXT),
+        Field(
+            "tags",
+            "标签",
+            value=detail.tags_text,
+            display=detail.tags_text or messages.EMPTY_FIELD_TEXT,
+            picker=True,
+        ),
     )
 
 
@@ -211,14 +218,43 @@ def priority_picker(detail: TaskDetail) -> tuple[FormField, ...]:
     )
 
 
+def tags_picker(detail: TaskDetail, tags: Sequence[str]) -> tuple[FormField, ...]:
+    """「标签」那一格：从**已有的**标签里多选（工单 #45）。
+
+    选项是引擎给的那一份（服务端那份名单 ∪ 本地任务上出现过的）。任务上已经打着的标签
+    即使不在名单里也照样看得见、去得掉——:class:`~dida.tui.overlays.MultiChoiceField`
+    把它们自己补成一档（与 ``ChoiceField`` 对认不出的颜色同一条口径），所以「取消一个标签」
+    在名单拉不到时也走得通。
+
+    值那一串用 :data:`~dida.tui.overlays.MULTI_SEPARATOR` 连：标签名里可以有逗号，
+    分隔符必须是一个打不出来的字符。
+
+    底部那行提示换成 :data:`~dida.tui.messages.TAGS_PICKER_HINT`：那一格要说清「新建标签
+    要回官方客户端」（验收标准 6），而默认那行提示只说键位。
+    """
+    return (
+        FormField(
+            name=TAGS_FIELD,
+            label="标签",
+            options=tuple(FormOption(name, name) for name in tags),
+            value=MULTI_SEPARATOR.join(detail.tags),
+            multi=True,
+        ),
+    )
+
+
 def picker_spec(
     key: str,
     detail: TaskDetail,
     *,
     lists: Sequence[ListRow] = (),
     tags: Sequence[str] = (),
+    notice: str = "",
 ) -> Picker | None:
     """哪一格开哪一张挑选浮层（``key`` 是字段注册表里的 ``key``）。
+
+    ``notice`` 是这一次开浮层前就该说的一句话（挑标签那一格用它说「名单没拉到，这一份是
+    本地的」）——写在浮层的提示最前面：浮层是模态的，说在它里面才看得见。
 
     认不出来的 ``key`` 给 ``None``（什么都不开）：这一页只认识自己那几格，别人传错名字时
     静默什么都不做，比开一张空浮层好。
@@ -227,6 +263,8 @@ def picker_spec(
         return Picker("搬到哪个清单", list_picker(detail, lists))
     if key == "priority":
         return Picker("优先级", priority_picker(detail))
+    if key == "tags":
+        return Picker("标签", tags_picker(detail, tags), messages.tags_picker_hint(notice))
     return None
 
 
