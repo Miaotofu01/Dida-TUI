@@ -45,14 +45,15 @@ def field_value(text: str, label: str) -> str:
     """表单里 ``label`` 那个字段的**控件**上写着什么。
 
     弹层是画在下面那一层**上面**的，所以屏幕文本里两层的字都在；要断「输入框里现在是
-    什么」，只能按字段名找到它自己那几行（边框与边框线不算内容）。
+    什么」，只能按字段名找到它自己那几行。两层的边框（浮层自己的 ``|`` 与输入框那圈
+    ``+--+``）都要剥掉——它们不是内容。
     """
     lines = text.splitlines()
     index = next((i for i, line in enumerate(lines) if label in line), None)
     if index is None:
         raise AssertionError(f"屏幕上没有「{label}」这个字段：\n{text}")
     for following in lines[index + 1 :]:
-        content = following.strip().strip("|").strip()
+        content = following.strip(" |")
         if not content or set(content) <= set("+-"):
             continue
         return content
@@ -200,3 +201,194 @@ async def test_the_form_shell_takes_whatever_fields_the_row_needs():
     assert "清单范围" in rendered and "关键词" in rendered
     assert field_value(rendered, "清单范围") == "< 生活 >", "字段自带的当前值要显示出来"
     assert handed_back == [{"scope": "life", "keyword": "ab"}]
+
+
+# ------------------------------------------------------------------ e：改名字与颜色
+
+
+async def test_e_opens_the_form_prefilled_and_the_row_takes_the_new_name():
+    """``e`` 的表单填着**当前的**名字与颜色，改完清单列表页上立刻是新名字（验收标准 2）。
+
+    打开时那一格的值是**全选**的（Textual ``Input`` 的 ``select_on_focus``），所以直接打字
+    就是换掉整个名字——像文件管理器里的重命名。要接着改就先把光标挪进去。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await move_cursor_to(pilot, app.index_page(), "work")
+        await pilot.press("e")
+        await pilot.pause()
+        prefilled = field_value(screen_text(app), "名字")
+
+        await pilot.press(*"renamed")  # 全选着，直接打就是整个换掉
+        await pilot.press("enter")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert prefilled == "工作", "改的是这一行，不是新建"
+    assert fake.created_lists == [], "``e`` 不新建"
+    assert fake.updated_lists == [("work", "renamed", None)], "没挑颜色就不动颜色"
+    assert LIST_MARK in row_of(after, "renamed")
+    assert "工作" not in after, "改完的清单列表页上是新名字，不是旧的"
+
+
+async def test_the_colour_of_a_list_stays_when_only_the_name_changes():
+    """清单上那个颜色不在客户端这一档里时，也要照原样留着并原样交回去。
+
+    手机端挑的颜色客户端不认识（文档只有 ``#F18181`` 一个样例）；改个名字顺手把它换成
+    别的颜色，与「改名把清单顺序重置成 0」是同一类静默破坏。
+    """
+    fake = backend()
+    fake.add_list("海外", id="abroad", color="#123456")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await move_cursor_to(pilot, app.index_page(), "abroad")
+        await pilot.press("e")
+        await pilot.pause()
+        shown = field_value(screen_text(app), "颜色")
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert shown == "< #123456 >", "认不出来的颜色自成一档，原样显示"
+    assert fake.updated_lists == [("abroad", "海外", "#123456")], "原样回写"
+
+
+# ------------------------------------------------------------------ d：删清单
+
+
+async def test_d_asks_once_with_the_truth_and_only_y_deletes():
+    """``d`` 一次 ``y/n`` 确认；文案如实说文档没写、且不承诺恢复（验收标准 3、4）。"""
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await move_cursor_to(pilot, app.index_page(), "work")
+        await pilot.press("d")
+        await pilot.pause()
+        asked = screen_text(app)
+
+        await pilot.press("n")
+        await pilot.pause()
+        after_cancel = screen_text(app)
+
+        await pilot.press("d")
+        await pilot.pause()
+        await pilot.press("y")
+        await pilot.pause()
+        after_yes = screen_text(app)
+
+    assert fake.deleted_lists == ["work"], "只有 y 那一次真的删了"
+
+    assert "删除清单「工作」" in asked, "问的是哪一条，写在最上面"
+    assert "里面的任务会怎样" in asked and "文档没写" in asked, (
+        "删掉一个清单时里面的任务会怎样，文档一个字都没写——确认文案必须如实说「不知道」"
+    )
+    assert "找不回来" in asked and "回收站" in asked, "不承诺任何恢复手段"
+    assert LIST_MARK in row_of(after_cancel, "工作"), "``n`` 之后清单还在"
+    assert "工作" not in after_yes, "``y`` 之后那一行没了"
+
+
+# ------------------------------------------------------------------ 改不动的那几种行
+
+
+async def test_the_inbox_cannot_be_renamed_or_deleted_from_here():
+    """收集箱那一行是客户端补的默认落点：``e`` / ``d`` 都说清原因，不写任何东西。
+
+    改名与删除都**不**给表单、也**不**问那一句——问一句就等于「有可能删」，而它不会。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("e")
+        await pilot.pause()
+        after_edit = screen_text(app)
+
+        await pilot.press("d")
+        await pilot.pause()
+        after_delete = screen_text(app)
+
+    assert messages.INBOX_LIST_MESSAGE in after_edit
+    assert "名字" not in after_edit, "没开表单"
+    assert messages.INBOX_LIST_MESSAGE in after_delete
+    assert "文档没写" not in after_delete, "没问那一句"
+    assert fake.updated_lists == [] and fake.deleted_lists == []
+
+
+async def test_a_list_without_write_permission_says_why_it_cannot_be_changed():
+    """``permission`` 不是 ``write`` 的清单改不动，说清是这一种（用户故事 24）。"""
+    fake = backend()
+    fake.add_list("别人的清单", id="shared", permission="read")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await move_cursor_to(pilot, app.index_page(), "shared")
+        await pilot.press("e")
+        await pilot.pause()
+        after = screen_text(app)
+        await pilot.press("d")
+        await pilot.pause()
+
+    assert "改不动" in after and "写权限" in after
+    assert fake.updated_lists == [] and fake.deleted_lists == []
+
+
+async def test_a_view_row_is_left_to_the_views_ticket():
+    """视图不是清单：``e`` / ``d`` 在这里如实说清，不假装改得动（视图那三条归 #36）。"""
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await move_cursor_to(pilot, app.index_page(), "mine")
+        await pilot.press("d")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert messages.VIEW_ROW_MESSAGE in after
+    assert "文档没写" not in after, "视图不是清单，不套用清单那套确认文案"
+    assert fake.deleted_lists == []
+
+
+# ------------------------------------------------------------------ 表单开着时键盘归谁
+
+
+async def test_the_form_keeps_the_keyboard_while_it_is_open():
+    """表单开着时 ``q`` 是**打字**，不是退出；``Ctrl+C`` 也不退出（键盘归那一格）。
+
+    #47 实测：浮层的键位解析**截断在最后一个浮层控件上**，app 的绑定在浮层开着时够不着；
+    而 ``Input`` 自己吃字符、也自己绑了 ``Ctrl+C`` = 复制。所以这张表单刻意**不**加退出
+    绑定——派生的规矩是一条、不随焦点变：「表单开着时 Ctrl+C 永远不退出（有输入框就是复制，
+    选择框上什么都不做），出口是 Esc」。给选择框单独绑一个退出，会让同一个键随焦点时灵时不灵，
+    那正是看起来像 bug 的东西。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("n")
+        await pilot.pause()
+        await pilot.press("q", "ctrl+c")
+        await pilot.pause()
+        typed = field_value(screen_text(app), "名字")
+        still_open = "新建清单" in screen_text(app)
+        await pilot.press("tab")  # 挪到选择框上再来一次：键位就够不着 app 了
+        await pilot.press("q", "ctrl+c")
+        await pilot.pause()
+        after_choice = screen_text(app)
+        await pilot.press("escape")
+        await pilot.pause()
+        back = screen_text(app)
+
+    assert typed == "q", "q 打进名字那一格——清单可以叫「quizzes」"
+    assert still_open, "两个键都没有把 app 带走"
+    assert "新建清单" in after_choice, "焦点在选择框上时同样不退出"
+    assert "工作" in row_of(back, "工作"), "Esc 是出口：回到清单列表页"
