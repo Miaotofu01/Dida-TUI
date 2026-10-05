@@ -261,6 +261,27 @@ async def test_a_rule_spans_the_page_and_never_ends_in_an_ellipsis(width: int):
             )
 
 
+async def test_a_resized_window_re_lays_every_rule():
+    """窗口宽度变了，细线要按**新的**宽度重铺（``on_resize`` → 重画）。
+
+    细线是按格算出来的，宽度一变那个算式就变了。61 是奇数：它顺带证明这里算的是格，不是
+    「半格」——也不是拿旧的宽度凑合。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=(100, 24)) as pilot:
+        await pilot.pause()
+        await pilot.resize_terminal(61, 24)
+        await pilot.pause()
+        resized = screen_text(app)
+
+    found = rule_lines(resized)
+    assert found, f"缩放之后细线不见了：\n{resized}"
+    assert all(line == theme.RULE * 61 for line in found), (
+        f"细线没跟着新宽度重铺：{[cell_len(line) for line in found]}"
+    )
+
+
 @pytest.mark.parametrize("width", RULE_WIDTHS)
 async def test_content_that_overflows_keeps_its_gutter_and_its_ellipsis(width: int):
     """会溢出的**内容**行照旧：两格行首空档 + 按格裁到页边 + 行尾一个 ``…``。
