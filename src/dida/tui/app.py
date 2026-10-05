@@ -527,7 +527,7 @@ class DidaApp(App[None]):
         进得去、服务端已经见过的那些），优先级是 ``messages.PRIORITY_NAMES`` 那张表，
         标签是 ``tags()``。标签那一份还要**拉一次**（``load_tags``，``GET /open/v1/tag``）
         ——那是这一格里唯一一次网络调用，所以拉不到时照旧开浮层（本地已知的那些照样挑得动），
-        只把「没拉到」如实写在状态栏上。
+        只把「没拉到」写在浮层的提示里（浮层是模态的，状态栏在它底下，看不见）。
         """
         detail = self.engine.task_detail(event.task_id)
         if detail is None:
