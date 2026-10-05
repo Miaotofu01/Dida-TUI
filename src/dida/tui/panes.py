@@ -745,8 +745,8 @@ class ConfirmScreen(ModalScreen[bool]):
     """一句提示 + 一个 Yes/No：``y`` 确认、``n`` 与 ``Esc`` 取消（工单 #16）。
 
     这一层只负责**问**：提示语原文进来、按键结果 ``dismiss(True/False)`` 出去。删除动作
-    归 :meth:`dida.tui.app.DidaApp._finish_delete`，提示语归
-    :func:`dida.tui.app.delete_prompt` 拼——控件不认识任务，也不认识引擎，所以换一个
+    归 :meth:`dida.tui.task_actions.TaskActionsMixin._finish_delete`，提示语归
+    :func:`dida.tui.messages.delete_prompt` 拼——控件不认识任务，也不认识引擎，所以换一个
     「确认」场景时不必动它。
 
     为什么是一次浮层：删除是**这一屏唯一不可挽回的动作**。滴答清单的 Open API 里没有
