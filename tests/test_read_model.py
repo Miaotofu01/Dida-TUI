@@ -175,6 +175,25 @@ def test_the_inbox_row_is_synthesised_even_when_nothing_is_known_yet():
     assert (rows[0].name, rows[0].unfinished) == ("收集箱", 0)
 
 
+def test_two_inbox_rows_collapse_into_the_one_keyed_by_the_server_id():
+    """库里既有旧的 ``inbox`` 行、又有服务端那一串的行时，收集箱只留一行，用服务端那一串。
+
+    v1 的库可能有一行 id 是字面量（那时服务端的 ``project`` 对象就叫 ``inbox``）；#33 的
+    刷新按服务端返回的 id 另写一行。两行并存时条数会分散在两行上，所以认出来的那一行要
+    把另一行并进来（被并的那一行不再单独出现）。
+    """
+    backend = make_backend()
+    backend.add_list("收集箱", id="inbox", is_inbox=True)
+    backend.add_list("收集箱", id=INBOX_SERVER_ID, is_inbox=True)
+    backend.add_task("买牛奶", list_name=INBOX_SERVER_ID)
+
+    rows = backend.list_index()
+
+    assert [row.id for row in rows if row.is_inbox] == [INBOX_SERVER_ID]
+    assert "inbox" not in {row.id for row in rows}
+    assert rows[0].unfinished == 1
+
+
 # ---------------------------------------------------------------- 任务列表：某个容器
 
 

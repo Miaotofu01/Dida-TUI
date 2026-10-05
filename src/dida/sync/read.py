@@ -292,15 +292,13 @@ def resolve_lists(
     数得到收集箱里的任务。
     """
     inbox_id, inbox_name, absorbed = _resolve_inbox(lists, tasks)
-    inbox_row: ListSnapshot | None = None
-    rest: list[ListSnapshot] = []
-    for row in lists:
-        if row.is_inbox or row.id == absorbed:
-            if inbox_row is None:  # 收集箱只留一行：别的标记行并进这一行
-                inbox_row = replace(row, name=inbox_name, is_inbox=True)
-            continue
-        rest.append(row)
-    if inbox_row is None:
+    inboxes = [row for row in lists if row.is_inbox or row.id == absorbed]
+    rest = [row for row in lists if not (row.is_inbox or row.id == absorbed)]
+    if inboxes:
+        # 并成一行，id 用认出来的那一个（库里可能同时留着旧的字面量行与服务端那一串的行）。
+        chosen = next((row for row in inboxes if row.id == inbox_id), inboxes[0])
+        inbox_row = replace(chosen, id=inbox_id, name=inbox_name, is_inbox=True)
+    else:
         inbox_row = ListSnapshot(id=inbox_id, name=inbox_name, is_inbox=True)
     return (inbox_row,) + tuple(rest)
 
@@ -324,18 +322,28 @@ def _resolve_inbox(
     """
     flagged = [row for row in lists if row.is_inbox]
     if flagged:
-        row = next((item for item in flagged if is_inbox_id(item.id)), flagged[0])
+        row = sorted(flagged, key=lambda item: _inbox_rank(item.id))[0]
         return row.id, (row.name or INBOX_NAME), row.id
 
     candidates = [row.id for row in lists if is_inbox_id(row.id)]
     candidates += [item.list_id for item in tasks if is_inbox_id(item.list_id)]
     if candidates:
-        # 服务端那一串优先于字面量别名：别名只是请求侧的叫法，不是身份。
-        chosen = sorted(candidates, key=lambda value: value.lower() == INBOX_ID)[0]
+        chosen = sorted(candidates, key=_inbox_rank)[0]
         named = next((row.name for row in lists if row.id == chosen and row.name != row.id), "")
         return chosen, (named or INBOX_NAME), chosen
 
     return INBOX_ID, INBOX_NAME, INBOX_ID
+
+
+def _inbox_rank(value: str) -> int:
+    """收集箱身份的优先次序：服务端那一串（0）→ 请求侧别名（1）→ 别的（2）。
+
+    别名只是请求侧的叫法，不是身份，所以它排在服务端返回的那一串后面（两者同时出现在
+    缓存里时——v1 的旧行加上 #33 刷新写的新行——认服务端那一串）。
+    """
+    if value.strip().lower() == INBOX_ID:
+        return 1
+    return 0 if is_inbox_id(value) else 2
 
 
 def list_index(
