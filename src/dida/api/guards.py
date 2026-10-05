@@ -150,19 +150,16 @@ def prepare_batch_body(body: Mapping[str, Any]) -> dict[str, Any]:
     收窄成 :data:`BATCH_UPDATE_FIELDS` 是同一件事的另一半：批量更新是**合并语义**
     （只发改动的字段，其余服务端保留），所以就算请求体里多带了别的字段，这里也不发出去
     ——「其余字段不因这次取消完成而改变」这句话靠的就是这一行。
+
+    与别的守卫不同，这里**不抛** ``FieldIgnoredError``：形状是这一层自己的调用方拼的
+    （引擎按词表给的 payload），拼错了是程序错误、当场就炸在本地，不会发出一个安静的请求。
     """
-    items = body.get("update")
-    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
-        raise FieldIgnoredError(
-            '批量更新的请求体必须是 {"update": [...]}：形状不对就一个字节都不发',
-            field="update",
-        )
-    narrowed = [
-        {field: entry[field] for field in BATCH_UPDATE_FIELDS if entry.get(field) is not None}
-        for entry in items
-        if isinstance(entry, Mapping)
-    ]
-    return {"update": narrowed}
+    return {
+        "update": [
+            {field: entry[field] for field in BATCH_UPDATE_FIELDS if entry.get(field) is not None}
+            for entry in body["update"]
+        ]
+    }
 
 
 def _normalize_item(index: int, item: Any) -> Any:

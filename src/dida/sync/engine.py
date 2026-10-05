@@ -201,6 +201,7 @@ __all__ = [
     "list_index",
     "next_priority",
     "order_key",
+    "pending_error",
     "priority_mark",
     "resolve_lists",
     "subtask_items",
@@ -210,6 +211,23 @@ __all__ = [
 
 DEFAULT_DAY_END = "00:00"
 """配置注入之前的默认日界：零偏移，逻辑日等于自然日（规范形式见 ADR 0003）。"""
+
+
+def pending_error(source: object) -> str | None:
+    """本地队列里最后一条推不出去的改动报的错（源上没有队列就是 ``None``）。
+
+    读的是一条**已经记下来的事实**：``Store.record_attempt`` 把失败原因写在那一行上
+    （``last_error``），这里只是把它带到 :class:`SyncStatus` 上，让它到得了界面（用户故事
+    81：保存失败要说具体原因）。
+
+    只读替身（``InMemorySource`` 那种）没有队列，于是没有这个信息——与写路径上那几个
+    ``isinstance`` 门同一条口径：不知道就说不知道，不猜一个。
+    """
+    pending = getattr(source, "pending", None)
+    if not callable(pending):
+        return None
+    errors = [str(change.last_error) for change in pending() if getattr(change, "last_error", None)]
+    return errors[-1] if errors else None
 
 
 @dataclass(frozen=True)
@@ -227,6 +245,13 @@ class SyncStatus:
 
     logical_day: date | None = None
     """当前逻辑日（t04 提供纯函数，t09 接入）。"""
+
+    last_error: str | None = None
+    """队列里最后一条**推不出去**的改动报的错；都推上去了就是 ``None``。
+
+    详细页底部那一行靠它说出**具体**原因（用户故事 81）：一个「保存失败」了事的话，用户不
+    知道该刷新、该重连、还是该重新粘 token。推成功的那条改动会出队，这里自然回到 ``None``。
+    """
 
 
 @runtime_checkable
@@ -267,6 +292,21 @@ class Engine(Protocol):
 
     async def refresh_completed(self) -> CompletedReport:
         """写：拉一次已完成流（按完成时间游标拉窗口）。**要 await**。"""
+        ...
+
+    def write(
+        self,
+        task_id: str,
+        *,
+        changes: Mapping[str, Any] | None = None,
+        kind: WriteKind = WriteKind.UPDATE,
+    ) -> None:
+        """写：把 ``changes`` 里那几个字段盖上去（本地当场生效 + 立刻推送）。
+
+        改一个字段（详细页 #43 的标题 / 描述 / 备注）与完成、删除走的是同一条乐观写路径；
+        本地没有这条任务的底稿时当场抛 :class:`~dida.sync.writes.UnknownTaskError`——界面
+        据此说出**具体**原因，而不是一个笼统的「保存失败」（用户故事 81）。
+        """
         ...
 
     def complete(self, task_id: str) -> None:
@@ -384,6 +424,7 @@ class SyncEngine(
             pending_count=state.pending_count,
             last_refresh_at=state.last_refresh_at,
             logical_day=logical_day(now, self._day_end).label,
+            last_error=pending_error(self._source),
         )
 
     def view(self) -> TodayView:

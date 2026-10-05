@@ -43,6 +43,7 @@ from dida.sync.engine import (
     ListRow,
     SyncStatus,
     TaskDetail,
+    UnknownTaskError,
 )
 from dida.tui import messages, theme
 from dida.tui.escape import open_in_browser, task_url
@@ -160,6 +161,20 @@ def status_line(status: SyncStatus, *, spinner: str = "") -> Text:
 def format_status(status: SyncStatus) -> str:
     """状态栏那一行的**纯文本**（措辞的唯一来源还是 :func:`status_line`）。"""
     return status_line(status).plain
+
+
+def save_line(status: SyncStatus) -> str:
+    """详细页底部那一行的纯文本：**这一下到底出去没有**（用户故事 65 + 81）。
+
+    三种读法，一个都不许含糊：推不出去就带**具体**原因（断网、凭据失效、服务端拒绝的原话），
+    队列里还有改动就报数，都没有才是「已保存」。只说一句「保存失败」的话，用户不知道该刷新、
+    该重连、还是该重新粘 token——那是三种完全不同的下一步。
+    """
+    if status.last_error:
+        return messages.field_save_failed_message(status.last_error)
+    if status.pending_count:
+        return messages.pending_message(status.pending_count)
+    return messages.saved_message()
 
 
 class DidaApp(App[None]):
@@ -391,8 +406,25 @@ class DidaApp(App[None]):
         return row.name if row is not None else container_id
 
     def update_status(self) -> None:
-        """把引擎的状态刷进状态栏。数据变化后都调它。"""
-        self._write_status(status_line(self.engine.status(), spinner=self._spinner()))
+        """把引擎的状态刷进状态栏与详细页底部那一行。数据变化后都调它。
+
+        两处说的是两件事（ADR-0007 四）：状态栏说「数据怎么样」（已同步 / 待推送 / 逻辑日），
+        详细页那一行说「你刚才那一下出去没有」。同一个 ``status()`` 读出来的两份读法，
+        所以它们永远不会互相矛盾。
+        """
+        status = self.engine.status()
+        self._write_status(status_line(status, spinner=self._spinner()))
+        self._write_save_line(save_line(status))
+
+    def _write_save_line(self, text: str) -> None:
+        """把详细页底部那一行写掉——与状态栏同一条规矩：**先问屏幕还在不在**。
+
+        它由 ``await`` 之后的那几次重画调到（逐字段编辑那一条路正好是跨 ``await`` 的），
+        关窗时页面已经拆了，再往它上面写就是 ``NoMatches``。
+        """
+        if not self.is_running:
+            return
+        self.detail_page().show_save(text)
 
     def _write_top(self) -> None:
         """把当前导航路径刷进顶栏（GLOSSARY 的「导航路径」：它是走出来的，不是猜的）。"""
@@ -480,6 +512,75 @@ class DidaApp(App[None]):
     def on_detail_page_back(self, event: DetailPage.Back) -> None:
         """详细页上按了 ``esc``：回任务列表页。"""
         self.back_to_tasks()
+
+    async def on_detail_page_field_edited(self, event: DetailPage.FieldEdited) -> None:
+        """详细页上改完一个字段：**立刻写出去**，并把结果留在那一页底部（工单 #43）。
+
+        乐观写（``write``）：本地当场生效、推送排到事件循环上立刻跑——用户按完 ``esc`` 不等
+        网络。后面那一次 ``push_pending`` 是**等这一笔落地**的确定性那一次（队列只有一条，
+        两次推送不会重复发），它回来之后底部那一行才知道该写「已保存」还是「待推送（N）」。
+
+        写失败分两种，两种都说出**具体**原因（用户故事 81）：引擎当场拒绝（本地没有这条任务
+        的底稿）在这里接住，用 ``messages`` 里那一句现成的话；推不出去（断网、服务端拒绝）
+        由引擎记在队列上，下一次 :meth:`update_status` 会把它读出来。
+        """
+        try:
+            self.engine.write(event.task_id, changes={event.field: event.value})
+        except UnknownTaskError:
+            # 「这条任务已经不在本地缓存里了，刷新之后再试一次」——本地没有底稿是一种**说得出
+            # 名字**的拒绝，不该混进「保存失败」那一类里（那条留给服务端与网络说的话）。
+            self.refresh_view()
+            if self.is_running:
+                self.detail_page().show_save(messages.UNKNOWN_TASK_MESSAGE)
+            return
+        except DidaError as exc:
+            self.refresh_view()
+            if not self.is_running:
+                return
+            self.detail_page().show_save(messages.field_save_failed_message(exc))
+            return
+        await self.engine.push_pending()
+        if not self.is_running:
+            return
+        self.refresh_view()
+
+    # ---------------------------------------------------------------- 任务的删除与顺延（#40）
+
+    def on_tasks_page_delete(self, event: TasksPage.Delete) -> None:
+        """``d``：删光标那条任务——**先如实问一句**，``y`` 才真的删（验收标准 1、3）。
+
+        确认文案在 :func:`dida.tui.messages.delete_prompt`：整份官方文档里没有回收站、没有
+        undelete、也没有「已删除」列表（``api-shapes.md`` §A6），所以那一句话不许承诺任何恢复
+        ——这次确认就是全部的防线。删掉的那条任务本地当场摘掉、推送走 ``DELETE``。
+        """
+        detail = self.engine.task_detail(event.task_id)
+        if detail is None:
+            return
+        self.push_screen(
+            ConfirmOverlay(messages.delete_prompt(detail.title), title="删除任务"),
+            partial(self._finish_delete_task, event.task_id),
+        )
+
+    def _finish_delete_task(self, task_id: str, confirmed: bool | None) -> None:
+        """删除确认关掉了：只有 ``True`` 才真的删（``n`` / ``Esc`` 与 ``None`` 都不动）。"""
+        if not confirmed:
+            return
+        try:
+            self.engine.delete(task_id)
+        except DidaError as exc:
+            self._write_status(messages.delete_failed_message(exc))
+            return
+        self.refresh_view()
+
+    def on_tasks_page_defer(self, event: TasksPage.Defer) -> None:
+        """``g`` / ``G``：顺延 ``days`` 个逻辑日，**截止时间以外的字段一个都不动**（验收标准 4–7）。
+
+        落点由引擎按注入的日界算（``sync/schedule.py``），这一层不重算日期、也不经过任何日期
+        解析。没有截止时间的任务引擎不动它——顺延不凭空给一条任务长出一个日期来，所以这里
+        没有「当场失败」要报的那种情况（引擎那一支没有可抛的结构化错误）。
+        """
+        self.engine.defer(event.task_id, days=event.days)
+        self.refresh_view()
 
     # ---------------------------------------------------------------- 清单的建 / 改 / 删（#42）
 

@@ -202,6 +202,25 @@ class TasksPage(CursorPage):
             self.completed = completed
             super().__init__()
 
+    class Delete(Message):
+        """用户按了 ``d``：删光标下这一条（问一句与真的删都归 app）。"""
+
+        def __init__(self, task_id: str) -> None:
+            self.task_id = task_id
+            super().__init__()
+
+    class Defer(Message):
+        """用户按了 ``g`` / ``G``：把这一条顺延 ``days`` 个逻辑日。
+
+        ``days`` 是**逻辑日**的个数（``g`` 是 1、``G`` 是 7）。落点怎么算不归这一页：
+        ``Engine.defer`` 按注入的日界算，这一页只说「往后几个逻辑日」。
+        """
+
+        def __init__(self, task_id: str, *, days: int) -> None:
+            self.task_id = task_id
+            self.days = days
+            super().__init__()
+
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(id=id)
         self._heading = ""
@@ -330,3 +349,21 @@ class TasksPage(CursorPage):
     def action_back(self) -> None:
         """``esc``：退回清单列表页。"""
         self.post_message(self.Back())
+
+    def action_delete(self) -> None:
+        """``d``：删光标下那一条——**先问一句**（问与写都归 app，与 ``d`` 删清单同一条路）。"""
+        if self.selected_id is not None:
+            self.post_message(self.Delete(self.selected_id))
+
+    def action_defer(self) -> None:
+        """``g``：顺延到下一个逻辑日。"""
+        self._post_defer(1)
+
+    def action_defer_week(self) -> None:
+        """``G``：顺延一周——按**逻辑日**数七天，不是自然日 +7（落点由引擎算）。"""
+        self._post_defer(7)
+
+    def _post_defer(self, days: int) -> None:
+        """把「顺延几个逻辑日」交给 app（这一页不认识引擎，也不认识日界）。"""
+        if self.selected_id is not None:
+            self.post_message(self.Defer(self.selected_id, days=days))
