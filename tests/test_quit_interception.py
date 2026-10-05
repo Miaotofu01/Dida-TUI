@@ -45,6 +45,16 @@ def assert_exited(app: DidaApp) -> None:
     assert app.is_running is False, "这个键该退出去了"
 
 
+def confirm_panels(app: DidaApp) -> int:
+    """屏幕上有几个退出确认框。
+
+    数的是**提示语那一行**（``还有 N 处改动没推上去。``）——一个框里只出现一次；框上的
+    「仍然退出」出现两次（``border_title`` 一次、``y`` 那一行的文案一次），拿它当计数会
+    数出 2 来，那是这块浮层的排版，不是叠了几个框。
+    """
+    return screen_text(app).count("处改动没推上去")
+
+
 # ---------------------------------------------------------------- 同一个判断
 
 
@@ -136,6 +146,53 @@ async def test_ctrl_c_cancelled_stays_and_the_prompt_can_be_raised_again():
         await pilot.pause()
         assert app.is_running, "再按一次还是拦"
         assert "2 处" in screen_text(app)
+
+
+async def test_pressing_a_quit_key_twice_raises_exactly_one_prompt():
+    """连按退出键只该问一句：确认框叠成一摞，``y`` / ``n`` 就得按好几次才关得掉。
+
+    两个键混着按也一样——它们本来就走同一个判断，不该因为换了键就多叠一层。
+    """
+    app = DidaApp(backend(pending=3))
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("q")
+        await pilot.pause()
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        await pilot.press("q")
+        await pilot.pause()
+        text = screen_text(app)
+
+        assert confirm_panels(app) == 1, f"确认框应该只有一个：\n{text}"
+        assert "仍然退出" in text, "框上给出的仍然是那条「仍然退出」的路"
+
+        await pilot.press("y")
+        await pilot.pause()
+        assert_exited(app)
+
+
+async def test_a_quit_key_over_the_help_overlay_does_not_stack_a_second_prompt():
+    """帮助浮层开着时按退出键：只该有一个确认框，而不是「帮助上面再叠一个确认框」。
+
+    浮层的绑定链把 ``app._bindings`` 并了进去，所以退出键在 ``?`` 那一屏上照样到得了
+    ``action_quit``。判定若只看 ``self.screen``（那时是帮助浮层），就会再叠一层出来。
+    """
+    app = DidaApp(backend(pending=3))
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("question_mark")
+        await pilot.pause()
+        assert "键位" in screen_text(app), "先确认帮助浮层真的开着"
+
+        await pilot.press("q")
+        await pilot.pause()
+        text = screen_text(app)
+
+        assert app.is_running, "退出键在浮层上照样要被拦"
+        assert confirm_panels(app) == 1, f"确认框应该只有一个：\n{text}"
 
 
 # ---------------------------------------------------------------- 没有待推送改动：两个键直接退

@@ -39,6 +39,8 @@ __all__ = [
     "LAYER_INDEX",
     "LAYER_TITLES",
     "LAYER_TASKS",
+    "QUIT_ACTION",
+    "QUIT_KEYS",
     "HelpRow",
     "Key",
     "bindings_for",
@@ -62,6 +64,23 @@ LAYER_DETAIL = "detail"
 LAYERS: tuple[str, ...] = (LAYER_INDEX, LAYER_TASKS, LAYER_DETAIL)
 """三层，按用户进入的顺序。``LAYERS`` 不含 :data:`GLOBAL`——那是每一层的附加项。"""
 
+QUIT_ACTION = "quit"
+"""退出那个动作名——**只有这一个**（工单 #47）。
+
+``q`` 与 ``Ctrl+C`` 都走它，所以两条路落在同一个判断上
+（:meth:`dida.tui.app.DidaApp.action_quit`）。名字单独拿出来，是因为浮层上的退出键也得绑到
+同一个动作上：浮层是模态的、绑定链很短，那一条见 :mod:`dida.tui.overlays`。
+"""
+
+QUIT_KEYS: tuple[str, ...] = ("q", "ctrl+c")
+"""能退出 app 的那两个键。
+
+``Ctrl+C`` 从 #47 起与 ``q`` 同级：它以前落在 Textual 自己的 ``help_quit`` 上（弹一句
+「按 q 退出」、**不退出**），而 Textual 又把 ``ctrl+c`` 绑在 ``Screen.BINDINGS`` 的
+``screen.copy_text`` 上，于是在浮层上它连那句提示都到不了、只是复制一段文字——一条按下去
+什么都不说的岔路。两条路合成一条之后，这个分歧没有了。
+"""
+
 
 @dataclass(frozen=True)
 class Key:
@@ -82,7 +101,7 @@ BINDINGS: dict[str, tuple[Key, ...]] = {
         Key(("question_mark",), "help", "当前这一层的键位"),
         Key(("r",), "refresh", "手动同步"),
         Key(("o",), "open", "在浏览器里打开当前任务"),
-        Key(("q",), "quit", "退出"),
+        Key(QUIT_KEYS, QUIT_ACTION, "退出"),
     ),
     LAYER_INDEX: (
         Key(("j", "down"), "cursor_down", "下一行"),
