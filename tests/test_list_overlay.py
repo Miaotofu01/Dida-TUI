@@ -92,6 +92,8 @@ async def test_n_asks_for_a_name_and_a_colour_then_the_new_list_is_on_the_page()
         await pilot.pause()
         await pilot.press("n")
         await pilot.pause()
+        await pilot.press("enter")  # #36：``n`` 先问「清单还是视图」，默认那一档是清单
+        await pilot.pause()
         form = screen_text(app)
 
         await pilot.press(*"shopping")
@@ -112,6 +114,8 @@ async def test_the_colour_can_be_picked_with_the_arrow_keys():
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
         await pilot.press("n")
+        await pilot.pause()
+        await pilot.press("enter")  # 先答「清单还是视图」
         await pilot.pause()
         await pilot.press(*"book")
         before = field_value(screen_text(app), "颜色")
@@ -136,6 +140,8 @@ async def test_escape_cancels_the_form_without_writing_anything():
         await pilot.pause()
         await pilot.press("n")
         await pilot.pause()
+        await pilot.press("enter")  # 先答「清单还是视图」
+        await pilot.pause()
         await pilot.press(*"shopping")
         await pilot.press("escape")
         await pilot.pause()
@@ -155,7 +161,9 @@ async def test_a_list_without_a_name_is_not_created():
         await pilot.pause()
         await pilot.press("n")
         await pilot.pause()
-        await pilot.press("enter")
+        await pilot.press("enter")  # 先答「清单还是视图」
+        await pilot.pause()
+        await pilot.press("enter")  # 名字那一格是空的
         await pilot.pause()
         after = screen_text(app)
 
@@ -341,8 +349,13 @@ async def test_a_list_without_write_permission_says_why_it_cannot_be_changed():
     assert fake.updated_lists == [] and fake.deleted_lists == []
 
 
-async def test_a_view_row_is_left_to_the_views_ticket():
-    """视图不是清单：``e`` / ``d`` 在这里如实说清，不假装改得动（视图那三条归 #36）。"""
+async def test_a_view_row_is_not_deleted_through_the_list_path():
+    """视图行不归清单那三条（#36 起视图有自己的建 / 改 / 删）：``d`` 问的是**视图**那一句。
+
+    #42 划的边界在这里换了个方向：它当初拒绝所有视图行（那时视图还没有写路径），现在
+    自建视图归 #36，而清单那条删除路径**一个字都不写**——``deleted_lists`` 是空的，
+    文案也不是清单那一套（清单那句说的是「里面的任务会怎样文档没写」，对视图不成立）。
+    """
     fake = backend()
     app = DidaApp(fake)
 
@@ -353,9 +366,9 @@ async def test_a_view_row_is_left_to_the_views_ticket():
         await pilot.pause()
         after = screen_text(app)
 
-    assert messages.VIEW_ROW_MESSAGE in after
+    assert "删除视图「我的一天」" in after, "问的是视图那一句"
     assert "文档没写" not in after, "视图不是清单，不套用清单那套确认文案"
-    assert fake.deleted_lists == []
+    assert fake.deleted_lists == [] and fake.deleted_views == [], "还没答 y，谁都不许删"
 
 
 # ------------------------------------------------------------------ 表单开着时键盘归谁
@@ -375,6 +388,8 @@ async def test_the_form_keeps_the_keyboard_while_it_is_open():
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
         await pilot.press("n")
+        await pilot.pause()
+        await pilot.press("enter")  # 先答「清单还是视图」
         await pilot.pause()
         focused = app.focused
         await pilot.press("q")
@@ -414,6 +429,8 @@ async def test_ctrl_c_still_quits_from_the_form_in_every_state():
         await pilot.pause()
 
         await pilot.press("n")  # 1. 空输入框，没有选中
+        await pilot.pause()
+        await pilot.press("enter")  # 先答「清单还是视图」（#36），才进得了清单那张表单
         await pilot.pause()
         empty = app.focused
         await pilot.press("ctrl+c")

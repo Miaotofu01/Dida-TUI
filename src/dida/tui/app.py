@@ -40,9 +40,13 @@ from textual.widgets import Static
 from dida.sync.engine import (
     DidaError,
     Engine,
+    ListKind,
     ListRow,
     SyncStatus,
     TaskDetail,
+    ViewDefinition,
+    ViewFormProblem,
+    parse_view_form,
 )
 from dida.tui import messages, theme
 from dida.tui.escape import open_in_browser, task_url
@@ -58,10 +62,17 @@ from dida.tui.keys import (
 from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay
 from dida.tui.pages import DetailPage, IndexPage, TasksPage
 from dida.tui.pages.index import (
+    KIND_VIEW,
     LIST_COLOR_FIELD,
     LIST_NAME_FIELD,
+    NEW_KIND_FIELD,
     list_form_fields,
+    list_scope_ids,
     list_write_refusal,
+    new_kind_fields,
+    view_form_fields,
+    view_form_hint,
+    view_write_refusal,
 )
 
 if TYPE_CHECKING:  # 只为了标注周期泵那个句柄，运行时用不到
@@ -233,6 +244,9 @@ class DidaApp(App[None]):
         """
         self._editing_list: str | None = None
         """正在改的是哪条清单（表单关掉时要用它；``None`` = 那一次是新建）。"""
+
+        self._editing_view: str | None = None
+        """正在改的是哪个自定义视图（#36）；``None`` = 那一次是新建视图。"""
         self._announce_sync = False
         """这一轮同步要不要用 toast 报完成——``r`` 要，启动刷新不要（那会每次开屏都弹一下）。"""
         self._spinning = False
@@ -454,38 +468,87 @@ class DidaApp(App[None]):
         """详细页上按了 ``esc``：回任务列表页。"""
         self.back_to_tasks()
 
-    # ---------------------------------------------------------------- 清单的建 / 改 / 删（#42）
+    # ---------------------------------------------------------------- 清单 / 视图的建 / 改 / 删（#42 / #36）
 
     def on_index_page_new_list(self, event: IndexPage.NewList) -> None:
-        """``n``：开建清单的表单（字段由选中行的类型决定，见 :mod:`dida.tui.overlays`）。"""
-        self._open_list_form(None)
+        """``n``：**先问一句「清单还是视图」**（#36 的验收标准 1），再开对应的那张表单。
+
+        两种东西后面完全是两回事：清单是服务端的容器（建了要推上去），视图只是一组只存在
+        本机的过滤条件。问一句比猜一个默认值好——猜错了用户会建出一个自己没想要的东西，
+        而且视图建错了在手机上还找不到它。
+        """
+        self.push_screen(
+            FormOverlay(
+                title="新建什么？",
+                fields=new_kind_fields(),
+                hint=messages.NEW_KIND_HINT,
+            ),
+            self._finish_kind_form,
+        )
+
+    def _finish_kind_form(self, values: dict[str, str] | None) -> None:
+        """「清单还是视图」答完了：``None`` 是取消（一个字节都不写），否则开对应的表单。"""
+        if values is None:
+            return
+        if values.get(NEW_KIND_FIELD) == KIND_VIEW:
+            self._open_view_form(None)
+        else:
+            self._open_list_form(None)
 
     def on_index_page_edit_list(self, event: IndexPage.EditList) -> None:
-        """``e``：改光标那一行的名字与颜色。"""
-        self._open_list_form(event.row_id)
+        """``e``：改光标那一行——清单给清单那张表单，自建视图给条件表单（#36）。"""
+        row = self.index_page().row(event.row_id)
+        if row is None:
+            return
+        refusal = self._refusal_for(row)
+        if refusal is not None:
+            self._write_status(refusal)
+            return
+        if row.kind is ListKind.LIST:
+            self._open_list_form(row.id)
+        else:
+            self._open_view_form(row.id)
 
     def on_index_page_delete_list(self, event: IndexPage.DeleteList) -> None:
         """``d``：删光标那一行——**先如实问一句**，``y`` 才真的删（验收标准 3、4、5）。
 
-        确认文案在 :func:`dida.tui.messages.delete_list_prompt`：它说的两件事都核实过
-        ——删掉一个清单时里面的任务会怎样文档没写，而回收站与撤销删除的接口都不存在。
+        清单与视图各问各的：删清单那句说「它里面的任务会怎样文档没写」（核实过，见
+        :func:`dida.tui.messages.delete_list_prompt`），删视图那句说「不会动任何任务」
+        ——视图只是一组过滤条件，这一句是能保证的（#36）。
         """
         row = self.index_page().row(event.row_id)
         if row is None:
             return
-        refusal = list_write_refusal(row)
+        refusal = self._refusal_for(row)
         if refusal is not None:
             self._write_status(refusal)
             return
-        self.push_screen(
-            ConfirmOverlay(messages.delete_list_prompt(row.name), title="删除清单"),
-            partial(self._finish_delete_list, row.id),
-        )
+        if row.kind is ListKind.LIST:
+            self.push_screen(
+                ConfirmOverlay(messages.delete_list_prompt(row.name), title="删除清单"),
+                partial(self._finish_delete_list, row.id),
+            )
+        else:
+            self.push_screen(
+                ConfirmOverlay(messages.delete_view_prompt(row.name), title="删除视图"),
+                partial(self._finish_delete_view, row.id),
+            )
+
+    def _refusal_for(self, row: ListRow) -> str | None:
+        """这一行改不动 / 删不掉时的那句话；清单行走 #42 那份判断，视图行走 #36 那份。
+
+        两份判断各自只有一处（``pages/index.py`` 的两个 ``*_write_refusal``）：清单那三种
+        改不动的行与视图那一种（内置视图）理由完全不同，合成一句就会说出「没有写权限」这种
+        对视图毫无意义的理由。
+        """
+        if row.kind is ListKind.LIST:
+            return list_write_refusal(row)
+        return view_write_refusal(row)
 
     def _open_list_form(self, row_id: str | None) -> None:
         """开清单表单：``row_id`` 是 ``None`` 就是新建，否则是改那一行。
 
-        改不动的行（视图、收集箱、没有写权限的清单）在这里就挡住并说清是哪一种——表单
+        改不动的行（收集箱、没有写权限的清单）在这里就挡住并说清是哪一种——表单
         开出来再拒绝，用户会以为自己填错了什么。
         """
         row = None if row_id is None else self.index_page().row(row_id)
@@ -505,8 +568,33 @@ class DidaApp(App[None]):
             self._finish_list_form,
         )
 
+    def _open_view_form(
+        self, view_id: str | None, values: dict[str, str] | None = None
+    ) -> None:
+        """开视图的条件表单：``view_id`` 是 ``None`` 就是新建，否则是改那一个。
+
+        ``values`` 是**用户刚填的那一份**：表单被拒（认不出的清单名之类）之后重新打开时
+        原样还给他——七个格子重填一遍是这一屏最不该有的惩罚。
+        """
+        definition = None if view_id is None else self.engine.view_definition(view_id)
+        if view_id is not None and definition is None:
+            # 那一行已经不在了（另一次删除、刷新之后没了）：什么都不开，也不假装改成功。
+            self._write_status(messages.UNKNOWN_VIEW_MESSAGE)
+            return
+        self._editing_view = view_id
+        self.push_screen(
+            FormOverlay(
+                title="新建视图" if definition is None else f"改「{definition.name}」",
+                fields=view_form_fields(
+                    definition, rows=self.index_page().rows(), values=values
+                ),
+                hint=view_form_hint(),
+            ),
+            self._finish_view_form,
+        )
+
     def _finish_list_form(self, values: dict[str, str] | None) -> None:
-        """表单关掉了：``None`` 是取消（一个字节都不写），否则按填的那一份建 / 改。
+        """清单表单关掉了：``None`` 是取消（一个字节都不写），否则按填的那一份建 / 改。
 
         颜色是空串就**不发** ``color`` 字段（那是「默认」，不是「清空」）；名字空着则
         什么都不做，只如实说一句。
@@ -530,6 +618,36 @@ class DidaApp(App[None]):
             return
         self.refresh_view()
 
+    def _finish_view_form(self, values: dict[str, str] | None) -> None:
+        """视图表单关掉了：``None`` 是取消，否则把那一份值读成定义再落本地库。
+
+        读不成定义时（认不出的清单名、永远筛不出任务的组合）**不保存**，把理由写进状态栏
+        并把用户填的那一份原样还回表单里——七个格子重填一遍是这一屏最不该有的惩罚。
+        """
+        if values is None:
+            return
+        editing = self._editing_view
+        parsed = parse_view_form(
+            values,
+            view_id=editing or "",
+            lists=list_scope_ids(self.index_page().rows()),
+        )
+        if isinstance(parsed, ViewFormProblem):
+            self._write_status(messages.view_form_problem(parsed))
+            self._open_view_form(editing, values=dict(values))
+            return
+        assert isinstance(parsed, ViewDefinition)
+        self._editing_view = None
+        try:
+            if editing is None:
+                self.engine.create_view(parsed)
+            else:
+                self.engine.update_view(parsed)
+        except DidaError as exc:
+            self._write_status(messages.view_write_failed_message(exc))
+            return
+        self.refresh_view()
+
     def _finish_delete_list(self, list_id: str, confirmed: bool | None) -> None:
         """删除确认关掉了：只有 ``True`` 才真的删（``n`` / ``Esc`` 与 ``None`` 都不动）。"""
         if not confirmed:
@@ -538,6 +656,21 @@ class DidaApp(App[None]):
             self.engine.delete_list(list_id)
         except DidaError as exc:
             self._write_status(messages.list_write_failed_message(exc))
+            return
+        self.refresh_view()
+
+    def _finish_delete_view(self, view_id: str, confirmed: bool | None) -> None:
+        """删视图那一次确认：只有 ``True`` 才真的删，而删的**只是那一行**（#36）。
+
+        视图是一组过滤条件，不是容器：它「里面」的任务本来就在各自的清单里，所以这里一条
+        任务都不动——验收标准「删视图不删任务」说的就是这一行代码。
+        """
+        if not confirmed:
+            return
+        try:
+            self.engine.delete_view(view_id)
+        except DidaError as exc:
+            self._write_status(messages.view_write_failed_message(exc))
             return
         self.refresh_view()
 

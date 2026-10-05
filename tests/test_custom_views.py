@@ -17,17 +17,21 @@
 
 from __future__ import annotations
 
-from dataclasses import fields
+import asyncio
+from dataclasses import fields, replace
 from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from dida.config import Config, config_path, load_config, save_config
+from dida.api.client import DidaApiClient
+from dida.config import Config, ConfigError, load_config, save_config
 from dida.storage.store import Store
 from dida.sync.engine import (
     Completion,
     DueWindow,
+    ListKind,
     SyncEngine,
+    UnknownViewError,
     ViewDefinition,
     builtin_view_definitions,
     evaluate_view,
@@ -52,7 +56,7 @@ from dida.sync.views import (
     ViewFormProblem,
     due_window_of,
 )
-from dida.testing import FakeBackend, ManualClock
+from dida.testing import FakeBackend, FakeTransport, ManualClock
 
 TZ = timezone(timedelta(hours=8))
 T0 = datetime(2026, 3, 14, 12, 3, tzinfo=TZ)
@@ -424,3 +428,252 @@ def test_a_payload_we_do_not_understand_degrades_to_a_usable_definition():
     assert isinstance(decoded, ViewDefinition)
     assert (decoded.name, decoded.due, decoded.completion) == ("半条", None, Completion.UNFINISHED)
     assert decoded.priorities == (5,)
+
+
+# ---------------------------------------------------------------- 接缝一：本地库与引擎
+
+
+@pytest.fixture
+def store(tmp_path):
+    """指向临时文件的库；关掉时不留句柄。"""
+    opened = Store(tmp_path / "dida.sqlite3")
+    yield opened
+    opened.close()
+
+
+def make_engine(store, *, now: datetime = T0, day_end: str = "24:00") -> SyncEngine:
+    """真引擎 + 真存储，**没有客户端**：视图那条路本来就不该需要网络。"""
+    return SyncEngine(clock=ManualClock(now), day_end=day_end, source=store)
+
+
+def seed(store) -> None:
+    """一份够用的缓存：两个清单、四条任务（高 / 中 / 已完成 / 没日期）。"""
+    store.apply_refresh(
+        lists=[{"id": "work", "name": "工作"}, {"id": "life", "name": "生活"}],
+        tasks=[
+            {
+                "id": "t1",
+                "projectId": "work",
+                "title": "交报告",
+                "priority": 5,
+                "status": 0,
+                "dueDate": at(15, 18).isoformat(),
+            },
+            {
+                "id": "t2",
+                "projectId": "work",
+                "title": "整理桌面",
+                "priority": 3,
+                "status": 0,
+            },
+            {
+                "id": "t3",
+                "projectId": "life",
+                "title": "买牛奶",
+                "priority": 5,
+                "status": 0,
+            },
+            {
+                "id": "t4",
+                "projectId": "life",
+                "title": "做完的",
+                "status": 2,
+                "completedTime": at(13, 9).isoformat(),
+            },
+        ],
+    )
+
+
+def test_the_store_is_where_custom_views_live(store):
+    """本地副本满足 ``ViewStore``：视图那五个方法都在它身上（不是另一份替身才有）。"""
+    from dida.sync.engine import ViewStore
+
+    assert isinstance(store, ViewStore)
+
+
+def test_a_created_view_lands_in_the_local_store_and_comes_back_as_a_definition(store):
+    """建一个视图：本地库里多出一行，读回来的是**同一份定义**（验收标准 3）。"""
+    engine = make_engine(store)
+
+    view_id = engine.create_view(
+        ViewDefinition(id="", name="高优先级未完成", priorities=(5,))
+    )
+
+    assert view_id.startswith("view-"), "本地分配的 id（没有服务端那一半要认领）"
+    assert store.view_definitions() == (
+        ViewDefinition(id=view_id, name="高优先级未完成", priorities=(5,)),
+    )
+    assert engine.view_definition(view_id) == store.view_definitions()[0]
+
+
+def test_a_view_survives_closing_and_reopening_the_store(tmp_path):
+    """视图定义落**本地库**：换一个连接打开同一个文件，它还在（这就是「落库」的意思）。
+
+    这条是「视图定义落本地库，不写进配置文件」那一条验收标准的前一半；后一半
+    （配置文件一个字节没变）在下面两条。
+    """
+    path = tmp_path / "dida.sqlite3"
+    with Store(path) as first:
+        make_engine(first).create_view(
+            ViewDefinition(id="", name="最近完成", completion=Completion.COMPLETED, completed_days=7)
+        )
+
+    with Store(path) as second:
+        definitions = second.view_definitions()
+
+    assert [item.name for item in definitions] == ["最近完成"]
+    assert definitions[0].completed_days == 7
+
+
+def test_a_custom_view_is_a_row_between_the_builtins_and_the_real_lists(store):
+    """建好的视图出现在清单列表页上：内置视图之后、真实清单之前，条数来自**同一次求值**。"""
+    seed(store)
+    engine = make_engine(store)
+
+    view_id = engine.create_view(ViewDefinition(id="", name="高优先级未完成", priorities=(5,)))
+    rows = {row.id: row for row in engine.list_index()}
+
+    assert [row.id for row in engine.list_index()][:5] == [
+        "inbox",
+        "today",
+        "next7",
+        "all",
+        view_id,
+    ]
+    assert rows[view_id].kind is ListKind.CUSTOM
+    assert (rows[view_id].name, rows[view_id].unfinished) == ("高优先级未完成", 2)
+    assert [item.title for item in engine.tasks_in(view_id).items] == ["交报告", "买牛奶"], (
+        "enter 进去看到的是过滤后的任务：两条高优先级未完成的，顺序是求值给的"
+    )
+
+
+def test_the_recently_completed_view_is_built_from_the_form_and_shows_through_the_engine(store):
+    """「最近完成」从表单那一份值一路走到任务列表页（验收标准 9 的那一半）。"""
+    seed(store)
+    engine = make_engine(store)
+    parsed = parse_view_form(recent_done_form())
+    assert isinstance(parsed, ViewDefinition)
+
+    view_id = engine.create_view(parsed)
+
+    assert [item.title for item in engine.tasks_in(view_id).items] == ["做完的"]
+    assert engine.list_index()[4].unfinished == 0, "它一条未完成的都没有（那一列数的是未完成）"
+
+
+def test_editing_a_view_keeps_its_place_in_the_index(store):
+    """改条件不让它在清单列表页上跳到末尾（``INSERT OR REPLACE`` 会换掉 rowid 的那个坑）。"""
+    engine = make_engine(store)
+    first = engine.create_view(ViewDefinition(id="", name="第一个"))
+    second = engine.create_view(ViewDefinition(id="", name="第二个"))
+
+    engine.update_view(replace(engine.view_definition(first), name="改过的"))
+
+    assert [item.name for item in store.view_definitions()] == ["改过的", "第二个"]
+    assert [row.id for row in engine.list_index()][4:6] == [first, second]
+
+
+def test_editing_a_view_that_is_no_longer_there_is_refused(store):
+    """本地没有那一行时不假装改成功（与清单那条 ``UnknownListError`` 同一条口径）。"""
+    engine = make_engine(store)
+
+    with pytest.raises(UnknownViewError):
+        engine.update_view(ViewDefinition(id="view-404", name="没有这个"))
+    with pytest.raises(UnknownViewError):
+        engine.delete_view("view-404")
+
+
+def test_deleting_a_view_leaves_every_task_in_its_own_list(store):
+    """删视图**不删任务**：同一份缓存上，那些任务还在各自的清单里（验收标准 8）。"""
+    seed(store)
+    engine = make_engine(store)
+    view_id = engine.create_view(ViewDefinition(id="", name="高优先级未完成", priorities=(5,)))
+
+    engine.delete_view(view_id)
+
+    ids = [row.id for row in engine.list_index()]
+    assert store.view_definitions() == ()
+    assert view_id not in ids, "视图那一行没了"
+    assert {"work", "life"} <= set(ids), "真实清单一条都没少"
+    assert [item.title for item in engine.tasks_in("work").items] == ["交报告", "整理桌面"], (
+        "工作里那两条一条都没少（清单那一份顺序：有截止的在前）"
+    )
+    assert [item.title for item in engine.tasks_in("life").items] == ["买牛奶"]
+
+
+def test_building_and_deleting_a_view_enqueues_nothing(store):
+    """视图只在本地：建 / 改 / 删前后待推送都是 0，队列里也没有一行提到它。
+
+    这是 #53 / #54 那一类坑的反面：**绝不**把一个改动排在一个服务端从没见过的 subject 上。
+    视图没有服务端那一半，所以它连队列都不该进——进去了就是一条永远推不出去的改动，
+    状态栏那个「待推送 N」会一直非零地骗人。
+    """
+    seed(store)
+    engine = make_engine(store)
+
+    view_id = engine.create_view(ViewDefinition(id="", name="高优先级未完成", priorities=(5,)))
+    assert engine.status().pending_count == 0
+    engine.update_view(replace(engine.view_definition(view_id), name="改过的"))
+    assert engine.status().pending_count == 0
+    engine.delete_view(view_id)
+    assert engine.status().pending_count == 0
+
+    assert store.pending() == () and store.pending_lists() == ()
+    assert all(change.task_id != view_id for change in store.pending())
+    assert all(change.list_id != view_id for change in store.pending_lists())
+
+
+def test_a_view_is_not_pushed_even_when_a_client_is_connected(store):
+    """接上真客户端也一样：``push_pending()`` 一个请求都不发——视图从来不进队列。
+
+    这一条比「待推送是 0」更硬：它钉的是**没有网络调用**（传输层上一条请求都没有）。
+    """
+    seed(store)
+    transport = FakeTransport(json=[])
+    engine = SyncEngine(
+        clock=ManualClock(T0),
+        source=store,
+        client=DidaApiClient(token="tok", transport=transport),
+    )
+    engine.create_view(ViewDefinition(id="", name="高优先级未完成", priorities=(5,)))
+
+    assert asyncio.run(engine.push_pending()) == 0
+    assert transport.requests == [], "视图没有服务端那一半：一个请求都不该发"
+
+
+# ---------------------------------------------------------------- 视图不进配置文件（ADR-0005）
+
+
+def test_building_and_deleting_a_view_leaves_the_config_file_untouched(tmp_path, store):
+    """``config.toml`` 是放 token 的文件：建 / 改 / 删视图一个字节都不写它（ADR-0005）。
+
+    配置文件里那一份是**凭据**，为了改一个过滤条件去动它是不对的；所以视图落在本地库里
+    （上面那条重开库的测试），配置文件连读都不用读。
+    """
+    config_file = tmp_path / "config.toml"
+    save_config(Config(token="tok-123"), config_file)
+    before = config_file.read_bytes()
+    engine = make_engine(store)
+
+    view_id = engine.create_view(ViewDefinition(id="", name="高优先级未完成", priorities=(5,)))
+    engine.update_view(replace(engine.view_definition(view_id), name="改过的"))
+    engine.delete_view(view_id)
+
+    assert config_file.read_bytes() == before, "配置文件一个字节都不该因为视图而变"
+
+
+def test_the_config_schema_has_nowhere_to_put_a_view():
+    """``Config`` 的字段就是 ``config.toml`` 的键：里面没有、也不许有一个视图段。
+
+    这一条是上面那条的**结构**那一半：真要往配置文件里塞视图，得先给 ``Config`` 加字段，
+    那时这里就红了——而不是等某个用户发现自己的 token 文件里多了一堆过滤条件。
+    """
+    assert [field.name for field in fields(Config) if "view" in field.name.lower()] == []
+
+
+def test_a_config_file_that_carries_a_views_section_is_refused(tmp_path):
+    """手写的配置文件里出现 ``[views]`` 时报错（不认识的键），不静默忽略。"""
+    path = tmp_path / "config.toml"
+    path.write_text('token = "tok"\n\n[views]\nname = "高优先级"\n', encoding="utf-8")
+
+    with pytest.raises(ConfigError):
+        load_config(path)
