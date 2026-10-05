@@ -383,6 +383,14 @@ CursorPage {
     text-wrap: nowrap;
     text-overflow: ellipsis;
 }
+/* 截断与折行**按页分工**（ADR-0007）：上面那条是列表页（裁断），这一条是详细页（换行）。
+   ``fold`` 不是可有可无的：Textual 在换行分支里按 ``text-overflow: fold`` 决定 ``divide_line``
+   的 ``fold`` 参数，而详细页的光标与滚动是按**屏幕行**算的（#43）——留着一个 ``ellipsis``
+   的话，一个比页宽还长的词会被裁掉而不是折下来，量出来的行数与画出来的就不是一回事。 */
+DetailPage #page-body {
+    text-wrap: wrap;
+    text-overflow: fold;
+}
 #cursor-bar {
     width: 100%;
     height: 1;

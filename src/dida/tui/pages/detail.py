@@ -20,6 +20,8 @@ from dataclasses import dataclass
 from rich.text import Text
 from textual.message import Message
 
+from rich._wrap import divide_line
+
 from dida.sync.engine import TaskDetail
 from dida.tui import messages, theme
 from dida.tui.keys import LAYER_DETAIL, bindings_for
@@ -114,6 +116,21 @@ def fields_of(detail: TaskDetail) -> tuple[Field, ...]:
         ),
         Field("tags", "标签", value=detail.tags_text, display=detail.tags_text or messages.EMPTY_FIELD_TEXT),
     )
+
+
+def _screen_lines(text: str, width: int) -> int:
+    """这段文字在 ``width`` 格下折成几**屏行**。
+
+    折点来自 rich 的 ``divide_line``——**Textual 自己就是用这个函数折行的**
+    （``textual/content.py`` 拼一行时调它，参数是同一个 ``fold``）。所以这里量出来的行数
+    与屏幕上真实的行数是同一份账：正文按 wrap + fold 排版（``theme`` 里那条
+    ``DetailPage #page-body``），一个字段因此可能占好几屏行。
+
+    ``fold=True`` 是照着 ``text-overflow: fold`` 来的：少了它，比页宽还长的词会被裁掉而不是
+    折下来，账就错了。私有模块那个下划线是不好看，但另一条路（自己重写一套折行）要与
+    Textual 逐格对齐，那是把一件已经实现过的事再实现一遍。
+    """
+    return sum(len(divide_line(line, width, fold=True)) + 1 for line in text.split("\n"))
 
 
 def read_only_rows(detail: TaskDetail) -> tuple[Row, ...]:
@@ -220,6 +237,26 @@ class DetailPage(CursorPage):
         ]
         rows += read_only_rows(self._detail)
         return tuple(rows)
+
+    def _row_lines(self) -> tuple[int, ...]:
+        """每个字段占几屏行——**这张前缀和表就是详细页的光标与滚动**（#43 的实现后果 2）。
+
+        一个长描述会占五六行，于是「第几个字段」与「第几屏行」分家：``CursorPage`` 里
+        ``_line_of_cursor`` / ``_total_lines`` / ``scroll_cursor_into_view`` 读的都是这一张表。
+        量的是 :meth:`_line_text` 那一份文字（含行首那两格光标空档），因为它才是画上去的
+        东西。宽度还没量出来（第一帧、隐藏时）就先当一行，等 ``on_resize`` 重画再算。
+        """
+        width = self._row_width()
+        if width <= 0:
+            return (1,) * len(self._rows)
+        return tuple(_screen_lines(self._line_text(row).plain, width) for row in self._rows)
+
+    def on_resize(self) -> None:
+        """宽度变了：折行块的行数跟着变，光标条与滚动的位置都要按新表重算。"""
+        super().on_resize()
+        if self._rows:
+            self._land_bar()
+            self.scroll_cursor_into_view()
 
     def action_back(self) -> None:
         """``esc``：退回任务列表页。"""
