@@ -27,7 +27,7 @@ def at(day: int, hour: int = 0, minute: int = 0) -> datetime:
 
 
 def make_backend() -> FakeBackend:
-    """一屏有代表性的缓存：逾期两条、今日三条（含全天与无日期）、未来的与已完成的不该出现。"""
+    """一屏有代表性的缓存：逾期两条、今日两条（含全天）、收集箱无日期一条；未来的与已完成的不该出现。"""
     backend = FakeBackend(clock=ManualClock(T0), day_end="24:00")
     backend.add_task("交季度报告", list_name="工作", due=at(11, 9, 0), priority=5)
     backend.add_task("还信用卡", list_name="生活", due=at(13), all_day=True)
@@ -48,8 +48,27 @@ async def test_task_pane_pins_overdue_on_top_with_counts_in_the_headers():
         text = screen_text(app)
 
     assert "── 逾期 · 2 项" in text
-    assert "── 今日 · 3 项" in text
-    assert text.index("── 逾期") < text.index("── 今日")
+    assert "── 今日 · 2 项" in text, "无日期那一条不在今日区里：今日只数今天截止的"
+    assert "── 收集箱无日期 · 1 项" in text
+    assert text.index("── 逾期") < text.index("── 今日") < text.index("── 收集箱无日期")
+
+
+async def test_the_undated_group_keeps_the_today_empty_line_away():
+    """今日区空着不等于这一屏空着：无日期那几条就摆在它下面的区里。"""
+    backend = FakeBackend(clock=ManualClock(T0), day_end="24:00")
+    backend.add_task("买牛奶", list_name="生活")
+    backend.add_task("记一笔", list_name="工作")
+    backend.set_sync_state(last_refresh_at=at(14, 12, 0), pending_count=0)
+    app = DidaApp(backend)
+
+    async with app.run_test(size=(110, 30)) as pilot:
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert "── 今日" not in text, "今天一条都没有：今日区整个不出现，而不是摆一个空标题"
+    assert "── 收集箱无日期 · 2 项" in text
+    assert "（今天没有未完成的任务）" not in text, "屏上明明有两条等着分诊，空状态那句话是在骗人"
+    assert "已同步 12:00 · 待推送 0 · 逻辑日 03-14" in text, "空的是今日区，不是状态栏"
 
 
 async def test_left_pane_shows_every_list_with_its_unfinished_badge():
@@ -190,7 +209,7 @@ async def test_the_cursor_stops_at_both_ends():
         for _ in range(10):
             await pilot.press("j")
         await pilot.pause()
-        assert task_pane.selected_task_id == "t5", "今日区最后一行是那条没有截止时间的任务"
+        assert task_pane.selected_task_id == "t5", "最后一行是「收集箱无日期」区里那条没有截止时间的任务"
 
 
 def test_the_overdue_group_header_is_red_and_today_is_not():

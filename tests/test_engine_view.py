@@ -31,8 +31,12 @@ def test_view_reads_the_cache_the_test_controls():
     view = engine.view()
 
     assert [(item.name, item.unfinished) for item in view.lists] == [("工作", 2), ("生活", 1)]
-    assert [group.kind for group in view.groups] == [GroupKind.OVERDUE, GroupKind.TODAY]
-    assert [group.count for group in view.groups] == [1, 2]
+    assert [group.kind for group in view.groups] == [
+        GroupKind.OVERDUE,
+        GroupKind.TODAY,
+        GroupKind.INBOX_UNDATED,
+    ]
+    assert [group.count for group in view.groups] == [1, 1, 1]
     assert view.groups[0].items[0].title == "交季度报告"
 
 

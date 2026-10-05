@@ -15,7 +15,10 @@
 
 - 逾期区置顶：有截止时间、且早于当前逻辑日的开始时刻。
 - 今日区：截止时间落在当前逻辑日区间内 ``[start, end)``。
-- 没有截止时间的任务留在今日区（读作「—」），等它们的分诊区落地后再分出去。
+- 收集箱无日期区：没有截止时间的任务（读作「—」），排在今日**之后**。它自成一区的理由有两层：
+  「今天要做完什么」这句话不该收留一件还没定日子的任务（story 23 要求这两者一眼可分），
+  而分诊看的是「有没有日期」、不是「在哪个清单」——按清单拆开会让收集箱之外的无日期任务
+  重新混回今日区，或者干脆从这一屏消失。
 - 未来（下一个逻辑日起）的任务不属于这张「今日」视图；已完成的也不属于。
 - 区内先按截止时间升序，没有截止时间的排在同区有截止时间的后面（按标题）。
 """
@@ -43,9 +46,21 @@ class GroupKind(Enum):
 
     OVERDUE = "overdue"
     TODAY = "today"
+    INBOX_UNDATED = "inbox_undated"
+    """没有截止时间的那些：收集箱里等着分诊的一堆（story 16）。"""
 
 
-_GROUP_TITLES = {GroupKind.OVERDUE: "逾期", GroupKind.TODAY: "今日"}
+GROUP_ORDER: tuple[GroupKind, ...] = (GroupKind.OVERDUE, GroupKind.TODAY, GroupKind.INBOX_UNDATED)
+"""中栏的区序（接口契约的顺序）：逾期置顶 → 今日 → 收集箱无日期。
+
+已完成区在中栏**底部**，由 :func:`completed_section` 单独给，不在这个序列里。
+"""
+
+_GROUP_TITLES = {
+    GroupKind.OVERDUE: "逾期",
+    GroupKind.TODAY: "今日",
+    GroupKind.INBOX_UNDATED: "收集箱无日期",
+}
 
 
 @dataclass(frozen=True)
@@ -241,15 +256,19 @@ def group_tasks(
     now: datetime,
     day_end: str,
 ) -> tuple[TaskGroup, ...]:
-    """未完成任务 → 分区（逾期在前）。空区不出现在结果里。"""
+    """未完成任务 → 分区，按 :data:`GROUP_ORDER` 排：逾期 → 今日 → 收集箱无日期。
+
+    空区不出现在结果里。分区只在这里做：TUI 拿到的是已经分好区的成品，它自己不判断
+    「这条算不算今天」。
+    """
     label = logical_day(now, day_end).label
     names = list_names(lists)
-    buckets: dict[GroupKind, list[TaskItem]] = {GroupKind.OVERDUE: [], GroupKind.TODAY: []}
+    buckets: dict[GroupKind, list[TaskItem]] = {kind: [] for kind in GROUP_ORDER}
     for snapshot in tasks:
         if snapshot.completed:
             continue
         if snapshot.due is None:
-            kind = GroupKind.TODAY
+            kind = GroupKind.INBOX_UNDATED
         else:
             day = due_day(snapshot.due, all_day=snapshot.all_day, day_end=day_end)
             if day < label:
@@ -261,9 +280,9 @@ def group_tasks(
         buckets[kind].append(task_item(snapshot, names, now=now, day_end=day_end))
 
     return tuple(
-        TaskGroup(kind=kind, items=tuple(_by_due(items)))
-        for kind, items in buckets.items()
-        if items
+        TaskGroup(kind=kind, items=tuple(_by_due(buckets[kind])))
+        for kind in GROUP_ORDER
+        if buckets[kind]
     )
 
 
