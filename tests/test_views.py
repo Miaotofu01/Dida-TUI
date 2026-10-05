@@ -131,3 +131,45 @@ def test_overdue_is_pinned_even_when_its_clock_time_is_later():
 
     assert titles(evaluated) == ["凌晨三点", "今天的全天"]
     assert [item.overdue for item in evaluated] == [True, False]
+
+
+# ---------------------------------------------------------------- 逻辑日边界（AC 的那一条）
+
+
+def test_the_0400_boundary_keeps_last_nights_deadline_in_today():
+    """边界配成 ``04:00`` 时，凌晨两点看到的仍是同一个逻辑日：昨夜 23:00 属于**今天**。
+
+    验收标准原话：「边界配成 ``04:00`` 时，凌晨两点看到的仍是同一个逻辑日的截止任务，
+    且截止于昨天 23:00 的任务归在今日而不是被判成逾期」。所以这一条同时钉两半：昨晚
+    23:00 在「今天」里且**不**逾期，而昨夜 03:00（落在同一个自然日的边界之前）属于更早
+    那个逻辑日——它才逾期。
+    """
+    tasks = (
+        task("昨夜 03 点", due=at(13, 3)),
+        task("昨晚 23 点", due=at(13, 23)),
+        task("明天 23 点", due=at(14, 23)),
+    )
+
+    evaluated = evaluate("today", tasks, now=at(14, 2), day_end="04:00")
+
+    assert titles(evaluated) == ["昨夜 03 点", "昨晚 23 点"]
+    assert [item.overdue for item in evaluated] == [True, False]
+
+
+def test_an_all_day_deadline_is_a_date_marker_not_an_instant():
+    """全天任务的截止是**日期标记**（当天 00:00），不是时刻：它不参与逻辑日偏移。
+
+    拿 03-13 00:00 去套 ``04:00`` 的边界，它会落进 03-12 那个逻辑日——于是每一条「今天」
+    的全天任务都被静默挪成逾期。所以这一条与上一条是同一件事的两半：**日期比较只有
+    :func:`dida.sync.view.due_day` 一份**，这里不重写第二份。
+    """
+    tasks = (
+        task("今天的全天", due=at(13), all_day=True),
+        task("今天的 09 点", due=at(13, 9)),
+        task("昨天的全天", due=at(12), all_day=True),
+    )
+
+    evaluated = evaluate("today", tasks, now=at(14, 2), day_end="04:00")
+
+    assert titles(evaluated) == ["昨天的全天", "今天的全天", "今天的 09 点"]
+    assert [item.overdue for item in evaluated] == [True, False, False]
