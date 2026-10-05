@@ -15,6 +15,23 @@ TUI 自己不 import 存储与 API 客户端，只拿 :class:`~dida.sync.engine.
 
 from __future__ import annotations
 
+import os
+
+# ⚠ 这一行必须在**下面那个 import 块上面**：关掉 kitty 键盘协议推送（ADR-0006、用户故事 115）。
+#
+# ``textual.constants.DISABLE_KITTY_KEY`` 是个 ``Final[bool]``，在 ``textual.constants`` 第一次
+# 被 import 时读一次就冻住了（``textual/constants.py:116``）——所以写在 ``main()`` 里就太晚了：
+# 那时 TUI（连带 ``textual``）已经 import 完。本文件下面 ``from dida.tui.app import …`` 正是
+# 整个进程第一处拉到 ``textual`` 的 import，这里就是最后能设的位置。
+#
+# 开着它的代价是输入法一次上屏超过四个汉字会变成乱码：那一段 CSI-u 有 78 字节，超过解析器
+# 32 字符的阈值，于是整串被逐字符重发（见 notes/terminal-input-evidence.md）。本客户端不依赖
+# ``ctrl+enter``，所以这个代价是零。
+#
+# ``setdefault``：外面显式设过就听外面的。真正的输入法上屏是**手测**项，自动化只能钉到
+# 「常量是 True」这一层。
+os.environ.setdefault("TEXTUAL_DISABLE_KITTY_KEY", "1")
+
 import asyncio
 import getpass
 from collections.abc import Callable
@@ -29,11 +46,22 @@ from dida.clock import Clock, SystemClock
 from dida.config import Config, Credentials, config_path, load_config, needs_token
 from dida.storage.store import Store
 from dida.sync.engine import SyncEngine
-from dida.tui.app import PUSH_TICK_SECONDS, DidaApp
+from dida.tui.app import DidaApp
 from dida.tui.escape import open_in_browser
 
 STORE_FILENAME = "cache.sqlite3"
 """本地副本的文件名：与 ``config.toml`` 同一个目录（spec 只写死了配置的位置）。"""
+
+PUSH_TICK_SECONDS = 1.0
+"""周期泵的间隔（工单 #21）：每秒问一次「有没有到点该重试的待推送改动」。
+
+这是 t10 明确留给界面层的那件事——退避算得再准，也得有人**定期**来问一句。间隔只决定
+「什么时候看一眼」，到没到点依然由引擎那口注入的钟判定（见 ``DidaApp.push_tick``）。1 秒的
+粒度对「按完 x 断网了、网络回来自动补上」这个体验足够，而每秒一次本地队列查询是免费的。
+
+它是**策略**，所以住在组合根（#34 从 ``dida.tui.app`` 搬过来的）：装配线在这里把它交给
+app，而 app 自己不写死一个默认值——直接 new 一个 app 的测试不该被迫挂上一个每秒跳的定时器。
+"""
 
 PASTE_PROMPT = "粘贴滴答清单的 API Token（输入不回显；网页版「设置 > 账户 > API Token」）："
 """首次运行的提示语。token 本身由用户输入，这一句里没有任何凭据。"""
