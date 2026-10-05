@@ -410,6 +410,33 @@ def test_the_switch_resolves_auto_off_for_remote_and_dumb_terminals():
     assert theme.animations_enabled("off", {"TERM": "xterm-kitty"}) is False
 
 
+async def test_neither_the_app_nor_the_pages_shadow_textuals_animator():
+    """``_animate`` 是 **Textual 自己的 animator**，谁都别拿它当自己的开关用。
+
+    ``App.__init__`` 把 ``self._animate`` 绑成 ``BoundAnimator``，``App.animate()`` 就是调它
+    （``Widget`` 那一半是第一次用时才绑的）。被一个 ``bool`` 占掉之后 ``app.animate(...)``
+    抛 ``TypeError: 'bool' object is not callable``，而报错点在 ``textual/`` 里面，离现场很远。
+    今天没有生产代码调它，所以这是**潜在**的——真按一下才知道。
+
+    ``pages/base.py`` 的 ``_motion`` 是对的做法（那里第 130 行起的文档就写着这个坑）；这条
+    顺手把三张页面也真按一次，不靠「以为它是干净的」。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        app.probe_value = 0.0
+        app.animate("probe_value", 1.0, duration=0.01)  # 撞名时这里抛 TypeError
+        for page in (app.index_page(), app.tasks_page(), app.detail_page()):
+            page.animate("scroll_y", 0, duration=0.01)  # 页面那一半也要能用
+        await pilot.pause(0.05)
+
+    assert "_animate" not in vars(app), "动效开关不许占用 Textual 的 animator 那个名字"
+    assert callable(app._animate), "Textual 的 animator 被盖掉了"
+    for page in (app.index_page(), app.tasks_page(), app.detail_page()):
+        assert callable(page._animate), "页面上的 animator 被盖掉了"
+
+
 async def test_resizing_the_window_keeps_you_on_the_page_you_were_on():
     """窗口宽度变了，舞台要重新对齐到**当前那一页**。
 
