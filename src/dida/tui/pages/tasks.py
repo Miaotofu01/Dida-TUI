@@ -19,7 +19,7 @@
 ## 清单名：清单里不重复，视图里必须显示
 
 清单视图里每一行都写着同一个清单名——重复一百遍是噪音；视图不是容器，行里的清单名是
-真信息（工单 #37 的验收标准）。哪一种是哪一种由读模型给（``TaskList.container_kind``），
+真信息（工单 #37 的验收标准）。哪一种是哪一种由读模型给（``TaskList.shows_list_name``），
 这一页不自己推。
 """
 
@@ -31,7 +31,7 @@ from rich.cells import cell_len
 from rich.text import Text
 from textual.message import Message
 
-from dida.sync.engine import CompletedItem, ListKind, TaskItem, TaskList
+from dida.sync.engine import CompletedItem, TaskItem, TaskList
 from dida.tui import messages, theme
 from dida.tui.keys import LAYER_TASKS, bindings_for
 from dida.tui.pages.base import EMPTY_STYLE, CursorPage, Row, empty_row, heading_row, rule_row
@@ -220,7 +220,7 @@ class TasksPage(CursorPage):
         self._heading = name
         self._task_list = task_list
         # 视图不是容器：行里必须写出这条任务属于哪个清单；清单里则不重复（工单 #37）。
-        self._show_list_name = task_list.container_kind not in (None, ListKind.LIST)
+        self._show_list_name = task_list.shows_list_name
         self.set_rows(self._build(), keep_cursor=same_container)
 
     def _build(self) -> tuple[Row, ...]:

@@ -118,6 +118,9 @@ def test_the_overdue_token_is_a_token_the_row_can_read():
     from dida.sync.engine import TaskItem
 
     assert theme.OVERDUE, "逾期得有个语义 token"
+    assert "OVERDUE" in theme.RICH_ROLES, (
+        "它得留在颜色角色表里——那张表是「每个角色都是 ANSI 槽位」那条断言的输入"
+    )
     assert "overdue" in {field.name for field in dataclasses.fields(TaskItem)}, (
         "TaskItem 得有一位现成的 overdue：没有它，行要标红就只能自己去判日期——那是不许的"
     )

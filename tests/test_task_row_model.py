@@ -22,7 +22,6 @@ from dida.sync.completed import DEFAULT_COMPLETED_WINDOW_HOURS
 from dida.sync.engine import (
     NO_DUE_TEXT,
     CompletedItem,
-    ListKind,
     SyncEngine,
     TaskItem,
     completed_section,
@@ -454,10 +453,10 @@ def test_the_read_model_says_whether_the_container_is_a_list_or_a_view():
     source.add_view("我的一天", id="mine", task_ids=("t1",))
     engine = engine_with(source)
 
-    assert engine.tasks_in("work").container_kind is ListKind.LIST
-    assert engine.tasks_in("today").container_kind is ListKind.BUILTIN
-    assert engine.tasks_in("mine").container_kind is ListKind.CUSTOM
-    assert engine.tasks_in("已经不在的清单").container_kind is None
+    assert engine.tasks_in("work").shows_list_name is False, "清单是容器，名字不必重复"
+    assert engine.tasks_in("today").shows_list_name is True, "内置视图不是容器"
+    assert engine.tasks_in("mine").shows_list_name is True, "自定义视图不是容器"
+    assert engine.tasks_in("已经不在的清单").shows_list_name is False
 
 
 # ------------------------------------------------------------------ 窄终端：丢弃顺序
