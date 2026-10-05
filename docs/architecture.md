@@ -13,7 +13,7 @@
 | 3 | 本地存储 | `dida/storage/store.py` | `Store`：清单、任务快照、待推送改动、同步状态 | t08 已实现 |
 | 4 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` + `dida/sync/read.py` | `SyncEngine(clock=, day_end=, source=, client=)`、`status() -> SyncStatus`、`view() -> TodayView`、**三种读形状**（#33）：`list_index() -> tuple[ListRow, ...]`、`tasks_in(container_id) -> TaskList`、`task_detail(task_id) -> TaskDetail \| None`、`refresh() -> RefreshReport`（**async**）、`complete(task_id)`、`defer(task_id)`、`push_pending()`；视图模型与分组纯函数在 `dida/sync/view.py`，读模型在 `dida/sync/read.py` | t05 / t09 / t10 已实现；读形状 #33 |
 | 5 | 逻辑日 | `dida/logical_day.py` | `parse_day_end(text) -> timedelta`、`logical_day(now, day_end) -> LogicalDay`（`label` / `start` / `end`，半开区间） | t04 已实现 |
-| 6 | TUI | `dida/tui/` | `DidaApp(engine)`；三层页面 `dida/tui/pages/`（`index` / `tasks` / `detail`）、按层的键位表 `dida/tui/keys.py`、浮层 `dida/tui/overlays.py`、状态栏 `#status-bar`（`status_line()` / `format_status()`） | v1 t05 / t18；一栏三层 #34 |
+| 6 | TUI | `dida/tui/` | `DidaApp(engine)`；三层页面 `dida/tui/pages/`（`index` / `tasks` / `detail`）、按层的键位表 `dida/tui/keys.py`、浮层 `dida/tui/overlays.py`、**视觉常量唯一出处 `dida/tui/theme.py`**（颜色 / 字形 / 间距 / 动效）、顶栏 `#top-bar`（`top_line()`，词标 + 导航路径）、状态栏 `#status-bar`（`status_line()` / `format_status()`） | v1 t05 / t18；一栏三层 #34；视觉地基 #51 |
 
 `SyncStatus` 字段：`checked_at`（来自时钟）、`pending_count`、`last_refresh_at`、`logical_day`。
 状态栏文本由 `dida.tui.app.status_line()` 生成（纯文本那一份是 `format_status()`），措辞按 GLOSSARY
@@ -33,7 +33,17 @@ bootstrap ─► config ─► api.client（「列清单」验证凭据；失败
 - TUI 只许 import `dida.sync.engine` 和自己的 `dida.tui.*`；不许碰存储与 API 客户端，
   `tests/test_architecture.py` 用 AST 守着这条。分组、排序、逾期判定全在引擎里。
 - 组合根是 `dida/bootstrap.py`（`dida` 命令 = `dida.bootstrap:main`），由它注入协作者。
-- 颜色只用终端 16 色（CSS 里写 `ansi_*`），不写死 hex。
+- 颜色**跟随终端主题**，而不是 app 自带的一套调色板（ADR-0007 一）。2026-10 的实测推翻了原先写在
+  这一行的说法：Textual 8.2.8 默认把每个 `ansi_*` 改写成它内建 Monokai 调色板里的**真彩色**
+  （`ansi_cyan` 出去是 `38;2;88;209;235`），所以「只写 `ansi_*`」在源码里成立、在像素上不成立——
+  用户自己的主题一眼都没被用到。落地方式是 `App(ansi_color=True)`，之后同一条 CSS 出去是 `36`。
+- 于是 `ansi_*` 这个名字是**承重的**：`rgb()` / `hsl()` / CSS 具名色 / `$` 主题变量，任何一处都会把
+  真彩色偷偷放回来。视觉常量只有**一个出处** `dida/tui/theme.py`（颜色、字形、间距、动效时长），
+  页面与浮层只引用语义名（`theme.ACCENT` / `theme.MUTED` / `theme.RULE` …）。
+- 这条规矩有**两条**守卫，缺一不可：源码扫描（`tests/test_architecture.py`，AST 只取「会被用到
+  的字符串」，hex / `rgb()` / `hsl()` / 具名色 / `$` 变量都拦）与**渲染级 SGR 断言**
+  （`tests/test_theme.py`：真跑一遍 app，断言强调色发出的是 ANSI 6、屏幕上一条 `38;2;` / `48;2;`
+  都没有）。前者抓不住 `Text("x", style="cyan")`——它走 Textual 的 CSS 颜色解析，静默发出 `#00FFFF`。
 
 ## 两个测试接缝
 

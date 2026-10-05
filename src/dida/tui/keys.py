@@ -25,7 +25,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from rich.cells import cell_len
 from textual.binding import Binding
+
+from dida.tui import theme
 
 __all__ = [
     "BINDINGS",
@@ -169,7 +172,10 @@ def help_body(layer: str) -> str:
     这一个来源。
     """
     rows = help_rows(layer)
-    width = max(len(row.key) for row in rows) + 2
+    # 按**格**补空格，不按字符数：``ljust`` 遇到 2 格宽的字形（CJK、emoji、歧义宽度的符号）
+    # 会把右边那一列推歪。今天键名里每个字形恰好都是 1 格，所以输出没变——这道算法是给
+    # 以后加进来的字形留的（#48 接手这张表时用它）。
+    width = max(cell_len(row.key) for row in rows) + 2
     lines = [f"── {LAYER_TITLES[layer]} ──", ""]
-    lines += [f"{row.key.ljust(width)}{row.label}" for row in rows]
+    lines += [f"{theme.pad(row.key, width)}{row.label}" for row in rows]
     return "\n".join(lines)

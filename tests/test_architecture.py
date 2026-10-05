@@ -14,13 +14,60 @@ import ast
 import importlib
 import re
 from pathlib import Path
+from typing import Iterator
 
 import pytest
+from rich.color import ANSI_COLOR_NAMES
+from rich.style import Style
+from textual._color_constants import COLOR_NAME_TO_RGB
 
 ROOT = Path(__file__).resolve().parents[1]
 
 HEX_COLOUR = re.compile(r"#(?:[0-9a-fA-F]{6}|[0-9a-fA-F]{8}|[0-9a-fA-F]{3})(?![0-9a-fA-F])")
 """颜色字面量：``#rrggbb`` / ``#rrggbbaa`` / ``#rgb``（不是照抄实现——这是终端那条规矩的形状）。"""
+
+COLOUR_FUNCTION = re.compile(r"\b(?:rgba?|hsla?)\s*\(")
+"""``rgb(…)`` / ``hsl(…)``：写死的颜色，只是换了个写法。"""
+
+THEME_VARIABLE = re.compile(r"\$[A-Za-z][\w-]*")
+"""``$surface`` 这类 Textual 主题变量：它们在 ``textual-dark`` 下是真彩色值（``#1E1E1E``）。"""
+
+STYLE_ATTRIBUTES = frozenset(
+    {
+        "bold",
+        "b",
+        "dim",
+        "italic",
+        "i",
+        "underline",
+        "u",
+        "uu",
+        "strike",
+        "reverse",
+        "blink",
+        "overline",
+        "o",
+        "not",
+        "none",
+        "default",
+        "on",
+    }
+)
+"""Rich 样式串里的**不是颜色**的那些词：字重、装饰、``default``（终端自己的前景/背景）。"""
+
+COLOUR_WORDS = frozenset(
+    {name.lower() for name in ANSI_COLOR_NAMES}
+    | {
+        name.lower()
+        for name in COLOR_NAME_TO_RGB
+        if not name.startswith("ansi_")  # ansi_* 是唯一合法的拼法
+    }
+)
+"""Rich 与 Textual 两边认得的**具名色**（``red`` / ``cyan`` / ``aquamarine1`` …）。
+
+两边的表都要：Rich 的样式串里 ``cyan`` 是 ANSI 6（合法但只许在 theme.py 拼），Textual 的
+CSS 里 ``cyan`` 是 ``#00FFFF``（真彩色）。同一个词两个意思——所以名字只许在一个地方出现。
+"""
 
 SEVEN_MODULES = [
     "dida.config",  # 配置与凭据
@@ -178,17 +225,205 @@ def test_the_guard_catches_every_way_into_a_module_outside_the_table(source):
     assert _violations(source, package="dida.tui")
 
 
-def test_the_tui_never_hardcodes_a_hex_colour():
-    """只用终端 16 色：源码里不许出现 ``#rrggbb`` 之类的颜色字面量。
+def colour_offences(source: str, *, allow_names: bool) -> tuple[str, ...]:
+    """这份源码里出现的每一处颜色字面量（``文件:行: 说明`` 的形状）。
 
-    颜色字面量写死之后，浅色主题、``NO_COLOR``、以及不是 24 位的终端上那一行就糊了。
-    这条规矩扫的是**源码文本**，与渲染出来的屏幕无关，所以它和上面那些边界测试住在一起
-    （原本钉在 ``test_app_view.py`` 里，#32 搬出来的——那是纯模块边界的房客）。
+    ``allow_names`` 是给 :mod:`dida.tui.theme` 留的：它是**唯一**允许拼颜色名的地方
+    （ANSI 名就是它的活），但连它也不许写 hex / ``rgb()`` / ``$`` 变量——那些一定会把
+    真彩色放回来。
+    """
+    offenders: list[str] = []
+    for lineno, text in _code_strings(source):
+        for label, pattern in (
+            ("hex", HEX_COLOUR),
+            ("rgb()/hsl()", COLOUR_FUNCTION),
+            ("$ 主题变量", THEME_VARIABLE),
+        ):
+            if pattern.search(text):
+                offenders.append(f"{lineno}: {label} in {text!r}")
+    if not allow_names:
+        for lineno, text in _style_strings(source):
+            named = _named_colour(text)
+            if named:
+                offenders.append(f"{lineno}: 样式串里的具名色 {named!r} in {text!r}")
+        for lineno, declaration in _css_declarations(source):
+            named = _named_colour(declaration)
+            if named:
+                offenders.append(f"{lineno}: CSS 里的具名色 {named!r} in {declaration!r}")
+    return tuple(offenders)
+
+
+def _named_colour(text: str) -> str | None:
+    """这段样式串里出现的具名色（不是颜色的那些词不算）。"""
+    for word in re.findall(r"[A-Za-z][A-Za-z0-9_]*", text):
+        lowered = word.lower()
+        if lowered in STYLE_ATTRIBUTES:
+            continue
+        if lowered in COLOUR_WORDS:
+            return word
+    return None
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'Text("x", style="cyan")',
+        'text.append("x", style="red bold")',
+        'text.stylize("on #00FFFF")',
+        'CSS = "Screen { color: red; }"',
+        'CSS = "Static { background: $surface; }"',
+        'CSS = "Static { background: rgb(255, 0, 0); }"',
+        'CSS = "Static { color: hsl(0, 100%, 50%); }"',
+        'CSS = "Toast { border-left: outer ansi_green; }" + "#ff0000"',
+    ],
+)
+def test_the_colour_guard_catches_every_way_of_naming_a_colour(source):
+    """这条守卫自己也要有人守：它拦得住的东西逐条钉住（不然它只是好看）。
+
+    ``#ff0000`` / ``rgb()`` / ``hsl()`` / ``red`` / ``$surface`` —— 这五种实测**都能**
+    溜过只拦 hex 的那一版，而任意一种都能把「跟随终端主题」静默毁掉。
+    """
+    assert colour_offences(source, allow_names=False)
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        "Text(detail.title, style='bold')",
+        "line.stylize('reverse')",
+        'CSS = "Toast { border-left: outer ansi_green; }"',
+        'CSS = "Screen { background: ansi_default; }"',
+        'theme.styled("x", theme.MUTED)',
+        'CSS = "Static { text-wrap: nowrap; text-overflow: ellipsis; }"',
+    ],
+)
+def test_the_colour_guard_lets_the_ansi_vocabulary_through(source):
+    """字重、装饰、与 ``ansi_*`` 都是合法的：守卫拦的是**写死的颜色**，不是样式本身。"""
+    assert colour_offences(source, allow_names=False) == ()
+
+
+def test_the_colour_guard_allows_names_inside_the_theme_module():
+    """``theme.py`` 是唯一允许拼颜色名的地方——但 ``rgb()`` / ``$`` 变量连它也不许。"""
+    assert colour_offences('ACCENT = "cyan"', allow_names=True) == ()
+    assert colour_offences('ACCENT = "rgb(0,255,255)"', allow_names=True)
+    assert colour_offences('CSS_PAGE = "$background"', allow_names=True)
+
+
+def test_the_tui_names_colours_in_exactly_one_place():
+    """只用终端 16 色：颜色字面量只许出现在 :mod:`dida.tui.theme` 一处（工单 #51）。
+
+    四类都拦：``#rrggbb`` / ``rgb()`` / ``hsl()`` / CSS 具名色 / ``$`` 主题变量。只拦 hex
+    的那一版实测挡不住后面三种（``rgb(255,0,0)``、``red``、``$surface`` 全部通过），而任意
+    一条都能把「跟随终端主题」静默毁掉：具名色与主题变量都是 Textual 那边的真彩色。
+    （纯 ANSI 名 ``ansi_cyan`` 不受影响——那正是主题自己拼出来的写法。）
+
+    **文档字符串不算**：仓库里到处在引用实测色值当证据（ADR-0007、theme 的模块文档），
+    那是说明，不是样式。扫的是**代码里的字符串**——样式在运行时只可能从那里来。
     """
     offenders = [
-        str(path.relative_to(ROOT))
+        f"{path.relative_to(ROOT)}:{offence}"
         for path in sorted((ROOT / "src" / "dida" / "tui").rglob("*.py"))
-        if HEX_COLOUR.search(path.read_text(encoding="utf-8"))
+        for offence in colour_offences(
+            path.read_text(encoding="utf-8"), allow_names=path.name == "theme.py"
+        )
     ]
 
-    assert offenders == []
+    assert offenders == [], "颜色只许在 dida/tui/theme.py 里拼：\n" + "\n".join(offenders)
+
+
+def test_no_colour_goes_into_a_base_style():
+    """颜色只许进 **span**，不许进 base style。
+
+    ``Text("x", style="cyan")`` 把样式放进 base style，而 Textual 用**自己的 CSS 颜色解析器**
+    读它——那里 ``cyan`` 是 ``#00FFFF``。于是那个「看起来写的是 ANSI 名」的调用点静默发出
+    真彩色，第一条颜色决定当场作废而且不报错。渲染级那条断言（``tests/test_theme.py``）
+    盯的是屏幕上的字节，这条盯的是源码的形状。
+    """
+    offenders: list[str] = []
+    for path in sorted((ROOT / "src" / "dida" / "tui").rglob("*.py")):
+        if path.name == "theme.py":
+            continue  # 唯一允许拼颜色的地方，它自己那条测试在 tests/test_theme.py
+        for lineno, style_text in _base_style_strings(path.read_text(encoding="utf-8")):
+            if not style_text:
+                continue
+            try:
+                style = Style.parse(style_text)
+            except Exception:  # noqa: BLE001 - 解析不了的串不是样式串
+                continue
+            if style.color is not None or style.bgcolor is not None:
+                offenders.append(f"{path.relative_to(ROOT)}:{lineno}: {style_text!r}")
+
+    assert offenders == [], (
+        "颜色要走 span（theme.styled / Text().append(style=…)），"
+        "base style 会被 Textual 的 CSS 解析器当成真彩色：\n" + "\n".join(offenders)
+    )
+
+
+# ---------------------------------------------------------------------------
+# 扫源码：颜色字面量只许在一个地方
+# ---------------------------------------------------------------------------
+
+
+def _documentation_nodes(tree: ast.AST) -> set[int]:
+    """**说明性**的字符串：光秃秃摆在那一行的那些（模块/类/函数的文档、常量下面那句说明）。
+
+    ``ACCENT = "cyan"`` 后面那一段独立成句的字符串不是样式，它是注释——它没有被赋给谁、
+    也没有被当参数传出去，运行时不可能是颜色。样式只可能从「有归属的字符串」来。
+    """
+    found: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Expr) and isinstance(node.value, ast.Constant):
+            if isinstance(node.value.value, str):
+                found.add(id(node.value))
+    return found
+
+
+def _code_strings(source: str) -> Iterator[tuple[int, str]]:
+    """源码里**真的会被用到**的每一个字符串常量（f-string 的片段也算）——说明性的除外。"""
+    tree = ast.parse(source)
+    documentation = _documentation_nodes(tree)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Constant) and isinstance(node.value, str):
+            if id(node) not in documentation:
+                yield node.lineno, node.value
+
+
+def _style_strings(source: str) -> Iterator[tuple[int, str]]:
+    """会被 Rich / Textual 当**样式**读的那些代码字符串。
+
+    两类：``style=`` 关键字（``Text(...)`` / ``Static(...)`` / ``append(...)``）与
+    ``stylize("…")`` 这种位置参数。
+    """
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "style" and isinstance(keyword.value, ast.Constant):
+                if isinstance(keyword.value.value, str):
+                    yield keyword.value.lineno, keyword.value.value
+        name = getattr(node.func, "attr", "") or getattr(node.func, "id", "")
+        if name in ("stylize", "styled"):
+            for arg in node.args:
+                if isinstance(arg, ast.Constant) and isinstance(arg.value, str):
+                    yield arg.lineno, arg.value
+
+
+def _base_style_strings(source: str) -> Iterator[tuple[int, str]]:
+    """``style=`` 关键字上的那些串——它们会被放进 base style（trap 1 的入口）。"""
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        for keyword in node.keywords:
+            if keyword.arg == "style" and isinstance(keyword.value, ast.Constant):
+                if isinstance(keyword.value.value, str):
+                    yield keyword.value.lineno, keyword.value.value
+
+
+def _css_declarations(source: str) -> Iterator[tuple[int, str]]:
+    """代码字符串里那些 CSS 声明（``属性: 值``）。"""
+    declaration = re.compile(r"[a-z-]+\s*:\s*[^;{}\n]+")
+    for lineno, text in _code_strings(source):
+        if ";" not in text and "{" not in text:
+            continue  # 不像样式表，别拿它当 CSS 扫
+        for match in declaration.finditer(text):
+            yield lineno, match.group()
