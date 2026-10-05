@@ -66,6 +66,16 @@ def _completed_status() -> int:
     return COMPLETED_STATUS
 
 
+def _uncompleted_status() -> int:
+    """任务「未完成」的 ``status`` 值（``0``，取消完成写回的那一档，工单 #38）。
+
+    与 :func:`_completed_status` 并排：这两个值是**同一张码表**的两档，分开写两处就会漂。
+    """
+    from dida.storage.store import UNCOMPLETED_STATUS
+
+    return UNCOMPLETED_STATUS
+
+
 @runtime_checkable
 class TaskWriter(Protocol):
     """推送要的那几个写操作；t07 的 ``DidaApiClient`` 满足它。
@@ -90,6 +100,14 @@ class TaskWriter(Protocol):
 
     async def complete_task(self, project_id: str, task_id: str) -> None:
         """``POST /open/v1/project/{projectId}/task/{taskId}/complete``：无请求体。"""
+        ...
+
+    async def batch_update(self, updates: Sequence[Mapping[str, Any]]) -> Any:
+        """``POST /open/v1/task/batch``：批量更新（取消完成的唯一路径，工单 #38）。
+
+        每一条只带 id / projectId / status；逐条失败藏在 ``200 OK`` 的 ``id2error`` 里，
+        由客户端读出来抛结构化错误。
+        """
         ...
 
     async def delete_task(self, project_id: str, task_id: str) -> None:
@@ -146,13 +164,30 @@ class PushMixin:
         self._push_now()
 
     def complete(self, task_id: str) -> None:
-        """写：完成任务并立即推送（ADR 0002，服务端不可逆）。
+        """写：完成任务并立即推送（ADR 0002 的乐观写：本地先动，服务端随后到）。
 
         就是 :meth:`write` 的一个预置：本地当场标记完成（``status`` 由引擎补 ``2``），
-        推送走没有请求体的 ``complete`` 端点。没有「取消完成」这条路径——服务端没有
-        这个接口，本地自己造一个只会在下一次刷新时被服务端权威抹掉（ADR-0002）。
+        推送走没有请求体的 ``complete`` 端点。
+
+        **反方向是 :meth:`uncomplete`，不是「没有这条路」**：ADR-0002 记的「完成不可逆」
+        已被实测推翻（spec 的实测事实第 1 条），服务端那条路是 ``task/batch`` 的
+        ``update`` 带 ``status: 0``。完成这条路本身仍然是不可逆的（它没有撤销参数），
+        所以「按键的手感比可撤销性值钱」这条口径没变——变的是它**真的**可逆了。
         """
         self.write(task_id, kind=WriteKind.COMPLETE)
+
+    def uncomplete(self, task_id: str) -> None:
+        """写：取消完成并立即推送（工单 #38，``space`` 的第二个方向）。
+
+        与 :meth:`complete` 同一条口径的预置：本地当场把 ``status`` 写回 ``0``（完成时间戳
+        不动——实测取消完成不会清掉它），推送走 ``task/batch`` 的 ``update`` 数组。
+
+        **为什么不是普通更新端点**：``status`` 在 ``POST /open/v1/task/{taskId}`` 上会被
+        服务端静默忽略（所以本地守卫一直拒绝它），实测能生效的只有批量更新这一条路
+        （spec 的实测事实第 1 条）。所以这一种写打的是一个**新形状**的端点，而它每一条
+        只发 id / projectId / status——批量更新是合并语义，其余字段服务端自己保留。
+        """
+        self.write(task_id, kind=WriteKind.UNCOMPLETE)
 
     def delete(self, task_id: str) -> None:
         """写：删除一条任务（``d``），本地当场摘掉快照、推送走 ``DELETE``（t16）。
@@ -254,6 +289,20 @@ class PushMixin:
             )
         elif wire is WireCall.COMPLETE_TASK:
             await writer.complete_task(change.list_id, change.task_id)
+        elif wire is WireCall.BATCH_UPDATE_TASK:
+            # 批量更新：请求体是 {update: [...]}，每一条只带 id / projectId / status。
+            # 取消完成是唯一走这条路的一种写（`_BEHAVIOUR` 说的一种写一种端点形状）；
+            # 那条改动在本地要写下的 ``status`` 就是这条请求要发的值——两者同一个来源，
+            # 不会出现「本地改成未完成、服务端收到的是别的」。
+            await writer.batch_update(
+                [
+                    {
+                        "id": change.task_id,
+                        "projectId": change.list_id,
+                        **change.payload,
+                    }
+                ]
+            )
         elif wire is WireCall.DELETE_TASK:
             await writer.delete_task(change.list_id, change.task_id)
         elif wire is WireCall.CREATE_TASK:
@@ -303,8 +352,15 @@ class PushMixin:
         而这个值只有 API 知道（Completed 是 ``2``，api-contracts.md 第 2 条）——由引擎补，
         不让 t11 自己记一个魔法数。它不会进请求体：完成走的是没有请求体的 ``complete``
         端点，而且 ``status`` 本来也不是新建/更新接受的字段（同文件第 5 条）。
+
+        取消完成是同一个例外**反过来的那一半**（工单 #38）：本地要把 ``status`` 写回
+        ``0``（完成时间戳不动），而那个值同样只有 API 知道。它进请求体——那一档正是
+        ``task/batch`` 的 ``update`` 要发的东西（实测确认，spec 的实测事实第 1 条）。
         """
         merged = dict(changes or {})
-        if kind.marks_completed:  # 「本地立刻完成」这件事由词表说（dida.sync.writes）
+        # 「本地立刻完成 / 立刻不再完成」这两件事都由词表说（dida.sync.writes 的 _BEHAVIOUR）
+        if kind.marks_completed:
             merged.setdefault("status", _completed_status())
+        elif kind.clears_completed:
+            merged.setdefault("status", _uncompleted_status())
         return merged

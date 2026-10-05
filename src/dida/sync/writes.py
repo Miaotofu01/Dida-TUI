@@ -14,7 +14,8 @@
 
 **一种写的全部行为都记在同一个地方**：:data:`_BEHAVIOUR` 那张表，每个成员一行——本地快照
 怎么变（``local``）、推送调客户端的哪一个方法（``wire``）、要不要顺手写下 ``status``
-（``marks_completed``）、冲突裁决时整条任务豁不豁免（``whole_row``）。分派这些行为的地方
+（``marks_completed`` / ``clears_completed`` 这一对，完成与取消完成）、冲突裁决时整条任务
+豁不豁免（``whole_row``）。分派这些行为的地方
 （:meth:`dida.storage.store.Store.enqueue`、:meth:`~dida.storage.store.Store._exempt_fields`、
 :meth:`dida.sync.push.PushMixin._send` / ``_local_effect``）一律**读表**，不再逐个成员写 ``if``：
 以前新增一种写要在两处枚举、一个换算函数、三处分派里各改一次，现在只在这里加一行。
@@ -72,6 +73,14 @@ class WireCall(Enum):
     COMPLETE_TASK = "complete_task"
     """``POST .../task/{taskId}/complete``，没有请求体。"""
 
+    BATCH_UPDATE_TASK = "batch_update_task"
+    """``POST /open/v1/task/batch`` 的 ``update`` 数组，每一条只带 id / projectId / status。
+
+    取消完成走这一种（工单 #38）。它是一个**新形状**的端点（请求体是一个对象、里面装着
+    数组，而不是一条任务），所以在这里单独列一种调用形状——这是新的外部行为，不是要同步
+    的词汇。这条用法官方文档一字未提，是实测确认的（spec 的实测事实第 1 条）。
+    """
+
     DELETE_TASK = "delete_task"
     """``DELETE .../task/{taskId}``，没有请求体。"""
 
@@ -84,6 +93,13 @@ class WriteBehaviour:
     wire: WireCall
     marks_completed: bool = False
     """本地还要顺手写下「已完成」的 ``status``（值从存储层取，同一份 API 事实只留一处）。"""
+
+    clears_completed: bool = False
+    """本地还要把 ``status`` 写回「未完成」那一档（取消完成是唯一的一种，工单 #38）。
+
+    值与 :attr:`marks_completed` 一样从存储层取，而且**只动 ``status``**：完成时间戳不动
+    ——实测取消完成不会清掉它，而「还算不算已完成」的判据只有 ``status``。
+    """
 
     whole_row: bool = False
     """冲突裁决时**整条任务**豁免于服务端权威（删除就是这一种）。"""
@@ -106,6 +122,13 @@ class WriteKind(Enum):
 
     COMPLETE = "complete"
     """完成：本地立刻标记完成，推送走 ``POST .../task/{taskId}/complete``（无请求体）。"""
+
+    UNCOMPLETE = "uncomplete"
+    """取消完成：本地把 ``status`` 写回 ``0``，推送走 ``task/batch`` 的 ``update``（工单 #38）。
+
+    与服务端权威的关系与别的写一样：本地先动，刷新时那条 ``status`` 由待推送改动豁免，
+    服务端真的照做了才由它说了算（``-1`` 已放弃也是服务端可能给的答案）。
+    """
 
     DELETE = "delete"
     """删除：本地立刻摘掉快照，推送走 ``DELETE .../task/{taskId}``。"""
@@ -131,6 +154,11 @@ class WriteKind(Enum):
         return _BEHAVIOUR[self].marks_completed
 
     @property
+    def clears_completed(self) -> bool:
+        """本地要不要把 ``status`` 写回「未完成」那一档（取消完成是唯一的一种）。"""
+        return _BEHAVIOUR[self].clears_completed
+
+    @property
     def whole_row(self) -> bool:
         """整条任务豁不豁免于服务端权威（删除是唯一的一种）。"""
         return _BEHAVIOUR[self].whole_row
@@ -142,13 +170,18 @@ _BEHAVIOUR: dict[WriteKind, WriteBehaviour] = {
     WriteKind.COMPLETE: WriteBehaviour(
         local=LocalEffect.MERGE, wire=WireCall.COMPLETE_TASK, marks_completed=True
     ),
+    WriteKind.UNCOMPLETE: WriteBehaviour(
+        local=LocalEffect.MERGE,
+        wire=WireCall.BATCH_UPDATE_TASK,
+        clears_completed=True,
+    ),
     WriteKind.DELETE: WriteBehaviour(
         local=LocalEffect.REMOVE, wire=WireCall.DELETE_TASK, whole_row=True
     ),
 }
 """**一处**记全每种写的行为。加一种写只改这里（外加它要打的新端点形状）。
 
-四个成员一个不少：``tests/test_write_kind.py`` 会逐个访问这些属性，漏一行当场红。
+五个成员一个不少：``tests/test_write_kind.py`` 会逐个访问这些属性，漏一行当场红。
 """
 
 

@@ -21,7 +21,7 @@ from typing import Any, Mapping, Sequence
 import httpx
 
 from dida.clock import Clock
-from dida.storage.store import COMPLETED_STATUS, RefreshReport
+from dida.storage.store import COMPLETED_STATUS, UNCOMPLETED_STATUS, RefreshReport
 from dida.sync.engine import (
     CompletedReport,
     ListRow,
@@ -156,6 +156,22 @@ class InMemorySource:
     def drop_list(self, list_id: str) -> None:
         """本地摘掉一行清单（#42 删除的本地效果）。"""
         self._lists.pop(list_id, None)
+
+    def set_completed(self, task_id: str, *, completed: bool) -> None:
+        """把一条任务标成完成 / 未完成（工单 #38 的乐观写在内存里的那一半）。
+
+        与真 ``Store`` 同一条口径：**只动 ``status``**，``completedTime`` 一个字不动。
+        取消完成之后完成时间戳还留着正是实测行为（spec 的实测事实第 1 条），而「还算不算
+        已完成」只看 ``status``——替身要是顺手把时间戳也清了，接缝一就再也测不到那句话。
+        """
+        snapshot = self._tasks.get(task_id)
+        if snapshot is None:
+            return
+        status = COMPLETED_STATUS if completed else UNCOMPLETED_STATUS
+        self._tasks[task_id] = replace(snapshot, completed=completed)
+        raw = self._raw.get(task_id)
+        if raw is not None:
+            self._raw[task_id] = {**raw, "status": status}
 
     def add_view(self, name: str, *, id: str | None = None, task_ids: Sequence[str] = ()) -> ViewRow:
         """加一条自定义视图行（#36）：``task_ids`` 是这一层算好的求值结果。
@@ -293,6 +309,9 @@ class FakeBackend:
         self.completed: list[str] = []
         """``complete(task_id)`` 收到的任务 id，按调用顺序。"""
 
+        self.uncompleted: list[str] = []
+        """``uncomplete(task_id)`` 收到的任务 id，按调用顺序（工单 #38）。"""
+
         self.deferred: list[str] = []
         """``defer(task_id, days=...)`` 收到的任务 id，按调用顺序。"""
 
@@ -422,7 +441,25 @@ class FakeBackend:
         return self._engine.status()
 
     def complete(self, task_id: str) -> None:
+        """写：记下这一笔，**并且真的把它标成完成**（工单 #38）。
+
+        与 :meth:`create` 同一条口径（清单那三种写也是）：本地效果是真引擎当场做的事
+        （``Store`` 的乐观写把 ``status`` 写成 2），只记录的话接缝一看不到「按下去这一行
+        就变了」——而完成 / 取消完成正是要按键才看得见的那一类。
+
+        ``completedTime`` 照真引擎的样子**不动**：服务端还没认过这一笔，屏幕上的完成时刻
+        要等已完成流把它带回来（#37 的 ``completed_section`` 只认服务端那个时间戳）。
+        """
         self.completed.append(task_id)
+        self.source.set_completed(task_id, completed=True)
+
+    def uncomplete(self, task_id: str) -> None:
+        """写：记下这一笔，并把它改回未完成（工单 #38 的第二个方向）。
+
+        与 :meth:`complete` 同一条口径，只是 ``status`` 写回 0；完成时间戳同样不动。
+        """
+        self.uncompleted.append(task_id)
+        self.source.set_completed(task_id, completed=False)
 
     def defer(self, task_id: str, *, days: int = 1) -> None:
         self.deferred.append(task_id)
