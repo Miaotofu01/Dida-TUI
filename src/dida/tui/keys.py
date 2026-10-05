@@ -125,7 +125,10 @@ BINDINGS: dict[str, tuple[Key, ...]] = {
         Key(("G",), "defer_week", "顺延一周"),
     ),
     LAYER_DETAIL: (
-        Key(("escape",), "back", "退回任务列表页"),
+        Key(("j", "down"), "cursor_down", "下一个字段"),
+        Key(("k", "up"), "cursor_up", "上一个字段"),
+        Key(("enter",), "enter", "编辑这个字段"),
+        Key(("escape",), "back", "结束编辑 / 退回任务列表页"),
     ),
 }
 
