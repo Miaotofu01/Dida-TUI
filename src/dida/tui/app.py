@@ -671,9 +671,10 @@ class DidaApp(App[None]):
     def _confirming_quit(self) -> bool:
         """退出浮层已经开着了吗。
 
-        看**整摞** screen，不是只看顶上那一块：``?`` 的帮助浮层盖在确认浮层上时，``q`` /
-        ``Ctrl+C`` 是能到这里的（浮层的绑定链把 ``app._bindings`` 并了进去），而那时
-        ``self.screen`` 是帮助浮层——只比它一块就会再叠一个确认框出来。
+        看**整摞** screen，不是只看顶上那一块：确认框上面还能再盖一层（``?`` 的帮助浮层
+        就盖得住它），而那时 ``self.screen`` 是**最上面**那一块——只比它一块就会再叠一个
+        确认框出来。这个口子是真的：浮层是模态的，键位解析在它那儿就截断了，
+        :meth:`action_quit` 照样会跑到。
         """
         return any(isinstance(screen, ConfirmOverlay) for screen in self.screen_stack)
 
