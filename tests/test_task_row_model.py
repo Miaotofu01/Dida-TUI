@@ -21,6 +21,7 @@ from dida.storage.store import Store
 from dida.sync.completed import DEFAULT_COMPLETED_WINDOW_HOURS
 from dida.sync.engine import (
     NO_DUE_TEXT,
+    CompletedItem,
     ListKind,
     SyncEngine,
     TaskItem,
@@ -31,7 +32,7 @@ from dida.sync.rows import completed_window_start, row_sort_key
 from dida.sync.view import ListSnapshot, TaskSnapshot
 from dida.testing import InMemorySource, ManualClock
 from dida.tui import theme
-from dida.tui.pages.tasks import task_line
+from dida.tui.pages.tasks import completed_line, task_line
 
 TZ = timezone(timedelta(hours=8))
 
@@ -519,3 +520,17 @@ def test_the_title_keeps_its_cells_when_the_row_gets_narrow():
 
     assert line.plain == ". 回邮件给产品经理"
     assert theme.ELLIPSIS not in line.plain
+
+
+def test_a_completed_row_keeps_its_title_and_drops_its_time_when_narrow():
+    """已完成的行与未完成的同一条规矩：宽度不够先丢注解（完成时刻），标题留着。"""
+    item = CompletedItem(
+        task_id="t1",
+        title="回邮件给产品经理",
+        list_name="工作",
+        completed_at=at(14, 11, 0),
+        completed_text="今天 11:00",
+    )
+
+    assert completed_line(item, width=24).plain == "☑ 回邮件给产品经理"
+    assert completed_line(item, width=40).plain.endswith("今天 11:00")

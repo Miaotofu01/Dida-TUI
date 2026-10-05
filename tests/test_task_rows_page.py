@@ -254,3 +254,46 @@ async def test_at_thirty_columns_the_title_survives_and_the_due_time_is_dropped(
     assert "18:00" not in row and "昨天" not in row, f"截止时间该先走：{row!r}"
     assert cell_len(row) <= 30, "这一行不许超出终端宽度"
     assert len([line for line in lines(text) if "回邮件" in line]) == 1, "一行仍然只放一条任务"
+
+
+# ------------------------------------------------------------------ 已完成
+
+
+async def test_completed_rows_are_struck_through_and_sunk_below_the_unfinished_ones():
+    """已完成的划掉显示、沉到列表最底（验收标准：划掉 + 沉底，用户故事 54/55）。"""
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_task("没做完的", list_name="work", id="t1", due=at(14, 18, 0))
+    fake.add_task("做完了的", list_name="work", id="t2", completed=True, completed_at=at(14, 11, 0))
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_work(pilot, app)
+        styled = screen_styled_text(app)
+        rows = lines(screen_text(app))
+
+    done = line_with(styled, "做完了的")
+    assert theme.DONE_MARK in done, f"已完成的行有自己的前缀记号：{done!r}"
+    assert STRIKE in sgr_parameters(style_before(done, "做完了的")), f"没划掉：{done!r}"
+
+    assert next(i for i, line in enumerate(rows) if "没做完的" in line) < next(
+        i for i, line in enumerate(rows) if "做完了的" in line
+    ), "已完成的要沉在未完成下面"
+
+
+async def test_a_task_completed_more_than_seven_days_ago_does_not_take_the_screen():
+    """只显示最近 7 天完成的：更早的不占屏幕（验收标准：窗口默认值已改成 7 天）。"""
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_task("六天前做完的", list_name="work", id="t1", completed=True, completed_at=at(8, 12, 0))
+    fake.add_task("八天前做完的", list_name="work", id="t2", completed=True, completed_at=at(6, 12, 0))
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_work(pilot, app)
+        text = screen_text(app)
+
+    assert "六天前做完的" in text
+    assert "八天前做完的" not in text
