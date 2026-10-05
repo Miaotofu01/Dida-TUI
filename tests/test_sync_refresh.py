@@ -435,3 +435,36 @@ async def test_a_task_without_a_project_id_is_attributed_to_its_list(store):
 
     assert [item.list_name for group in engine.view().groups for item in group.items] == ["工作"]
     assert store.task_payload("t1")["projectId"] == "work"
+
+
+async def test_offline_still_reads_the_cache_and_queues_writes(store):
+    """断网：刷新如实失败，但缓存照读、写照样本地生效并排队。
+
+    这是「本地副本」这条设计的全部意义（ADR-0002 / 用户故事 62）：网络不是这一屏的前置
+    条件。结论原本钉在 ``test_sync_session.py`` 里，靠着起屏按 ``r``、再看状态栏那个数；
+    搬过来的是**引擎那一半**——失败的刷新不许动缓存，写不许因为推不出去就撤销。
+
+    界面上那句「同步失败：……」（以及「凭据失效，请重新粘贴 token」那一支）归 #34 的状态栏
+    工单，不在这里。
+    """
+    transport = FakeTransport()
+    transport.enqueue(NetworkError("连不上"))
+    seed = task(id="t1", title="写周报", project_id="work")
+    store.apply_refresh(lists=[inbox(), project()], tasks=[seed])
+    engine = make_engine(store, transport)
+
+    with pytest.raises(NetworkError):
+        await engine.refresh()
+
+    assert [item.title for group in engine.view().groups for item in group.items] == ["写周报"], (
+        "缓存里的任务还在，断网不改变这一屏"
+    )
+
+    engine.cycle_priority("t1")
+    await engine.wait_for_pushes()
+
+    assert store.task_payload("t1")["priority"] == 1, "断网也照样能改任务（乐观写：本地先动）"
+    assert [(change.task_id, change.kind) for change in store.pending()] == [
+        ("t1", ChangeKind.UPDATE)
+    ], "推不出去就留在队列里"
+    assert engine.status().pending_count == 1, "这个数就是给用户看的「还没上去」"

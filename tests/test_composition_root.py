@@ -11,6 +11,8 @@
 from __future__ import annotations
 
 import asyncio
+import importlib
+import tomllib
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -23,6 +25,8 @@ from dida.bootstrap import build_app, default_transport
 from dida.config import Config
 from dida.storage.store import Store
 from dida.testing import ManualClock
+
+ROOT = Path(__file__).resolve().parents[1]
 
 TZ = timezone(timedelta(hours=8))
 
@@ -88,6 +92,21 @@ def make_app(
         transport=server,
         db_path=db,
     )
+
+
+def test_the_console_script_points_at_an_importable_main():
+    """``pyproject`` 里 ``dida`` 那个入口指向的东西真的能拿到：导入它、取出属性、可调用。
+
+    这是整个包唯一一条「敲 ``dida`` 会启动」的守卫，而它原本与界面测试住在同一个文件里
+    （``test_bootstrap.py`` 也 import ``DidaApp``，属于 v1 那 19 个要被删的文件之一）。
+    界面重写最容易踩坏的就是它：改了模块路径、或者删了 ``main``，这里当场红。
+    """
+    pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
+
+    target = pyproject["project"]["scripts"]["dida"]
+    module_name, _, attribute = target.partition(":")
+
+    assert callable(getattr(importlib.import_module(module_name), attribute))
 
 
 def test_the_day_end_from_the_config_reaches_the_engine(tmp_path):
