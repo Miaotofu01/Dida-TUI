@@ -17,7 +17,13 @@
 
 from __future__ import annotations
 
-from dida.sync.engine import AuthError, DidaError, UnknownListError, UnclaimedTaskError
+from dida.sync.engine import (
+    AuthError,
+    DidaError,
+    UnclaimedTaskError,
+    UnknownListError,
+    UnknownTaskError,
+)
 
 UNKNOWN_TASK_MESSAGE = "没有改成：这条任务已经不在本地缓存里了，刷新之后再试一次"
 """引擎拒绝写入（本地没有这条任务的底稿，工单 #25）时的话：如实说没改成。"""
@@ -45,6 +51,69 @@ EMPTY_TASKS_MESSAGE = "（这个清单里还没有任务）"
 
 EMPTY_DETAIL_MESSAGE = "（这条任务已经不在本地缓存里了）"
 """详细页指向的任务刷新之后没了（远端删掉了）时的话。"""
+
+EMPTY_FIELD_TEXT = "（空）"
+"""详细页上一个**可编辑**字段没有内容时画的那一句（工单 #43）。
+
+描述与备注可以是空的，但空字段照样要留在字段列表里、光标照样停得上去——否则「给一条没有
+描述的任务加描述」这件事在界面上无路可走。读的那一段（子任务/提醒/重复）不一样：那些没有
+内容时整行不画，它们只是告知，不是入口。
+"""
+
+PRIORITY_NAMES: dict[int, str] = {0: "无", 1: "低", 3: "中", 5: "高"}
+"""优先级四个档位的**用户语言**（GLOSSARY：无 / 低 / 中 / 高）。
+
+与 API 的线上编码 ``0/1/3/5`` 是两套东西——那一套留在 ``dida.sync.view`` 里，这一张表是给
+人看的。表外的取值读作「无」，与 ``priority_mark`` 同一条口径。#45 的挑选器也用这一张表。
+"""
+
+FIELD_SAVE_FAILED_PREFIX = "保存失败："
+"""保存失败那一行的开头：**后面必须跟上具体原因**（用户故事 81）。
+
+一个「保存失败」了事的话用户不知道该重试、该刷新、还是该去查网络——四种原因（本地没有
+底稿、凭据失效、断网、服务端拒绝）要做的事完全不同。
+"""
+
+NO_TITLE_EDIT_MESSAGE = "标题不能为空：这一下没有改"
+"""把标题清空之后按 ``esc`` 时的话（用户故事 66：空标题不被接受）。
+
+说清「没有改」而不是「保存失败」：这不是网络或服务端的问题，是这一栏本来就不能是空的，
+而字段里的旧标题原样还在（没有「取消」，所以也不能把用户留在一个退不出去的编辑态里）。
+"""
+
+READ_ONLY_NOTE = "以上只读：子任务、提醒、重复规则要回官方客户端改"
+"""只读那三段下面那一句（用户故事 76 / 77 / 78：**明确告知**在客户端里改不了）。
+
+这三样都不是「暂时没做」：子任务的勾选要连同整条任务一起写回、重复规则的编辑是一整套
+UI，都不在 v2 的范围里。用户在这一页能做的就是读到它们，所以这里直说。"""
+
+
+def pending_message(pending: int) -> str:
+    """详细页底部那一行：还有几处改动没推上去（用户故事 65）。
+
+    与状态栏那个「待推送 N」是同一个数（队列只有一条），措辞按工单写全角括号：这一行在
+    编辑现场，说的是「你刚才那一下到底出去没有」。
+    """
+    return f"待推送（{pending}）"
+
+
+def saved_message() -> str:
+    """详细页底部那一行：队列是空的，改完就出去了（用户故事 65）。"""
+    return "已保存"
+
+
+def field_save_failed_message(reason: object) -> str:
+    """保存失败那一行：把引擎/服务端说的那句话原样带出来（用户故事 81）。
+
+    ``reason`` 是**具体**的那一句（``UnknownTaskError`` 的「本地没有这条任务的底稿」、断网
+    时的「连不上」、服务端拒绝时的原话），不是一个笼统的「保存失败」。
+    """
+    return f"{FIELD_SAVE_FAILED_PREFIX}{reason}"
+
+
+def priority_name(priority: int) -> str:
+    """优先级那一格的读法（``0/1/3/5`` → 无 / 低 / 中 / 高）。"""
+    return PRIORITY_NAMES.get(priority, PRIORITY_NAMES[0])
 
 EMPTY_LIST_NAME_MESSAGE = "没写名字：清单得有个名字"
 """建清单时名字一格是空的（#42）。与任务的 ``NO_TITLE_MESSAGE`` 同一条口径。"""
@@ -195,11 +264,28 @@ def no_browser_message(url: str) -> str:
 
 
 def delete_prompt(title: str) -> str:
-    """删除确认浮层上的那句话（工单 #16）。
+    """删除确认浮层上的那句话（工单 #16 / #40）。
 
     措辞是这一屏最要紧的一行字：**不许暗示还能找回来**。滴答清单 Open API 里没有
     undelete、没有回收站、没有「已删除」列表，所以这里只说删了就没有了，绝不说「可恢复」
     「稍后可找回」「已移入回收站」——那种话会让用户在按 ``y`` 的时候以为还有退路，
     而实际上没有。
+
+    最后一行那个分隔符是 **ASCII** 的 ``，`` 之外一个都不放：这块浮层是 ``width: auto``，
+    宽度由 rich 量出来的最宽那行决定，而 ``·``（U+00B7）是东亚**歧义**宽度——rich 量 1 格、
+    CJK 字体下终端画 2 格，多出来的那格会把右边框挤掉（#48 在帮助正文上立的是同一条规矩，
+    ``tests/test_task_delete_defer.py`` 在这句文案上守它）。
     """
-    return f"删除「{title}」？\n删掉就找不回来了，滴答清单没有回收站。\n\ny 确认删除 · n / Esc 取消"
+    return f"删除「{title}」？\n删掉就找不回来了，滴答清单没有回收站。\n\ny 确认删除，n / Esc 取消"
+
+
+def delete_failed_message(error: DidaError) -> str:
+    """删除当场失败时的话（工单 #40）。
+
+    与 :func:`list_write_failed_message` 同一条口径：引擎当场拒绝的（本地已经没有这条任务的
+    底稿）与别的失败分开说——前者刷新一下再看，后者是网络或权限。删除这一支尤其不能含糊：
+    这句话说的是「**没**删成」，而不是「删了」。
+    """
+    if isinstance(error, UnknownTaskError):
+        return UNKNOWN_DELETE_MESSAGE
+    return f"没有删：{error}"
