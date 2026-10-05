@@ -88,3 +88,46 @@ def test_all_holds_every_unfinished_task():
     )
 
     assert titles(evaluate("all", tasks)) == ["昨天到期", "今天到期", "下个月", "没日期"]
+
+
+# ---------------------------------------------------------------- 「今天」= 逾期 ∪ 今天到期
+
+
+def test_today_is_overdue_union_due_today():
+    """「今天」= 逾期 ∪ 截止于当前逻辑日（用户故事 25 / spec 的定义）。
+
+    **它不是一个干净的截止时间区间**：写成「截止时间落在今天之内」会静默丢掉每一条逾期
+    任务，而那些正是最该被看见的。所以这条测试同时断两半：昨前天的逾期在，明天的、
+    没日期的、已完成的都不在。
+    """
+    tasks = (
+        task("前天到期", due=T0 - timedelta(days=2)),
+        task("昨天到期", due=T0 - timedelta(days=1)),
+        task("今天 18 点", due=T0.replace(hour=18)),
+        task("明天", due=T0 + timedelta(days=1)),
+        task("没日期"),
+        task("今天做完的", due=T0.replace(hour=9), completed=True),
+    )
+
+    evaluated = evaluate("today", tasks)
+
+    assert titles(evaluated) == ["前天到期", "昨天到期", "今天 18 点"]
+    assert [item.overdue for item in evaluated] == [True, True, False], "逾期的前面两条要标红"
+
+
+def test_overdue_is_pinned_even_when_its_clock_time_is_later():
+    """逾期置顶是**独立的一条**，压过「谁的时刻更早」。
+
+    边界 ``04:00`` 下当天 03:00 属于昨天：它逾期、要置顶，可它的时刻（03-14 03:00）比
+    当天那个全天标记（03-13 00:00，属于同一个逻辑日、不逾期）**更晚**。只按时刻升序排
+    就会把它排到后面——这就是「置顶」这两个字值钱的地方。
+    """
+    tasks = (
+        task("今天的全天", due=at(13), all_day=True),
+        task("凌晨三点", due=at(13, 3)),
+    )
+
+    evaluated = evaluate("today", tasks, now=at(14, 2), day_end="04:00")
+
+    assert titles(evaluated) == ["凌晨三点", "今天的全天"]
+    assert [item.overdue for item in evaluated] == [True, False]

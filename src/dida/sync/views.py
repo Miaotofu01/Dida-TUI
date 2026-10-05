@@ -103,7 +103,7 @@ class ViewDefinition:
     completion: Completion = Completion.UNFINISHED
 
 
-TODAY_VIEW = ViewDefinition(id="today", name="今天", due=DueWindow(last=0))
+TODAY_VIEW = ViewDefinition(id="today", name="今天", due=DueWindow(first=None, last=0))
 """「今天」= 逾期 ∪ 截止于当前逻辑日（用户故事 25）。
 
 ``first=None``（下界不设）是**承重**的：它就是「逾期也在里面」的那一半。写成
