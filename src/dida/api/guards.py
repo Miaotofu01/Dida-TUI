@@ -48,6 +48,13 @@ COMPLETED_WINDOW_DATE_FIELDS = ("startDate", "endDate")
 #: 写它们等于什么都没写：服务端静默忽略，用户以为完成了，其实没有（ADR 0002）。
 NON_WRITABLE_FIELDS = ("status",)
 
+#: 批量更新（``POST /open/v1/task/batch``）的 ``update`` 里每一条**只发**这三个字段。
+#:
+#: 端点与数组的形状是文档给的（openapi §A3 :559–562），``status`` 则是**实测确认**的
+#: （spec 的实测事实第 1 条）：文档在这一节里一次都没提它。所以这张表不是照文档抄的，
+#: 它记的是「我们确实这么用过、且回读确认生效」的那一份。
+BATCH_UPDATE_FIELDS: tuple[str, ...] = ("id", "projectId", "status")
+
 #: 清单（``Project``）的写请求体接受的字段（openapi-dida365.md:1184–1188 建、:1235–1239 改）。
 #:
 #: ``groupId`` **不在里面**：它在整份文档里只出现在 Project 的**响应**与定义上
@@ -129,6 +136,32 @@ def normalize_dates(
 def prepare_completed_window_body(body: Mapping[str, Any]) -> dict[str, Any]:
     """已完成流窗口的守卫：``startDate`` / ``endDate`` 两端同一套规则（工单 #26）。"""
     return normalize_dates(body, fields=COMPLETED_WINDOW_DATE_FIELDS)
+
+
+def prepare_batch_body(body: Mapping[str, Any]) -> dict[str, Any]:
+    """批量更新（``POST /open/v1/task/batch``）的守卫：``update`` 里每一条**只留三个字段**。
+
+    这是 :data:`NON_WRITABLE_FIELDS` 唯一的例外，而且范围就到这里为止：``status`` 在普通
+    更新端点上会被服务端静默忽略（所以 :func:`guard_writable` 继续拒绝它），但在批量更新
+    的 ``update`` 数组里它是**实测确认**能生效的（spec 的实测事实第 1 条：带 ``status: 0``
+    能把已完成的任务改回未完成）。放宽的是一个端点加一个数组，不是那条规矩本身。
+
+    收窄成 :data:`BATCH_UPDATE_FIELDS` 是同一件事的另一半：批量更新是**合并语义**
+    （只发改动的字段，其余服务端保留），所以就算请求体里多带了别的字段，这里也不发出去
+    ——「其余字段不因这次取消完成而改变」这句话靠的就是这一行。
+    """
+    items = body.get("update")
+    if not isinstance(items, Sequence) or isinstance(items, (str, bytes)):
+        raise FieldIgnoredError(
+            '批量更新的请求体必须是 {"update": [...]}：形状不对就一个字节都不发',
+            field="update",
+        )
+    narrowed = [
+        {field: entry[field] for field in BATCH_UPDATE_FIELDS if entry.get(field) is not None}
+        for entry in items
+        if isinstance(entry, Mapping)
+    ]
+    return {"update": narrowed}
 
 
 def _normalize_item(index: int, item: Any) -> Any:

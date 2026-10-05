@@ -6,6 +6,8 @@ UI 只会看到这几类失败，绝不会看到裸异常。第 4 类（字段�
 
 from __future__ import annotations
 
+from typing import Mapping
+
 
 class DidaError(Exception):
     """本客户端对外失败的基类。"""
@@ -68,3 +70,27 @@ class MalformedResponseError(DidaError):
     该是对象的地方给了数组、该是数组的地方给了对象、缺必需字段。``json.JSONDecodeError``
     / ``AttributeError`` / ``KeyError`` 这种裸异常一个都不许抛给 UI。
     """
+
+
+class BatchRejectedError(DidaError):
+    """批量更新（``POST /open/v1/task/batch``）里**每个任务**的失败。
+
+    它藏在 ``200 OK`` 里：响应体是 ``{id2etag, id2error}``（openapi :567），HTTP 状态码
+    对逐条结果一个字都没说——整批全失败也是 200。所以「没抛异常」不等于「改成了」，
+    这个类就是那道分界线：:attr:`errors` 是任务 id → 文档给的错误码（``NOT_EXISTED`` /
+    ``DELETED`` / ``EXCEED_QUOTA`` ……）。
+
+    取消完成走的就是这条路，而它**一个字都不能静默**：批量更新没成而用户以为成了，
+    那条任务在屏幕上就不再是已完成的样子，重开却还在已完成区里——两边各说各话。
+    """
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        errors: Mapping[str, str] | None = None,
+        status_code: int | None = None,
+    ) -> None:
+        super().__init__(message, status_code=status_code)
+        self.errors: Mapping[str, str] = dict(errors or {})
+        """哪个任务、哪一个错误码（文档 :567 的那张码表里的一档）。"""
