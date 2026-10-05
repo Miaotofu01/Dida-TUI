@@ -10,7 +10,7 @@ TUI 读写一切只能走本模块；分组、排序、逾期判定、冲突裁�
 - ``write(task_id, changes=, kind=)`` —— 写：乐观写，本地当场生效、立即推送（:mod:`dida.sync.push`）。
 - ``complete(task_id)`` / ``delete(task_id)`` —— 写：完成与删除的两个预置（:mod:`dida.sync.push`）。
 - ``refresh_completed() -> CompletedReport`` —— 写：已完成流，**async**（:mod:`dida.sync.completed`）。
-- ``defer(task_id)`` / ``plan(text)`` / ``reschedule(...)`` —— 写：顺延与改期（:mod:`dida.sync.schedule`）。
+- ``defer(task_id)`` / ``reschedule(...)`` —— 写：顺延与改期（:mod:`dida.sync.schedule`）。
 - ``create(title, ...)`` —— 写：新建，落在收集箱（:mod:`dida.sync.create`）。
 - ``cycle_priority(task_id)`` —— 写：优先级推进一档（:mod:`dida.sync.priority`）。
 - ``subtasks(task_id)`` / ``toggle_subtask(...)`` —— 读 / 写：子任务（:mod:`dida.sync.subtasks`）。
@@ -55,7 +55,6 @@ from typing import TYPE_CHECKING, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import AuthError, DidaError
 from dida.clock import Clock
-from dida.date_parser import ParsedTask
 from dida.logical_day import logical_day
 from dida.sync.completed import (
     DEFAULT_COMPLETED_WINDOW_HOURS,
@@ -244,10 +243,6 @@ class Engine(Protocol):
 
     def delete(self, task_id: str) -> None:
         """写：删除一条任务（服务端没有撤销，t16）。"""
-        ...
-
-    def plan(self, text: str) -> ParsedTask:
-        """读：用注入的钟与日界把一行输入解析成计划（新建与改期共用同一套语法）。"""
         ...
 
     def reschedule(self, task_id: str, *, due: datetime, all_day: bool) -> None:

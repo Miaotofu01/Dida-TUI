@@ -21,7 +21,6 @@ from typing import Any, Mapping, Sequence
 import httpx
 
 from dida.clock import Clock
-from dida.date_parser import ParsedTask
 from dida.storage.store import COMPLETED_STATUS, RefreshReport
 from dida.sync.engine import (
     CompletedReport,
@@ -387,10 +386,6 @@ class FakeBackend:
     def defer(self, task_id: str, *, days: int = 1) -> None:
         self.deferred.append(task_id)
         self.deferred_days.append(days)
-
-    def plan(self, text: str) -> ParsedTask:
-        """读：委托给真引擎——「现在」、日界、语法都是生产那一份，替身不自己编一套。"""
-        return self._engine.plan(text)
 
     def reschedule(self, task_id: str, *, due: datetime, all_day: bool = False) -> None:
         """写：只记录（与 ``complete`` / ``defer`` 一样，替身不动缓存）。

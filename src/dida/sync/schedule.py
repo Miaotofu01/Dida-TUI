@@ -1,9 +1,11 @@
 """时间写：顺延（t13 / #40）与改期（t14 / #44）——把任务的截止时间挪到某一天。
 
 这一片只管一件事：**截止时间怎么挪**。落点一律按逻辑日算（注入的 ``day_end``），而且
-**只动 ``dueDate``**：不改优先级、不碰重复规则、不凭空补一个日期。``plan()`` 是那一行输入
-的解析入口（新建与改期共用同一套语法），解析不在这里实现——它在
-:mod:`dida.date_parser`（v2 整体作废它，见 #34 的收尾清单）。
+**只动 ``dueDate``**：不改优先级、不碰重复规则、不凭空补一个日期。
+
+v1 还有一条 ``plan()``（把一行自然语言解析成日期，新建与改期共用）：v2 整体作废日期解析器
+（#34 删的，spec：「不做自然语言日期输入」），改期改走 #44 的结构化选择器——所以这里只剩
+「已经知道改到哪一刻」之后的写路径。
 
 日期一律走 :func:`dida.api.guards.api_date` 原样写成文档形式，不换时区：换时区就是「静默
 位移」那个坑。
@@ -15,7 +17,6 @@ from datetime import datetime, timedelta
 from typing import Any, Mapping
 
 from dida.api.guards import api_date
-from dida.date_parser import ParsedTask, parse
 from dida.logical_day import LogicalDay, logical_day
 
 
@@ -47,31 +48,15 @@ class ScheduleMixin:
             return
         self.write(task_id, changes=changes)
 
-    def plan(self, text: str) -> ParsedTask:
-        """读：把一行输入解析成计划（``ParsedTask``）——新建与改期共用同一套语法。
-
-        「现在」取注入的钟、日界取注入的 ``day_end``，逻辑日由
-        :func:`dida.date_parser.parse` 自己问纯函数：TUI 不看表、也不算日界。
-
-        诊断随结果一起回来，提不提交由调用方定：这里的职责只是「用同一个时钟、同一套语法
-        翻译一行输入」，一个判断都不做。``diagnostics`` 非空 = 用户写了没人认得的东西，
-        调用方必须提示、不许静默提交（见 ``date_parser`` 的约定）。
-        """
-        return parse(text, self._clock.now(), self._day_end)
-
     def reschedule(self, task_id: str, *, due: datetime, all_day: bool) -> None:
-        """写：改期（``e``）——把截止时间换成解析出来的那一刻，只动 ``dueDate`` 与 ``isAllDay``。
+        """写：改期——把截止时间换成给定那一刻，只动 ``dueDate`` 与 ``isAllDay``。
 
-        「改成哪一天」由 :func:`dida.date_parser.parse` 定（与新建共用一套语法，入口是
-        :meth:`plan`）；这里只把那一份结果交给 :meth:`write`：本地当场生效、立即推送、
-        推不动留在队列里按注入的钟退避重试。
+        「改成哪一天」由调用方（#44 的结构化选择器）定；这里只把结果交给 :meth:`write`：
+        本地当场生效、立即推送、推不动留在队列里按注入的钟退避重试。
 
         **截止时间原样写回，不做任何逻辑日加减。** ``all_day=True`` 时 ``due`` 是那一天的
         00:00，是个**日期标记**：按 ``[start, end)`` 去把它挪进「当前逻辑日」，会让一个
         「今天」的全天任务整天掉出今日区（``due_day()`` 对全天任务只看 ``due.date()``）。
-        时刻也不在这里顺延：只写时刻且已过去的那一次滚动，解析器已经算完了；写明了日期
-        （哪怕「今天」）的那一种本来就不该滚——再滚一次就是第二次顺延（``date_parser``
-        的两条约定）。
         """
         self.write(
             task_id,

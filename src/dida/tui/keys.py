@@ -1,55 +1,175 @@
-"""键位表：这个界面收哪些键、每个键做什么（工单 #18 的键位帮助 + #48 的守卫）。
+"""键位表：这个界面收哪些键、每个键做什么——**按层**，一个数据结构两个读者。
 
-**一个数据结构，两个读者**：``DidaApp.BINDINGS`` 读它来真的绑定，``?`` 那张帮助表读它来
-列出「有哪些键」。手抄第二份的下场是：加了键忘了写帮助，用户找不到那个功能——而测试
-（``tests/test_key_help.py``）只能看见两份表不一致，说不出哪一份是对的。
+两个读者是：
 
-这是 **#48 的接缝**（「键位守卫 + 分层帮助」）：那张工单要把这张表按层（清单列表页 /
-任务列表页 / 任务详细页）拆开，并让帮助跟着表走。v1 的这张表是平铺的 20 条——``ESC``
-``enter`` 这些在浮层里的绑定不在其中（它们属于各自的浮层）。
+- 真实绑定：三张页面各自的 ``BINDINGS`` 与 app 的 ``BINDINGS`` 都从 :func:`bindings_for`
+  长出来，没有人在别处手写第二条绑定；
+- ``?`` 那张帮助：:func:`help_rows` 从同一张表里取当前这一层该看到的行。
 
-放在这个模块而不是 ``app.py`` 里的理由：键位是**一个变化原因**（谁按什么键），
-与「界面怎么组装、同步怎么跑」是两件事。
+手抄第二份的下场是加了键忘了写帮助——用户找不到那个功能，而测试只能看见两份表不一致，
+说不出哪一份是对的。
+
+**按层**是 v2 的要求（用户故事 119：帮助里是「当前这一层可用的键」，不是一张混杂所有层
+的大表）。``enter`` 在清单列表页是「进入这个清单」、在任务列表页是「进入详细页」，
+``esc`` 在任务列表页是「退回清单列表页」——同一个键在不同层做不同的事，所以它必须跟着层走。
+
+**这是 #48 的接缝**（「键位守卫 + 分层帮助」）：那一张要在这张表上加一道守卫（键位只能用
+终端一定会传上来的那些），并把帮助做成分层的样子。:func:`help_rows` 就是它要读的口子。
+
+只用终端一定会传上来的键：字母、``enter``、``esc``、方向键。``ctrl+enter`` / ``ctrl+shift+*``
+/ ``alt+方向键`` 一个都不绑——它们要么收不到，要么会静默塌缩成不加修饰的键（spec 的键位表
+「明确不绑」那一节）。
 """
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 from textual.binding import Binding
 
-BINDINGS: list[Binding] = [
-    # 非 priority：焦点在输入框里时 q 应当是普通字符（t15/t17 的输入框）
-    Binding("q", "quit", "退出"),
-    # 完成在服务端不可逆（ADR-0002）：x 在主键区下面那一行，与 j/k 隔着整行。防误按
-    # 是这个动作唯一的补偿；footer 上带标签显示，看得见才按得准。
-    Binding("x", "complete", "完成"),
-    # 键位表这一格是两个键：``x`` / ``Space``，做的是同一个「完成」。防误按的理由与 x
-    # 一字不差：它不在栏位的光标键位组里（j/k/↑/↓），也**不是** priority 绑定——焦点
-    # 在输入框里时空格仍然是空格（t15/t17 的新建、改期、过滤输入）。footer 上不重复
-    # 出现第二次：一个动作一行，两个键的说明都在键位帮助表里。
-    Binding("space", "complete", "完成", show=False),
-    Binding("g", "defer", "顺延"),
-    Binding("G", "defer_week", "顺延一周"),
-    Binding("e", "reschedule", "改期"),
-    Binding("a", "quick_add", "新建"),
-    # 删除是这一屏唯一不可挽回的动作：服务端没有 undelete、没有回收站，所以 `d` 不直接
-    # 删，先弹一次确认（t16）。
-    Binding("d", "delete", "删除"),
-    Binding("p", "priority", "优先级"),
-    Binding("/", "filter", "过滤"),
-    # 逃生舱（t19）：把光标下那一条交给系统浏览器。完成在服务端不可逆（ADR-0002），
-    # 官方客户端又不接受任务深链，所以按错之后唯一能走的路就是这个键。
-    Binding("o", "open", "浏览器"),
-    # 手动同步（t21）：全量刷新 + 推待推送改动 + 拉已完成流，一次做完。断网时它只是
-    # 如实报一句，缓存照旧读、改动照旧排队——这一屏不因为没网就不能用。
-    Binding("r", "refresh", "同步"),
-    # 子任务（t20）：s 把焦点移到右栏那份子任务列表上，t 在那里勾选。
-    Binding("s", "subtasks", "子任务"),
-    # 右栏详情的开合（t18）。三档语义一致：右栏在屏上就收放它，收起了就弹浮层。
-    # 不抢输入框：焦点在 Input 里时 Enter 归 Input（提交），到不了这里。
-    Binding("enter", "toggle_detail", "详情"),
-    # 清单浮层（t18）。窄档（<80 列）左栏不在屏上，清单只能从这里看；
-    # 更宽的两档左栏本来就在，这个键照样能开——同一个键在哪里都做同一件事。
-    Binding("l", "lists", "清单"),
-    # 键位帮助（t18）。footer 只显示得下头几个键，这张表才是找键的地方。
-    Binding("question_mark", "help", "帮助"),
+__all__ = [
+    "BINDINGS",
+    "GLOBAL",
+    "KEY_NAMES",
+    "LAYERS",
+    "LAYER_DETAIL",
+    "LAYER_INDEX",
+    "LAYER_TITLES",
+    "LAYER_TASKS",
+    "HelpRow",
+    "Key",
+    "bindings_for",
+    "help_body",
+    "help_rows",
+    "key_text",
 ]
+
+GLOBAL = "global"
+"""每一层都有的那几条：退出、手动同步、浏览器、帮助。"""
+
+LAYER_INDEX = "index"
+"""层一，清单列表页：启动落在这里。"""
+
+LAYER_TASKS = "tasks"
+"""层二，任务列表页：某个清单或视图里的任务。"""
+
+LAYER_DETAIL = "detail"
+"""层三，任务详细页（#43 接手扩展）。"""
+
+LAYERS: tuple[str, ...] = (LAYER_INDEX, LAYER_TASKS, LAYER_DETAIL)
+"""三层，按用户进入的顺序。``LAYERS`` 不含 :data:`GLOBAL`——那是每一层的附加项。"""
+
+
+@dataclass(frozen=True)
+class Key:
+    """表里的一行：哪些键、做什么、帮助里怎么写。"""
+
+    keys: tuple[str, ...]
+    """Textual 的键名。多个键做同一件事时写在同一个 :class:`Key` 里（帮助里合成一行）。"""
+
+    action: str
+    """Textual 的动作名：真正被调用的是 ``action_<action>``（页面或 app 上的方法）。"""
+
+    label: str
+    """帮助里那一列说明。"""
+
+
+BINDINGS: dict[str, tuple[Key, ...]] = {
+    GLOBAL: (
+        Key(("question_mark",), "help", "当前这一层的键位"),
+        Key(("r",), "refresh", "手动同步"),
+        Key(("o",), "open", "在浏览器里打开当前任务"),
+        Key(("q",), "quit", "退出"),
+    ),
+    LAYER_INDEX: (
+        Key(("j", "down"), "cursor_down", "下一行"),
+        Key(("k", "up"), "cursor_up", "上一行"),
+        Key(("enter",), "enter", "进入这一行"),
+    ),
+    LAYER_TASKS: (
+        Key(("j", "down"), "cursor_down", "下一条"),
+        Key(("k", "up"), "cursor_up", "上一条"),
+        Key(("enter",), "enter", "任务详细页"),
+        Key(("escape",), "back", "退回清单列表页"),
+    ),
+    LAYER_DETAIL: (
+        Key(("escape",), "back", "退回任务列表页"),
+    ),
+}
+
+KEY_NAMES: dict[str, str] = {
+    "question_mark": "?",
+    "escape": "esc",
+    "enter": "enter",
+    "down": "↓",
+    "up": "↑",
+}
+"""帮助里怎么写这些键名：Textual 的名字（``question_mark``）不是给人看的。"""
+
+
+def key_text(key: str) -> str:
+    """一个键在帮助里的写法。"""
+    return KEY_NAMES.get(key, key)
+
+
+def bindings_for(layer: str) -> list[Binding]:
+    """这一层真正的 Textual 绑定：全局那几条 + 这一层自己的。
+
+    同一个 :class:`Key` 里的多个键合成一条 ``a,b`` 绑定——它们做的是同一件事，footer 上也
+    只该占一格。动作名就是 :attr:`Key.action`：Textual 调的是 ``action_<action>``，所以
+    「清单列表页的 ``enter``」与「任务列表页的 ``enter``」各自落到自己那个控件的方法上。
+    """
+    return [
+        Binding(",".join(key.keys), key.action, key.label) for key in BINDINGS[GLOBAL] + BINDINGS[layer]
+    ]
+
+
+@dataclass(frozen=True)
+class HelpRow:
+    """``?`` 那张表里的一行：左边是怎么按，右边是做什么。"""
+
+    key: str
+    """帮助里的键位写法，如 ``j / ↓``。"""
+
+    label: str
+
+    keys: tuple[str, ...] = ()
+    """这一行背后的原始键名（``("j", "down")``）——对账用，显示的是 :attr:`key`。"""
+
+
+def help_rows(layer: str) -> tuple[HelpRow, ...]:
+    """当前这一层的帮助行：全局 + 这一层，顺序与绑定表一致。
+
+    一个 :class:`Key` 里的多个键并成一行：``j / ↓``。这不是「手抄一份」——键名与说明都
+    是从表里读出来的，表改一行这里就跟着变。
+    """
+    return tuple(
+        HelpRow(
+            key=" / ".join(key_text(name) for name in key.keys),
+            label=key.label,
+            keys=key.keys,
+        )
+        for key in BINDINGS[GLOBAL] + BINDINGS[layer]
+    )
+
+
+LAYER_TITLES: dict[str, str] = {
+    LAYER_INDEX: "清单列表页",
+    LAYER_TASKS: "任务列表页",
+    LAYER_DETAIL: "任务详细页",
+}
+"""``?`` 那张帮助的抬头：先说清「这是哪一层的键」。"""
+
+
+def help_body(layer: str) -> str:
+    """``?`` 那一屏的正文：当前这一层的键 + 说明，跟着绑定表走。
+
+    抬头就是层名（用户故事 119：帮助里是**当前这一层**可用的键，而不是一张混杂了所有层的
+    大表）。#48 接手时改的是这一段的排版与那道守卫，键与说明仍然只有 :data:`BINDINGS`
+    这一个来源。
+    """
+    rows = help_rows(layer)
+    width = max(len(row.key) for row in rows) + 2
+    lines = [f"── {LAYER_TITLES[layer]} ──", ""]
+    lines += [f"{row.key.ljust(width)}{row.label}" for row in rows]
+    return "\n".join(lines)
