@@ -453,7 +453,7 @@ def app_css() -> str:
 
 _FORM_CSS = """
 {name} .overlay-box {
-    width: 70%;
+    width: 80%;
 }
 {name} .overlay-label {
     width: 100%;
@@ -493,8 +493,10 @@ def form_css(name: str) -> str:
     - **字段名**与**底部那行提示**：``dim``（层级靠字重与明暗，不靠更亮的颜色）。
     - **选择框**一行高（它自己那两个 ``< >`` 是 ASCII，宽度不含糊）。
 
-    ``width: 70%`` 是给输入框的：``overlay_css`` 的 ``width: auto`` 配一个
-    ``width: 100%`` 的子控件量不出宽度来（百分比要有个有宽度的容器参照）。
+    ``width: 80%`` 是给输入框的：``overlay_css`` 的 ``width: auto`` 配一个 ``width: 100%``
+    的子控件量不出宽度来（百分比要有个有宽度的容器参照）。80% 而不是更窄，是为了底部那行
+    提示在一屏 100 格里排得下——排不下它会折行，折行本身不算坏，但两行的提示看起来像
+    出了错。窄终端上折行是正常的（40 格时折成三行，仍然读得完）。
     """
     return overlay_css(name) + _fill(_FORM_CSS).replace("{name}", name)
 

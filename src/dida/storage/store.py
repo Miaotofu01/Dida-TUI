@@ -212,6 +212,10 @@ class FieldOverride:
 
     ``field`` 是 ``"*"`` 时表示**整条任务**：本地有一条还没推成功的删除，服务端那份
     整个不许写回来，否则用户删掉的任务会在下一次刷新时复活。
+
+    ``task_id`` 在清单那一行上装的是**清单 id**（#42）：清单的整行豁免（本地有一笔还没推
+    成功的建 / 改 / 删）与任务是同一条规矩，报告的读者要的就是那个 id 加「整行」这个事实。
+    沿用 ``task_id`` 这个名字是因为这一处是清单侧唯一用到它的地方，为它另起一个类型不值当。
     """
 
     task_id: str
@@ -606,12 +610,21 @@ class Store:
         屏幕上出现两遍。两步在同一个事务里。
 
         服务端给的 id 与临时 id 相同时只写、不删（删了就是把刚写的那一行删掉）。
+
+        **这条清单后面还排着几笔改动时，它们也跟着挪到真 id 上**：建好之后又改了名
+        （断网时先建后改，很正常）会留下一条 ``list_id`` 指向本地临时 id 的改动，而服务端
+        没有那个清单——不挪的话它永远推不出去，状态栏那个数一直非零，用户读到的是
+        「等一下就好」（与 :class:`~dida.sync.writes.UnknownTaskError` 挡的是同一类安静错误）。
         """
         target = str(payload["id"])
         with self._db:
             self._write_list(payload)
             if target != local_id:
                 self._db.execute("DELETE FROM lists WHERE id = ?", (local_id,))
+                self._db.execute(
+                    "UPDATE pending_list_changes SET list_id = ? WHERE list_id = ?",
+                    (target, local_id),
+                )
 
     def pending_lists(self) -> tuple[PendingListChange, ...]:
         """还没推成功的清单改动，按发生顺序（与 :meth:`pending` 同一条口径）。"""

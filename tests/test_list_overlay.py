@@ -10,6 +10,7 @@
 
 from __future__ import annotations
 
+import unicodedata
 from datetime import datetime, timedelta, timezone
 
 from dida.sync.engine import LIST_COLORS
@@ -361,13 +362,12 @@ async def test_a_view_row_is_left_to_the_views_ticket():
 
 
 async def test_the_form_keeps_the_keyboard_while_it_is_open():
-    """表单开着时 ``q`` 是**打字**，不是退出；``Ctrl+C`` 也不退出（键盘归那一格）。
+    """表单开着时 ``q`` 是**打字**，不是退出；出口是 ``Esc``——焦点在输入框上也一样。
 
-    #47 实测：浮层的键位解析**截断在最后一个浮层控件上**，app 的绑定在浮层开着时够不着；
-    而 ``Input`` 自己吃字符、也自己绑了 ``Ctrl+C`` = 复制。所以这张表单刻意**不**加退出
-    绑定——派生的规矩是一条、不随焦点变：「表单开着时 Ctrl+C 永远不退出（有输入框就是复制，
-    选择框上什么都不做），出口是 Esc」。给选择框单独绑一个退出，会让同一个键随焦点时灵时不灵，
-    那正是看起来像 bug 的东西。
+    #47 实测：浮层的键位解析**截断在最后一个浮层控件上**，app 的绑定在浮层开着时够不着。
+    所以这几条必须在**浮层真的挂着、输入框真的拿到焦点**时按（下面的 ``app.focused``
+    断言就是把这件事钉住）。``q`` 必须是一个字母（清单可以叫 ``quizzes``），而 ``Input``
+    的绑定里没有 ``escape``，所以 Esc 照样到达浮层。
     """
     fake = backend()
     app = DidaApp(fake)
@@ -376,19 +376,108 @@ async def test_the_form_keeps_the_keyboard_while_it_is_open():
         await pilot.pause()
         await pilot.press("n")
         await pilot.pause()
-        await pilot.press("q", "ctrl+c")
+        focused = app.focused
+        await pilot.press("q")
         await pilot.pause()
         typed = field_value(screen_text(app), "名字")
         still_open = "新建清单" in screen_text(app)
-        await pilot.press("tab")  # 挪到选择框上再来一次：键位就够不着 app 了
-        await pilot.press("q", "ctrl+c")
-        await pilot.pause()
-        after_choice = screen_text(app)
         await pilot.press("escape")
         await pilot.pause()
         back = screen_text(app)
 
-    assert typed == "q", "q 打进名字那一格——清单可以叫「quizzes」"
-    assert still_open, "两个键都没有把 app 带走"
-    assert "新建清单" in after_choice, "焦点在选择框上时同样不退出"
+    assert focused is not None and focused.id == "field-name", "输入框拿到焦点，才谈得上「谁吃键」"
+    assert typed == "q", "q 打进名字那一格——没有变成退出"
+    assert still_open, "``q`` 没有把 app 带走"
     assert "工作" in row_of(back, "工作"), "Esc 是出口：回到清单列表页"
+
+
+async def test_ctrl_c_still_quits_from_the_form_in_every_state():
+    """表单开着时 ``Ctrl+C`` **照旧退出**，三种状态都一样（写下来的决定，见浮层文档）。
+
+    Textual 把 ``ctrl+c`` 绑给 ``screen.copy_text``，而它在绑定链里更靠前：**没选中东西时
+    它 SkipAction**，有选中就复制——不压过它，同一个键就会看「用户有没有选中文字」行事
+    （#47 的 merger 实测过这条链）。所以这里**三种状态都按一遍**：
+
+    1. 输入框空着、没有选中（按 ``n`` 刚打开）；
+    2. 选择框上有焦点（没有文本框参与）；
+    3. 输入框里**有选中**（按 ``e`` 打开时那一格是全选的，``select_on_focus``）。
+
+    有待推送改动时退出先拦一句，所以「屏幕上出现了那句确认」就是「它真的走到了 app 的退出」
+    ——不是在断言绑定表。
+    """
+    fake = backend()
+    fake.set_sync_state(pending_count=1)
+    app = DidaApp(fake)
+    asked: list[str] = []
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+
+        await pilot.press("n")  # 1. 空输入框，没有选中
+        await pilot.pause()
+        empty = app.focused
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        asked.append(screen_text(app))
+
+        await pilot.press("n")  # 取消退出，回到表单；2. 挪到选择框上
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.pause()
+        on_choice = app.focused
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        asked.append(screen_text(app))
+
+        await pilot.press("n")
+        await pilot.pause()
+        await pilot.press("escape")  # 关掉表单
+        await pilot.pause()
+        await move_cursor_to(pilot, app.index_page(), "work")
+        await pilot.press("e")  # 3. 输入框里那整个名字是选中的
+        await pilot.pause()
+        selected = app.focused
+        selection = getattr(selected, "selection", None)
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        asked.append(screen_text(app))
+
+    assert empty is not None and empty.id == "field-name", "1. 空输入框"
+    assert on_choice is not None and on_choice.id == "field-color", "2. 选择框"
+    assert selection is not None and selection.start != selection.end, (
+        "3. 这一格真的有选中的文字（select_on_focus），才谈得上「复制还是退出」"
+    )
+    assert all("仍然退出" in text for text in asked), "三种状态下 Ctrl+C 都是退出"
+    assert all(messages.quit_prompt(1).splitlines()[0] in text for text in asked)
+
+
+# ------------------------------------------------------------------ 表单上的字也得宽度老实
+
+
+def test_the_form_text_uses_no_ambiguous_width_glyphs():
+    """表单上那几行字里不许出现东亚**歧义**宽度的字形（#48 在帮助正文上立的同一条规矩）。
+
+    ``·``（分隔符）、``←``/``→``（方向键）都是 rich 量 1 格、CJK 字体下终端可能画 2 格的
+    字形：落进一行要对齐或要撑出一块宽度的地方，整块布局就歪。表单里没有对齐列，但同一条
+    规矩在这里一样成立——底部那行提示与字段名就是这块浮层的宽度来源。
+    """
+    from dida.tui.overlays import FORM_HINT
+    from dida.tui.pages.index import DEFAULT_COLOR_OPTION, list_form_fields
+
+    texts = [
+        FORM_HINT,
+        *(field.label for field in list_form_fields()),
+        DEFAULT_COLOR_OPTION.label,
+        *(color.label for color in LIST_COLORS),
+    ]
+    # 这条守卫自己也有人守：它拦的正是 ``·`` 与方向箭头这种字形（前提变了要重新决定）。
+    assert all(unicodedata.east_asian_width(char) == "A" for char in "·←→"), (
+        "这几个字形不再是歧义宽度了——守卫的前提变了，重新决定还要不要拦"
+    )
+    offenders = [
+        (text, char)
+        for text in texts
+        for char in text
+        if unicodedata.east_asian_width(char) == "A"
+    ]
+    assert offenders == [], f"表单上出现了歧义宽度的字形：{offenders}"

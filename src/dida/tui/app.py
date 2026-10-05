@@ -57,7 +57,12 @@ from dida.tui.keys import (
 )
 from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay
 from dida.tui.pages import DetailPage, IndexPage, TasksPage
-from dida.tui.pages.index import LIST_COLOR_FIELD, LIST_NAME_FIELD, list_form_fields, list_write_refusal
+from dida.tui.pages.index import (
+    LIST_COLOR_FIELD,
+    LIST_NAME_FIELD,
+    list_form_fields,
+    list_write_refusal,
+)
 
 if TYPE_CHECKING:  # 只为了标注周期泵那个句柄，运行时用不到
     from textual.timer import Timer

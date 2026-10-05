@@ -311,25 +311,39 @@ class ListMixin:
         与任务的 :meth:`~dida.sync.push.PushMixin.push_pending` 同一条口径：一条失败不影响
         后面那些，失败的记一次尝试并按 ``backoff_delay`` 排下一次。等待发生在调用方
         （周期泵、``r``、下一次写），这一层不睡。
+
+        **每一笔都重新取一次队列**（不是先取一份快照再遍历）：新建推成功会把这一条清单排在
+        后面的改动挪到服务端给的 id 上（``Store.adopt_created_list``），同一轮里紧接着的那
+        一笔必须看见新的 id。循环一定会停：每一轮要么删掉一行、要么把它的 ``next_retry_at``
+        推到将来（于是它不再是「到期的第一笔」）。
         """
         target = self._list_target()
         writer = self._list_writer()
         pushed = 0
         async with self._push_lock:
-            for change in target.pending_lists():
+            while True:
                 now = self._clock.now()
-                if change.next_retry_at is not None and change.next_retry_at > now:
-                    continue
+                change = next(
+                    (
+                        item
+                        for item in target.pending_lists()
+                        if item.next_retry_at is None or item.next_retry_at <= now
+                    ),
+                    None,
+                )
+                if change is None:
+                    return pushed
                 try:
                     await self._send_list(writer, target, change)
                 except DidaError as exc:
                     target.record_list_attempt(
-                        change.id, error=str(exc), next_retry_at=now + backoff_delay(change.attempts)
+                        change.id,
+                        error=str(exc),
+                        next_retry_at=now + backoff_delay(change.attempts),
                     )
                     continue
                 target.resolve_list(change.id)
                 pushed += 1
-        return pushed
 
     async def _send_list(
         self, writer: ProjectWriter, target: ListWriteTarget, change: PendingListChange
@@ -346,6 +360,13 @@ class ListMixin:
                 # 底稿是本地那一行的原文：不打算改的字段（sortOrder 最要紧）靠它 echo 回去。
                 snapshot=target.list_payload(change.list_id),
             )
+            # 推成功之后把**刚发出去的那一份**盖回本地：服务端建好这条清单时回的原文
+            # （认领那一步）里是**旧**名字，而这一笔改名就排在它后面——本地那一行因此可能
+            # 显示成服务端刚回的那份，与刚刚发出去的内容不一致。用户写下的那份才是屏幕上
+            # 该有的，直到下一次全量刷新由服务端权威裁决。
+            local = target.list_payload(change.list_id)
+            if local is not None:
+                target.save_list({**local, **change.payload})
         else:
             await writer.delete_project(change.list_id)
 
