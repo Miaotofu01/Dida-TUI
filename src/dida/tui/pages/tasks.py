@@ -47,7 +47,7 @@ class TasksPage(CursorPage):
     """任务列表页：某个清单或视图里的全部任务。"""
 
     LAYER = LAYER_TASKS
-    BINDINGS = bindings_for(LAYER_TASKS)
+    BINDINGS = bindings_for(LAYER)
     EMPTY_TEXT = messages.EMPTY_TASKS_MESSAGE
 
     class Entered(Message):

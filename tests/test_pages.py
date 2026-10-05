@@ -319,3 +319,19 @@ async def test_a_background_refresh_keeps_the_cursor_on_both_layers():
         detail = screen_text(app)
 
     assert TITLES[before] in detail, "光标还在原来那条任务上（详细页说的是它）"
+
+
+async def test_an_empty_cache_still_shows_the_inbox_and_the_builtin_views():
+    """第一次跑（缓存还是空的）不许崩：收集箱那一行是客户端补的，三个内置视图也在。
+
+    真实场景就是「刚粘完 token、第一次启动」：本地库是空的，清单索引里除了内置视图什么都
+    没有——屏幕得照样立得住，网络回来之后再填上。
+    """
+    app = DidaApp(FakeBackend(clock=ManualClock(T0)))
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert INBOX_MARK in text and "收集箱" in text, "收集箱那一行是客户端补的，空缓存里也要有"
+    assert "今天" in text and "最近七天" in text and "所有" in text

@@ -101,16 +101,6 @@ class CursorPage(VerticalScroll):
         self._selected_id = selectable[self._cursor] if selectable else None
         self._redraw()
 
-    def select(self, row_id: str) -> None:
-        """把光标摆到某一行上（那一行不在时什么都不做）。"""
-        selectable = [row.id for row in self._rows if row.id is not None]
-        if row_id not in selectable:
-            return
-        self._cursor = selectable.index(row_id)
-        self._selected_id = row_id
-        self._redraw()
-        self._scroll_cursor_into_view()
-
     # ---------------------------------------------------------------- 光标
 
     def action_cursor_down(self) -> None:

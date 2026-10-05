@@ -28,20 +28,19 @@ SEVEN_MODULES = [
     "dida.storage.store",  # 本地存储
     "dida.sync.engine",  # 同步引擎
     "dida.logical_day",  # 逻辑日
-    "dida.date_parser",  # 日期解析器：#34 删它的时候这一行也要一起删（见 #32 的收尾说明）
     "dida.tui.app",  # TUI
 ]
 
 ALLOWED_IN_TUI = ("dida.sync.engine", "dida.tui")
 """TUI 的允许表：引擎的公开面，以及它自己这一支（``dida.tui.*``）。
 
-``dida.logical_day`` / ``dida.date_parser`` 不在表里，是故意的：分组、逾期判定、逻辑日换算
-都是引擎的事，TUI 拿到的是已经判断好的视图模型（AGENTS.md 与 spec 的接口契约）。
+``dida.logical_day`` 不在表里，是故意的：分组、逾期判定、逻辑日换算都是引擎的事，TUI 拿到
+的是已经判断好的视图模型（AGENTS.md 与 spec 的接口契约）。
 """
 
 
 def _module_of(path: Path) -> str:
-    """这个文件在包里的名字：``src/dida/tui/panes.py`` → ``dida.tui.panes``。"""
+    """这个文件在包里的名字：``src/dida/tui/pages/index.py`` → ``dida.tui.pages.index``。"""
     parts = list(path.relative_to(ROOT / "src").with_suffix("").parts)
     if parts[-1] == "__init__":
         parts.pop()
@@ -49,7 +48,7 @@ def _module_of(path: Path) -> str:
 
 
 def _package_of(path: Path) -> str:
-    """这个文件所在的包：``src/dida/tui/panes.py`` → ``dida.tui``（``__init__.py`` 就是它自己）。"""
+    """这个文件所在的包：``src/dida/tui/keys.py`` → ``dida.tui``（``__init__.py`` 就是它自己）。"""
     module = _module_of(path)
     return module if path.name == "__init__.py" else module.rpartition(".")[0]
 
@@ -57,7 +56,7 @@ def _package_of(path: Path) -> str:
 def _absolute_module(node: ast.ImportFrom, *, package: str) -> str:
     """``ImportFrom`` 的绝对模块名；相对导入按文件所在的包往上走 ``node.level`` 层。
 
-    ``level == 1`` 是当前包、``level == 2`` 是上一层：写在 ``dida/tui/panes.py`` 里的
+    ``level == 1`` 是当前包、``level == 2`` 是上一层：写在 ``dida/tui/keys.py`` 里的
     ``from ..storage import store`` 落到的是 ``dida.storage``，而不是 ``storage``。
     """
     if node.level == 0:
@@ -156,8 +155,8 @@ def test_the_guard_catches_a_relative_import_that_escapes_the_package():
 def test_the_guard_lets_the_engine_and_the_tui_itself_through():
     source = (
         "from dida.sync.engine import TaskGroup\n"
-        "from dida.tui.panes import TaskPane\n"
-        "from . import panes\n"
+        "from dida.tui.pages.index import IndexPage\n"
+        "from . import keys\n"
         "from dida.sync import engine\n"
     )
 

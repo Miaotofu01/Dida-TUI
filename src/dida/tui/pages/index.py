@@ -120,7 +120,7 @@ class IndexPage(CursorPage):
     """清单列表页：内置视图、自建视图、真实清单、项目组小标题。"""
 
     LAYER = LAYER_INDEX
-    BINDINGS = bindings_for(LAYER_INDEX)
+    BINDINGS = bindings_for(LAYER)
     EMPTY_TEXT = messages.EMPTY_INDEX_MESSAGE
 
     class Entered(Message):

@@ -19,6 +19,7 @@ from dida.testing import FakeBackend, ManualClock
 from dida.tui.app import DidaApp, status_line
 from dida.tui.escape import URL_TEMPLATE
 from dida.tui.keys import LAYER_INDEX
+from dida.tui.messages import delete_prompt
 from support import screen_styled_text, screen_text
 
 TZ = timezone(timedelta(hours=8))
@@ -288,3 +289,64 @@ async def test_the_quit_prompt_does_not_claim_the_queue_is_lost():
     assert "1 处" in prompt
     assert "下次打开" in prompt, "要说清它们去哪儿了：留在本地，下次接着补推"
     assert "丢了" not in prompt, "它们没丢——本地库里有，下次启动会接着推"
+
+
+# ------------------------------------------------------------------ 逃生舱的失败面（工单 #19）
+
+
+async def test_a_browser_that_says_no_reports_the_url_instead_of_failing_silently():
+    """开不了浏览器时必须出声，并把 URL 原样给人抄（逃生舱不能静默失败）。
+
+    完成在服务端不可逆，``o`` 是它的补偿：按下去什么都没发生，比吵一句坏得多。
+    """
+    app = DidaApp(backend(), open_url=lambda url: False)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("j")
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("o")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert "打不开浏览器" in text
+    assert URL_TEMPLATE.format(project_id="work", task_id="t1") in text, "URL 原样给人抄"
+
+
+async def test_a_browser_that_raises_is_reported_instead_of_taking_the_app_down():
+    """开手当场抛（``webbrowser.Error``）也不许把整个界面带走。"""
+    def boom(url: str) -> bool:
+        raise RuntimeError("没有浏览器")
+
+    app = DidaApp(backend(), open_url=boom)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("j")
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("o")
+        await pilot.pause()
+        text = screen_text(app)
+        still_up = app.is_running
+
+    assert still_up, "界面还在"
+    assert "打不开浏览器" in text
+
+
+# ------------------------------------------------------------------ 确认文案的结论（#40 会用它）
+
+
+def test_the_delete_prompt_never_implies_the_task_can_be_recovered():
+    """删除确认的文案**不许**暗示还能找回来（服务端没有 undelete、没有回收站）。
+
+    v1 有两条测试从渲染出来的屏幕上断这句话（``test_delete.py``，随三栏界面一起作废）；
+    结论搬到这里：文案本身不承诺恢复手段，#40 接删除时直接用这一份。
+    """
+    prompt = delete_prompt("写周报")
+
+    assert "写周报" in prompt, "要点名删的是哪一条"
+    assert "找不回来" in prompt and "没有回收站" in prompt
+    for promise in ("可恢复", "能恢复", "稍后可", "已移入回收站", "撤销"):
+        assert promise not in prompt, f"这句话不该出现：{promise}"

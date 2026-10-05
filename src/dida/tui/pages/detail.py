@@ -73,7 +73,7 @@ class DetailPage(CursorPage):
     """任务详细页：一条任务的字段（这一票只读；编辑归 #43）。"""
 
     LAYER = LAYER_DETAIL
-    BINDINGS = bindings_for(LAYER_DETAIL)
+    BINDINGS = bindings_for(LAYER)
     EMPTY_TEXT = messages.EMPTY_DETAIL_MESSAGE
 
     class Back(Message):

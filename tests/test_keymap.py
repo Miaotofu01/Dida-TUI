@@ -61,3 +61,15 @@ def test_the_table_is_keyed_by_layer_not_one_flat_list():
     assert set(BINDINGS) == {GLOBAL, *LAYERS}
     for layer, keys in BINDINGS.items():
         assert keys, f"{layer} 是空的"
+
+
+def test_every_page_binds_its_own_layer_from_the_one_table():
+    """每一层的真实绑定都是从表里取的那一份，页面里没有手写的第二条。
+
+    ``BINDINGS`` 手抄一份的下场与帮助手抄一份一样，只是更难发现：按键真的会不通。
+    """
+    from dida.tui.pages import DetailPage, IndexPage, TasksPage
+
+    for page in (IndexPage, TasksPage, DetailPage):
+        assert page.LAYER in LAYERS, f"{page.__name__} 的层名不在表里"
+        assert page.BINDINGS == bindings_for(page.LAYER), f"{page.__name__} 的绑定不是从表里来的"
