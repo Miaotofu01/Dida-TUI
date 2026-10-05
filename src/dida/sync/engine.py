@@ -104,6 +104,7 @@ from dida.sync.view import (
     format_due,
     fuzzy_match,
     group_tasks,
+    list_names,
     next_priority,
     priority_mark,
     subtask_items,

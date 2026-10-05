@@ -217,3 +217,54 @@ def test_an_empty_or_unknown_container_reads_as_empty():
     assert backend.tasks_in("已经不在的清单").items == ()
 
 
+# ---------------------------------------------------------------- 任务详情
+
+
+def test_the_detail_reads_repeat_reminders_subtasks_and_unknown_fields():
+    """单条任务的详情：标题/描述/备注/清单/截止/优先级/标签 + 只读的重复、提醒、子任务，
+    以及原文里**我们不认识**的字段（#33 验收 #8）。
+
+    ``desc`` / ``content`` 只按服务端字段名读，不在这一层下「哪个是描述」的判断：
+    v1 把两者标反了，翻过来是 #43 的事（``GLOSSARY.md`` 说 描述=``content``、备注=``desc``）。
+    """
+    backend = make_backend()
+    backend.add_list("工作", id="work")
+    backend.add_task(
+        "交季度报告",
+        list_name="work",
+        due=T0.replace(hour=18, minute=0),
+        priority=5,
+        desc="本周的三件事",
+        content="记得附上上周的对比数据",
+        tags=("工作", "季度"),
+        raw={
+            "repeatFlag": "RRULE:FREQ=DAILY;INTERVAL=1",
+            "reminders": ["TRIGGER:P0DT9H0M0S", "TRIGGER:PT0S"],
+            "items": [{"id": "s1", "title": "收集数据", "status": 1}],
+            "someFieldTheClientNeverHeardOf": {"nested": [1, 2]},
+        },
+    )
+
+    detail = backend.task_detail("t1")
+
+    assert detail is not None
+    assert detail.title == "交季度报告"
+    assert (detail.list_id, detail.list_name) == ("work", "工作")
+    assert detail.due_text == "今天 18:00"
+    assert detail.priority_mark == "!"
+    assert detail.tags_text == "#工作 #季度"
+    assert (detail.desc, detail.content) == ("本周的三件事", "记得附上上周的对比数据")
+    assert detail.repeat_flag == "RRULE:FREQ=DAILY;INTERVAL=1"
+    assert detail.reminders == ("TRIGGER:P0DT9H0M0S", "TRIGGER:PT0S")
+    assert [(row.title, row.completed) for row in detail.subtasks] == [("收集数据", True)]
+    assert detail.unknown["someFieldTheClientNeverHeardOf"] == {"nested": [1, 2]}
+    assert "repeatFlag" not in detail.unknown, "认识的字段不算未知"
+    assert detail.raw["items"][0]["id"] == "s1", "原文整份带着（回写不丢字段）"
+
+
+def test_a_task_that_is_not_in_the_cache_has_no_detail():
+    """本地没有这条任务（光标停在一条已经不在的行上）时给 ``None``，不是错误。"""
+    assert make_backend().task_detail("没有这条任务") is None
+
+
+

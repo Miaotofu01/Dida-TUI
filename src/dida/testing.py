@@ -16,13 +16,13 @@ import json
 from collections import deque
 from dataclasses import replace
 from datetime import datetime, timedelta
-from typing import Any, Sequence
+from typing import Any, Mapping, Sequence
 
 import httpx
 
 from dida.clock import Clock
 from dida.date_parser import ParsedTask
-from dida.storage.store import RefreshReport
+from dida.storage.store import COMPLETED_STATUS, RefreshReport
 from dida.sync.engine import (
     CompletedReport,
     ListRow,
@@ -105,6 +105,7 @@ class InMemorySource:
         self._lists: dict[str, ListSnapshot] = {}
         self._tasks: dict[str, TaskSnapshot] = {}
         self._views: dict[str, ViewRow] = {}
+        self._raw: dict[str, Mapping[str, Any]] = {}
         self._seq = 0
 
     def add_list(
@@ -160,12 +161,17 @@ class InMemorySource:
         desc: str = "",
         content: str = "",
         tags: tuple[str, ...] = (),
+        raw: Mapping[str, Any] | None = None,
     ) -> TaskSnapshot:
         """加一条任务快照；``id`` 默认 ``t1``、``t2``……（按加入顺序）。
 
         ``completed_at`` 是服务端的完成时刻：已完成区（t12）按它决定谁在窗口里。
         ``desc`` / ``content`` / ``tags`` 是右栏常驻显示的那三样（工单 #20）：替身照
         ``Store`` 的口径把它们摆进快照，读路径因此与生产那一份走同一条。
+
+        ``raw`` 是**服务端原文里多出来的那些字段**（重复规则、提醒、子任务、我们不认识的
+        字段）：替身把它们盖在按快照拼出来的那份原文上，详情页因此读得到它们（#33）。
+        替身不自己编这些字段——编出来的东西会让「详情页读得到」这句话变成空话（#39 的教训）。
         """
         self._seq += 1
         snapshot = TaskSnapshot(
@@ -183,7 +189,38 @@ class InMemorySource:
         )
         self._lists.setdefault(snapshot.list_id, ListSnapshot(id=snapshot.list_id, name=list_name))
         self._tasks[snapshot.id] = snapshot
+        self._raw[snapshot.id] = {**self._payload_of(snapshot), **(raw or {})}
         return snapshot
+
+    def task_payload(self, task_id: str) -> Mapping[str, Any] | None:
+        """一条任务的完整原文（详情页要的重复规则、提醒、子任务、未知字段都在里面）。
+
+        按 ``Store`` 读服务端原文的口径反着拼一份：字段名与 ``_snapshot`` 认的那几个一一
+        对应，测试摆进来的 ``raw`` 盖在上面。
+        """
+        return self._raw.get(task_id)
+
+    def _payload_of(self, snapshot: TaskSnapshot) -> dict[str, Any]:
+        """快照 → 服务端原文那样的字典（只拼 ``Store._snapshot`` 会读的那几个字段）。"""
+        payload: dict[str, Any] = {
+            "id": snapshot.id,
+            "projectId": snapshot.list_id,
+            "title": snapshot.title,
+            "priority": snapshot.priority,
+            "status": COMPLETED_STATUS if snapshot.completed else 0,
+        }
+        if snapshot.due is not None:
+            payload["dueDate"] = snapshot.due.isoformat()
+            payload["isAllDay"] = snapshot.all_day
+        if snapshot.completed_at is not None:
+            payload["completedTime"] = snapshot.completed_at.isoformat()
+        if snapshot.desc:
+            payload["desc"] = snapshot.desc
+        if snapshot.content:
+            payload["content"] = snapshot.content
+        if snapshot.tags:
+            payload["tags"] = list(snapshot.tags)
+        return payload
 
     def lists(self) -> tuple[ListSnapshot, ...]:
         return tuple(self._lists.values())
