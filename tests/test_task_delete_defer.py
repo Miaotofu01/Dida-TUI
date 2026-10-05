@@ -314,9 +314,6 @@ async def test_g_and_G_push_only_a_new_due_date_landing_on_logical_days(store, k
     assert body["priority"] == 5 and body["tags"] == ["工作"]
 
 
-
-
-
 # ------------------------------------------------------------------ 文案的宽度：浮层是 width: auto
 
 
@@ -336,6 +333,9 @@ def test_the_delete_prompt_uses_no_ambiguous_width_glyphs():
             f"这一行宽度说得不准：rich 说 {cell_len(line)} 格，CJK 终端画 {drawn_width(line)} 格"
             f"——多出来的格会把浮层的右边框挤掉：\n{line!r}"
         )
+
+
+# ------------------------------------------------------------------ 拒绝与「什么都没做」
 
 
 async def test_a_delete_the_engine_refuses_says_so_instead_of_pretending():
