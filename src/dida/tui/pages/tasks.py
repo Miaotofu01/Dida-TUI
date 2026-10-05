@@ -16,13 +16,16 @@ from rich.text import Text
 from textual.message import Message
 
 from dida.sync.engine import CompletedItem, TaskItem, TaskList
-from dida.tui import messages
+from dida.tui import messages, theme
 from dida.tui.keys import LAYER_TASKS, bindings_for
-from dida.tui.pages.base import CursorPage, Row, empty_row
+from dida.tui.pages.base import CursorPage, Row, empty_row, heading_row, rule_row
 
-__all__ = ["COMPLETED_STYLE", "TasksPage", "task_line"]
+__all__ = ["COMPLETED_STYLE", "DONE_MARK", "TasksPage", "task_line"]
 
-COMPLETED_STYLE = "dim strike"
+DONE_MARK = theme.DONE_MARK
+"""已完成那一行的前缀字符。"""
+
+COMPLETED_STYLE = theme.DONE
 """已完成的行：暗灰 + 删除线（用户故事 54）。
 
 删除线是「这条已经做完了」的读法，而它**还在列表里**——用户才有机会对它的取消完成
@@ -39,8 +42,8 @@ def task_line(item: TaskItem) -> Text:
 
 
 def completed_line(item: CompletedItem) -> Text:
-    """已完成的一条：暗灰 + 删除线（沉在列表最底，见 ``Engine.tasks_in`` 的排序）。"""
-    return Text(f"☑ {item.title}", style=COMPLETED_STYLE)
+    """已完成的一条：暗 + 删除线（沉在列表最底，见 ``Engine.tasks_in`` 的排序）。"""
+    return theme.styled(f"{DONE_MARK} {item.title}", COMPLETED_STYLE)
 
 
 class TasksPage(CursorPage):
@@ -80,10 +83,16 @@ class TasksPage(CursorPage):
         same_container = task_list.container_id == self._container_id
         self._container_id = task_list.container_id
         self._name = name
-        rows: list[Row] = [Row(id=None, text=Text(f"── {name} ──", style="bold"))]
+        # 抬头是「哪一屏 + 两条暗线夹着」：顶上一条（顶栏下面的分隔）、抬头本身、
+        # 抬头下面一条（分区标题的细线）。分隔与留白承担层级，不靠框线。
+        rows: list[Row] = [
+            rule_row(),
+            heading_row(theme.styled(name, theme.HEADING)),
+            rule_row(),
+        ]
         rows += [Row(id=item.task_id, text=task_line(item)) for item in task_list.items]
         rows += [Row(id=None, text=completed_line(item)) for item in task_list.completed.items]
-        if len(rows) == 1:
+        if len(rows) == 3:
             # 空清单要说一句明确的话，而不是只留一个标题（用户故事 53）。
             rows.append(empty_row(self.EMPTY_TEXT))
         self.set_rows(rows, keep_cursor=same_container)

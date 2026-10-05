@@ -8,9 +8,13 @@ TUI 只通过 :class:`~dida.sync.engine.Engine` 读写；分组、计数、逾�
 全部留在引擎里，页面只把引擎给的成品画出来。一启动就读本地缓存渲染——网络不是这一屏的
 前置条件（用户故事 3/4）。
 
-留在这里的是**组装与生命周期**：``__init__`` / ``compose`` / ``on_mount``、状态栏的重画、
-同步泵（``r`` 与周期重试）、三层进出、以及退出流。按 wave-plan 的约定，#34 之后 #46
-（逻辑日立刻生效）与 #47（退出拦截）各自扩展的就是这一片。
+留在这里的是**组装与生命周期**：``__init__`` / ``compose`` / ``on_mount``、上下两行的
+分工（顶栏说「你在哪」、状态栏说「数据怎么样」）、同步泵（``r`` 与周期重试）、三层进出、
+以及退出流。按 wave-plan 的约定，#34 之后 #46（逻辑日立刻生效）与 #47（退出拦截）各自
+扩展的就是这一片。
+
+**外观一行都不在这里**：颜色、字形、间距、动效时长全在 :mod:`dida.tui.theme`（工单 #51）。
+这里只决定**什么时候**动（换层平移、光标条追赶、同步转圈、toast）。
 
 ⚠ **``await`` 之后动 DOM 的每一处都要先问 ``self.is_running``**（``_write_status`` /
 ``refresh_view`` 就是那两个口子）。这不是洁癖：``Timer._tick`` 会把回调里的异常吞给自己
@@ -24,11 +28,12 @@ TUI 只通过 :class:`~dida.sync.engine.Engine` 读写；分组、计数、逾�
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Callable
+from typing import TYPE_CHECKING, Callable, Sequence
 
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.widgets import Footer, Static
+from textual.containers import HorizontalScroll
+from textual.widgets import Static
 
 from dida.sync.engine import (
     DidaError,
@@ -37,42 +42,108 @@ from dida.sync.engine import (
     SyncStatus,
     TaskDetail,
 )
-from dida.tui import messages
+from dida.tui import messages, theme
 from dida.tui.escape import open_in_browser, task_url
-from dida.tui.keys import GLOBAL, LAYER_DETAIL, LAYER_INDEX, LAYER_TASKS, bindings_for, help_body
+from dida.tui.keys import (
+    GLOBAL,
+    LAYER_DETAIL,
+    LAYER_INDEX,
+    LAYER_TASKS,
+    LAYER_TITLES,
+    bindings_for,
+    help_body,
+)
 from dida.tui.overlays import ConfirmOverlay, MessageOverlay
 from dida.tui.pages import DetailPage, IndexPage, TasksPage
 
 if TYPE_CHECKING:  # 只为了标注周期泵那个句柄，运行时用不到
     from textual.timer import Timer
 
-__all__ = ["DidaApp", "PENDING_STYLE", "StatusBar", "format_status", "status_line"]
+__all__ = [
+    "DidaApp",
+    "PENDING_STYLE",
+    "Stage",
+    "StatusBar",
+    "TopBar",
+    "format_status",
+    "status_line",
+    "top_line",
+]
 
 SYNC_GROUP = "sync"
 """同步 worker 的组名：``exclusive=True`` 靠它保证同时只有一轮同步在跑。"""
 
-PENDING_STYLE = "bold yellow"
+PENDING_STYLE = theme.PENDING
 """待推送数量非零时的高亮（用户故事 100）。
 
-用终端 16 色里的名字，不写死 hex——浅色主题、``NO_COLOR``、不是 24 位的终端上颜色都得
-由终端的调色板说了算（``tests/test_architecture.py`` 扫源码守着这条）。
+十六色的名字只有一个出处（:mod:`dida.tui.theme`），这里留一个别名给老读者。
 """
 
 
+class TopBar(Static):
+    """顶栏：词标 + 当前导航路径（GLOSSARY 的「顶栏」：它说「你在哪」）。"""
+
+
 class StatusBar(Static):
-    """状态栏：已同步时刻、待推送数量（非零时高亮）、当前逻辑日。"""
+    """状态栏：已同步时刻、待推送数量（非零时高亮）、当前逻辑日。
+
+    它与顶栏是分工关系（ADR-0007 四）：**顶栏说「你在哪」，状态栏说「数据怎么样」**。
+    """
 
 
-def status_line(status: SyncStatus) -> Text:
+class Stage(HorizontalScroll):
+    """三层页面并排停在这里；换层就是把它横向滚过一整屏。
+
+    换层 = 平移不是装饰：``enter`` 压栈、``esc`` 出栈本来就是**导航栈**（GLOSSARY 的
+    「导航路径」），左右平移正是这个语义的标准表达。页面底色必须不透明（:data:`CSS_PAGE`），
+    否则滑走的那块会漏出后面的东西。
+    """
+
+    def show(self, index: int, *, animate: bool = True) -> None:
+        """把第 ``index`` 页滑到眼前（``animate=False`` 就是直接到）。"""
+        self._index = index
+        target = float(index * self.size.width)
+        if not animate or self.size.width <= 0:
+            self.scroll_to(x=target, animate=False, immediate=True)
+        else:
+            self.scroll_to(x=target, animate=True, duration=theme.PAN_MS / 1000, easing="out_cubic")
+
+    def on_resize(self) -> None:
+        """窗口宽度变了：每一页的位置跟着变，得把当前那一页重新对齐（不滑）。"""
+        index = getattr(self, "_index", 0)
+        if self.size.width > 0:
+            self.scroll_to(x=float(index * self.size.width), animate=False, immediate=True)
+
+    _index = 0
+    """当前该对齐在第几页；``show()`` 记下来，宽度变了由 :meth:`on_resize` 用它重算。"""
+
+
+def top_line(path: Sequence[str]) -> Text:
+    """顶栏那一行：词标 + 导航路径。
+
+    颜色只进 span（``Text().append(style=…)``）：``Text("dida", style="cyan")`` 会走 Textual
+    的 CSS 颜色解析，把真彩色偷偷放回来（``theme`` 的模块文档里写了这条坑）。
+    """
+    line = Text()
+    line.append(f" {theme.WORDMARK_ICON} dida", style=f"{theme.ACCENT} {theme.HEADING}")
+    for index, segment in enumerate(path):
+        line.append(f"  {theme.BUILTIN_MARK}  ", style=theme.MUTED)
+        line.append(segment, style=theme.HEADING if index == len(path) - 1 else theme.MUTED)
+    return line
+
+
+def status_line(status: SyncStatus, *, spinner: str = "") -> Text:
     """状态栏那一行：待推送非零时那一段高亮，其余不变。
 
     措辞一个字都没改（``GLOSSARY.md``：已同步 / 待推送 / 逻辑日）——加的是**非零时高亮**
     这一个信号：那个数说明本地比服务端新（ADR-0002 的豁免代价），看不见它就会以为
     「按了就是发出去了」。
+
+    ``spinner`` 是同步超过阈值之后才出现的那一帧（默认空串 = 平时一个字都不多）。
     """
     logical_day = status.logical_day.strftime("%m-%d") if status.logical_day else "—"
     last_refresh = status.last_refresh_at.strftime("%H:%M") if status.last_refresh_at else "—"
-    text = Text(f"已同步 {last_refresh} · ")
+    text = Text(f"{spinner}{'同步中 · ' if spinner else ''}已同步 {last_refresh} · ")
     text.append(f"待推送 {status.pending_count}", style=PENDING_STYLE if status.pending_count else "")
     text.append(f" · 逻辑日 {logical_day}")
     return text
@@ -91,15 +162,9 @@ class DidaApp(App[None]):
     """全局那几条（退出 / 同步 / 浏览器 / 帮助）。各层自己的键在各自的页面上——
     所以 ``?`` 列出来的、以及 footer 上显示的，都是**当前这一层真正能按的**那些。"""
 
-    CSS = """
-    CursorPage {
-        height: 1fr;
-    }
-    #status-bar {
-        height: 1;
-        color: ansi_cyan;
-    }
-    """
+    CSS = theme.app_css()
+    """外观**一个来源**（:mod:`dida.tui.theme`）：页面底色、顶栏/状态栏、浮层、toast、
+    滚动条全在那里。这个类里一行颜色都不写。"""
 
     def __init__(
         self,
@@ -108,6 +173,7 @@ class DidaApp(App[None]):
         open_url: Callable[[str], bool] = open_in_browser,
         refresh_on_start: bool = False,
         push_tick_seconds: float | None = None,
+        animations: str = "auto",
     ) -> None:
         """``open_url`` 是**注入**的浏览器开手（工单 #19）。
 
@@ -119,8 +185,15 @@ class DidaApp(App[None]):
         产品行为由组合根按 ``config.toml`` 决定（``dida.bootstrap`` 传 ``refresh_on_start=``
         与 ``PUSH_TICK_SECONDS``）。这里不写死默认值，是为了让「直接 new 一个 app」的测试
         不必先接上客户端与存储——后台同步需要一个真引擎才跑得起来。
+
+        ``ansi_color=True`` 是**跟随终端主题**那一条决定的落点（ADR-0007 一）：Textual 默认
+        会把每个 ``ansi_*`` 改写成 Monokai 的真彩色（``ansi_cyan`` → ``#58D1EB``），用户的
+        调色板一眼都用不上；打开之后同一条 CSS 发出的是 ``\\x1b[36m``，由终端说了算。
+
+        ``animations`` 是 ``auto|on|off`` 开关（ADR-0007 三），默认 ``auto``：ssh 与低能力
+        终端上自动关掉。关掉时换层不滑、光标条不飞，屏幕一步到位。
         """
-        super().__init__()
+        super().__init__(ansi_color=True)
         self.engine = engine
         self._open_url = open_url
         self._refresh_on_start = refresh_on_start
@@ -136,18 +209,41 @@ class DidaApp(App[None]):
         """当前打开的是哪个容器（清单或视图的 id）；``None`` = 还没进过任何一层。"""
         self._detail_task_id: str | None = None
         """详细页正在说的是哪条任务。"""
+        self._container_title: str | None = None
+        """当前容器（清单或视图）的**名字**——顶栏那段路径要写它。"""
+        self._detail_title: str | None = None
+        """详细页那条任务的标题——路径的最后一段写它。"""
+        self._animations = animations
+        self._animate = False
+        """这一台机器上到底动不动（``on_mount`` 里按开关与环境定一次）。"""
+        self._announce_sync = False
+        """这一轮同步要不要用 toast 报完成——``r`` 要，启动刷新不要（那会每次开屏都弹一下）。"""
+        self._spinning = False
+        self._spinner_frame = 0
+        self._spinner_timer: Timer | None = None
+        self._spin_delay_timer: Timer | None = None
 
     # ---------------------------------------------------------------- 组装
 
     def compose(self) -> ComposeResult:
-        yield IndexPage(id=LAYER_INDEX)
-        yield TasksPage(id=LAYER_TASKS)
-        yield DetailPage(id=LAYER_DETAIL)
-        yield Footer()
+        yield TopBar(id="top-bar")
+        with Stage(id="stage"):
+            yield IndexPage(id=LAYER_INDEX)
+            yield TasksPage(id=LAYER_TASKS)
+            yield DetailPage(id=LAYER_DETAIL)
         yield StatusBar(id="status-bar")
 
     def on_mount(self) -> None:
-        """开屏：**先**把本地缓存画上屏，网络刷新排在事件循环上不等它（用户故事 3/4）。"""
+        """开屏：**先**把本地缓存画上屏，网络刷新排在事件循环上不等它（用户故事 3/4）。
+
+        外观的开关只在这里定一次：动效档位（``auto|on|off``）落到每张页面上——页面自己
+        不知道 ``auto`` 是什么意思，它只知道「动不动」。
+        """
+        self._animate = theme.animations_enabled(self._animations)
+        if not self._animate:
+            self.animation_level = "none"
+        for page in self._pages().values():
+            page.set_animate(self._animate)
         self._show(LAYER_INDEX)
         self.refresh_view()
         if self._refresh_on_start:
@@ -167,6 +263,7 @@ class DidaApp(App[None]):
         if self._push_timer is not None:
             self._push_timer.stop()
             self._push_timer = None
+        self._stop_spinner()
 
     # ---------------------------------------------------------------- 三层进出
 
@@ -193,18 +290,31 @@ class DidaApp(App[None]):
         }
 
     def _show(self, layer: str) -> None:
-        """只让这一层在屏上，并把焦点交给它（``j``/``k``/``enter`` 立刻能用）。
+        """把这一层滑到眼前，并把焦点交给它（``j``/``k``/``enter`` 立刻能用）。
 
-        不在屏上的那两层**留在 DOM 里**（只是 ``display = False``）：它们的行与光标因此原样
-        留着，``esc`` 回去时用户看到的就是他离开时那一行（用户故事 20/62）。
+        三层**都在 DOM 里**、并排停在 :class:`Stage` 上：它们的行与光标因此原样留着，
+        ``esc`` 回去时用户看到的就是他离开时那一行（用户故事 20/62）。换层是横向平移——
+        ``enter`` 压栈、``esc`` 出栈本来就是导航栈（ADR-0007 三）。
         """
+        previous = self._layer
         self._layer = layer
-        pages = self._pages()
-        for name, page in pages.items():
-            page.display = name == layer
-        pages[layer].focus()
+        page = self._pages()[layer]
+        self._write_top()
+        self._stage().show(self._layer_index(layer), animate=self._animate and layer != previous)
+        # ``scroll_visible=False``：Textual 交焦点时默认会把那个控件**立刻**滚进可见区，
+        # 而这一页正好是整个舞台（平移就是把它滑过来）——那一下会把动画当场抹平（实测：
+        # 默认交焦点时 ``scroll_x`` 一步到 100，动画一帧都看不到）。
+        page.focus(scroll_visible=False)
         # 切回来时光标不止要「还在那一行」，还要看得见（#34 的验收标准 8）。
-        pages[layer].scroll_cursor_into_view()
+        page.scroll_cursor_into_view()
+
+    def _stage(self) -> Stage:
+        return self.query_one("#stage", Stage)
+
+    @staticmethod
+    def _layer_index(layer: str) -> int:
+        """这一层是并排三页里的第几页（顺序就是 ``compose`` 的顺序）。"""
+        return (LAYER_INDEX, LAYER_TASKS, LAYER_DETAIL).index(layer)
 
     def open_container(self, container_id: str) -> None:
         """进层二：某个清单或视图里的任务（``enter``）。"""
@@ -243,14 +353,19 @@ class DidaApp(App[None]):
             return
         rows = self.engine.list_index()
         self.index_page().show_lists(rows)
+        self._container_title = (
+            None if self._container_id is None else self._container_name(rows, self._container_id)
+        )
         if self._container_id is not None:
             self.tasks_page().show_tasks(
-                self.engine.tasks_in(self._container_id),
-                name=self._container_name(rows, self._container_id),
+                self.engine.tasks_in(self._container_id), name=self._container_title or ""
             )
         if self._detail_task_id is not None:
-            self.detail_page().show_detail(self.engine.task_detail(self._detail_task_id))
+            detail = self.engine.task_detail(self._detail_task_id)
+            self._detail_title = None if detail is None else detail.title
+            self.detail_page().show_detail(detail)
         self.update_status()
+        self._write_top()
 
     @staticmethod
     def _container_name(rows: tuple[ListRow, ...], container_id: str) -> str:
@@ -260,7 +375,30 @@ class DidaApp(App[None]):
 
     def update_status(self) -> None:
         """把引擎的状态刷进状态栏。数据变化后都调它。"""
-        self._write_status(status_line(self.engine.status()))
+        self._write_status(status_line(self.engine.status(), spinner=self._spinner()))
+
+    def _write_top(self) -> None:
+        """把当前导航路径刷进顶栏（GLOSSARY 的「导航路径」：它是走出来的，不是猜的）。"""
+        if not self.is_running:
+            return
+        self.query_one(TopBar).update(top_line(self.nav_path()))
+
+    def nav_path(self) -> tuple[str, ...]:
+        """当前导航路径：清单列表页 → 任务列表页 → 任务详细页，最多三级。
+
+        第一段是**页面**（它只有三种），后面两段是走在那一页上的**东西**：容器名与任务名。
+        「你在哪」在详细页的答案就是「在哪条任务上」，所以最后一段写的是它。
+        """
+        index = LAYER_TITLES[LAYER_INDEX]
+        if self._layer == LAYER_TASKS:
+            return (index, self._container_title or LAYER_TITLES[LAYER_TASKS])
+        if self._layer == LAYER_DETAIL:
+            return (
+                index,
+                self._container_title or LAYER_TITLES[LAYER_TASKS],
+                self._detail_title or LAYER_TITLES[LAYER_DETAIL],
+            )
+        return (index,)
 
     def _write_status(self, message: str | Text) -> None:
         """把一句话写进状态栏——TUI 里状态栏的**唯一**写入口。
@@ -359,19 +497,25 @@ class DidaApp(App[None]):
     def action_refresh(self) -> None:
         """``r``：手动同步——全量刷新 + 推待推送改动 + 拉已完成流。
 
-        先写「同步中…」再排 worker：用户按了键，得有个「它动了」的信号；真正的活儿在事件
-        循环上跑，界面不因为等网络而卡住（引擎那条 ``refresh()`` 是 async 的就是为这个）。
+        用户按了键得有反馈，但**不是**靠改状态栏那一行字符串（那正是本票要去掉的）：按下去
+        先什么都不说，超过阈值（:data:`~dida.tui.theme.SPINNER_DELAY_MS`）才出现转圈，
+        完成或失败用 toast 说一句。真正的活儿在事件循环上跑，界面不因为等网络而卡住
+        （引擎那条 ``refresh()`` 是 async 的就是为这个）。
         """
-        self._write_status(messages.SYNCING_MESSAGE)
-        self.start_sync()
+        self.start_sync(announce=True)
 
-    def start_sync(self) -> None:
+    def start_sync(self, *, announce: bool = False) -> None:
         """把一轮同步排到事件循环上（不等它）。``r`` 与启动刷新都走这里。
 
         ``exclusive=True``：连按 ``r`` 不会让两轮同步叠在一起（同一份缓存被两个协程交替写）。
         协程 worker 跑在事件循环**同一根线程**上，sqlite 连接有线程亲和，所以这里不能改成
         ``thread=True``。
+
+        ``announce`` 决定这一轮要不要用 toast 报完成：``r`` 要（用户按了键，他在等一个回声），
+        启动刷新不要——每天早上开屏弹一下是噪音，那一行的「已同步 HH:MM」本来就是记录。
         """
+        self._announce_sync = announce
+        self._arm_spinner()
         self.run_worker(self._sync(), group=SYNC_GROUP, exclusive=True, description="同步")
 
     async def _sync(self) -> None:
@@ -383,27 +527,92 @@ class DidaApp(App[None]):
 
         三处 ``await`` 之后动界面的地方都不是裸写：状态栏走 :meth:`_write_status`、重画走
         :meth:`refresh_view`，两边都认得「关窗了」。
+
+        「说一句」的话（失败、覆盖告知）**攒到最后**才写：它们比「数据怎么样」更该留在屏幕
+        上，而收尾那一次重画（把转圈收掉）会覆盖状态栏——顺序反了就会把话吞掉。
         """
+        message: str | None = None
         try:
             report = await self.engine.refresh()
         except DidaError as exc:
-            self._write_status(messages.refresh_failed_message(exc))
-            return
-        # 队列里那些到点的改动顺手推一轮：`r` 是用户能按的那个「现在再试一次」。
-        await self.engine.push_pending()
-        try:
-            await self.engine.refresh_completed()
-        except DidaError as exc:
-            completed_failed: DidaError | None = exc
+            message = messages.refresh_failed_message(exc)
+            self._notify_failed(message)
         else:
-            completed_failed = None
-        self.refresh_view()
-        # 覆盖告知排在最后：服务端真的盖掉了用户的东西，这句话比什么都该留在屏幕上
-        # （ADR-0002）。被待推送改动挡回去的不算——那些改动还在，没有被盖掉。
-        if report.overwritten:
-            self._write_status(messages.overwritten_message(len(report.overwritten)))
-        elif completed_failed is not None:
-            self._write_status(messages.completed_failed_message(completed_failed))
+            # 队列里那些到点的改动顺手推一轮：`r` 是用户能按的那个「现在再试一次」。
+            pushed = await self.engine.push_pending()
+            try:
+                await self.engine.refresh_completed()
+            except DidaError as exc:
+                completed_failed: DidaError | None = exc
+            else:
+                completed_failed = None
+            self.refresh_view()
+            # 覆盖告知排在最后：服务端真的盖掉了用户的东西，这句话比什么都该留在屏幕上
+            # （ADR-0002）。被待推送改动挡回去的不算——那些改动还在，没有被盖掉。
+            if report.overwritten:
+                message = messages.overwritten_message(len(report.overwritten))
+            elif completed_failed is not None:
+                message = messages.completed_failed_message(completed_failed)
+            elif self._announce_sync:
+                self._notify_done(
+                    f"已推送 {pushed} 处改动" if pushed else "本地已是最新"
+                )
+        finally:
+            self._stop_spinner()
+            self.update_status()
+        if message is not None:
+            self._write_status(message)
+
+    # ---------------------------------------------------------------- 瞬时反馈：转圈与 toast
+
+    def _arm_spinner(self) -> None:
+        """排一个「阈值到了再看一眼」的定时器——大多数同步在这里之前就结束了。"""
+        self._stop_spinner()
+        self._spin_delay_timer = self.set_timer(
+            theme.SPINNER_DELAY_MS / 1000, self._maybe_spin
+        )
+
+    def _maybe_spin(self) -> None:
+        """阈值到点：这一轮同步**还在跑**才开始转（跑完了就什么都不显示）。"""
+        self._spin_delay_timer = None
+        if not self.is_running:
+            return
+        self._spinning = True
+        self._spinner_frame = 0
+        self._spinner_timer = self.set_interval(1 / 12, self._tick_spinner)
+        self.update_status()
+
+    def _tick_spinner(self) -> None:
+        self._spinner_frame += 1
+        self.update_status()
+
+    def _stop_spinner(self) -> None:
+        """收掉转圈与它的两个定时器（关窗时也走这里）。"""
+        for timer in (self._spin_delay_timer, self._spinner_timer):
+            if timer is not None:
+                timer.stop()
+        self._spin_delay_timer = None
+        self._spinner_timer = None
+        self._spinning = False
+        self._spinner_frame = 0
+
+    def _spinner(self) -> str:
+        """状态栏上当前那一帧（没在转就是空串——平时一个字都不多）。"""
+        if not self._spinning:
+            return ""
+        return theme.SPINNER_FRAMES[self._spinner_frame % len(theme.SPINNER_FRAMES)]
+
+    def _notify_done(self, message: str) -> None:
+        """完成 = **原生 toast**（``App.notify()``），不是改状态栏那一行字符串。"""
+        if not self.is_running:
+            return
+        self.notify(message, title="同步完成", timeout=3)
+
+    def _notify_failed(self, message: str) -> None:
+        """失败也走 toast；状态栏那一份照留——它是留在屏幕上的记录。"""
+        if not self.is_running:
+            return
+        self.notify(message, title="同步失败", severity="error", timeout=6)
 
     async def push_tick(self) -> None:
         """推一轮**到点**的待推送改动（工单 #21 的周期泵；也是测试的确定性入口）。

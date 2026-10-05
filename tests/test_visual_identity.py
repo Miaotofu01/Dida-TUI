@@ -1,0 +1,399 @@
+"""视觉地基里「看得见的那一半」：顶栏、平移、会追赶的光标条、转圈、toast（工单 #51）。
+
+**接缝一**：真 ``DidaApp`` + ``FakeBackend`` + Pilot，断的是外部行为——「我按了这个键，
+屏幕上出现了什么」。这里不断控件树、不断内部状态；读的「里面」只有 ``selected_id``
+（页面给外层的公开口子）与 ``screen_text`` / ``screen_styled_text`` 这两个既有的接缝。
+
+这个文件里唯一读样式的地方是**渲染级**那几条：颜色到底发出什么字节，只有真跑一遍才看得见
+（``Text("x", style="cyan")`` 那类写法会静默发出真彩色）。断的是 ANSI 槽位号，不是某个
+主题下的具体色值。
+"""
+
+from __future__ import annotations
+
+import asyncio
+import re
+from datetime import datetime, timedelta, timezone
+
+import pytest
+
+from dida.sync.engine import DidaError
+from dida.testing import FakeBackend, ManualClock
+from dida.tui import theme
+from dida.tui.app import DidaApp
+from support import screen_sgr, screen_text
+
+TZ = timezone(timedelta(hours=8))
+T0 = datetime(2026, 3, 14, 12, 3, tzinfo=TZ)
+WIDE = (100, 30)
+
+SGR = re.compile(r"\x1b\[[0-9;]*m")
+"""ANSI 的 SGR 序列：样式在屏幕文本里就长这样。"""
+
+
+@pytest.fixture(autouse=True)
+def a_colour_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """摘掉 shell 的 ``NO_COLOR``：否则 ``App`` 会挂一层 Monochrome，颜色断言全部假绿。"""
+    monkeypatch.delenv("NO_COLOR", raising=False)
+
+
+def backend(*, pending: int = 0, slow: float = 0.0, broken: bool = False) -> FakeBackend:
+    """一份够用的缓存；``slow`` / ``broken`` 用来演「同步慢」与「同步失败」。"""
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work", group_id="g1")
+    fake.add_task("写周报", list_name="work", id="t1", due=at(14, 18))
+    fake.add_task("交水费", list_name="work", id="t2")
+    fake.add_list("生活", id="life", group_id="g1")
+    fake.add_list("笔记本", id="note", kind="NOTE")
+    fake.set_sync_state(last_refresh_at=T0, pending_count=pending)
+    if slow or broken:
+        real_refresh = fake.refresh
+
+        async def refresh() -> object:
+            if slow:
+                await asyncio.sleep(slow)
+            if broken:
+                raise DidaError("网络不可达")
+            return await real_refresh()
+
+        fake.refresh = refresh  # type: ignore[method-assign]
+    return fake
+
+
+def at(day: int, hour: int = 0, minute: int = 0) -> datetime:
+    return datetime(2026, 3, day, hour, minute, tzinfo=TZ)
+
+
+def lines(text: str) -> list[str]:
+    return text.splitlines()
+
+
+def line_with(text: str, needle: str) -> str:
+    """屏幕上写着 ``needle`` 的那一行（没有就是测试写错了）。"""
+    for line in lines(text):
+        if needle in line:
+            return line
+    raise AssertionError(f"屏幕上没有「{needle}」这一行：\n{text}")
+
+
+def sgr_parameters(emitted: str) -> set[int]:
+    """屏幕字节里出现过的每一个 SGR 参数（``\x1b[36;49m`` → ``{36, 49}``）。"""
+    out: set[int] = set()
+    for group in re.findall(r"\x1b\[([0-9;]*)m", emitted):
+        out.update(int(part) for part in group.split(";") if part)
+    return out
+
+
+async def sample_while(action, project) -> list:
+    """一边按键一边**逐帧**取一个观测量。
+
+    ``pilot.press`` 会等到这一屏静下来（Textual 的动画跑完才算 idle），所以按完再抓屏只能
+    看到落定后的样子——动效本身只有一个并发采样的人看得见。``project`` 是「这一帧上我要读
+    什么」，返回的列表按时间顺序。
+    """
+    frames: list = []
+
+    async def sample() -> None:
+        while True:
+            frames.append(project())
+            await asyncio.sleep(0.01)
+
+    sampler = asyncio.create_task(sample())
+    try:
+        await action()
+    finally:
+        sampler.cancel()
+    return frames
+
+
+async def enter_work(pilot, app: DidaApp) -> None:
+    """走到「工作」这个清单里（光标停在它的第一条任务上）。"""
+    for _ in range(20):
+        if app.index_page().selected_id == "work":
+            break
+        await pilot.press("j")
+    await pilot.press("enter")
+    await pilot.pause()
+
+
+# ------------------------------------------------------------------ 顶栏与 chrome
+
+
+async def test_the_top_bar_says_where_you_are_and_the_footer_is_gone():
+    """顶栏说「你在哪」：词标 + 导航路径；**Footer 已去掉**，键位归按层的 ``?``。
+
+    chrome 净增 0 行：底部原本是**两行**（Footer 之上还有状态栏），顶栏是拿 Footer 换来的。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        text = screen_text(app)
+
+    top = lines(text)[0]
+    assert "dida" in top, "顶栏要有词标"
+    assert "清单列表页" in top, "启动时导航路径的第一段就是当前页"
+    assert "当前这一层的键位" not in text, "Footer 已经去掉了：键位提示归按层的 ?"
+    assert "手动同步" not in text, "Footer 上那一条键位提示也不该再占一行"
+    assert lines(text)[-1].strip().startswith("已同步"), "底部只剩状态栏那一行"
+
+
+async def test_the_breadcrumb_is_the_navigation_path_you_walked():
+    """面包屑就是**导航路径**（GLOSSARY：``enter`` 压栈、``esc`` 出栈，最多三级）。
+
+    页面只有三种，路径是走出来的：清单列表页 → 任务列表页 → 任务详细页。第三段写的是这条
+    任务自己（顶层那一条正文也是它），因为「我在哪」在详细页的答案就是「在哪条任务上」。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        assert lines(screen_text(app))[0].count("▸") == 1, "一层路径：词标后面一段"
+
+        for _ in range(20):  # 走到「工作」这个清单
+            if app.index_page().selected_id == "work":
+                break
+            await pilot.press("j")
+        await pilot.press("enter")
+        await pilot.pause()
+        inside = lines(screen_text(app))[0]
+        assert "清单列表页" in inside and "工作" in inside, "进了清单，路径上要多一段"
+        assert inside.count("▸") == 2, "两段路径"
+
+        await pilot.press("enter")  # 进第一条任务的详细页
+        await pilot.pause()
+        detail = lines(screen_text(app))[0]
+        assert detail.count("▸") == 3, "第三层：三段路径"
+        assert "写周报" in detail, "最后一段就是这条任务"
+
+        await pilot.press("escape")
+        await pilot.pause()
+        back = lines(screen_text(app))[0]
+
+    assert back.count("▸") == 2, "esc 出栈，路径跟着退回去"
+    assert "写周报" not in back
+
+
+# ------------------------------------------------------------------ 平移与开关
+
+
+async def test_changing_layer_pans_horizontally_and_lands_aligned():
+    """换层 = 横向平移（``enter`` 压栈、``esc`` 出栈是导航栈，平移是它的标准表达）。
+
+    断的是外部行为：飞行途中，新那一页**还没对齐**（它的抬头被推到右边若干格），落定之后
+    它对齐在最左边。中间那几帧就是「平移」这件事在屏幕上唯一的样子。
+    """
+    app = DidaApp(backend(), animations="on")
+
+    def heading_column(text: str) -> int:
+        """屏幕上**任务那一行**左边缩进了几格（找不到就是还没进屏）。
+
+        找的是任务标题而不是容器名：容器名也在顶栏的面包屑里，而顶栏永远对齐在最左边，
+        拿它当坐标只会得到 0。
+        """
+        for line in lines(text):
+            if "写周报" in line:
+                return len(line) - len(line.lstrip())
+        return -1
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        for _ in range(20):
+            if app.index_page().selected_id == "work":
+                break
+            await pilot.press("j")
+        offsets = await sample_while(
+            lambda: pilot.press("enter"), lambda: heading_column(screen_text(app))
+        )
+        await pilot.pause(0.3)
+        settled = screen_text(app)
+
+    assert any(offset > 0 for offset in offsets), f"没有一帧是「滑进来」的样子：{offsets}"
+    assert len(set(offsets)) > 2, f"中间帧应当是一格一格滑过来的：{offsets}"
+    assert heading_column(settled) == 0, "落定之后要正好对齐在最左边"
+
+
+async def test_animations_off_switches_layers_in_one_frame():
+    """``animations=off``：换层不滑，直接到（ssh / 低能力终端就是这么用的）。"""
+    app = DidaApp(backend(), animations="off")
+
+    def task_offset(text: str) -> int | None:
+        """任务那一行左边缩进了几格；它还没进屏就是 ``None``。"""
+        for line in lines(text):
+            if "写周报" in line:
+                return len(line) - len(line.lstrip())
+        return None
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        for _ in range(20):
+            if app.index_page().selected_id == "work":
+                break
+            await pilot.press("j")
+        frames = await sample_while(
+            lambda: pilot.press("enter"), lambda: task_offset(screen_text(app))
+        )
+        await pilot.pause(0.2)
+        settled = task_offset(screen_text(app))
+
+    assert frames, "一帧都没采到"
+    assert all(offset in (None, 0) for offset in frames), (
+        f"关掉动效之后不该还有「在路上」的帧：{sorted(set(frames), key=str)}"
+    )
+    assert settled == 0, "换层之后直接对齐在那一页上"
+
+
+def test_the_switch_resolves_auto_off_for_remote_and_dumb_terminals():
+    """``auto``：ssh / 低能力终端上不动（动效在慢链路上只是延迟）。"""
+    assert theme.animations_enabled("auto", {"TERM": "xterm-kitty"}) is True
+    assert theme.animations_enabled("auto", {"TERM": "xterm-kitty", "SSH_CONNECTION": "1 2 3 4"}) is False
+    assert theme.animations_enabled("auto", {"TERM": "dumb"}) is False
+    assert theme.animations_enabled("auto", {"TERM": "xterm-kitty", "TEXTUAL_ANIMATIONS": "none"}) is False
+    assert theme.animations_enabled("on", {"TERM": "dumb"}) is True
+    assert theme.animations_enabled("off", {"TERM": "xterm-kitty"}) is False
+
+
+# ------------------------------------------------------------------ 会追赶的光标条
+
+
+async def test_the_cursor_marker_survives_the_travelling_bar():
+    """光标条是**装饰**：它飞过去、到站退场，``❯`` 与标题一个字都不能少。
+
+    原型里这条没有 ``on_complete``，条子就永远停在落点，用自己那两个空格盖住 ``❯``——
+    用户报的是「上下键选中的行会消失」。这条测试盯的就是那个报告。
+    """
+    app = DidaApp(backend(), animations="on")
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_work(pilot, app)
+        before = line_with(screen_text(app), "写周报")
+        await pilot.press("j")
+        instant = line_with(screen_text(app), "交水费")
+        await pilot.pause(0.4)  # 远超过 120ms：条子早就该退场了
+        after = line_with(screen_text(app), "交水费")
+
+    assert before.startswith("❯"), "进清单时光标在第一条任务上"
+    assert instant.startswith("❯"), "数据选中必须**立刻**到位，不能等装饰条"
+    assert after.startswith("❯"), "条子飞过之后，光标记号还得在"
+    assert "交水费" in after, "条子不许盖住标题"
+    assert after.lstrip().startswith("❯ 交水费"), "条子退场之后那一行与平时一模一样"
+
+
+async def test_the_travelling_bar_is_a_short_lived_accent_block():
+    """飞行途中屏幕上多一块**强调色实心**（SGR 46 = 青底），到站之后它必须消失。
+
+    「必须消失」就是那个 ``on_complete``：原型里漏了它，条子会永远停在落点。
+    """
+    app = DidaApp(backend(), animations="on")
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_work(pilot, app)
+        frames = await sample_while(
+            lambda: pilot.press("j"),
+            lambda: 46 in sgr_parameters(screen_sgr(app)),
+        )
+        await pilot.pause(0.2)
+        landed = sgr_parameters(screen_sgr(app))
+
+    assert any(frames), f"飞行途中该有一块强调色实心的条子在动：{frames}"
+    assert 46 not in landed, "到站之后条子要退场：屏幕上不再多任何东西"
+
+
+# ------------------------------------------------------------------ 同步转圈
+
+
+async def test_a_fast_sync_never_shows_a_spinner():
+    """快同步什么都不显示——本地缓存那一屏不该有个东西一直在转。"""
+    app = DidaApp(backend(pending=1))
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        seen = []
+        await pilot.press("r")
+        for _ in range(6):
+            await pilot.pause(0.05)
+            seen.append(screen_text(app))
+        await pilot.pause(0.2)
+
+    assert not any(theme.SPINNER_FRAMES[i] in text for text in seen for i in range(len(theme.SPINNER_FRAMES))), (
+        "快同步里出现了转圈"
+    )
+
+
+async def test_a_slow_sync_shows_a_spinner_only_after_the_threshold():
+    """超过阈值才转圈：300ms 之前屏幕上没有它，之后有。"""
+    app = DidaApp(backend(slow=1.2))
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("r")
+        await pilot.pause(0.12)
+        early = screen_text(app)
+        await pilot.pause(0.5)
+        late = screen_text(app)
+        await pilot.pause(0.9)  # 同步跑完了
+
+    def spins(text: str) -> bool:
+        return any(frame in text for frame in theme.SPINNER_FRAMES)
+
+    assert not spins(early), "阈值之前不该出现转圈"
+    assert spins(late), "超过阈值之后要看得见它在转"
+
+
+# ------------------------------------------------------------------ toast
+
+
+async def test_a_manual_sync_that_works_says_so_with_a_native_toast():
+    """完成 = 原生 toast（``App.notify()``），不是改状态栏那一行字符串。"""
+    app = DidaApp(backend(pending=1))
+
+    async with app.run_test(size=WIDE, notifications=True) as pilot:
+        await pilot.pause()
+        await pilot.press("r")
+        await pilot.pause(0.2)
+        text = screen_text(app)
+
+    assert "同步完成" in text, f"完成没有以 toast 说出来：\n{text}"
+
+
+async def test_a_failed_sync_says_so_with_a_native_toast_and_keeps_the_status_line():
+    """失败也是 toast（用户故事 43 要的「短暂的视觉反馈」）；状态栏那一份**照留**。
+
+    两份不重复：状态栏是留在屏幕上的记录（刷新失败时它写的正是那句话），toast 是「刚刚那
+    一下」的信号。断网时用户按了 ``r`` 却什么都不发生，比吵一句坏得多。
+    """
+    quiet = DidaApp(backend(broken=True))
+    async with quiet.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("r")
+        await pilot.pause(0.2)
+        without_toast = screen_text(quiet)
+
+    app = DidaApp(backend(broken=True))
+    async with app.run_test(size=WIDE, notifications=True) as pilot:
+        await pilot.pause()
+        await pilot.press("r")
+        await pilot.pause(0.2)
+        with_toast = screen_text(app)
+
+    record = lines(without_toast)[-1].strip()
+    assert record.startswith("同步失败"), f"状态栏留着那句话：{record!r}"
+    assert any(
+        "同步失败" in line and line.strip() != record for line in lines(with_toast)
+    ), f"toast 里也该说一遍：\n{with_toast}"
+
+
+async def test_toasts_are_painted_in_ansi_slots_like_everything_else():
+    """toast 的颜色也要覆盖：Textual 自带的规则用 ``$success`` / ``$text-success``（真彩色）。"""
+    app = DidaApp(backend(broken=True))
+
+    async with app.run_test(size=WIDE, notifications=True) as pilot:
+        await pilot.pause()
+        await pilot.press("r")
+        await pilot.pause(0.2)
+        emitted = screen_sgr(app)
+
+    assert "38;2;" not in emitted, f"toast 把真彩色带回来了：\n{emitted[:400]}"
+    assert "48;2;" not in emitted, f"toast 的底色是真彩色：\n{emitted[:400]}"

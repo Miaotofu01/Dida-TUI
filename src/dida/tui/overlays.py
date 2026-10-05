@@ -19,26 +19,13 @@ from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Static
 
+from dida.tui import theme
+
 __all__ = ["ConfirmOverlay", "MessageOverlay"]
 
-BOX_CSS = """
-{name} {{
-    align: center middle;
-}}
-{name} .overlay-box {{
-    width: auto;
-    max-width: 80%;
-    height: auto;
-    max-height: 80%;
-    border: round ansi_cyan;
-    padding: 1 2;
-    background: $surface;
-}}
-{name} .overlay-body {{
-    width: auto;
-    height: auto;
-}}
-"""
+# 浮层的全部外观只在 dida.tui.theme 一处（工单 #51）：这个文件从此不出现任何颜色值。
+# 抬起来的面（槽 0）、那条 ascii 细边框、以及「不做遮罩压暗」的理由都写在主题里；
+# 每个类各自向主题要一份壳子（theme.overlay_css(<类名>)），两个类因此长得一模一样。
 
 
 class MessageOverlay(ModalScreen[None]):
@@ -50,7 +37,7 @@ class MessageOverlay(ModalScreen[None]):
 
     TITLE = ""
 
-    DEFAULT_CSS = BOX_CSS.format(name="MessageOverlay")
+    DEFAULT_CSS = theme.overlay_css("MessageOverlay")
 
     BINDINGS = [
         Binding("escape", "close", "关闭", show=False),
@@ -84,7 +71,7 @@ class ConfirmOverlay(ModalScreen[bool]):
     ``Esc`` 一律走取消：默认答案永远是「没做」。
     """
 
-    DEFAULT_CSS = BOX_CSS.format(name="ConfirmOverlay")
+    DEFAULT_CSS = theme.overlay_css("ConfirmOverlay")
 
     BINDINGS = [
         Binding("y", "confirm", "确认"),

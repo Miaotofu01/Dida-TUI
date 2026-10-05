@@ -19,14 +19,14 @@ from rich.text import Text
 from textual.message import Message
 
 from dida.sync.engine import TaskDetail
-from dida.tui import messages
+from dida.tui import messages, theme
 from dida.tui.keys import LAYER_DETAIL, bindings_for
 from dida.tui.pages.base import EMPTY_STYLE, CursorPage, Row, empty_row
 
 __all__ = ["DetailPage", "field_line", "field_lines"]
 
-SUBTASK_DONE_MARK = "☑"
-SUBTASK_TODO_MARK = "☐"
+SUBTASK_DONE_MARK = theme.SUBTASK_DONE_MARK
+SUBTASK_TODO_MARK = theme.SUBTASK_TODO_MARK
 """子任务的两种状态标记（只读显示：v2 不在客户端里勾子任务）。"""
 
 
@@ -70,7 +70,15 @@ def field_lines(detail: TaskDetail) -> tuple[Text, ...]:
 
 
 class DetailPage(CursorPage):
-    """任务详细页：一条任务的字段（这一票只读；编辑归 #43）。"""
+    """任务详细页：一条任务的字段（这一票只读；编辑归 #43）。
+
+    .. note::
+
+       **折行的那一半在这里**（ADR-0007 的「截断与折行按页分工」）：这一页要能读完整的
+       描述与备注，所以 #43 接手时把 :attr:`CursorPage.CLIP_ROWS` 关掉。今天这一页没有
+       可停光标的行（所有 ``Row`` 都是 ``id=None``），所以折行还不会破坏光标算术；
+       #43 开字段光标时，光标与滚动要一起换成**屏幕行偏移表**——一个字段不再等于一屏一行。
+    """
 
     LAYER = LAYER_DETAIL
     BINDINGS = bindings_for(LAYER)
@@ -94,7 +102,7 @@ class DetailPage(CursorPage):
         if detail is None:
             self.set_rows((empty_row(self.EMPTY_TEXT),))
             return
-        rows = [Row(id=None, text=Text(detail.title, style="bold"))]
+        rows = [Row(id=None, text=theme.styled(detail.title, theme.HEADING))]
         rows += [Row(id=None, text=line) for line in field_lines(detail)]
         self.set_rows(rows)
 

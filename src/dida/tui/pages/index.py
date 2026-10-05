@@ -21,9 +21,9 @@ from rich.text import Text
 from textual.message import Message
 
 from dida.sync.engine import ListKind, ListRow
-from dida.tui import messages
+from dida.tui import messages, theme
 from dida.tui.keys import LAYER_INDEX, bindings_for
-from dida.tui.pages.base import EMPTY_STYLE, CursorPage, Row, empty_row
+from dida.tui.pages.base import EMPTY_STYLE, CursorPage, Row, empty_row, rule_row
 
 __all__ = [
     "BUILTIN_MARK",
@@ -38,23 +38,28 @@ __all__ = [
     "project_heading",
 ]
 
-INBOX_MARK = "▣"
+INBOX_MARK = theme.INBOX_MARK
 """收集箱：它是真实清单，但置顶显示，给它一个一眼能认出来的记号。"""
 
-BUILTIN_MARK = "▸"
+BUILTIN_MARK = theme.BUILTIN_MARK
 """内置视图（今天 / 最近七天 / 所有）。"""
 
-CUSTOM_MARK = "★"
+CUSTOM_MARK = theme.CUSTOM_MARK
 """用户自建的视图：一组只存在本机的过滤条件。"""
 
-LIST_MARK = "☰"
-"""真实清单（API 叫 project）。"""
+LIST_MARK = theme.LIST_MARK
+"""真实清单（API 叫 project）。
 
-BLOCKED_MARK = "⚠ 不可进入"
+原来是 ``☰``：rich 量它 2 格而 Unicode 说它中性宽度，每一行会比终端实际画出来的宽一格
+（今天没有对齐列所以看不出来，一旦有列就整列歪）。记号都住在 :mod:`dida.tui.theme`，
+宽度由 ``tests/test_theme.py`` 守着。
+"""
+
+BLOCKED_MARK = f"{theme.BLOCKED_GLYPH} 不可进入"
 """进不去的清单（``kind`` 是 NOTE 或没有写权限）的记号。"""
 
-HEADING_STYLE = "bold"
-"""项目组小标题的样式；小标题本身不可停光标，怎么画都不影响光标。"""
+HEADING_STYLE = theme.MUTED
+"""项目组小标题那一档：安静的，不可停光标，怎么画都不影响光标。"""
 
 
 def mark_of(row: ListRow) -> str:
@@ -69,7 +74,11 @@ def mark_of(row: ListRow) -> str:
 
 
 def list_line(row: ListRow) -> Text:
-    """一行清单：前缀字符 + 名字 + 未完成条数（+ 进不去的记号）。"""
+    """一行清单：前缀字符 + 名字 + 未完成条数（+ 进不去的记号）。
+
+    条数与「不可进入」是**注解**，所以它们是暗的那一档；名字不带上色——光标压上来时整行
+    才换成强调色（:meth:`~dida.tui.pages.base.CursorPage._redraw`），一屏里只有一行是亮的。
+    """
     text = Text()
     text.append(f"{mark_of(row)} {row.name}  ")
     text.append(str(row.unfinished), style=EMPTY_STYLE)
@@ -79,12 +88,12 @@ def list_line(row: ListRow) -> Text:
 
 
 def project_heading(group_id: str) -> Text:
-    """项目组小标题（不可进入）。
+    """项目组小标题（不可进入）：一条暗色的抬头，下面跟一条通栏细线。
 
     服务端的清单索引只给 ``groupId``，没有组名（``GET /open/v1/project`` 的 ``Project`` 上
     只有这一个字段）——所以小标题如实显示那个 id，而不是编一个名字出来。
     """
-    return Text(f"── 项目组 {group_id} ──", style=HEADING_STYLE)
+    return theme.styled(f"项目组 {group_id}", HEADING_STYLE)
 
 
 def group_by_project(
@@ -147,13 +156,19 @@ class IndexPage(CursorPage):
         self.set_rows(self._build(rows))
 
     def _build(self, rows: Sequence[ListRow]) -> tuple[Row, ...]:
-        built: list[Row] = []
+        """清单索引那一页的行：**先一条通栏细线**，然后是每个项目组的抬头 + 细线 + 成员。
+
+        顶上那条细线是页面自己的第一行（不是第三行 chrome）：顶栏说「你在哪」，紧跟着一条
+        暗线把 chrome 与内容分开，而底部仍然只有状态栏那一行——chrome 净增 0 行。
+        """
+        built: list[Row] = [rule_row()]
         for group_id, members in group_by_project(rows):
             if group_id is not None:
                 built.append(Row(id=None, text=project_heading(group_id)))
+                built.append(rule_row())
             built += [Row(id=row.id, text=list_line(row)) for row in members]
-        if not built:
-            return (empty_row(self.EMPTY_TEXT),)
+        if len(built) == 1:
+            return (built[0], empty_row(self.EMPTY_TEXT))
         return tuple(built)
 
     def action_enter(self) -> None:
