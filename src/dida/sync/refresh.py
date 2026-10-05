@@ -58,8 +58,14 @@ class RefreshTarget(ViewSource, Protocol):
         *,
         lists: Sequence[Mapping[str, Any]] = (),
         tasks: Sequence[Mapping[str, Any]] = (),
+        prune_lists: bool = False,
+        prune_unfinished_tasks: bool = False,
     ) -> RefreshReport:
-        """只写变化地落一次全量刷新，返回这次到底写了什么。"""
+        """只写变化地落一次全量刷新，返回这次到底写了什么。
+
+        ``prune_*`` 是调用方在断言「这一路取全了」；断言成立时才剪掉服务端已经不给了的
+        清单 / 未完成任务（#41）。没取全就断言，剪掉的正是没取到的那部分。
+        """
         ...
 
     def set_sync_state(
@@ -120,7 +126,15 @@ class RefreshMixin:
                     lists.append(project_payload)
                     known.add(project_id)
 
-        report = target.apply_refresh(lists=lists, tasks=tasks)
+        # 取数到这里已经取全了（清单索引翻页翻到底、每个清单的未完成都拿到），所以落库时
+        # 一并剪枝：远端已经没有的清单与未完成任务从本地库里删掉（#41）。剪枝**只**发生在
+        # 这一步，不在翻页途中——上面任何一页失败就已经抛出去了，本地库一动不动。
+        report = target.apply_refresh(
+            lists=lists,
+            tasks=tasks,
+            prune_lists=True,
+            prune_unfinished_tasks=True,
+        )
 
         # 只有整份落地了才记「刷新成功」：失败的那次不算已同步。游标原样带回去——
         # set_sync_state 的 None 是清空，顺手抹掉的话 t12 的已完成流会从头再拉一遍。

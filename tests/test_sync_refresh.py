@@ -329,6 +329,118 @@ async def test_only_the_task_that_changed_is_written(store):
     ]
 
 
+async def test_the_inbox_is_never_pruned_even_when_the_index_never_mentions_it(store):
+    """收集箱不在清单索引里，所以「索引没提它」不等于「服务端没有它」（#41 的第四条）。
+
+    ``GET /open/v1/project`` **不包含收集箱**（ADR-0001），它是默认清单。照「索引里没有的
+    就剪掉」办，第一次刷新就会把收集箱从本地库里删掉：左栏少一格、随手记的任务无处可去，
+    而且不报错。
+    """
+    server = PagedProjectServer(
+        projects=[inbox(), project()],
+        tasks={"inbox": [task(id="t9", project_id="inbox", title="随手记")]},
+    )
+    engine = make_engine(store, server)
+    await engine.refresh()
+
+    # 第二次：索引照真实服务端的样子只回工作清单，而收集箱的 data 根本没有 project 字段。
+    index_only = PagedProjectServer(projects=[project()])
+    engine = make_engine(store, index_only)
+
+    report = await engine.refresh()
+
+    assert [item.name for item in store.lists()] == ["收集箱", "工作"]
+    assert [item.name for item in engine.view().lists] == ["收集箱", "工作"]
+    assert report.pruned_lists == 0
+
+
+async def test_a_task_deleted_remotely_disappears_from_the_local_library(store):
+    """远端已经没有的任务，刷新之后不许留在本地库里（#41 的第三条验收标准）。
+
+    落库原先只做插入与更新、从不删除，所以用户在手机上删掉的任务会永远留在本地：屏幕上
+    看得见一条服务端已经不存在的任务，而且刷新多少次都在。
+    """
+    transport = FakeTransport()
+    index = [inbox(), project()]
+    serve(
+        transport,
+        index=index,
+        data=[data(inbox()), data(project(), [task(id="t1"), task(id="t2", title="买牛奶")])],
+    )
+    serve(
+        transport,
+        index=index,
+        data=[data(inbox()), data(project(), [task(id="t2", title="买牛奶")])],
+    )
+    engine = make_engine(store, transport)
+    await engine.refresh()
+
+    report = await engine.refresh()
+
+    assert [item.id for item in store.tasks()] == ["t2"]
+    assert report.pruned_tasks == 1
+    assert report.written_tasks == 0, "留下那条没变，一个字节都不写"
+    assert [item.title for group in engine.view().groups for item in group.items] == ["买牛奶"]
+
+
+async def test_a_list_deleted_remotely_disappears_from_the_library(store):
+    """远端已经没有的清单，刷新之后不许留在本地库里（#41 的第四条验收标准的前半）。
+
+    「还在本地库里」就是「还在清单列表页上」：清单页读的是本地那份索引。
+    """
+    transport = FakeTransport()
+    serve(
+        transport,
+        index=[inbox(), project()],
+        data=[data(inbox()), data(project(), [task()])],
+    )
+    serve(transport, index=[inbox()], data=[data(inbox())])
+    engine = make_engine(store, transport)
+    await engine.refresh()
+
+    report = await engine.refresh()
+
+    assert [item.name for item in store.lists()] == ["收集箱"]
+    assert [item.name for item in engine.view().lists] == ["收集箱"]
+    assert report.pruned_lists == 1
+
+
+async def test_a_task_with_an_unpushed_change_is_never_pruned(store):
+    """剪枝不误删待推送改动对应的任务（#41 的第五条验收标准）。
+
+    两类都在这里：改过还没推上去的老任务（服务端这次没给），和刚刚在本地新建、服务端
+    根本还没见过的任务（临时 id）。剪掉任何一个都等于把用户刚做的操作悄悄撤销。
+    """
+    transport = FakeTransport()
+    index = [inbox(), project()]
+    serve(transport, index=index, data=[data(inbox()), data(project(), [task(id="t1")])])
+    engine = make_engine(store, transport)
+    await engine.refresh()
+
+    store.enqueue(
+        task_id="t1", kind=ChangeKind.UPDATE, payload={"title": "写周报（我改的）"}, now=T0
+    )
+    store.enqueue(
+        task_id="local-new",
+        kind=ChangeKind.CREATE,
+        payload={"title": "随手记", "projectId": "inbox"},
+        now=T0,
+        list_id="inbox",
+    )
+
+    serve(transport, index=index, data=[data(inbox()), data(project(), [])])
+    report = await engine.refresh()
+
+    assert store.pending_count() == 2, "两条改动都还在队列里"
+    assert store.task_payload("t1")["title"] == "写周报（我改的）"
+    assert store.task_payload("local-new")["title"] == "随手记"
+    assert [item.title for group in engine.view().groups for item in group.items] == [
+        "写周报（我改的）",
+        "随手记",
+    ]
+    assert report.pruned_tasks == 0
+
+
 async def test_a_failed_list_fetch_writes_nothing(store):
     """取数中途失败：本地库一动不动——半份刷新比旧数据更难查（t08 的整事务口径）。"""
     transport = FakeTransport()
