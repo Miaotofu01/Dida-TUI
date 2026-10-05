@@ -446,7 +446,7 @@ async def test_a_missing_status_bar_while_the_app_runs_is_still_an_error(tmp_pat
     """守卫只放过关窗那一种：app 还在跑时状态栏不见了，照旧是 bug，不许被吞掉。
 
     别的测试摆错东西时也要看得见错——一个「什么 NoMatches 都咽下去」的守卫，会把「状态栏
-    根本没组出来」这种真 bug 变成一片安静。
+    根本没组出来」这种真 bug 变成一片安静。两条路各来一次：状态栏那一句、与重画那一屏。
     """
     store = open_store(tmp_path)
     seed(store, task(id="t1", title="写周报", project_id="inbox"), lists=[inbox()])
@@ -460,6 +460,8 @@ async def test_a_missing_status_bar_while_the_app_runs_is_still_an_error(tmp_pat
 
         with pytest.raises(NoMatches):
             app.update_status()
+        with pytest.raises(NoMatches):
+            app.refresh_view()  # 重画最后也要刷状态栏，同一个洞
 
 
 async def test_the_pump_timer_is_stopped_when_the_app_unmounts(tmp_path):
