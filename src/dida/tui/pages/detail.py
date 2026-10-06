@@ -89,6 +89,12 @@ DUE_TOGGLE_KEY = "x"
 DUE_STEPS = ("date", "time")
 """截止时间编辑器的两步：先日期、再时刻（验收标准 1）。"""
 
+DUE_EMPTY_REASON = "日期那一格还是空的"
+"""日期那一格没被碰过时的说法（``enter`` 与 ``esc`` 共用一句）。
+
+两处共用一份：这是同一个事实（没有改动可提交），两个键说的不该是两句不同的话。
+"""
+
 
 class DueInput(Input):
     """截止时间编辑器里的一个格子：多一个「全天」开关的键（工单 #44 验收标准 2）。
@@ -593,6 +599,9 @@ class DetailPage(CursorPage):
         self._due_date_touched = False
         """用户动过日期那一格没有（清空也算动过）。程序化回填不算。"""
 
+        self._zone: tzinfo | None = None
+        """用户墙钟当前的时区（app 从注入的钟上取来，随 :meth:`show_detail` 递进来）。"""
+
     def compose(self) -> ComposeResult:
         """正文 + 装饰光标条（页面的那两块），加上这一页自己的两块：底部那一行 + 编辑器。
 
@@ -619,8 +628,16 @@ class DetailPage(CursorPage):
         """这一页正在说的是哪条任务（``o`` 要知道）。"""
         return self._task_id
 
-    def show_detail(self, detail: TaskDetail | None) -> None:
-        """铺开一条任务的字段；``None`` = 它已经不在本地缓存里了。"""
+    def show_detail(self, detail: TaskDetail | None, *, zone: tzinfo | None = None) -> None:
+        """铺开一条任务的字段；``None`` = 它已经不在本地缓存里了。
+
+        ``zone`` 是**用户墙钟当前的时区**，由 app 从注入的钟上取来（工单 #58 的 T1）。这一页
+        要把用户敲的 ``2026-03-15`` / ``18:00`` 理解成一个时刻，而任务本来没有截止时间时它
+        没有 offset 可借（见 :meth:`_zone_hint`）。页面自己**不读时钟**：``datetime.now()``
+        正是业务代码里被禁的那一个（README 与 docs/architecture.md 的硬规则，
+        ``tests/test_clock_seam.py`` 用 AST 守着），所以这一份只能是递进来的事实。
+        """
+        self._zone = zone
         previous = self._task_id
         self._task_id = None if detail is None else detail.task_id
         self._detail = detail
@@ -806,12 +823,33 @@ class DetailPage(CursorPage):
         """任务没有截止时间时，用哪一个时区理解用户敲的墙钟。
 
         有截止时间时不需要它——那一刻自己带着 offset（``due.due_change`` 的 ``reference``）。
-        没有的时候只能给一个本地时区：文档对 ``timeZone`` 字段写错会怎样一个字都没写
-        （api-shapes §D17），所以这里**不**把那个名字换算成 offset（那要一整个 tzdata，
-        而算错正是静默位移）。给不出来（``None``）就让 ``datetime`` 是 naive 的——
-        ``guards.api_date`` 会当场拒绝，而不是替它猜一个。
+        没有的时候只能给一个本地时区，而「本地」是**注入的钟**说的：app 把 ``zone`` 随
+        :meth:`show_detail` 递进来（工单 #58 的 T1），这一页自己不读时钟。文档对 ``timeZone``
+        字段写错会怎样一个字都没写（api-shapes §D17），所以这里**不**把那个名字换算成 offset
+        （那要一整个 tzdata，而算错正是静默位移）。给不出来（``None``）就让 ``datetime`` 是
+        naive 的——``guards.api_date`` 会当场拒绝，而不是替它猜一个。
         """
-        return datetime.now().astimezone().tzinfo
+        return self._zone
+
+    def _due_draft(self) -> tuple[date | None, time | None]:
+        """编辑器里这两格当前的内容 → （哪一天、哪一刻）；认不出来就抛 :class:`ValueError`。
+
+        两格**一起**读：用户可能只走到第一步（日期敲完、时刻那格还是回填的原值），也可能
+        两步都动过。``enter`` 与 ``esc`` 提交的是同一份草稿，所以读法也只有这一处——同一个
+        键在同一个页面上不该有两种含义。
+        """
+        return self._typed_day(), due.parse_time(self.query_one("#due-time", Input).value)
+
+    def _commit_due(self, day: date | None, at: time | None) -> None:
+        """把这两格组成的那一刻写出去（``day=None`` 是清除）。
+
+        参考时刻是这条任务**当前**的截止时间：用户敲的墙钟就落在那一刻原来的 offset 上，
+        不换算（任务本来没有截止时间时才用 :meth:`_zone_hint`）。``_due_all_day`` 一起走
+        ——「全天」是用户在编辑器里切出来的那一档，提交时不许丢。
+        """
+        entry = due.DueInput(day=day, at=at, all_day=self._due_all_day)
+        reference = None if self._detail is None else self._detail.due
+        self._finish_due_edit(due.due_change(entry, reference=reference, tz=self._zone_hint()))
 
     def _submit_due(self) -> None:
         """``enter``：日期那一格提交 → 走到时刻；时刻那一格提交 → 这一次改动出去。
@@ -822,22 +860,50 @@ class DetailPage(CursorPage):
         明确动作；而一片从来没被碰过的空白只是「还没填」。
         """
         try:
-            day = self._typed_day()
-            at = due.parse_time(self.query_one("#due-time", Input).value)
+            day, at = self._due_draft()
         except ValueError as exc:
             self.show_save(messages.due_invalid_message(exc))
             return
         if day is None and not self._due_date_touched:
-            self.show_save(messages.due_invalid_message("日期那一格还是空的"))
+            self.show_save(messages.due_invalid_message(DUE_EMPTY_REASON))
             return
         if day is not None and self._due_step == DUE_STEPS[0] and not self._due_all_day:
             self._due_step = DUE_STEPS[1]
             self._show_due_step()
             self.query_one("#due-time", Input).focus()
             return
-        entry = due.DueInput(day=day, at=at, all_day=self._due_all_day)
-        reference = None if self._detail is None else self._detail.due
-        self._finish_due_edit(due.due_change(entry, reference=reference, tz=self._zone_hint()))
+        self._commit_due(day, at)
+
+    def _escape_due_edit(self) -> None:
+        """``esc``（截止编辑器里）：**结束这次编辑**——改动已经生效，没有「取消」（用户故事 62）。
+
+        与 #43 的自由文本框是同一个含义：把用户已经敲进去的东西交出去、回到字段列表。
+        草稿有三种状态，各有明确落点，**没有一条是「悄悄丢掉」**：
+
+        1. **日期敲完了、还没走到时刻那一步**：把两格**一起**提交。时刻那一格要么是回填的
+           原值、要么是用户敲的值，「留空 = 只有日期」与 ``enter`` 在时刻那一格上的读法
+           是同一条（``_show_due_step`` 就写着这句话）。``esc`` 只是不必再按一次 ``enter``
+           往前走一步，它不是「跳到第 2 步」。
+        2. **有哪一格认不出来**（``2026-02-30``、``18:7`` 这种）：**一个字都不写**，编辑器
+           留在原地，下面那一行说清是哪一格不认。与 ``enter`` 同一个规矩：非法输入在发出前
+           被本地拦下（验收标准 6）——既不写垃圾，也不是悄悄什么都不做。
+        3. **日期那一格从来没被碰过**（连里面的日期都没删过）：没有改动可言，于是没有改动
+           可生效。编辑器收起、回到字段列表，下面那一行说出为什么一个字都没写。这一下
+           **不是清除**：「还没填」与「要清除」在请求体里是同一个空值，而清除要求用户真的
+           动过那一格（``_due_date_touched`` 就是这条分界）。
+
+        ``x`` 的全天开关在每一条真的提交里都跟着走（``_due_all_day`` 进 :meth:`_commit_due`）。
+        """
+        try:
+            day, at = self._due_draft()
+        except ValueError as exc:
+            self.show_save(messages.due_invalid_message(exc))
+            return
+        if day is None and not self._due_date_touched:
+            self._dismiss_due_edit()
+            self.show_save(messages.due_invalid_message(DUE_EMPTY_REASON))
+            return
+        self._commit_due(day, at)
 
     def on_input_changed(self, event: Input.Changed) -> None:
         """日期那一格**被用户改过**（清空也算）。
@@ -860,13 +926,13 @@ class DetailPage(CursorPage):
             return
         self.post_message(self.DueChanged(task_id, landed, all_day))
 
-    def _cancel_due_edit(self) -> None:
-        """``esc``：**这次编辑没有提交**，收起编辑器回到字段列表。
+    def _dismiss_due_edit(self) -> None:
+        """收起编辑器、**一个字都不写**（草稿里没有可提交的东西）。
 
-        与自由文本字段那条路不同（那里 ``esc`` 是「改动已经生效」）：截止时间是一个两步的
-        选择，中途退出的语义只能是「没改」。已经提交的那一次不走这里——它提交完就收起来了。
+        这**不是**「取消」那条路（用户故事 62：没有取消）：它是 ``esc`` 在第 3 种状态下唯一
+        诚实的落点——用户什么都没改过，于是没有任何改动可生效。调用方负责把「为什么一个字
+        都没写」说出来；这里悄悄收起是不行的。
         """
-        self._due_editing = False
         self._due_step = DUE_STEPS[0]
         self._end_edit()
 
@@ -892,7 +958,7 @@ class DetailPage(CursorPage):
     def _end_edit(self) -> None:
         """收起编辑器，把这一页还给字段列表（三套编辑器共用这一条退出）。
 
-        **幂等**：三套编辑器的退出路径都调它（自由文本框结束编辑、截止时间提交或取消），
+        **幂等**：三套编辑器的退出路径都调它（自由文本框结束编辑、截止时间提交或收起），
         而其中两条可能连着来（提交之后 ``_finish_due_edit`` 立刻收起、接着 app 又刷一次）。
         没有编辑态时它只是把已经藏着的两块再藏一次——不报错，也不多做一件事。
         """
@@ -936,12 +1002,12 @@ class DetailPage(CursorPage):
     def action_back(self) -> None:
         """``esc``：编辑中结束这次编辑，字段列表上退回任务列表页（验收标准 4 + 5）。
 
-        截止时间编辑器（#44）是第三种：它**没有提交就退出**——那是一个两步的选择，中途
-        退出只能是「没改」（自由文本框那条路上 ``esc`` 是「改动已经生效」，因为那里只有
-        一步）。
+        三种编辑器**同一个含义**：自由文本框（#43）把文字交出去，截止时间（#44）把两格草稿
+        交出去（细节见 :meth:`_escape_due_edit`）——**没有「取消」**（用户故事 62）。只有
+        光标已经在字段列表上时，``esc`` 才是「退回上一层」。
         """
         if self._due_editing:
-            self._cancel_due_edit()
+            self._escape_due_edit()
             return
         if self._editing is not None:
             self._finish_edit()

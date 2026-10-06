@@ -463,7 +463,10 @@ class DidaApp(App[None]):
         if self._detail_task_id is not None:
             detail = self.engine.task_detail(self._detail_task_id)
             self._detail_title = None if detail is None else detail.title
-            self.detail_page().show_detail(detail)
+            # 时区提示走**注入的钟**：``status().checked_at`` 就是那只钟给的时刻，它的
+            # ``tzinfo`` 是用户墙钟当前的时区。详细页要把用户敲的日期与时刻理解成一个时刻，
+            # 而它自己不读时钟（README：「业务代码不许调 datetime.now()」，#58 的 T1）。
+            self.detail_page().show_detail(detail, zone=self.engine.status().checked_at.tzinfo)
         self.update_status()
         self._write_top()
 
