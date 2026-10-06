@@ -157,6 +157,33 @@ async def test_d_asks_once_and_only_y_deletes_the_task():
     assert fake.deleted == ["t1"], "只有 y 那一次真的删了"
 
 
+async def test_escape_on_the_delete_confirm_still_means_no():
+    """删除确认框里 ``Esc`` 仍然是**「没做」**：一条任务都不删（#66 的例外，ADR-0008 二）。
+
+    确认框与表单是**两个意思**的 ``Esc``：表单里它是保存，这里它是对一件不可挽回的事说
+    「没做」——API 里没有 undelete、没有回收站，那一次确认就是全部的防线。``y`` / ``n``
+    一个都没动（``test_d_asks_once_and_only_y_deletes_the_task`` 钉着它们）。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_work(app, pilot)
+        await pilot.press("d")
+        await pilot.pause()
+        asked = screen_text(app)
+
+        await pilot.press("escape")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert "删除「写周报」？" in asked, "先确认问的是那一句"
+    assert fake.deleted == [], "Esc 是「没做」"
+    assert "删掉就找不回来了" not in after, "框收掉了"
+    assert "写周报" in after, "任务还在列表里"
+
+
 # ------------------------------------------------------------------ g / G：顺延
 
 

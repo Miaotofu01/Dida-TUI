@@ -646,7 +646,10 @@ class DidaApp(App[None]):
         )
 
     def _finish_new_task(self, values: dict[str, str] | None) -> None:
-        """表单关掉了：``None`` 是取消，否则按填的标题建一条（空标题不建，如实说一句）。
+        """表单关掉了：按填的标题建一条（空标题不建，如实说一句）。
+
+        ``None`` 那条分支从 #66 起走不到了（表单没有「取消」，``Esc`` 就是保存），留着只是
+        防御——调用方按交回来那一份值判断，这一层不认识表单的键位。
 
         落点与隐含日期都**读读模型**（:meth:`~dida.sync.engine.Engine.tasks_in`）：
 
@@ -784,7 +787,7 @@ class DidaApp(App[None]):
     async def _finish_pick(
         self, task_id: str, field: str, values: dict[str, str] | None
     ) -> None:
-        """挑选浮层关掉了：``None`` 是取消（一个字节都不写），否则按挑的那一份写出去。
+        """挑选浮层关掉了：按挑的那一份写出去（``None`` 从 #66 起走不到，表单没有「取消」）。
 
         三条路各自走该走的端点——**搬运不是一次普通字段更新**（``move_task``），优先级与
         标签是普通更新（整份底稿带回去那件事由 ``update_task`` 的 ``snapshot=`` 管，
@@ -916,7 +919,7 @@ class DidaApp(App[None]):
         )
 
     def _finish_kind_form(self, values: dict[str, str] | None) -> None:
-        """「清单还是视图」答完了：``None`` 是取消（一个字节都不写），否则开对应的表单。"""
+        """「清单还是视图」答完了：开对应的表单（``None`` 从 #66 起走不到，表单没有「取消」）。"""
         if values is None:
             return
         if values.get(NEW_KIND_FIELD) == KIND_VIEW:
@@ -1023,7 +1026,7 @@ class DidaApp(App[None]):
         )
 
     def _finish_list_form(self, values: dict[str, str] | None) -> None:
-        """清单表单关掉了：``None`` 是取消（一个字节都不写），否则按填的那一份建 / 改。
+        """清单表单关掉了：按填的那一份建 / 改（``None`` 从 #66 起走不到，表单没有「取消」）。
 
         颜色是空串就**不发** ``color`` 字段（那是「默认」，不是「清空」）；名字空着则
         什么都不做，只如实说一句。
@@ -1048,7 +1051,7 @@ class DidaApp(App[None]):
         self.refresh_view()
 
     def _finish_view_form(self, values: dict[str, str] | None) -> None:
-        """视图表单关掉了：``None`` 是取消，否则把那一份值读成定义再落本地库。
+        """视图表单关掉了：把那一份值读成定义再落本地库（``None`` 从 #66 起走不到）。
 
         读不成定义时（认不出的清单名、永远筛不出任务的组合）**不保存**，把理由写进状态栏
         并把用户填的那一份原样还回表单里——七个格子重填一遍是这一屏最不该有的惩罚。

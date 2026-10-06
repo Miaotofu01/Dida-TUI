@@ -364,6 +364,33 @@ async def test_d_asks_once_with_the_truth_and_only_y_deletes():
     assert "工作" not in after_yes, "``y`` 之后那一行没了"
 
 
+async def test_escape_on_the_delete_confirm_still_means_no():
+    """删除确认框里 ``Esc`` 仍然是**「没做」**：清单还在，一个字节都没写（#66 的例外）。
+
+    确认框与表单是**两个意思**的 ``Esc``（ADR-0008 二）：表单里它是保存，这里它是对一件
+    不可挽回的事说「没做」——API 里没有回收站、没有 undelete，那一次确认是全部的防线。
+    ``y`` / ``n`` 一个都没动（``test_d_asks_once_with_the_truth_and_only_y_deletes`` 钉着）。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await move_cursor_to(pilot, app.index_page(), "work")
+        await pilot.press("d")
+        await pilot.pause()
+        asked = screen_text(app)
+
+        await pilot.press("escape")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert "删除清单「工作」" in asked, "先确认问的是那一句"
+    assert fake.deleted_lists == [], "Esc 是「没做」"
+    assert "文档没写" not in after, "框收掉了"
+    assert LIST_MARK in row_of(after, "工作"), "清单还在"
+
+
 # ------------------------------------------------------------------ 改不动的那几种行
 
 
