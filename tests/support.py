@@ -5,6 +5,11 @@
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
+from collections.abc import Callable
+from typing import Any
+
 from textual.app import App
 
 
@@ -41,3 +46,34 @@ def screen_sgr(app: App) -> str:
     console = Console(color_system="truecolor", force_terminal=True, width=400)
     strips = app.screen._compositor.render_strips()  # type: ignore[attr-defined]
     return "\n".join(strip.render(console) for strip in strips)
+
+
+async def sample_frames(
+    app: App,
+    action: Callable[[], Any],
+    project: Callable[[App], Any],
+) -> list[Any]:
+    """一边做 ``action``（通常是按一个键）一边**逐帧**取 ``project(app)``。
+
+    ``pilot.press`` 会等到这一屏静下来（Textual 的动画跑完才算 idle），所以「按完再抓屏」
+    只能看到落定后的样子——动效本身只有一个并发采样的人看得见。
+
+    采样任务取消之后**等它真的结束**再返回：``cancel()`` 只是投递，不等它会把一个待处理的
+    取消留到下一个事件循环回合，而那个回合会吞掉紧接着的第一次 ``pilot.press``（``notes/
+    progress.md`` 记过这个坑）。把它 await 掉，连着采样几次才是安全的。
+    """
+    frames: list[Any] = []
+
+    async def sample() -> None:
+        while True:
+            frames.append(project(app))
+            await asyncio.sleep(0.005)
+
+    sampler = asyncio.create_task(sample())
+    try:
+        await action()
+    finally:
+        sampler.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await sampler
+    return frames
