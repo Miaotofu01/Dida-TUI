@@ -151,7 +151,17 @@ class Stage(HorizontalScroll):
     为什么不是「别用 :class:`HorizontalScroll`」：``scroll_to`` 与三页并排的版式都建在它
     上面，换掉它不是修一个缺陷，是把 ADR-0007 的平移重做一遍。滚动条那条路本来就是关着的
     （``scrollbar-size-*`` 都是 0，何况现在 overflow 也不是 scroll 了）。
+
+    ## 它自己也**不是个焦点目标**（工单 #60）
+
+    轨道上没有键位（``j`` / ``enter`` / … 全在页面上），可它继承了 ``ScrollableContainer``
+    的 ``can_focus = True``，于是 ``tab`` 会在它身上停一站。聚焦它什么也不会发生，却让焦点
+    离开了页面——而页面才是按键该去的地方：``_show`` 每次都把焦点交给当前那一页，用户按下
+    去的键就该落在那一页上。所以这里把 ``can_focus`` 关掉。
     """
+
+    can_focus = False
+    """轨道不给聚焦：换层时 ``_show`` 会把焦点交给**页面**，而这一格自己没有键位（工单 #60）。"""
 
     def show(self, index: int, *, animate: bool = True) -> None:
         """把第 ``index`` 页滑到眼前（``animate=False`` 就是直接到）。
