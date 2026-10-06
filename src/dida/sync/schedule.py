@@ -48,7 +48,7 @@ class ScheduleMixin:
             return
         self.write(task_id, changes=changes)
 
-    def reschedule(self, task_id: str, *, due: datetime, all_day: bool) -> None:
+    def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> None:
         """写：改期——把截止时间换成给定那一刻，只动 ``dueDate`` 与 ``isAllDay``。
 
         「改成哪一天」由调用方（#44 的结构化选择器）定；这里只把结果交给 :meth:`write`：
@@ -57,11 +57,35 @@ class ScheduleMixin:
         **截止时间原样写回，不做任何逻辑日加减。** ``all_day=True`` 时 ``due`` 是那一天的
         00:00，是个**日期标记**：按 ``[start, end)`` 去把它挪进「当前逻辑日」，会让一个
         「今天」的全天任务整天掉出今日区（``due_day()`` 对全天任务只看 ``due.date()``）。
+
+        ``due=None`` 是**清除**（工单 #44 的「把任务变回没有日期」）：写显式的
+        ``dueDate: null``，而不是省略这个字段。理由见 :func:`_date_changes`。
+
+        ``all_day`` 默认 ``False``：只想清掉日期或者只想挪到某一天的调用方不必重复写它，而
+        「全天」永远是**显式**写出去的一笔（省略它的话，一条原来是全天的任务会带着
+        ``isAllDay = true`` 收到一个带时刻的 ``dueDate``，用户写的 14:00 就静默没了）。
         """
-        self.write(
-            task_id,
-            changes={"dueDate": api_date(due, field="dueDate"), "isAllDay": all_day},
-        )
+        self.write(task_id, changes=_date_changes(due=due, all_day=all_day))
+
+
+def _date_changes(*, due: datetime | None, all_day: bool) -> dict[str, Any]:
+    """改期要写进 ``write(changes=)`` 的那一份字段：只动 ``dueDate`` 与 ``isAllDay``。
+
+    **清除**（``due=None``）写的是显式的 ``None``，不是「不发这个字段」。api-shapes §A2
+    记着省略字段是替换还是合并**文档没说**（openapi-dida365.md:309–333 一个字都没提），
+    所以「不发 dueDate」在两种语义下意思不同，其中一种是「别动它」——那用户按了清除却什么
+    都没发生。显式 null 是唯一一个把「清空」说出来的形状。
+
+    ``isAllDay`` 一起写出去：清除之后不该留下「全天、但没有日期」这个组合（读法上它是
+    自相矛盾的一格），所以界面那一侧清除时写 ``False``；这里照样把调用方给的那一档写下去，
+    不替他改主意。
+
+    时刻一律走 :func:`dida.api.guards.api_date` 原样写成文档形式，不换时区——换时区就是
+    「静默位移」那个坑。
+    """
+    if due is None:
+        return {"dueDate": None, "isAllDay": all_day}
+    return {"dueDate": api_date(due, field="dueDate"), "isAllDay": all_day}
 
 
 def _defer_changes(
