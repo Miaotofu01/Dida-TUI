@@ -283,6 +283,21 @@ PRIORITY_CYCLE: tuple[int, ...] = (0, 1, 3, 5)
 """四个档位的**线上编码**，按 ``p`` 键的循环顺序：无 → 低 → 中 → 高。"""
 
 
+PRIORITY_NAMES: dict[int, str] = {0: "无", 1: "低", 3: "中", 5: "高"}
+"""四个档位的**用户语言**（GLOSSARY：无 / 低 / 中 / 高），键是上面的线上编码。
+
+**这是这张表唯一的家**（工单 #58 的 T3）。它原来在 ``tui/messages.py`` 与
+``sync/views.py`` 各写了一份，而界面的注释还把其中一份称作「唯一一张表」——两处实现、
+一句假话。它只能住在 sync 这一侧：``dida/tui/`` 只许 import ``dida.sync.engine``
+（``tests/test_architecture.py`` 的允许表），而 ``sync/`` 永远不 import ``tui/``，
+所以视图表单（:mod:`dida.sync.views`）与界面（经引擎的公开面）都得 import 这一份。
+
+**次序是承重的**：``views.py`` 把「一条改动里点了哪些档」倒过来查它（``by_label``），
+而界面的挑选器是按这里的插入顺序画四档的（无 → 低 → 中 → 高），所以次序照用户读的顺序写，
+**不要**改成「高 → 无」。表外的取值读作「无」（与 :func:`priority_mark` 同一条口径）。
+"""
+
+
 def next_priority(priority: int) -> int:
     """``p`` 的下一档：无 → 低 → 中 → 高 → 无，值都是 API 的线上编码 ``0/1/3/5``。
 

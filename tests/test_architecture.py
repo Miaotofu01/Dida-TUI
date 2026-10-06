@@ -14,12 +14,15 @@ import ast
 import importlib
 import re
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import pytest
 from rich.color import ANSI_COLOR_NAMES
 from rich.style import Style
 from textual._color_constants import COLOR_NAME_TO_RGB
+
+from dida.sync import engine
+from dida.tui import messages
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -433,3 +436,68 @@ def _css_declarations(source: str) -> Iterator[tuple[int, str]]:
         for match in declaration.finditer(text):
             yield lineno, match.group()
 
+
+# 单一出处：一条判断只许有一份实现（工单 #58 的 T3 / T5 / T6）
+#
+# 三条守的是同一件事，只是说法不同：**一张表 / 一个函数 / 一次比较**。它们的形状都是
+# 「谁再抄一份就当场红」，而不是「现在这一份是对的」——抄一份正是这三条当初的病因。
+# ---------------------------------------------------------------------------
+
+PRIORITY_CODES = frozenset({0, 1, 3, 5})
+"""优先级四档的**线上编码**（服务端那一套，见 :data:`dida.sync.view.PRIORITY_CYCLE`）。"""
+
+PRIORITY_WORDS = frozenset({"无", "低", "中", "高"})
+"""四档的**用户语言**（spec 用户故事 73 那几个字）。"""
+
+PRIORITY_HOME = "src/dida/sync/view.py"
+"""优先级四档中文写法的**唯一一处**（工单 #58 的 T3）。
+
+它只能在 sync 那一侧：``tui/`` 只许 import ``dida.sync.engine``，而 ``sync/`` 永远不
+import ``tui/``，所以这张表不可能住在 :mod:`dida.tui.messages` 又被视图表单 import。
+"""
+
+
+def _constant_dicts(source: str) -> Iterator[tuple[int, dict[Any, Any]]]:
+    """源码里的字典字面量（键值都是字面量的那些）→ ``(行号, 内容)``。"""
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Dict) or not node.keys:
+            continue
+        pairs: dict[Any, Any] = {}
+        for key, value in zip(node.keys, node.values):
+            if not (isinstance(key, ast.Constant) and isinstance(value, ast.Constant)):
+                break
+            pairs[key.value] = value.value
+        else:
+            yield node.lineno, pairs
+
+
+def _priority_tables() -> dict[str, list[int]]:
+    """``src/dida`` 里那些「``0/1/3/5`` → 无 / 低 / 中 / 高」的字典字面量：模块 → 行号。"""
+    found: dict[str, list[int]] = {}
+    for path in sorted((ROOT / "src" / "dida").rglob("*.py")):
+        for lineno, pairs in _constant_dicts(path.read_text(encoding="utf-8")):
+            if set(pairs) == PRIORITY_CODES and set(pairs.values()) == PRIORITY_WORDS:
+                found.setdefault(str(path.relative_to(ROOT)), []).append(lineno)
+    return found
+
+
+def test_the_priority_vocabulary_is_written_down_once():
+    """优先级四档的中文写法只有**一处**（工单 #58 的 T3）。
+
+    :data:`dida.tui.messages.PRIORITY_NAMES` 与 ``sync/views.py`` 的 ``_PRIORITY_LABELS``
+    曾经各写一份——而 ``app.py`` 那几行的注释还把前者称作「唯一一张表」。这一条扫的是源码里
+    的字典字面量：谁再抄一份同样的映射就当场红。修法是 import :data:`PRIORITY_HOME` 那一份
+    （界面经过引擎的公开面拿它）。
+    """
+    assert list(_priority_tables()) == [PRIORITY_HOME], (
+        f"优先级四档的中文写法只许在 {PRIORITY_HOME} 里写一次，别处 import 它"
+    )
+
+
+def test_the_tui_reads_the_priority_vocabulary_through_the_engine():
+    """界面拿到的是**引擎那一份表**，不是自己抄的一张（工单 #58 的 T3）。
+
+    这一条比上一条更严一点：上一条拦「又写了一个字面量」，这一条拦「换成一个长得一样的新
+    字典」（推导式、``dict(...)``、逐项抄）。断的是**同一个对象**，所以只有真的转出来才过。
+    """
+    assert messages.PRIORITY_NAMES is engine.PRIORITY_NAMES
