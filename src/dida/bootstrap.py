@@ -1,4 +1,4 @@
-"""组合根：把七个模块拼成一个 app。
+"""组合根：把模块拼成一个 app（模块表与依赖方向见 docs/architecture.md，那里也不写数目）。
 
 TUI 自己不 import 存储与 API 客户端，只拿 :class:`~dida.sync.engine.SyncEngine`；
 接线发生在这一层。``dida`` 命令与 ``python -m dida`` 都走这里。

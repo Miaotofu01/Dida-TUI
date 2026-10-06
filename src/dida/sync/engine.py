@@ -109,6 +109,7 @@ from dida.sync.tags import TagMixin, TagReader
 from dida.sync.view import (
     INBOX_ID,
     NO_DUE_TEXT,
+    PRIORITY_NAMES,
     SUBTASK_COMPLETED_STATUS,
     CompletedItem,
     CompletedSection,
@@ -135,6 +136,7 @@ from dida.sync.writes import (
     WireCall,
     WriteKind,
     WriteTarget,
+    is_a_move,
     is_local_id,
     is_local_list_id,
 )
@@ -185,6 +187,7 @@ __all__ = [
     "LOCAL_TASK_PREFIX",
     "NO_DUE_TEXT",
     "PRIORITY_CHOICES",
+    "PRIORITY_NAMES",
     "VIEW_COMPLETED_DAYS_FIELD",
     "VIEW_COMPLETION_FIELD",
     "VIEW_DUE_FIELD",
@@ -250,6 +253,7 @@ __all__ = [
     "evaluate_view",
     "format_due",
     "implied_due_for",
+    "is_a_move",
     "is_inbox_id",
     "is_local_id",
     "is_local_list_id",

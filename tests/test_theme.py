@@ -201,3 +201,86 @@ async def test_the_accent_reaches_the_terminal_as_ansi_six_not_truecolour():
     assert "48;2;" not in emitted, f"背景发出了真彩色：\n{emitted[:400]}"
     assert 36 in sgr_parameters(emitted), "强调色没有以 ANSI 6（\\x1b[36…）发出去"
     assert 49 in sgr_parameters(emitted), "页面底色不是终端自己的（\\x1b[49m）"
+
+
+# ------------------------------------------------------- 强调色的用法（#58d）
+
+
+ACCENT_AS_GROUND = re.compile(
+    r"background(?:-color)?:\s*(?:\{accent\}|\{CSS_ACCENT\}|ansi_cyan)"
+)
+"""把强调色当**底色**用的每一种写法：模板里的占位符、f-string 里的角色名、填完之后的字面量。"""
+
+REVERSED_BLOCK = re.compile(r"([^{}]*)\{([^{}]*)\}")
+"""样式表里的每个规则块（选择器，声明）。``_fill`` 填完之后没有嵌套花括号。"""
+
+TERMINAL_PAIR = ("background: ansi_default", "color: ansi_default")
+"""终端自己的一对：它自己的前景压在它自己的背景上——**唯一**被保证过可读的一对。"""
+
+
+def production_sheets() -> dict[str, str]:
+    """app 真正会发到终端上的那几份样式表（占位符已经填完）。
+
+    扫的是**填完的样式表**而不是模块源码：禁令本身要能写在文档里（``theme.py`` 的说明里就
+    提到了 ``background: {accent}`` 这个写法），而这里要拦的是真会生效的规则。
+    """
+    from dida.tui import overlays
+
+    sheets = {"DidaApp.CSS": DidaApp.CSS}
+    for klass in (overlays.FormOverlay, overlays.MessageOverlay, overlays.ConfirmOverlay):
+        sheets[f"{klass.__name__}.DEFAULT_CSS"] = klass.DEFAULT_CSS
+    return sheets
+
+
+def test_the_accent_is_never_a_ground():
+    """**本票（#58d）的守卫**：强调色只当**墨**用，绝不当承载文字的那块底。
+
+    为什么这必须是一条守卫，而不是一句「写的时候注意点」：``background: {accent}`` 配一句
+    ``color: {page}`` 在源码里看着很正当（「用了主题色」「跟随终端主题」），实际上是把**两个
+    槽位当成已知的亮度**在用——而槽 6 是亮是暗、默认前景是深是浅，都是用户主题说了算。
+    Catppuccin Mocha 里两个都是浅色（``ansi_cyan`` = ``#94e2d5``、默认前景 = ``#cdd6f4``），
+    于是打进去的字与底色糊成一片（#58d 用户报的就是这张截图）。**128 个主题里撞上一个就够
+    了**，所以 app 不许挑那个底：要一块盖住字的块，走
+    :func:`test_a_reversed_block_states_the_terminals_own_pair` 那条路（反色）。
+
+    顺带钉住反面：强调色当**前景**是允许的，而且必须继续存在——真删干净了，
+    上面那条「强调色以 ANSI 6 发出去」会先红。
+    """
+    offenders: list[str] = []
+    assert theme.CSS_RULE_ROLES, "一条声明组角色都没有：这条守卫只扫到模板，扫不到角色本身"
+    for name in theme.CSS_RULE_ROLES:
+        value = getattr(theme, name)
+        for match in ACCENT_AS_GROUND.finditer(value):
+            offenders.append(f"  theme.{name} → {match.group(0)!r}")
+    for where, css in production_sheets().items():
+        for match in ACCENT_AS_GROUND.finditer(css):
+            line = css[: match.start()].count("\n") + 1
+            offenders.append(f"  {where}:{line} → {match.group(0)!r}")
+    assert not offenders, (
+        "强调色被当成底色用了（那样压在上面的字就是 app 在赌两个槽位不撞车）：\n"
+        + "\n".join(offenders)
+        + "\n要一块盖住字的块请用 text-style: reverse（见 theme.CSS_BLOCK）"
+    )
+
+
+def test_a_reversed_block_states_the_terminals_own_pair():
+    """反色的块必须**先声明终端自己的一对**，再交换它——这是它能跨主题成立的全部理由。
+
+    ``text-style: reverse`` 交换的是这一格**解析出来的**前景与背景。只写 ``reverse`` 而不声明
+    那一对，交换的就是继承来的颜色（表单里是槽 0 的面 + 默认前景）——那还是 app 挑的一对，
+    照样能在某个主题里撞车。声明成终端自己的一对之后，交换与主题无关了：对比度是对称的，
+    终端保证过它自己那一对读得出来，交换之后仍然读得出来。
+    """
+    found: list[tuple[str, str, str]] = []
+    for where, css in production_sheets().items():
+        for selector, body in REVERSED_BLOCK.findall(css):
+            if "reverse" in body:
+                found.append((where, selector.strip(), body))
+    assert found, "一份样式表里一条反色的规则都没有：这条守卫失去意义了（它该管着七处块高亮）"
+    for where, selector, body in found:
+        missing = [declaration for declaration in TERMINAL_PAIR if declaration not in body]
+        assert not missing, (
+            f"{where} 的 {selector!r} 反色了，却没声明终端自己的一对（缺 {missing}）：\n"
+            f"    {body.strip()}\n"
+            "反色交换的是解析出来的那一对——不声明成终端自己的，交换的就是 app 挑的颜色"
+        )

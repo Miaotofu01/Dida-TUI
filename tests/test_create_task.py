@@ -337,11 +337,34 @@ async def test_creating_in_a_list_that_has_not_synced_yet_is_refused_on_screen()
 SGR = re.compile(r"\x1b\[[0-9;]*m")
 """屏幕字节里的样式序列；剥掉它剩下的才是**文本**（``test_task_rows_page.py`` 同形）。"""
 
-ACCENT_BACKGROUND = 46
-"""强调色的**底色**（ANSI 槽 6 的背景；前景是 36，见 ``theme.ACCENT``）。
+ACCENT_FOREGROUND = 36
+"""强调色的**前景**（ANSI 槽 6 的前景，见 ``theme.ACCENT`` / ``SELECTED``）。
 
-与 ``tests/test_visual_identity.py`` 那条「条子是一块强调色实心」用的是同一个参数。
+#58d 之后表单的聚焦信号走的是这一个：强调色当**墨**，压在终端自己的背景上。
 """
+
+ACCENT_BACKGROUND = 46
+"""强调色的**底色**（ANSI 槽 6 的背景）——#58d 之后表单里**不许**再有它。
+
+留着这个常量是因为它现在是**反面**的那个码：它压在上面的字是「终端默认前景」，而两个槽位
+的明暗都由用户主题决定（Catppuccin Mocha 里 ``ansi_cyan`` = ``#94e2d5``、默认前景 =
+``#cdd6f4``，两个都是浅色——用户报的就是这一张截图）。所以压在它上面的断言只剩一句
+「不许出现」。
+"""
+
+PAGE_BACKGROUND = 49
+"""终端自己的背景（``theme.CSS_PAGE``）：聚焦那一格的底，也是那行字的落脚处。"""
+
+SURFACE_BACKGROUND = 40
+"""槽 0 的面（``theme.CSS_SURFACE``）：**没聚焦**的输入框的底，也是浮层自己的面。
+
+它在断言里是个**反面**：聚焦那一格的字不许落在这上面——底翻过来了才有一半信号在
+（没打字也看得见）。顺带它还是 ``style_of`` 不偷懒的证据：整行的参数里永远有 40
+（浮层的面），只有真的取到「字自己那一段」才拿不到它。
+"""
+
+BOLD = 1
+"""字重（SGR 1）。#58d 里它是**信号强度**的补偿：整格实心换成一行变色，得把字重加上。"""
 
 
 def sgr_parameters(emitted: str) -> set[int]:
@@ -365,19 +388,34 @@ def line_with(emitted: str, needle: str) -> str:
     raise AssertionError(f"屏幕上没有「{needle}」这一行：\n{emitted}")
 
 
-async def test_the_focused_title_field_carries_the_accent(monkeypatch: pytest.MonkeyPatch):
-    """焦点在标题那一格上时，那一行带**强调底色**（SGR ``46``）——表单的聚焦信号（#39）。
+def style_of(emitted_line: str, needle: str) -> set[int]:
+    """那一行里**紧挨着** ``needle`` 之前那一段的 SGR 参数——这一段就是它的样式。
 
-    断的是 ``46``（ANSI 槽 6 的**背景**，见 ``theme.form_css`` 的「聚焦的记号从边框换成强调色
-    的底色」），**不是** ``38;2;`` / ``48;2;`` 那类真彩色。理由实测过（编排者量过两种浮层
-    状态，我在这一张表单上复核过）：浮层自己那层 ANSI 面已经把真彩色挡在外面，这张表单渲染
-    出来的字节里**一个真彩色序列都没有**——断言 ``38;2;`` 是空的，去掉 ``Input:focus`` 那条
-    覆盖它照样是 0，永远不会红。跟着那条覆盖一起消失的是 ``46``。页面里的输入框（不在浮层里）
-    是另一个场合，那里才该断真彩色（#44 在详细页上量到过 24 处）。
+    断「这一格的字是什么颜色」不能整行取参数：同一行里还有浮层的边框（槽 8）、页面的底（49）
+    与槽 0 的面（40）。整行取会把它们一起算进来，而它们永远都在——那种断言恒真，没有信息量。
+    """
+    match = re.search(r"((?:\x1b\[[0-9;]*m)+)[^\x1b]*" + re.escape(needle), emitted_line)
+    assert match is not None, f"这一行里找不到 {needle!r} 前面那一段样式：\n{emitted_line}"
+    return sgr_parameters(match.group(1))
+
+
+async def test_the_focused_title_field_turns_the_accent_into_ink(monkeypatch: pytest.MonkeyPatch):
+    """焦点在标题那一格上时，那一行**看得出不一样**，而那点不一样是强调色**当前景**（#58d）。
+
+    原来这里断的是底色（SGR ``46``）：聚焦那一格铺一块强调色实心。那条在用户的主题里读不出来
+    ——``ansi_cyan`` 与默认前景都是浅色，打进去的字与底色糊成一片（#58d 的截图）。现在断三
+    件事，都不绑某一个具体码位：
+
+    - 聚焦那一行与没聚焦那一行的参数**不同**（信号在，而且只标那一格）；
+    - 强调色以**前景**出现在打进去的字上，且**没有**以底色出现在那一行；
+    - 落在字上的那一段里，底是**终端自己的背景**（49）而不是槽 0 的面（40），并且带字重（1）。
+
+    最后两条是**信号强度**：整格实心换成了「一行变色 + 底色翻转」，所以字重与「七格里只有这
+    一格不是石板」这两半都必须真的在——没打字的时候，看得见的就只有后半条。
 
     ⚠ ``NO_COLOR`` 必须在**构造 App 之前**摘掉（#51 实测的次序）：这个 shell 有 ``NO_COLOR=1``，
-    留着它整个 App 会挂一层 Monochrome，上面这条断言就成了「测 shell 的样子」——我第一次量
-    就是这么量出「一个 46 都没有」的。
+    留着它整个 App 会挂一层 Monochrome，上面这些断言就成了「测 shell 的样子」——我第一次量
+    就是这么量出「一个颜色都没有」的。
     """
     monkeypatch.delenv("NO_COLOR", raising=False)  # 先摘，再构造 App
 
@@ -399,10 +437,25 @@ async def test_the_focused_title_field_carries_the_accent(monkeypatch: pytest.Mo
     )
     field = line_with(emitted, "写周报")
     label = line_with(emitted, "标题")
-    assert ACCENT_BACKGROUND in sgr_parameters(field), (
-        "聚焦的那一格要带强调底色（表单唯一的聚焦信号）；"
-        f"这一行的 SGR 参数是 {sorted(sgr_parameters(field))}"
+    typed = style_of(field, "写周报")
+    assert sorted(sgr_parameters(field)) != sorted(sgr_parameters(label)), (
+        "聚焦的那一格与没聚焦的那一行在屏幕上必须看得出不一样（表单唯一的聚焦信号）"
     )
-    assert ACCENT_BACKGROUND not in sgr_parameters(label), (
-        "底色标的是**那一格**，不是「标题」那行字段名——否则整张表单看着都像聚焦的"
+    assert ACCENT_FOREGROUND in typed, (
+        f"打进去的字要带强调色（当前景）：这一段是 {sorted(typed)}"
+    )
+    assert ACCENT_BACKGROUND not in sgr_parameters(field), (
+        "强调色又当底色了——那正是 #58d 修掉的那条（槽 6 与默认前景都由用户主题决定，"
+        f"两个都是浅色时字就糊在底上）；这一行是 {sorted(sgr_parameters(field))}"
+    )
+    assert BOLD in typed, f"字重是信号强度的补偿，不能少：这一段是 {sorted(typed)}"
+    assert PAGE_BACKGROUND in typed, (
+        f"聚焦那一格的底是终端自己的背景（没打字也看得见的那一半信号）：这一段是 {sorted(typed)}"
+    )
+    assert SURFACE_BACKGROUND not in typed, (
+        "聚焦那一格的字还压在槽 0 的面上——底没翻过来，没打字的时候就一点信号都没有；"
+        f"这一段是 {sorted(typed)}（整行是 {sorted(sgr_parameters(field))}）"
+    )
+    assert ACCENT_FOREGROUND not in sgr_parameters(label), (
+        "强调色标的是**那一格**，不是「标题」那行字段名——否则整张表单看着都像聚焦的"
     )

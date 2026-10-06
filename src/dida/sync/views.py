@@ -57,7 +57,7 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import DidaError
 from dida.logical_day import logical_day
-from dida.sync.view import PRIORITY_CYCLE, TaskSnapshot, due_day, is_overdue
+from dida.sync.view import PRIORITY_CYCLE, PRIORITY_NAMES, TaskSnapshot, due_day, is_overdue
 
 __all__ = [
     "ANY_VALUE",
@@ -422,12 +422,14 @@ DUE_CHOICES: tuple[ViewChoice, ...] = tuple(
     ViewChoice(value, label) for value, label, _ in _DUE_CHOICE_TABLE
 )
 
-_PRIORITY_LABELS: dict[int, str] = {5: "高", 3: "中", 1: "低", 0: "无"}
-"""优先级四档的中文写法；值是 API 的线上编码（见 :data:`~dida.sync.view.PRIORITY_CYCLE`）。"""
-
 PRIORITY_CHOICES: tuple[ViewChoice, ...] = tuple(
-    ViewChoice(str(value), _PRIORITY_LABELS[value]) for value in (5, 3, 1, 0)
+    ViewChoice(str(value), PRIORITY_NAMES[value]) for value in (5, 3, 1, 0)
 )
+"""优先级那几档：**高 → 中 → 低 → 无**，值是线上编码 ``5/3/1/0``。
+
+四档的中文写法不在这一页：表本体是 :data:`dida.sync.view.PRIORITY_NAMES`（一处，
+工单 #58 的 T3）。这里只决定**表单里的次序**（筛选条件从高往低读最自然），所以显式写出
+那四个值，不拿表的插入顺序当屏上顺序——表的次序是给界面的挑选器用的（无 → 低 → 中 → 高）。"""
 
 COMPLETION_CHOICES: tuple[ViewChoice, ...] = (
     ViewChoice(Completion.UNFINISHED.value, "未完成"),
@@ -472,7 +474,7 @@ def view_form_values(
         VIEW_PRIORITY_FIELD: " ".join(
             # 认不出来的档照原样显示成数字（手改过的库）：静默丢掉一维就是静默筛错东西，
             # 而写成数字之后用户一按确认就会被拒、并且被告知是哪一个词。
-            _PRIORITY_LABELS.get(item, str(item)) for item in definition.priorities
+            PRIORITY_NAMES.get(item, str(item)) for item in definition.priorities
         ),
         VIEW_TAGS_FIELD: " ".join(definition.tags),
         VIEW_COMPLETION_FIELD: definition.completion.value,
@@ -591,7 +593,7 @@ def _scope_ids(
 
 def _priority_values(text: str) -> tuple[tuple[int, ...], tuple[str, ...]]:
     """优先级那一格 → ``(认出来的档, 认不出来的词)``；中文写法与线上编码都认。"""
-    by_label = {label: value for value, label in _PRIORITY_LABELS.items()}
+    by_label = {label: value for value, label in PRIORITY_NAMES.items()}
     found: list[int] = []
     unknown: list[str] = []
     for token in _tokens(text):

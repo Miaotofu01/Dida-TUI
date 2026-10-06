@@ -27,6 +27,7 @@ from dida.sync.engine import (
     UnknownViewError,
     ViewFormProblem,
 )
+from dida.sync.engine import PRIORITY_NAMES as _ENGINE_PRIORITY_NAMES
 
 UNKNOWN_TASK_MESSAGE = "没有改成：这条任务已经不在本地缓存里了，刷新之后再试一次"
 """引擎拒绝写入（本地没有这条任务的底稿，工单 #25）时的话：如实说没改成。"""
@@ -40,11 +41,6 @@ UNKNOWN_DELETE_MESSAGE = "没有删：这条任务已经不在本地缓存里了
 与改期那句分开写：这里**不能**说「刷新之后再试一次」——刷新会把它拉回来，看着像删掉了
 其实没有；而删除这条路径上「本来就没这条」与「删掉了」必须一眼分得清。
 """
-
-"""按下 ``r`` 之后、同步落地之前状态栏里的话（工单 #21）。
-
-只给**手动**同步用：用户主动按了键，得先有个「它动了」的信号；启动时那次后台刷新不写它，
-否则每次开屏都会闪一下这句。"""
 
 EMPTY_INDEX_MESSAGE = "（还没有清单）"
 """清单列表页一行都没有时的话（缓存是空的、第一次运行还没刷新）。"""
@@ -63,11 +59,18 @@ EMPTY_FIELD_TEXT = "（空）"
 内容时整行不画，它们只是告知，不是入口。
 """
 
-PRIORITY_NAMES: dict[int, str] = {0: "无", 1: "低", 3: "中", 5: "高"}
+PRIORITY_NAMES: dict[int, str] = _ENGINE_PRIORITY_NAMES
 """优先级四个档位的**用户语言**（GLOSSARY：无 / 低 / 中 / 高）。
 
-与 API 的线上编码 ``0/1/3/5`` 是两套东西——那一套留在 ``dida.sync.view`` 里，这一张表是给
-人看的。表外的取值读作「无」，与 ``priority_mark`` 同一条口径。#45 的挑选器也用这一张表。
+**这一张表不是这个模块的**：它是引擎公开面上的一员，表本体在
+:data:`dida.sync.view.PRIORITY_NAMES`（工单 #58 的 T3 之前，这里与
+``sync/views.py`` 各写了一份同样映射，而这里的名字被注释称作「唯一一张表」）。
+界面只许 import ``dida.sync.engine``，所以它经引擎的公开面到这里；这一行是**转出**
+（同一个对象），不是第二张表——改档位的文案请改那一处。
+
+与 API 的线上编码 ``0/1/3/5`` 是两套东西：那一套在 ``dida.sync.view``（``PRIORITY_CYCLE``）
+里。表外的取值读作「无」，与 ``priority_mark`` 同一条口径。#45 的挑选器按**这里的插入顺序**
+画四档（无 → 低 → 中 → 高），所以次序也是承重的。
 """
 
 FIELD_SAVE_FAILED_PREFIX = "保存失败："
