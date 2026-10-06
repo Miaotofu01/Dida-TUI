@@ -17,11 +17,13 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from rich.cells import cell_len
+from textual.containers import ScrollableContainer
 
 from dida.sync.engine import DidaError
 from dida.testing import FakeBackend, ManualClock
 from dida.tui import theme
-from dida.tui.app import DidaApp
+from dida.tui.app import DidaApp, Stage
+from dida.tui.keys import LAYER_DETAIL, LAYER_INDEX, LAYER_TASKS
 from support import screen_sgr, screen_text
 
 TZ = timezone(timedelta(hours=8))
@@ -355,6 +357,259 @@ async def test_changing_layer_pans_horizontally_and_lands_aligned():
     assert any(offset > 0 for offset in offsets), f"没有一帧是「滑进来」的样子：{offsets}"
     assert len(set(offsets)) > 2, f"中间帧应当是一格一格滑过来的：{offsets}"
     assert heading_column(settled) == 0, "落定之后要正好对齐在最左边"
+
+
+USER_SCROLL_KEYS = (
+    "left",
+    "right",
+    "home",
+    "end",
+    "pageup",
+    "pagedown",
+    "ctrl+pageup",
+    "ctrl+pagedown",
+)
+"""**用户按下去不许推动平移轨道**的那些键。
+
+前六个是工单 #59 点名的；后两个是 Textual 的滚动键表里剩下的两个横向那半边——实测它们同样
+推得动轨道（``page_left`` / ``page_right`` 一次挪一整屏），工单那张表漏了它们。``up`` / ``down``
+不在这里：它们是页面自己的光标键（与 ``j`` / ``k`` 同一条绑定），按下去本该动光标。
+"""
+
+
+async def go_to_layer(pilot, app: DidaApp, layer: int) -> None:
+    """走到第 ``layer`` 层（0 就是开屏那一层）。"""
+    if layer:
+        await enter_work(pilot, app)
+    if layer >= 2:
+        await pilot.press("enter")
+        await pilot.pause()
+
+
+@pytest.mark.parametrize("layer", [0, 1, 2])
+async def test_the_user_scroll_keys_never_push_the_pan_track(layer: int):
+    """``←`` ``→`` ``home`` ``end`` ``pageup`` ``pagedown`` 在三层上**什么都不做**（工单 #59）。
+
+    平移是**程序驱动**的（``show()`` 与 ``on_resize()`` 调 ``scroll_to``），不是用户滚的：
+    轨道是个真能横向滚动的容器，于是继承了 Textual 的滚动键位——一按就挪一格，那条铺满整幅的
+    规则线当场少一格；在第一层按 ``→`` 还会露出下一页的一条边。``home`` 更糟：在详细页按下去
+    视图跳到第一页的位置，而 app 仍然认为你在第三层——屏幕和状态彻底对不上。
+
+    ``←`` / ``→`` 本来就不在 spec 的键位表里（清单层 ``n`` / ``e`` / ``d`` / ``enter``，任务层
+    ``space`` / ``n`` / ``d`` / ``g`` / ``G`` / ``enter``），所以「什么都不做」就是它们该有的样子。
+
+    断的是外部行为：屏幕**逐字节不变**，且轨道停在原处（两层证据缺一不可——只断文本的话，
+    页内自己横向挪一格也算通过）。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await go_to_layer(pilot, app, layer)
+        stage = app.query_one("#stage", Stage)
+        parked = stage.scroll_offset.x
+        assert parked == layer * WIDE[0], f"第 {layer} 层没停在该停的地方（x={parked}）"
+
+        for key in USER_SCROLL_KEYS:
+            before = screen_text(app)
+            await pilot.press(key)
+            await pilot.pause()
+
+            assert stage.scroll_offset.x == parked, (
+                f"第 {layer} 层按 {key}，平移轨道从 {parked} 被推到了 {stage.scroll_offset.x}"
+            )
+            assert screen_text(app) == before, (
+                f"第 {layer} 层按 {key}，屏幕不该有任何变化：\n{screen_text(app)}"
+            )
+
+
+def scroll_bindings() -> dict[str, str]:
+    """Textual **自己那张表**里，每一个滚动键绑到哪个 action（``{'left': 'scroll_left', …}``）。
+
+    键位表不在这里抄第二遍：Textual 加一个新键、或者把某个 action 改名，下面两条守卫立刻
+    变红——而不是等用户又按一下看见页面滑走。
+    """
+    bound: dict[str, str] = {}
+    for binding in ScrollableContainer.BINDINGS:
+        for key in str(binding.key).split(","):
+            bound[key.strip()] = str(binding.action)
+    return bound
+
+
+def test_the_pan_track_neutralises_every_scroll_action_textual_binds():
+    """**复发守卫（形状级）**：Textual 绑到滚动上的每一个 action，这一层都得自己接住。
+
+    只修一次不够——平移轨道是个 ``HorizontalScroll``，谁把它继承来的那一层还回去，用户按
+    ``←`` / ``→`` / ``home`` 就又推得动它。所以这条断言问的不是「今天修好了没有」，而是
+    「Textual 那张表上的每一个滚动 action，``Stage`` 是不是都有自己的空操作」。
+
+    它同时是那个**代价的哨兵**：空操作的名字是 Textual 的 action 名，Textual 哪天改名，几个
+    覆盖会静默失效（继承来的那一个又开始滚）。那时这条断言按**新名字**来找覆盖，当场变红。
+
+    查的是 ``Stage.__dict__``（**类**上），不是实例：实例名字空间里继承来的方法一直都在，
+    查那儿的话这条断言两边都绿，什么也证明不了（同一个坑见下面 ``_animate`` 那条）。
+    """
+    actions = scroll_bindings()
+    assert actions, "Textual 的滚动键表是空的——这条守卫已经没有牙齿了，别再信它"
+
+    missing = sorted(
+        f"{action}（{key}）"
+        for key, action in actions.items()
+        if f"action_{action}" not in Stage.__dict__
+    )
+    assert not missing, (
+        "这些滚动 action 在 Stage 上没有被接住——用户的键又能推动平移轨道了："
+        f"{missing}。若 Textual 改了 action 名，就在 Stage 上按新名字补空操作。"
+    )
+
+
+def test_the_only_scroll_keys_this_file_leaves_alone_are_the_pages_cursor_keys():
+    """``up`` / ``down`` 是**页面自己的光标键**，其余滚动键一个都不许漏。
+
+    每一条守卫都得有个「谁在看这张表」的对账：Textual 哪天往族里加一个新键，这条变红，
+    逼着下一个人去看它是「真的推不动」（那就加进 :data:`USER_SCROLL_KEYS`）还是「另有主人」。
+    """
+    bound = set(scroll_bindings())
+    watched = set(USER_SCROLL_KEYS) | {"up", "down"}
+
+    assert bound == watched, (
+        "Textual 的滚动键表变了："
+        f"新来的 {sorted(bound - watched)} 要么进 USER_SCROLL_KEYS，要么说明它为什么可以例外；"
+        f"走掉的 {sorted(watched - bound)} 从那份名单里删掉。"
+    )
+
+
+@pytest.mark.parametrize("layer", [0, 1, 2])
+async def test_up_and_down_move_the_cursor_and_do_not_push_the_track(layer: int):
+    """``↑`` / ``↓`` 顶多做到 ``k`` / ``j`` 那件事，**一件都不许多**（工单 #59）。
+
+    这两个键不能断「屏幕逐字节不变」：它们在每一页上都绑着 ``cursor_up`` / ``cursor_down``
+    （与 ``k`` / ``j`` 同一条绑定），按下去本来就该动光标。它们那半边风险是**顺带**把轨道
+    也推了——所以比的是「按 ``↓`` 得到的屏幕」与「按 ``j`` 得到的屏幕」：两个 app 从同一份
+    缓存、同一层出发，一个键走两条路，屏幕不一样就说明 ``↓`` 多做了别的事。
+    """
+    async def screen_after(key: str) -> tuple[str, int]:
+        app = DidaApp(backend())
+        async with app.run_test(size=WIDE) as pilot:
+            await pilot.pause()
+            await go_to_layer(pilot, app, layer)
+            await pilot.press(key)
+            await pilot.pause()
+            return screen_text(app), app.query_one("#stage", Stage).scroll_offset.x
+
+    cursor_down, after_down = await screen_after("down")
+    cursor_j, after_j = await screen_after("j")
+    assert cursor_down == cursor_j, f"第 {layer} 层按 down 与按 j 应当是同一件事"
+    assert after_down == after_j == layer * WIDE[0], (
+        f"第 {layer} 层按 down / j 都不该推动平移轨道：{after_down} / {after_j}"
+    )
+
+    cursor_up, after_up = await screen_after("up")
+    cursor_k, after_k = await screen_after("k")
+    assert cursor_up == cursor_k, f"第 {layer} 层按 up 与按 k 应当是同一件事"
+    assert after_up == after_k == layer * WIDE[0], (
+        f"第 {layer} 层按 up / k 都不该推动平移轨道：{after_up} / {after_k}"
+    )
+
+
+LAYER_BODY_ROW = {
+    LAYER_INDEX: ("▪ 收集箱", 2),
+    LAYER_TASKS: (". 写周报", 2),
+    LAYER_DETAIL: ("标题", 2),
+}
+"""每一层正文里**只有这一层有**的那一行，以及它在屏幕上该停在第几格（工单 #59）。
+
+格数是承重的：轨道只要偏一格，整幅正文就跟着偏一格，这三个记号当场不在原来那一格上。行首
+那两格是光标空档（``❯ `` 或两个空格），所以内容从第 2 格起——光标停在哪一行都不影响这个数，
+``esc`` 回去时光标还停在 ``⋮ 工作`` 上也不影响。``写周报`` 单独当记号不行：详细页的面包屑
+里也有它，而顶栏永远齐左，量不出平移。
+"""
+
+
+async def test_every_layer_change_still_parks_the_track_on_that_layer():
+    """``enter`` / ``esc`` 换层照旧把轨道**正好**停在那一页上（工单 #59 的另一半）。
+
+    这条与上面几条是一对：修的是「用户按不动它」，不是「谁也推不动它」——``show()`` 与
+    ``on_resize()`` 必须照旧能滑。两次压栈两次出栈，每一站三个独立的证据：``scroll_offset.x``
+    正好是 ``层号 × 宽度``、细线照旧铺满一百格（偏一格它就只剩九十九格），以及这一页自己的
+    那一行**就在第一格**。
+    """
+    app = DidaApp(backend())
+
+    def check(what: str, layer: str) -> None:
+        """这一站该有的三件证据：app 认为在第几层、轨道停在第几格、屏幕上对不对齐。"""
+        assert app.layer == layer, f"{what}：app 认为自己在 {app.layer} 层，不是 {layer}"
+
+        expected = (LAYER_INDEX, LAYER_TASKS, LAYER_DETAIL).index(layer) * WIDE[0]
+        assert stage.scroll_offset.x == expected, (
+            f"{what}：轨道 x={stage.scroll_offset.x}，应当停在 {expected}"
+        )
+
+        text = screen_text(app)
+        rules = rule_lines(text)
+        assert rules and all(line == theme.RULE * WIDE[0] for line in rules), (
+            f"{what}：轨道没对齐在页边界上，细线不是整幅宽：{[cell_len(line) for line in rules]}"
+        )
+        needle, column = LAYER_BODY_ROW[layer]
+        row = line_with(text, needle)
+        assert row.index(needle) == column, (
+            f"{what}：这一页的正文被推走了——「{needle}」在第 {row.index(needle)} 格，"
+            f"应当在第 {column} 格：{row!r}"
+        )
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        stage = app.query_one("#stage", Stage)
+        stops = []
+
+        def parked(what: str, layer: str) -> None:
+            stops.append(stage.scroll_offset.x)
+            check(what, layer)
+
+        parked("开屏", LAYER_INDEX)
+        await enter_work(pilot, app)  # 0 → 1
+        parked("enter 进任务列表页", LAYER_TASKS)
+        await pilot.press("enter")  # 1 → 2
+        await pilot.pause()
+        parked("enter 进任务详细页", LAYER_DETAIL)
+        await pilot.press("escape")  # 2 → 1
+        await pilot.pause()
+        parked("esc 回任务列表页", LAYER_TASKS)
+        await pilot.press("escape")  # 1 → 0
+        await pilot.pause()
+        parked("esc 回清单列表页", LAYER_INDEX)
+
+    assert stops == [0, 100, 200, 100, 0], f"每一站的停点变了：{stops}"
+
+
+async def test_a_resize_re_parks_the_track_on_the_layer_you_are_on():
+    """窗口缩放之后仍然对齐：``on_resize`` 按**新的**宽度重新停一次（工单 #59 验收 4）。
+
+    停在第二层（x=100），把窗口缩到 61 格——新的停点是 61。中途每一帧都得是「旧的停点」或
+    「新的停点」：``on_resize`` 是 ``animate=False`` 的，出现中间值就是那一下变成了一次乱滑
+    （动效开着时才看得出来，所以这个 app 用 ``animations="on"``）。
+    """
+    app = DidaApp(backend(), animations="on")
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_work(pilot, app)
+        stage = app.query_one("#stage", Stage)
+        assert stage.scroll_offset.x == WIDE[0]
+
+        frames = await sample_while(
+            lambda: pilot.resize_terminal(61, 24), lambda: stage.scroll_offset.x
+        )
+        await pilot.pause()
+
+        assert stage.scroll_offset.x == 61, f"缩放之后没停在新的页边界上：{stage.scroll_offset.x}"
+        assert set(frames) <= {float(WIDE[0]), 61.0}, f"重新对齐的路上出现了中间帧：{sorted(set(frames))}"
+        rules = rule_lines(screen_text(app))
+        assert rules and all(line == theme.RULE * 61 for line in rules), (
+            f"缩放之后细线没按新宽度铺：{[cell_len(line) for line in rules]}"
+        )
+
+    assert frames, "一帧都没采到"
 
 
 async def test_animations_off_switches_layers_in_one_frame():
