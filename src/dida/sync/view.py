@@ -380,12 +380,15 @@ def completed_section(
 
 # ------------------------------------------------------------------ 子任务（t20）
 
-SUBTASK_NORMAL_STATUS = 0
 SUBTASK_COMPLETED_STATUS = 1
-"""子任务的完成状态是**另一对**取值（``api-contracts.md``）：Normal ``0`` / Completed ``1``。
+"""子任务「勾上了」的那个 ``status``（``api-contracts.md``）：Normal ``0`` / Completed ``1``。
 
 不是任务级那一对 ``-1/0/2``：拿 ``status == 1`` 判任务完成是错的，拿 ``status == 2``
-判子任务完成同样是错的。两对取值只在这里相接，别处一律用这两个常量。
+判子任务完成同样是错的。两对取值只在这里相接。
+
+「没勾上」的 ``0`` 不再有自己的常量：写路径（勾选 / 取消勾选）在 #58 里删掉了（spec 的
+「子任务只看不勾」），读这一半只认「是不是 1」，其余取值一律读作没勾上
+（:func:`subtask_completed`，与 ``priority`` 同一口径）。
 """
 
 
