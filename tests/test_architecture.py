@@ -1,4 +1,4 @@
-"""架构不变量：七个模块的边界，TUI 的依赖方向，以及「只用终端 16 色」。
+"""架构不变量：模块的边界，TUI 的依赖方向，以及「只用终端 16 色」。
 
 TUI 的规矩写成**允许表**，不是黑名单：``src/dida/tui/**`` 只许 import ``dida.sync.engine``
 （它唯一的读写入出口）与 ``dida.tui.*`` 自己这一支，``dida`` 命名空间里别的任何东西都算越界。
@@ -69,7 +69,7 @@ COLOUR_WORDS = frozenset(
 CSS 里 ``cyan`` 是 ``#00FFFF``（真彩色）。同一个词两个意思——所以名字只许在一个地方出现。
 """
 
-SEVEN_MODULES = [
+MODULE_WHITELIST = [
     "dida.config",  # 配置与凭据
     "dida.api.client",  # 滴答 API 客户端
     "dida.storage.store",  # 本地存储
@@ -77,6 +77,11 @@ SEVEN_MODULES = [
     "dida.logical_day",  # 逻辑日
     "dida.tui.app",  # TUI
 ]
+"""深模块的**白名单**：每一个都得能 import（``test_module_is_importable``）。
+
+名字里不写数目：v1 的日期解析器（``dida.date_parser``）已由 #34 删除，而它原来叫
+``SEVEN_MODULES``——从此这个名字就在说一句假话（名字说七、内容是六）。这张表本来就是一份
+**清单**，不是一次计数；加一个模块就往这里加一行，名字不用动。"""
 
 ALLOWED_IN_TUI = ("dida.sync.engine", "dida.tui")
 """TUI 的允许表：引擎的公开面，以及它自己这一支（``dida.tui.*``）。
@@ -172,7 +177,7 @@ def _scan_tui() -> tuple[set[str], list[str]]:
     return referenced, offenders
 
 
-@pytest.mark.parametrize("module", SEVEN_MODULES)
+@pytest.mark.parametrize("module", MODULE_WHITELIST)
 def test_module_is_importable(module):
     assert importlib.import_module(module) is not None
 
@@ -427,3 +432,4 @@ def _css_declarations(source: str) -> Iterator[tuple[int, str]]:
             continue  # 不像样式表，别拿它当 CSS 扫
         for match in declaration.finditer(text):
             yield lineno, match.group()
+
