@@ -483,6 +483,33 @@ class DidaApp(App[None]):
         """任务列表页上按了 ``esc``：回清单列表页。"""
         self.back_to_index()
 
+    def on_tasks_page_toggle_complete(self, event: TasksPage.ToggleComplete) -> None:
+        """任务列表页上按了 ``space``：完成 / 取消完成（工单 #38）。
+
+        两个方向都是**乐观写**（ADR-0002）：本地当场生效、立即推送，界面不等网络。
+        ``event.completed`` 是按下那一刻读模型里的状态，所以「取消完成」这条路的判据是
+        服务端的 ``status``，不是这一层记的什么东西。
+
+        引擎当场拒绝（本地已经没有这条任务的底稿，工单 #25）时如实说一句——按下去什么都
+        不发生，用户会以为它成了。**这一条路没有 ``await``**：``complete`` / ``uncomplete``
+        都是同步的（推送排在事件循环上，写的人当场返回），所以写完之后碰 DOM 不需要
+        「先问 ``is_running``」那道守卫；重画与 toast 各自还有一道，见它们的说明。
+        """
+        try:
+            if event.completed:
+                self.engine.uncomplete(event.task_id)
+            else:
+                self.engine.complete(event.task_id)
+        except DidaError as exc:
+            self._write_status(messages.toggle_complete_failed_message(exc))
+            return
+        self.refresh_view()
+        self._notify_step(
+            messages.uncompleted_message(event.title)
+            if event.completed
+            else messages.completed_message(event.title)
+        )
+
     def on_detail_page_back(self, event: DetailPage.Back) -> None:
         """详细页上按了 ``esc``：回任务列表页。"""
         self.back_to_tasks()
@@ -956,6 +983,18 @@ class DidaApp(App[None]):
         if not self.is_running:
             return
         self.notify(message, title="同步失败", severity="error", timeout=6)
+
+    def _notify_step(self, message: str) -> None:
+        """一笔写当场生效的短暂回声（用户故事 43：完成 / 取消完成要有反馈）。
+
+        toast 自己会走（``timeout`` 就是那个「短暂」），所以它不占状态栏那一行——那一行说的是
+        「数据怎么样」（已同步 / 待推送 / 逻辑日，GLOSSARY），不该被一次按键挤掉。推送要是
+        失败了，那条改动留在队列里、状态栏那个「待推送 N」照旧顶上：两句话说的是两件事，
+        都是真的。
+        """
+        if not self.is_running:
+            return
+        self.notify(message, timeout=2)
 
     async def push_tick(self) -> None:
         """推一轮**到点**的待推送改动（工单 #21 的周期泵；也是测试的确定性入口）。

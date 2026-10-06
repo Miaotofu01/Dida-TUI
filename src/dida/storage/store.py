@@ -72,6 +72,15 @@ ChangeKind = WriteKind
 COMPLETED_STATUS = 2
 """任务「已完成」的 ``status`` 值（api-contracts.md：Completed 是 2，不是 1）。"""
 
+UNCOMPLETED_STATUS = 0
+"""任务「未完成」的 ``status`` 值（``0`` 是正常、``-1`` 是已放弃；spec 的「本地判定已完成
+一律看 ``status``」）。
+
+取消完成写回的就是这一档（工单 #38）。**它旁边的完成时间戳不会被清掉**——实测
+（spec 的实测事实第 1 条）取消完成只改 ``status``，所以「还算不算已完成」只认这一个值，
+不认有没有 ``completedTime``。与 :data:`COMPLETED_STATUS` 并排放在这里：同一个 API 事实
+（状态码表）只写一处，调用点一个字面量都不写。
+"""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS lists (

@@ -8,7 +8,8 @@ TUI 读写一切只能走本模块；分组、排序、逾期判定、冲突裁�
 - ``refresh() -> RefreshReport`` —— 写：全量刷新，**async**（:mod:`dida.sync.refresh`；清单索引
   翻页翻到底、远端已经没有的清单与任务顺手剪掉，#41）。
 - ``write(task_id, changes=, kind=)`` —— 写：乐观写，本地当场生效、立即推送（:mod:`dida.sync.push`）。
-- ``complete(task_id)`` / ``delete(task_id)`` —— 写：完成与删除的两个预置（:mod:`dida.sync.push`）。
+- ``complete(task_id)`` / ``uncomplete(task_id)`` / ``delete(task_id)`` —— 写：完成、取消完成
+  与删除的三个预置（:mod:`dida.sync.push`；取消完成走 ``task/batch``，工单 #38）。
 - ``refresh_completed() -> CompletedReport`` —— 写：已完成流，**async**（:mod:`dida.sync.completed`）。
 - ``defer(task_id)`` / ``reschedule(...)`` —— 写：顺延与改期（:mod:`dida.sync.schedule`）。
 - ``create(title, ...)`` —— 写：新建，落在收集箱（:mod:`dida.sync.create`）。
@@ -328,6 +329,14 @@ class Engine(Protocol):
 
     def complete(self, task_id: str) -> None:
         """写：完成并立即推送。"""
+        ...
+
+    def uncomplete(self, task_id: str) -> None:
+        """写：取消完成并立即推送（``space`` 的第二个方向，工单 #38）。
+
+        本地当场把 ``status`` 写回「未完成」那一档（完成时间戳不动），推送走
+        ``task/batch`` 的 ``update``——那是实测确认能生效的唯一一条路。
+        """
         ...
 
     def defer(self, task_id: str, *, days: int = 1) -> None:

@@ -24,6 +24,7 @@ import httpx
 
 from dida.api.errors import (
     AuthError,
+    BatchRejectedError,
     DidaError,
     MalformedResponseError,
     NetworkError,
@@ -32,6 +33,7 @@ from dida.api.errors import (
 from dida.api.guards import (
     guard_writable,
     merge_snapshot,
+    prepare_batch_body,
     prepare_completed_window_body,
     prepare_project_body,
     prepare_write_body,
@@ -107,6 +109,47 @@ class DidaApiClient:
             self._request("POST", f"/open/v1/project/{project_id}", body=body)
         )
         return self._payload_object_or_none(response, endpoint=f"更新清单 {project_id} 的响应")
+
+    async def batch_update(self, updates: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """POST /open/v1/task/batch —— 批量更新（工单 #38：**取消完成的唯一路径**）。
+
+        这条用法官方文档**一字未提**（：551–590 通篇没有 ``status``、也没有 ``delete`` 数组）：
+        实测是批量更新带 ``status: 2`` 能把任务完成、带 ``status: 0`` 能把已完成的任务改回
+        未完成（spec 的实测事实第 1 条）。所以它按「实测确认的用法」写，不写成文档化特性。
+
+        批量更新是**合并语义**：每一条只发 :data:`~dida.api.guards.BATCH_UPDATE_FIELDS`
+        那几个字段，标题 / 描述 / 备注 / 优先级一个都不发——多带一个字段就是拿本地那一份
+        去覆盖服务端，那正是「更新时没带回去的字段会把手机端设置的东西抹掉」的另一半。
+
+        响应里的 ``id2error`` 必须读（见 :meth:`_batch_errors`）：每个任务的失败藏在
+        ``200 OK`` 里。
+        """
+        body = prepare_batch_body({"update": [dict(item) for item in updates]})
+        response = await self._send(self._request("POST", "/open/v1/task/batch", body=body))
+        payload = self._payload_object(response, endpoint="批量更新的响应")
+        self._reject_batch_errors(payload, response)
+        return payload
+
+    @staticmethod
+    def _reject_batch_errors(payload: Mapping[str, Any], response: httpx.Response) -> None:
+        """``id2error`` 非空就是失败，哪怕 HTTP 是 200（openapi :567 的那张码表）。
+
+        ``id2etag`` 不读：它不是结果，只是服务端顺手给的 etag，而且这一层不认识它。
+        """
+        errors = payload.get("id2error")
+        if errors is None or errors == {}:
+            return
+        if not isinstance(errors, Mapping):
+            raise MalformedResponseError(
+                f"批量更新的响应里 id2error 期望一个对象，收到 {type(errors).__name__}",
+                status_code=response.status_code,
+            )
+        listed = "、".join(f"{task_id}: {code}" for task_id, code in errors.items())
+        raise BatchRejectedError(
+            f"批量更新失败了 {len(errors)} 条（服务端返回 HTTP {response.status_code}）：{listed}",
+            errors={str(task_id): str(code) for task_id, code in errors.items()},
+            status_code=response.status_code,
+        )
 
     async def delete_project(self, project_id: str) -> None:
         """DELETE /open/v1/project/{projectId} —— 删清单（工单 #42）。
