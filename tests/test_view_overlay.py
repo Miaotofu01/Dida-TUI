@@ -120,9 +120,11 @@ async def test_n_asks_whether_it_is_a_list_or_a_view_first():
     """``n`` 先问一句「清单还是视图」（验收标准 1）——这两种东西后面完全是两回事。
 
     问完才开表单，而且两张表单的字段不一样：清单是名字 + 颜色，视图是名字 + 条件。
+
+    两张表单分两次会话看：编辑态从 #66 起没有「取消」（ADR-0008 二），``Esc`` 是「交回这一
+    份」，所以没法把一张表单原地收回去、再在同一段会话里开另一张。
     """
-    fake = backend()
-    app = DidaApp(fake)
+    app = DidaApp(backend())
 
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
@@ -135,7 +137,8 @@ async def test_n_asks_whether_it_is_a_list_or_a_view_first():
         await pilot.pause()
         view_form = screen_text(app)
 
-        await pilot.press("escape")
+    app = DidaApp(backend())
+    async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
         await pilot.press("n")
         await pilot.pause()
@@ -148,10 +151,13 @@ async def test_n_asks_whether_it_is_a_list_or_a_view_first():
     assert "颜色" in list_form and "清单范围" not in list_form, "选清单照旧是 #42 那张表单"
 
 
-async def test_escape_on_the_question_writes_nothing_at_all():
-    """在「清单还是视图」那一句上按 ``esc``：什么都不发生（一个字节都不写）。
+async def test_escape_on_the_question_takes_the_default_choice():
+    """在「清单还是视图」那一句上按 ``esc``：交回**第一档**（清单），接着开清单表单（#66）。
 
-    问一句是多一次按键，那一次就得能反悔——否则用户按错 ``n`` 之后只能建点什么才能走开。
+    这一问也是同一张 ``FormOverlay``（``index.py`` 的 ``new_kind_fields``），所以它没有
+    「取消」这道门（ADR-0008 二）：``Esc`` 与 ``Enter`` 一样交回当前那一档，而当前那一档的
+    起点就是「清单」，于是 ``Esc`` 走的是「建清单」那条路。到这一步一个字节都还没写——真正
+    的写入要等清单表单那一份值交回来（名字空着还会被 ``EMPTY_LIST_NAME_MESSAGE`` 挡下）。
     """
     fake = backend()
     app = DidaApp(fake)
@@ -164,9 +170,9 @@ async def test_escape_on_the_question_writes_nothing_at_all():
         await pilot.pause()
         after = screen_text(app)
 
-    assert fake.created_lists == [] and fake.created_views == []
-    assert "名字" not in after and "清单范围" not in after, "两张表单都没开"
-    assert CUSTOM_MARK not in after and LIST_MARK in row_of(after, "工作"), "回到清单列表页"
+    assert fake.created_lists == [] and fake.created_views == [], "还没填名字，谁都还没建"
+    assert "名字" in after and "颜色" in after, "Esc 交回默认那一档（清单），清单表单开着"
+    assert "清单范围" not in after, "开出来的不是视图那张表单"
 
 
 async def test_choosing_list_still_builds_a_list():
@@ -306,8 +312,13 @@ async def test_an_unknown_list_name_is_reported_instead_of_saving_an_empty_view(
     assert "清单范围" in after, "表单还开着，用户可以接着改"
 
 
-async def test_escape_cancels_the_view_form_without_writing_anything():
-    """``esc`` 关掉表单：一个字节都不写（与清单那条同一条口径）。"""
+async def test_escape_saves_the_view_form_just_like_enter():
+    """``esc`` 在视图表单上也是保存：填的那一份落进本地库、索引上多一行（#66 / ADR-0008 二）。
+
+    视图只在本地（ADR-0005：API 没有「保存一组过滤条件」这个接口），所以「写出去」在这一屏
+    就是清单列表页上多出那一行自建视图。这一条原来是
+    ``test_escape_cancels_the_view_form_without_writing_anything``。
+    """
     fake = backend()
     app = DidaApp(fake)
 
@@ -319,9 +330,9 @@ async def test_escape_cancels_the_view_form_without_writing_anything():
         await pilot.pause()
         after = screen_text(app)
 
-    assert fake.created_views == []
-    assert "buzhu" not in after
-    assert CUSTOM_MARK not in after, "清单列表页上一条自建视图都没有"
+    assert [view.name for view in fake.created_views] == ["buzhu"], "Esc 交回那一份，视图建下了"
+    assert CUSTOM_MARK in row_of(after, "buzhu"), "清单列表页上多了一行自建视图"
+    assert "清单范围" not in after, "表单关掉了"
 
 
 # ------------------------------------------------------------------ e：改条件，立刻生效

@@ -15,6 +15,14 @@
 
 浮层是**模态**的：它开着的时候 ``j``/``k`` 到不了下面那一层。所以 ``esc`` 在浮层里是
 「关掉浮层」，不是「退回上一层」——两者不能混。
+
+**``Esc`` 在两个地方是两个意思，这是定下来的，别去「统一」它**（#66 / ADR-0008 二）：
+
+- 编辑器（:class:`FormOverlay`：表单、三个单档挑选器、标签多选、「清单还是视图」那一问）里
+  它是**保存并退出**，**没有「取消」**——与详细页的内联编辑器同一条规矩；
+- 确认框（:class:`ConfirmOverlay`：删除与退出共用）里它仍然是**「没做」**。它问的两件事
+  都不可挽回（API 里没有 undelete、没有回收站；待推送改动只活在本地 DB），默认答案永远是
+  「没做」。一处是「改了什么」，一处是「删掉 / 退出」，所以让了这一步。
 """
 
 from __future__ import annotations
@@ -65,8 +73,12 @@ FORM_QUIT_BINDINGS = [
   「用户有没有选中文字」行事。表单里 Ctrl+C 因此**永远是退出**，代价是没有 Ctrl+C 复制。
 """
 
-FORM_HINT = "Tab 换一格 / 选择框用左右方向键 / Enter 确认 / Esc 取消 / Ctrl+C 退出"
+FORM_HINT = "Tab 换一格 / 选择框用左右方向键 / Enter 或 Esc 保存 / Ctrl+C 退出"
 """表单底部那行提示：写的都是终端一定传得上来的键（spec 的键位表）。
+
+**``Esc`` 与 ``Enter`` 是同一个结果**（保存），所以这一行不再有「取消」那半句——这正是
+#66 改的那件事（ADR-0008 二）。表单里想放弃刚打的字只能自己改回去；这一行提示不该写一个
+按下去不存在的出口。
 
 分隔符用 ASCII 的 ``/``、方向键写「左右方向键」而不是 ``←``/``→``：那两个字是东亚**歧义**
 宽度（rich 量 1 格、CJK 字体下终端可能画 2 格），浮层这一行没有对齐列，但同一条规矩在这里
@@ -302,10 +314,15 @@ class MultiChoiceField(Static):
 
 
 class FormOverlay(ModalScreen[dict[str, str] | None]):
-    """一张表单：字段由调用方给，填完 ``Enter`` 交回 ``{字段名: 值}``。
+    """一张表单：字段由调用方给，``Enter`` / ``Esc`` 交回 ``{字段名: 值}``。
 
-    ``Esc`` 交回 ``None``（取消），**什么都不写**——这一层不认识引擎，也不认识清单，
-    所以「取消」在这里是纯粹的「没发生」；写不写由调用方按 ``None`` 判断。
+    **编辑态没有「取消」**（#66 / ADR-0008 二）：``Esc`` 与 ``Enter`` 是同一个结果——把当前
+    这一份值交出去（:meth:`action_confirm`，:class:`~textual.widgets.Input` 的 ``submit``
+    也送到这里）。这一层不认识引擎、也不认识清单，所以「保存」在这里就是「交回去」；写不写
+    由调用方按那一份值判断。代价是想放弃刚打的字只能自己改回去。
+
+    :class:`ConfirmOverlay` 的 ``Esc`` 是另一个意思（「没做」），那是有意让的一步，理由写在
+    模块文档与那个类上。
 
     字段的顺序就是屏幕上的顺序，第一格自动拿到焦点（打开就能打字）。
     ``Tab`` / ``shift+Tab`` 在字段之间走（Textual 给每一层都绑了这两个键），
@@ -320,7 +337,7 @@ class FormOverlay(ModalScreen[dict[str, str] | None]):
     #47 实测：浮层的键位解析**截断在最后一个浮层控件上**——浮层开着时 ``App.BINDINGS``
     够不着。所以这一层需要的每一个键都必须绑在**它自己**身上，而且要用 Textual 的动作
     命名空间（``"app.quit"`` 那种），写一个裸 ``"quit"`` 会解析到浮层自己身上、没有那个
-    ``action_``、**键被静默吃掉**。这里的确认与取消都是本层的动作，所以是裸名字；
+    ``action_``、**键被静默吃掉**。这里的确认是本层的动作，所以是裸名字；
     :class:`ChoiceField` 的左右键同理。
 
     ### 退出键：``Ctrl+C`` 照旧退出，``q`` 不绑
@@ -341,8 +358,8 @@ class FormOverlay(ModalScreen[dict[str, str] | None]):
     那一半，所以它**必须**写下来——#36 复用这张壳子时，默认就是这一条。
 
     ``q`` **不绑**：表单里 ``q`` 必须是一个字母（清单可以叫 ``quizzes``），而字母属于那一格。
-    表单自己的出口是 ``Esc``（底部那行提示写着它）：``Input`` 的绑定里没有 ``escape``，
-    所以它在输入框拿到焦点时照样到达这一层。
+    表单自己的出口是 ``Esc``（底部那行提示写着它），而 ``Esc`` 从 #66 起是**保存并退出**：
+    ``Input`` 的绑定里没有 ``escape``，所以它在输入框拿到焦点时照样到达这一层。
     """
 
     DEFAULT_CSS = theme.form_css("FormOverlay")
@@ -351,7 +368,7 @@ class FormOverlay(ModalScreen[dict[str, str] | None]):
         # 退出键必须**绑在这一层**：浮层的键位解析截断在最后一个浮层控件上，app 的绑定在
         # 浮层开着时够不着（#47 实测）。表单只取其中不是字母的那些，理由见 FORM_QUIT_BINDINGS。
         *FORM_QUIT_BINDINGS,
-        Binding("escape", "cancel", "取消", show=False),
+        Binding("escape", "confirm", "保存", show=False),
         Binding("enter", "confirm", "确认"),
     ]
 
@@ -392,12 +409,8 @@ class FormOverlay(ModalScreen[dict[str, str] | None]):
         self.action_confirm()
 
     def action_confirm(self) -> None:
-        """``Enter``：交回填好的这一份。"""
+        """``Enter`` / ``Esc``：交回填好的这一份（**没有「取消」**，ADR-0008 二）。"""
         self.dismiss(self.values())
-
-    def action_cancel(self) -> None:
-        """``Esc``：取消，交回 ``None``（一个字节都不写）。"""
-        self.dismiss(None)
 
 QUIT_BINDINGS = [Binding(key, f"app.{QUIT_ACTION}", "退出", show=False) for key in QUIT_KEYS]
 """浮层上的退出键（工单 #47）——转发到 **app 上那一个** :meth:`~dida.tui.app.DidaApp.action_quit`。
@@ -462,6 +475,20 @@ class ConfirmOverlay(ModalScreen[bool]):
     undelete、没有回收站、也没有「已删除」列表，所以删除那一次确认就是全部的防线；
     待推送改动只活在本地库里，退出前问一句才不会让用户以为「按了 q 就等于做完了」。
     ``Esc`` 一律走取消：默认答案永远是「没做」。
+
+    ### ``Esc`` 在这里是例外，而且**必须**例外（#66 / ADR-0008 二）
+
+    从 #66 起编辑态（:class:`FormOverlay`）的 ``Esc`` 是**保存并退出**，这一层却还是
+    「没做」——同一个键两个意思，是有意让的一步，不是漏改。判据是这两层问的事情不同：
+
+    - 编辑器那一边问的是「**改了什么**」：交出去的是一份值，最坏是一次空写（写操作只写
+      变化的那些字段，没动过的字段不会产生一次写）。
+    - 这一边问的是「**删掉 / 退出**」：两件都不可挽回——没有 undelete、没有回收站，待推送
+      改动只活在本地 DB。所以默认答案永远是「没做」，用户必须**主动**按 ``y``。
+
+    **想去「统一」这两个意思之前先读 ADR-0008 第二节**：把 ``Esc`` 改成确认，等于给一件
+    不可挽回的事配一个「顺手按下去就成立」的键，而那正是这一层存在的理由。
+    ``y`` / ``n`` 不受这次改动影响。
     """
 
     DEFAULT_CSS = theme.overlay_css("ConfirmOverlay")
