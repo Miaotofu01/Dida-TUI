@@ -414,9 +414,11 @@ class DidaApp(App[None]):
         page = self._pages()[layer]
         self._write_top()
         self._stage().show(self._layer_index(layer), animate=self._motion and layer != previous)
-        # ``scroll_visible=False``：Textual 交焦点时默认会把那个控件**立刻**滚进可见区，
-        # 而这一页正好是整个舞台（平移就是把它滑过来）——那一下会把动画当场抹平（实测：
-        # 默认交焦点时 ``scroll_x`` 一步到 100，动画一帧都看不到）。
+        # ``scroll_visible=False``：#59 **之前**它是承重的——Textual 交焦点时默认会把那个控件
+        # **立刻**滚进可见区，而这一页正好是整个舞台（平移就是把它滑过来），那一下会把动画
+        # 当场抹平。现在 ``#stage`` 的 ``overflow-x`` 关成了 ``hidden``，横向根本滚不动，
+        # 于是它**已经不是**动画的保障（实测 2×2：闸开着时 ``True`` 照样有 9 帧动画）。
+        # 留着它是第二道保险：闸若被改回 ``scroll``，动画与输入会一起坏。
         page.focus(scroll_visible=False)
         # 切回来时光标不止要「还在那一行」，还要看得见（#34 的验收标准 8）。
         page.scroll_cursor_into_view()
