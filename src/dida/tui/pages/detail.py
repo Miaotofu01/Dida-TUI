@@ -11,18 +11,25 @@ spec 的三层状态机里，任务列表页 ``enter`` 进这一页、``esc`` �
 占好几屏行，于是「第几个字段」与「第几屏行」分家——光标与滚动一律按**屏幕行偏移表**算
 （:meth:`DetailPage._row_lines`，折点用 Textual 自己那个 ``divide_line``）。
 
-可编辑的三个字段是**自由文本**（标题单行、描述与备注多行）；所属清单、截止时间、优先级、
-标签今天只读显示——改它们要打另外三个形状的端点，归 #44（截止）与 #45（清单/优先级/标签）。
+可编辑的三个字段是**自由文本**（标题单行、描述与备注多行）；所属清单、优先级、标签今天只读
+显示——改它们要打另外三个形状的端点，归 #45（清单/优先级/标签）。
+
+**截止时间（#44）是第四种编辑器**：它不是自由文本，而是一个结构化的日期 + 时刻（外加一个
+「全天」开关），因为改它要打的是另一个形状的端点（``POST /task/{id}`` 上的 ``dueDate`` +
+``isAllDay``，见 :mod:`dida.sync.schedule`）。它复用这一页已经摆好的那块编辑区
+（``#detail-edit``）与那条保存行，自己只多两个格子和一个开关——折行、光标、滚动都不动。
 """
 
 from __future__ import annotations
 
 import re
 from dataclasses import dataclass
+from datetime import date, datetime, time, tzinfo
 
 from rich._wrap import divide_line
 from rich.text import Text
 from textual.app import ComposeResult
+from textual.binding import Binding
 from textual.containers import Vertical
 from textual.message import Message
 from textual.widgets import Input, Static, TextArea
@@ -30,6 +37,7 @@ from textual.widgets import Input, Static, TextArea
 from dida.sync.engine import TaskDetail
 from dida.tui import messages, theme
 from dida.tui.keys import LAYER_DETAIL, bindings_for
+from dida.tui.pages import due
 from dida.tui.pages.base import EMPTY_STYLE, CursorPage, Row, empty_row, rule_row
 
 __all__ = ["DetailPage", "Field", "field_line", "fields_of", "read_only_rows", "reminder_text"]
@@ -38,6 +46,67 @@ SUBTASK_DONE_MARK = theme.SUBTASK_DONE_MARK
 SUBTASK_TODO_MARK = theme.SUBTASK_TODO_MARK
 """子任务的两种状态标记（只读显示：v2 不在客户端里勾子任务）。"""
 
+DUE_FIELD_KEY = "due"
+"""「截止」那一行在字段列表里的 key（编辑器按它分派，不按标签文字认）。"""
+
+DUE_WIRE = "dueDate"
+"""截止时间写回服务端的字段名（``Field.wire`` 上的值）。
+
+它是**结构化编辑器**的分派凭据：``action_enter`` 看到这个值就走
+:meth:`DetailPage._begin_due_edit`，不走那个自由文本框。写成服务端的字段名而不是一个
+自造的标记，是因为这一页的字段表说的就是「这一格对应请求体上的哪一个字段」。
+"""
+
+DUE_TOGGLE_KEY = "x"
+"""「全天」开关的键（工单 #44 验收标准 2）。
+
+它**不进** ``keys.py`` 的绑定表：那一张表的守卫（``tests/test_keymap.py``）要求
+「帮助里列出的键 === 真实绑定的键」，而这一页的绑定必须整份从表里来
+（``test_every_page_binds_its_own_layer_from_the_one_table``）。
+
+所以它绑在**那两个格子自己**身上（:class:`DueInput`）：焦点在格子里时 Textual 先看那个
+控件的绑定表，而 ``Input`` 自己那张表里没有 ``x``（它绑的是光标、删除、剪贴板那几组），
+所以这个键到得了这里、也**只**在编辑器里有效。页面自己的绑定表一个字不动。"""
+
+DUE_STEPS = ("date", "time")
+"""截止时间编辑器的两步：先日期、再时刻（验收标准 1）。"""
+
+
+class DueInput(Input):
+    """截止时间编辑器里的一个格子：多一个「全天」开关的键（工单 #44 验收标准 2）。
+
+    绑在控件上而不是页面上（见 :data:`DUE_TOGGLE_KEY`）。动作名**不带前缀**：Textual 拿
+    **拥有这条绑定的那个控件**当默认命名空间，所以 ``toggle_all_day`` 解析到这个格子自己身上
+    ——这也正是它必须在这里有个 ``action_`` 方法的原因（不带前缀而目标没有那个方法时，键会被
+    **静默吃掉**）。``app.`` 前缀在这里**不行**：它解析到的是 ``DidaApp``，而 ``action_``
+    长在页面上（实测：``run_action`` 返回 ``False``，键什么都不做）。
+    """
+
+    BINDINGS = [Binding(DUE_TOGGLE_KEY, "toggle_all_day", "全天", show=False, priority=True)]
+    """``priority=True`` 是**承重**的（实测）。
+
+    普通绑定只在「从焦点往上找」那一趟里被查，而那一趟发生在焦点控件**已经**处理完这个键
+    之后：``Input._on_key`` 见到可打印字符就把它插进去（``event.stop()``），于是用户按下
+    ``x`` 得到的是 ``2026-03-15x``（实测屏幕上的原文）。优先级那一趟在事件被转发给焦点
+    控件**之前**跑，所以这一个键在这里被吃掉、不会变成正文——与 ``#42`` 的 ``Ctrl+C``
+    要用 ``priority=True`` 是同一个道理（少了它，键的含义跟着焦点跑）。
+    """
+
+    def action_toggle_all_day(self) -> None:
+        """把这一下交给这一页（真正的开关状态在 :class:`DetailPage` 上）。
+
+        沿祖先往上找那一页，而不是认 ``self.parent``：这一格被挂在一个 ``Vertical`` 里
+        （与提示行同一块），父节点不是页面（实测：按了 ``x`` 什么都不发生，因为
+        ``isinstance(self.parent, DetailPage)`` 是假）。状态只有一份，就在这里转交，不在
+        控件上再复制一份——复制出来的那一份迟早与页面上那一份说不一样的话。
+        """
+        node = self.parent
+        while node is not None:
+            if isinstance(node, DetailPage):
+                node._toggle_all_day()
+                return
+            node = node.parent
+
 
 @dataclass(frozen=True)
 class Field:
@@ -45,8 +114,9 @@ class Field:
 
     ``key`` 是这一行的身份，也是光标认回来的凭据（后台刷新之后光标要留在同一个字段上）。
     ``wire`` 是写回服务端的字段名：三个自由文本字段各有自己的一个（``title`` /
-    ``content`` / ``desc``——**描述 = content、备注 = desc**，GLOSSARY），``None`` 表示
-    「这一票还不改它」：#44 接截止时间、#45 接清单/优先级/标签那三个挑选型字段。
+    ``content`` / ``desc``——**描述 = content、备注 = desc**，GLOSSARY），截止时间是
+    ``dueDate``（#44：它走 :meth:`DetailPage._begin_due_edit` 那个结构化编辑器，不是自由
+    文本框），``None`` 表示「这一票还不改它」：#45 接清单/优先级/标签那三个挑选型字段。
     **它们扩展这一张表，不重写这一页**：给 ``wire`` 填上值、把 ``action_enter`` 的分派
     接过去就够了（光标、折行、保存行都不必再动）。
     """
@@ -94,25 +164,36 @@ def _free_text(
     )
 
 
+def _due_field(detail: TaskDetail) -> Field:
+    """「截止」那一行：显示照旧，但 ``wire`` 上挂的是**结构化编辑器**（工单 #44 的接缝）。
+
+    ``value`` 与 ``display`` 都还是引擎给的读法（``今天 18:00`` / ``无``）：这一行画什么
+    由读模型说了算，这里只是把「``enter`` 该进哪个编辑器」补上——``#43`` 把这一格留成
+    ``wire=None`` 正是为了这件事。
+    """
+    shown = theme.NO_VALUE if detail.due is None else detail.due_text
+    return Field(
+        DUE_FIELD_KEY,
+        "截止",
+        value=shown,
+        display=shown,
+        style="" if detail.due is not None else EMPTY_STYLE,
+        wire=DUE_WIRE,
+    )
+
+
 def fields_of(detail: TaskDetail) -> tuple[Field, ...]:
     """详情页的字段列表，按 spec 的顺序（标题、描述、备注、所属清单、截止时间、优先级、标签）。
 
-    后四个今天只读显示：改它们要打**另外三个形状**的端点（改期 / 搬运 / 优先级），
-    归 #44（截止）与 #45（清单、优先级、标签）。它们的顺序、标签与光标位置就在这里定下来，
-    那两张工单只把 ``wire`` 与编辑器接上。
+    所属清单、优先级、标签今天只读显示：改它们要打**另外三个形状**的端点（搬运 / 优先级），
+    归 #45。它们的顺序、标签与光标位置就在这里定下来，那张工单只把 ``wire`` 与编辑器接上。
     """
     return (
         _free_text("title", "标题", detail.title, wire="title", multiline=False),
         _free_text("content", "描述", detail.content, wire="content", multiline=True),
         _free_text("desc", "备注", detail.desc, wire="desc", multiline=True),
         Field("list", "清单", value=detail.list_name, display=detail.list_name),
-        Field(
-            "due",
-            "截止",
-            value=theme.NO_VALUE if detail.due is None else detail.due_text,
-            display=theme.NO_VALUE if detail.due is None else detail.due_text,
-            style="" if detail.due is not None else EMPTY_STYLE,
-        ),
+        _due_field(detail),
         Field(
             "priority",
             "优先级",
@@ -300,6 +381,21 @@ class DetailPage(CursorPage):
             self.value = value
             super().__init__()
 
+    class DueChanged(Message):
+        """用户提交了截止时间编辑器：这一刻（或「没有日期」）要写到这条任务上（工单 #44）。
+
+        与 :class:`FieldEdited` 分开，因为它是**另一种形状的写**：不是一个 ``{字段: 文字}``，
+        而是一对 ``{dueDate, isAllDay}``，落点是引擎的 ``reschedule``（只动这两个字段、
+        不碰重复规则、整份底稿照旧回写）。页面照样不认识引擎——它只说清「哪条任务、哪一刻、
+        是不是全天」，``due=None`` 就是清除。
+        """
+
+        def __init__(self, task_id: str, due: datetime | None, all_day: bool) -> None:
+            self.task_id = task_id
+            self.due = due
+            self.all_day = all_day
+            super().__init__()
+
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(id=id)
         self._task_id: str | None = None
@@ -308,12 +404,30 @@ class DetailPage(CursorPage):
         self._editing: Field | None = None
         """正在编辑哪个字段；``None`` = 光标停在字段列表上（这一页的常态）。"""
 
+        self._due_editing = False
+        """截止时间编辑器开着没有（它有自己的两个格子，不是 ``_editing`` 那一档）。"""
+
+        self._due_all_day = False
+        """截止时间编辑器里「全天」那一档（``x`` 切换；提交时决定要不要写时刻）。"""
+
+        self._due_step: str = DUE_STEPS[0]
+        """编辑器走到哪一步了（先日期、再时刻——验收标准 1）。"""
+
+        self._due_prefill = ""
+        """日期那一格进编辑器时回填的值；用户改过它没有，是「还没填」与「要清除」的分界。"""
+
+        self._due_date_touched = False
+        """用户动过日期那一格没有（清空也算动过）。程序化回填不算。"""
+
     def compose(self) -> ComposeResult:
         """正文 + 装饰光标条（页面的那两块），加上这一页自己的两块：底部那一行 + 编辑器。
 
-        编辑器（单行 / 多行两个框）**预先摆好、平时藏着**（``display: none``）：进编辑就是把
-        正文藏起来、把它亮出来，退出反过来。挂载与卸载留到按键那一刻做的话，一次 ``esc``
-        要跨两次布局，用户看到的是闪一下。
+        编辑器（单行 / 多行 / 截止时间那三套）**预先摆好、平时藏着**（``display: none``）：
+        进编辑就是把正文藏起来、把它亮出来，退出反过来。挂载与卸载留到按键那一刻做的话，
+        一次 ``esc`` 要跨两次布局，用户看到的是闪一下。
+
+        截止时间那一套（#44）与自由文本框共用 ``#detail-edit`` 这一块：同一个位置、同一条
+        标签行、同一条保存行——用户看到的「进编辑器」始终是同一件事。
         """
         yield from super().compose()
         yield Static(id="detail-save")
@@ -321,6 +435,10 @@ class DetailPage(CursorPage):
             yield Static(id="detail-edit-label")
             yield Input(id="detail-input")
             yield TextArea(id="detail-text", show_line_numbers=False)
+            with Vertical(id="due-edit"):
+                yield Static(id="due-hint")
+                yield DueInput(id="due-date")
+                yield DueInput(id="due-time")
 
     @property
     def task_id(self) -> str | None:
@@ -338,9 +456,10 @@ class DetailPage(CursorPage):
             self.set_rows((empty_row(self.EMPTY_TEXT),))
             return
         self._fields = fields_of(detail)
-        if self._editing is not None:
-            # 正在编辑时**不重铺**：用户手里那段文字是他的，后台刷新（周期泵）不该把它换掉。
-            # 这一次编辑结束后由 app 再刷新一遍，字段列表拿到的是最新那一份。
+        if self._editing is not None or self._due_editing:
+            # 正在编辑时**不重铺**：用户手里那段文字（或者他正在选的那个日期）是他的，
+            # 后台刷新（周期泵）不该把它换掉。这一次编辑结束后由 app 再刷新一遍，字段列表
+            # 拿到的是最新那一份。
             return
         # 换了一条任务就从**标题**开始（前一条任务停在第几个字段与这一条无关）；同一条任务
         # 再铺一遍（后台刷新回来）则按行 id 认回原来那个字段。
@@ -393,14 +512,18 @@ class DetailPage(CursorPage):
     def action_enter(self) -> None:
         """``enter``：进当前字段的编辑（验收标准 3）。
 
-        只有三个自由文本字段有编辑器（:attr:`Field.wire`）；截止时间与那三个挑选型字段今天
-        什么都不做——**接缝留给 #44 / #45**：它们给 ``Field.wire`` 填上值、在这里接一个编辑
-        器，光标、折行、保存行都不必再动。编辑态下这个键归编辑器自己（多行框里它是换行）。
+        三个自由文本字段进那个文本框；截止时间（#44）进**结构化**编辑器——先日期、再时刻
+        （验收标准 1）。所属清单、优先级、标签今天什么都不做——**接缝留给 #45**：它给
+        ``Field.wire`` 填上值、在这里接一个挑选器，光标、折行、保存行都不必再动。
+        编辑态下这个键归编辑器自己（多行框里它是换行）。
         """
-        if self._editing is not None:
+        if self._editing is not None or self._due_editing:
             return
         field = self._current_field()
         if field is None or field.wire is None:
+            return
+        if field.key == DUE_FIELD_KEY and self._detail is not None:
+            self._begin_due_edit(self._detail)
             return
         self._begin_edit(field)
 
@@ -435,6 +558,143 @@ class DetailPage(CursorPage):
         self._bar().styles.visibility = "hidden"
         self.query_one("#detail-edit").styles.display = "block"
 
+    # ---------------------------------------------------------------- 截止时间（#44）
+
+    def _begin_due_edit(self, detail: TaskDetail) -> None:
+        """把正文藏起来、亮出截止时间那两格，光标交给日期（验收标准 1）。
+
+        两格**回填当前那一刻**：用户看着 ``2026-03-14`` / ``18:00`` 改，而不是对着一片空白
+        猜格式。回填的是这条任务当前截止时间在他墙上那一刻（引擎给的 ``due`` 自带时区），
+        所以「只改时刻那一位」是可能的。
+        """
+        self._due_editing = True
+        self._due_all_day = detail.all_day
+        self._due_step = DUE_STEPS[0]
+        self._due_date_touched = False
+        self.query_one("#detail-input", Input).display = False
+        self.query_one("#detail-text", TextArea).display = False
+        self.query_one("#due-edit").display = True
+        date_input = self.query_one("#due-date", Input)
+        time_input = self.query_one("#due-time", Input)
+        self._due_prefill = "" if detail.due is None else detail.due.strftime(due.DATE_FORMAT)
+        date_input.value = self._due_prefill
+        time_input.value = "" if detail.due is None else due.format_time_input(detail.due.time())
+        time_input.display = not self._due_all_day
+        self._body().styles.display = "none"
+        self._bar().styles.visibility = "hidden"
+        self.query_one("#detail-edit").styles.display = "block"
+        self._show_due_step()
+        date_input.focus()
+
+    def _show_due_step(self) -> None:
+        """把「现在在第几步」画出来（验收标准 1 的「先日期、再时刻」要看得见）。
+
+        这一行同时是那个**全天开关**的读数（验收标准 2）：它画出 ``[x]`` / ``[ ]``，
+        用户按 ``x`` 能看见它翻。整行都是 ASCII 与汉字，没有一个歧义宽度的字形——它要
+        与日期、时刻排在一起，宽度含糊就会把后面几格推歪。
+        """
+        if self._due_step == DUE_STEPS[0]:
+            step = f"第 1 步：日期（{messages.DUE_DATE_FORMAT_HINT}）"
+        else:
+            step = f"第 2 步：时刻（{messages.DUE_TIME_FORMAT_HINT}，留空 = 只有日期）"
+        self.query_one("#detail-edit-label", Static).update(
+            theme.styled("改截止", theme.HEADING)
+        )
+        self.query_one("#due-hint", Static).update(
+            theme.styled(
+                f"{step}  {messages.all_day_toggle_text(self._due_all_day)}（x 切换）", theme.MUTED
+            )
+        )
+
+    def _typed_day(self) -> date | None:
+        """日期那一格敲进去的那一天；**空着给 ``None``**（还没填 / 要清除），不认就抛。
+
+        空串不交给 :func:`~dida.tui.pages.due.parse_date`：那里对空串也说「不是一个日期」，
+        而这一页要把「空着」与「写错了」分开——前者是用户按早了或者要清除，后者才是敲错了。
+        """
+        typed = self.query_one("#due-date", Input).value
+        return None if not typed.strip() else due.parse_date(typed)
+
+    def _zone_hint(self) -> tzinfo | None:
+        """任务没有截止时间时，用哪一个时区理解用户敲的墙钟。
+
+        有截止时间时不需要它——那一刻自己带着 offset（``due.due_change`` 的 ``reference``）。
+        没有的时候只能给一个本地时区：文档对 ``timeZone`` 字段写错会怎样一个字都没写
+        （api-shapes §D17），所以这里**不**把那个名字换算成 offset（那要一整个 tzdata，
+        而算错正是静默位移）。给不出来（``None``）就让 ``datetime`` 是 naive 的——
+        ``guards.api_date`` 会当场拒绝，而不是替它猜一个。
+        """
+        return datetime.now().astimezone().tzinfo
+
+    def _submit_due(self) -> None:
+        """``enter``：日期那一格提交 → 走到时刻；时刻那一格提交 → 这一次改动出去。
+
+        日期那一格**一个字都没敲过**时在这里被拦下：它是「还没填」还是「要清除」在请求体里
+        长得一样（``dueDate: null``），而误按一次就把日期删掉是不可接受的（本地当场生效、
+        立刻推送）。所以「清除」要求用户真的**改过**那一格——把里面的日期删掉，那是他的
+        明确动作；而一片从来没被碰过的空白只是「还没填」。
+        """
+        try:
+            day = self._typed_day()
+            at = due.parse_time(self.query_one("#due-time", Input).value)
+        except ValueError as exc:
+            self.show_save(messages.due_invalid_message(exc))
+            return
+        if day is None and not self._due_date_touched:
+            self.show_save(messages.due_invalid_message("日期那一格还是空的"))
+            return
+        if day is not None and self._due_step == DUE_STEPS[0] and not self._due_all_day:
+            self._due_step = DUE_STEPS[1]
+            self._show_due_step()
+            self.query_one("#due-time", Input).focus()
+            return
+        entry = due.DueInput(day=day, at=at, all_day=self._due_all_day)
+        reference = None if self._detail is None else self._detail.due
+        self._finish_due_edit(due.due_change(entry, reference=reference, tz=self._zone_hint()))
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        """日期那一格**被用户改过**（清空也算）。
+
+        这是「还没填」与「要清除」之间唯一的分界：两个在请求体里长得一样，所以只能由
+        「用户动过这一格没有」来回答。``Input.Changed`` 在程序化回填时也发（Textual 的行为），
+        所以比对的是回填那一刻的值——回填自己不算「动过」。
+        """
+        if event.input.id == "due-date" and event.value != self._due_prefill:
+            self._due_date_touched = True
+
+    def _finish_due_edit(self, landed: datetime | None) -> None:
+        """收起编辑器并把这一刻交给 app（``DueChanged``）；``landed=None`` 就是清除。"""
+        task_id = self._task_id
+        all_day = self._due_all_day
+        self._due_editing = False
+        self._due_step = DUE_STEPS[0]
+        self._end_edit()
+        if task_id is None:
+            return
+        self.post_message(self.DueChanged(task_id, landed, all_day))
+
+    def _cancel_due_edit(self) -> None:
+        """``esc``：**这次编辑没有提交**，收起编辑器回到字段列表。
+
+        与自由文本字段那条路不同（那里 ``esc`` 是「改动已经生效」）：截止时间是一个两步的
+        选择，中途退出的语义只能是「没改」。已经提交的那一次不走这里——它提交完就收起来了。
+        """
+        self._due_editing = False
+        self._due_step = DUE_STEPS[0]
+        self._end_edit()
+
+    def _toggle_all_day(self) -> None:
+        """``x``：在「有具体时刻」与「只有日期」之间切换（验收标准 2）。
+
+        由 :class:`DueInput` 上那一条绑定调（它把这一下委托过来），所以只有焦点在那两个格子
+        里时它才到得了这里——编辑器收起之后这个动作在屏幕上没有入口。
+        """
+        if not self._due_editing:
+            return
+        self._due_all_day = not self._due_all_day
+        self.query_one("#due-time", Input).display = not self._due_all_day
+        self._show_due_step()
+
     def _editor_value(self) -> str:
         """编辑器里当前那段文字。"""
         field = self._editing
@@ -443,10 +703,15 @@ class DetailPage(CursorPage):
         return self.query_one("#detail-input", Input).value
 
     def _end_edit(self) -> None:
-        """收起编辑器，把这一页还给字段列表。"""
-        if self._editing is None:
-            return
+        """收起编辑器，把这一页还给字段列表（三套编辑器共用这一条退出）。
+
+        **幂等**：三套编辑器的退出路径都调它（自由文本框结束编辑、截止时间提交或取消），
+        而其中两条可能连着来（提交之后 ``_finish_due_edit`` 立刻收起、接着 app 又刷一次）。
+        没有编辑态时它只是把已经藏着的两块再藏一次——不报错，也不多做一件事。
+        """
         self._editing = None
+        self._due_editing = False
+        self.query_one("#due-edit").display = False
         self.query_one("#detail-edit").styles.display = "none"
         self._body().styles.display = "block"
         self._redraw()
@@ -470,12 +735,27 @@ class DetailPage(CursorPage):
         self.post_message(self.FieldEdited(self._task_id, field.wire or field.key, value))
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        """单行输入里按 ``enter`` ＝ 提交（键位表：``enter`` 是「进入下一层 / 提交输入」）。"""
+        """单行输入里按 ``enter`` ＝ 提交（键位表：``enter`` 是「进入下一层 / 提交输入」）。
+
+        截止时间那两格（#44）与自由文本框走同一条：日期那一格提交就轮到时刻，时刻那一格
+        提交就把这一刻写出去（``#detail-input`` 那一路仍然是「结束这次编辑」）。
+        """
+        if self._due_editing:
+            self._submit_due()
+            return
         if self._editing is not None and not self._editing.multiline:
             self._finish_edit()
 
     def action_back(self) -> None:
-        """``esc``：编辑中结束这次编辑，字段列表上退回任务列表页（验收标准 4 + 5）。"""
+        """``esc``：编辑中结束这次编辑，字段列表上退回任务列表页（验收标准 4 + 5）。
+
+        截止时间编辑器（#44）是第三种：它**没有提交就退出**——那是一个两步的选择，中途
+        退出只能是「没改」（自由文本框那条路上 ``esc`` 是「改动已经生效」，因为那里只有
+        一步）。
+        """
+        if self._due_editing:
+            self._cancel_due_edit()
+            return
         if self._editing is not None:
             self._finish_edit()
             return
