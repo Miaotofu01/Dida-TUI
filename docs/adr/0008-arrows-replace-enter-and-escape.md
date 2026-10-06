@@ -23,12 +23,17 @@ v2 的键位一直是「`enter` 向下、`esc` 向上」（[ADR-0004](0004-termi
   > ——至少在两张**改**表单（改清单 / 改视图）上不是。`esc` 保存时表单把整份值原样交回去，而
   > `update_list` / `update_view` 拿起来就写，不比当前值。实测（integration 工作树，清单列表页，
   > `e` → `esc`，一个字段都没动）：`updated_lists == [("work", "工作", None)]`——一次真的入队
-  > 加一轮推送；视图那一半是同一天发生在本地库上的一次重写。**#66 补上了这一层判断之后它才是
-  > 真的**：判据只有一份（`sync/lists.py` 的 `is_list_edit` 与 `sync/views.py` 的 `is_view_edit`），
-  > 引擎与界面两个时刻各问一次（与 `is_a_move` 同一个形状）。随之作废的还有上面最后那半句：
-  > 没动过的表单现在落地的不是「一次空写」，而是**什么都不落**。详细页内联编辑器
-  > （`DetailPage._finish_edit` 里的同值收敛）与三个挑选器（`app._apply_pick`）当时就是真的，
-  > 不在这次更正的范围里。
+  > 加一轮推送；视图那一半是同一天发生在本地库上的一次重写。**#66 给这两张表单补上了这一层
+  > 判断**：判据只有一份（`sync/lists.py` 的 `is_list_edit` 与 `sync/views.py` 的 `is_view_edit`），
+  > 引擎与界面两个时刻各问一次（与 `is_a_move` 同一个形状）；上面最后那半句因此对**这两张表单**
+  > 作废——没动过的表单现在落地的不是「一次空写」，而是**什么都不落**。
+  >
+  > **这句缓解话到今天仍然不是普遍成立的**，别把它读成「全程序都没有空写」：详细页的**截止
+  > 编辑器**什么都没改就提交，照样产生一笔写（`DetailPage._submit_due` → `_commit_due` →
+  > `engine.reschedule`，`reschedule` 与 `write` 都不做同值收敛；实测：在详细页把光标走到
+  > 「截止」上，连按三次 `enter`（进编辑器 → 日期步 → 时刻步提交），`rescheduled == ["t1"]`）。
+  > 它属于哪张票要另定，不在 #66 的射程里。当时就是真的只有两处：详细页**自由文本框**那条
+  > （`DetailPage._finish_edit` 里的同值收敛）与三个挑选器（`app._apply_pick`）。
 - **会红的测试有六条**，名字全是「escape cancels … without writing anything」：`tests/test_list_overlay.py:134`、`tests/test_create_task.py:183`、`tests/test_picker_fields.py:395` 与 `:642`、`tests/test_view_overlay.py:151` 与 `:309`。
 - 文本框里 `enter` **保留**为同一个结果（`Input` 原生把它绑给 `submit`，`FormOverlay.on_input_submitted` 收的正是它）：两个键同一个结果，不去改输入框。
 
