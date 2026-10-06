@@ -296,12 +296,29 @@ def order_key(snapshot: TaskSnapshot, *, today: date, day_end: str) -> tuple:
     逾期置顶 → 截止时间升序 → 优先级降序 → 没有截止时间的靠后 → 已完成的沉底；
     末尾再按标题与 id 断开剩下的平局，所以结果是**确定的**（同一份输入不会两次不同）。
 
+    **已完成那一档内部也走这条链**（工单 #64）：沉底之后仍按「有没有截止时间 → 截止时间
+    升序 → 优先级降序 → 标题 → id」排，与真实清单已完成段的
+    :func:`dida.sync.rows.row_sort_key` 逐位相同——同一个已完成集合在视图里与在清单里不会
+    排成两个样子（用户故事 155/156）。**这个 ``due is None`` 位是必需的**，与那边同一条
+    理由：直接拿 ``None`` 去比 ``datetime`` 会抛 ``TypeError``。
+
+    三个档位的第一位互不相同（逾期 ``0`` / 未逾期 ``1`` / 无日期 ``2`` / 已完成 ``3``），
+    而已完成那一档多一位，所以元组长度并不齐——**不会**跨档比到长度差：第一位不等就在那里
+    短路了，跨档比较只发生在第一位上。
+
     ``due_day``（逻辑日）而不是裸的时刻，是「逾期置顶」与「截止时间升序」真正分开的地方：
     ``day_end = "04:00"`` 时当天 03:00 属于**昨天**，它逾期、要置顶，而它的时刻又比当天
     00:00 那个全天标记更晚——只按时刻升序会把它排到那条全天任务后面。
     """
     if snapshot.completed:
-        return (3, 0.0, -snapshot.priority, snapshot.title, snapshot.id)
+        return (
+            3,
+            snapshot.due is None,
+            snapshot.due,
+            -snapshot.priority,
+            snapshot.title,
+            snapshot.id,
+        )
     if snapshot.due is None:
         return (2, 0.0, -snapshot.priority, snapshot.title, snapshot.id)
     rank = 0 if is_overdue(snapshot, today=today, day_end=day_end) else 1
