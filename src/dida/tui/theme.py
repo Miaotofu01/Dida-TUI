@@ -82,6 +82,7 @@ __all__ = [
     "SUBTASK_DONE_MARK",
     "SUBTASK_TODO_MARK",
     "SURFACE",
+    "TODO_MARK",
     "WORDMARK_ICON",
     "animations_enabled",
     "animations_setting",
@@ -275,6 +276,15 @@ U+2691，东亚宽度中性、rich 量 1 格。提醒只读（v2 不改它），
 SUBTASK_DONE_MARK = "☑"
 SUBTASK_TODO_MARK = "☐"
 """子任务的两种状态标记（只读显示：v2 不在客户端里勾子任务）。"""
+
+TODO_MARK = SUBTASK_TODO_MARK
+"""未完成的任务行首那一列（工单 #63）：列表行从此只表示「做完没有」，不再兼职优先级。
+
+与 :data:`CHECK_OFF` / :data:`SUBTASK_TODO_MARK` 是**同一个字符串**，不是第二份常量——
+宽度守卫（:data:`STRUCTURAL_GLYPHS`）只认那一份。取第二个名字的理由与 :data:`CHECK_OFF`
+一样：读任务行的人不该在代码里看到 ``SUBTASK_``（那说的是子任务）。已完成的那个名字是
+现成的 :data:`DONE_MARK`。
+"""
 
 CHECK_ON = SUBTASK_DONE_MARK
 CHECK_OFF = SUBTASK_TODO_MARK

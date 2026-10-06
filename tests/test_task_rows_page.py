@@ -129,8 +129,11 @@ async def test_the_overdue_row_is_red_and_the_others_are_not():
     assert RED not in sgr_parameters(today), f"今天到期的被标红了：{today!r}"
 
 
-async def test_a_row_reads_its_priority_mark_its_due_and_its_tags_on_screen():
-    """屏幕上真读得到：优先级标记、标题、人类可读的截止时间、标签（验收标准 1）。"""
+async def test_a_row_reads_its_checkbox_its_due_and_its_tags_on_screen():
+    """屏幕上真读得到：勾选框、标题、人类可读的截止时间、标签（工单 #63 验收标准 1、3）。
+
+    这一条带的是**高优先级**（``!``）：列表行从此只表示「做完没有」，优先级字形一个都不出现。
+    """
     fake = backend()
     fake.add_task("交季度报告", list_name="work", id="t9", due=at(14, 20, 0), priority=5, tags=("周报",))
     app = DidaApp(fake)
@@ -141,9 +144,47 @@ async def test_a_row_reads_its_priority_mark_its_due_and_its_tags_on_screen():
         text = screen_text(app)
 
     row = line_with(text, "交季度报告")
-    assert row.lstrip().startswith(f"{theme.CURSOR_MARK} ! 交季度报告") or "! 交季度报告" in row
+    assert f"{theme.TODO_MARK} 交季度报告" in row, f"未完成的行首该是 {theme.TODO_MARK}：{row!r}"
+    assert "!" not in row, f"列表行里不该再出现高优先级字形：{row!r}"
     assert row.rstrip().endswith("今天 20:00"), f"截止时间要读成人类可读的样子：{row!r}"
     assert "#周报" in row
+
+
+async def test_space_flips_the_leading_checkbox_between_the_two_states():
+    """``space`` 完成 / 取消完成：行首那一列真的在两态之间翻（工单 #63 验收标准 2）。
+
+    这一条从**已完成**那一条起步（``backend()`` 的 t4 带着完成时刻），两个方向都看：
+    ``☑`` → 按一下 → 未完成段里的 ``☐``；再按一下 → 回到已完成段里的 ``☑``。
+
+    为什么必须从「本来就有完成时刻」的那一条起步，写在 ``completed_section`` 的 docstring 里：
+    本地刚按了完成、服务端还没认过的任务**不会**出现在已完成段（那里只认服务端的完成时刻），
+    所以刚做的那一条会先离开屏幕、等下一次已完成流带回来——两个方向都看得见的只有这一条。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_work(pilot, app)
+        for _ in range(20):  # 已完成的那一条沉在列表最底：光标一路走到它上面
+            if app.tasks_page().selected_id == "t4":
+                break
+            await pilot.press("j")
+        assert app.tasks_page().selected_id == "t4", "光标走不到已完成的行上"
+        assert f"{theme.DONE_MARK} 已经做完的" in line_with(screen_text(app), "已经做完的")
+
+        await pilot.press("space")  # 取消完成
+        await pilot.pause(0.2)
+        back = line_with(screen_text(app), "已经做完的")
+        assert f"{theme.TODO_MARK} 已经做完的" in back, f"取消完成之后该是 {theme.TODO_MARK}：{back!r}"
+        assert f"{theme.DONE_MARK} 已经做完的" not in back, back
+
+        assert app.tasks_page().selected_id == "t4", "翻过来之后光标还得在这一条上"
+        await pilot.press("space")  # 再完成
+        await pilot.pause(0.2)
+        done = line_with(screen_text(app), "已经做完的")
+
+    assert f"{theme.DONE_MARK} 已经做完的" in done, f"再完成之后该是 {theme.DONE_MARK}：{done!r}"
+    assert f"{theme.TODO_MARK} 已经做完的" not in done, done
 
 
 async def test_a_row_without_a_due_date_does_not_look_like_one_due_today():
