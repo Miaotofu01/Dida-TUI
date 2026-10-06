@@ -94,6 +94,7 @@ from dida.sync.read import (
 from dida.sync.refresh import ProjectReader, RefreshMixin, RefreshTarget
 from dida.sync.schedule import ScheduleMixin
 from dida.sync.subtasks import SubtaskMixin, SubtaskWrite, TaskReader
+from dida.sync.tags import TagMixin, TagReader
 from dida.sync.view import (
     INBOX_ID,
     NO_DUE_TEXT,
@@ -174,6 +175,7 @@ __all__ = [
     "TaskList",
     "TaskReader",
     "ProjectWriter",
+    "TagReader",
     "TaskSnapshot",
     "TodayView",
     "UnknownListError",
@@ -273,8 +275,24 @@ class Engine(Protocol):
         """读：某个容器的任务列表（一个清单，或一个视图）。"""
         ...
 
+    def move_targets(self) -> tuple[ListRow, ...]:
+        """读：能把任务搬进去的那些清单（工单 #45 的挑选器只给这一份）。
+
+        真实清单、进得去、**而且服务端已经见过它**——三条判据写在
+        :meth:`SyncEngine.move_targets` 上。
+        """
+        ...
+
     def task_detail(self, task_id: str) -> TaskDetail | None:
         """读：单条任务的详情；本地没有这条任务时 ``None``。"""
+        ...
+
+    def tags(self) -> tuple[str, ...]:
+        """读：现在能挑的那些标签名（服务端给过的那一份 ∪ 本地任务上出现过的，#45）。"""
+        ...
+
+    async def load_tags(self) -> tuple[str, ...]:
+        """读：拉一次标签列表（``GET /open/v1/tag``）——**要 await**（#45）。"""
         ...
 
     async def refresh(self) -> RefreshReport:
@@ -318,6 +336,10 @@ class Engine(Protocol):
 
     def delete(self, task_id: str) -> None:
         """写：删除一条任务（服务端没有撤销，t16）。"""
+        ...
+
+    def move_task(self, task_id: str, *, to_list_id: str) -> None:
+        """写：把这条任务搬到另一个清单——走**搬运端点**，不是普通字段更新（#45）。"""
         ...
 
     def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> None:
@@ -377,6 +399,7 @@ class SyncEngine(
     CreateMixin,
     PriorityMixin,
     SubtaskMixin,
+    TagMixin,
 ):
     """通用客户端的数据与写入入口（组装各片；读路径在本模块）。
 
@@ -391,7 +414,7 @@ class SyncEngine(
         clock: Clock,
         day_end: str = DEFAULT_DAY_END,
         source: ViewSource | None = None,
-        client: ProjectReader | TaskWriter | CompletedReader | None = None,
+        client: ProjectReader | TaskWriter | CompletedReader | TagReader | None = None,
         completed_window_hours: int = DEFAULT_COMPLETED_WINDOW_HOURS,
         push_on_change: bool = True,
     ) -> None:
@@ -400,6 +423,8 @@ class SyncEngine(
         self._source = source
         self._client = client
         self._completed_window_hours = completed_window_hours
+        # 标签列表：用户打开挑标签那一格时拉一次，只活在内存里（见 dida.sync.tags 的模块文档）。
+        self._tags: tuple[str, ...] = ()
         # 「界面上的改动立即推送」（配置键 push_on_change，spec 的配置 schema）。关掉它只是
         # 不排那一轮**立刻**的推送：改动照样入队、照样在本地生效，等下一次 push_pending
         # （手动同步 r，或 t21 的周期泵）再出去。默认开着，ADR-0002 要的就是立刻推。
@@ -488,6 +513,42 @@ class SyncEngine(
             names,
             now=self._clock.now(),
             day_end=self._day_end,
+        )
+
+    def move_targets(self) -> tuple[ListRow, ...]:
+        """读：能把任务搬进去的那些清单（工单 #45 的挑选器只给这一份）。
+
+        三条判据缺一不可：
+
+        - **是真实清单**（``ListKind.LIST``）：内置视图与自定义视图不是清单，搬不进去。
+        - **进得去**（:attr:`~dida.sync.read.ListRow.enterable`）：``kind`` 是 ``NOTE`` 的
+          装不了任务、没有写权限的改不动（用户故事 23 / 24）——搬进去只会被服务端拒掉。
+        - **服务端已经见过它**：本地刚建、还没推上去的那一行 id 是**本地临时的**
+          （``local-list-N``），拿它当 ``toProjectId`` 会 404，而那条改动**永远推不出去**
+          ——状态栏那个数从此一直非零（#53/#54 是同一类）。判据是队列里还有没有这一行的
+          ``CREATE``，不是 id 长什么样。
+        """
+        unseen = self._unseen_list_ids()
+        return tuple(
+            row
+            for row in self.list_index()
+            if row.kind is ListKind.LIST and row.enterable and row.id not in unseen
+        )
+
+    def _unseen_list_ids(self) -> frozenset[str]:
+        """服务端还没见过的清单 id（本地还有一笔没推成功的 ``CREATE``）。
+
+        读的是一条**已经记下来的事实**（``Store.pending_lists`` 那张队列表），不是 id 的
+        形状。只读替身没有队列，于是没有这个信息——与写路径上那几个 ``isinstance`` 门
+        同一条口径：不知道就说不知道，不猜一个。
+        """
+        source = self._source
+        if not isinstance(source, ListWriteTarget):
+            return frozenset()
+        return frozenset(
+            change.list_id
+            for change in source.pending_lists()
+            if change.kind is ListWriteKind.CREATE
         )
 
     def _view_rows(self) -> tuple[ViewRow, ...]:

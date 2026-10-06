@@ -145,6 +145,68 @@ def field_save_failed_message(reason: object) -> str:
     return f"{FIELD_SAVE_FAILED_PREFIX}{reason}"
 
 
+NO_CHOICES_TEXT = "（没有可选项）"
+"""多选那一格一个可挑的都没有时画的那一句（工单 #45）。
+
+它不是「空状态」，而是**事实**：这个客户端不做新建标签（见
+:data:`TAGS_PICKER_HINT`），所以一个标签都没有时这一格确实是空的——用户要看到的是
+「一个都没有」加上「去哪儿能建」，而不是一片什么都没有的黑。
+"""
+
+TAGS_PICKER_HINT = (
+    "空格 打上或取消 / 上下方向键 换一个 / Enter 确认 / Esc 取消 / Ctrl+C 退出\n"
+    "这个客户端不做新建标签：要打一个还没有的标签，请回官方客户端建。\n"
+    "删除标签的接口官方文档里没有，所以这里也删不掉。"
+)
+"""挑标签那一格的底部提示（工单 #45，验收标准 6）——**这一票最要紧的一行字**。
+
+措辞里那两件事，一件是范围决定、一件是接口事实，**不许混**：
+
+- **新建标签**：``POST /open/v1/tag`` 是文档里**有**的端点（``openapi-dida365.md:1612–1654``，
+  ``name`` 与 ``label`` 都必填、小写、且 ``label`` 必须等于小写后的 ``name``，``:1620–1621``）。
+  所以「不能新建」是**这个客户端**的范围决定（spec 的 Out of Scope :306），不是接口做不到。
+  写成「API 没有这个能力」就是对用户说假话——那句话会被一个真去查文档的人当场戳穿。
+- **删除标签**：``:1576–1654`` 整节只有 ``GET`` 与 ``POST``，没有 update、没有 delete。
+  这一半是接口真的没有（用户故事 113 要的就是这句如实告知）。
+
+``空格``/``上下方向键`` 而不是 ``⎵``/``↑↓``：后两个是东亚**歧义**宽度（rich 量 1 格、CJK
+字体下终端可能画 2 格），而这块浮层是 ``width: auto``——宽度正由最宽那行算出来（#48 在
+帮助正文上立的同一条规矩）。
+"""
+
+
+def hidden_choices_message(hidden: int) -> str:
+    """多选那一格没画出来的那几个（工单 #45）：说个数，**不静默地藏**。
+
+    选项多于 :data:`~dida.tui.theme.PICKER_VISIBLE_ROWS` 时只画光标周围那一段；被藏起来的
+    那几个照样走得过去（光标会把它带进窗口），但用户得知道「下面还有」。
+    """
+    return f"还有 {hidden} 个未显示"
+
+
+def tags_load_failed_message(error: object) -> str:
+    """标签列表没拉到（工单 #45）时的那一句：挑标签那一格照旧开出来，这一句写在它的提示里。
+
+    与 :func:`field_save_failed_message` 同一条口径：后面跟的是**具体**那一句（断网、凭据
+    失效、服务端拒绝），不是一个笼统的「失败」。
+
+    **为什么写在浮层里而不是状态栏上**：浮层是模态的，用户的眼睛在它身上——状态栏那一行
+    在浮层底下（实测：模态开着时 ``screen_text`` 只画得出浮层自己）。而且这一句说的正是
+    「你现在看到的这一份是什么」，写在被说的那份名单旁边才对得上。
+
+    后半句是**必须**的：不说清「这一份是本地的」，用户会以为自己一个标签都没有。
+    """
+    return f"标签列表没拉到：{error}（下面这一份是本地已经见过的）"
+
+
+def tags_picker_hint(notice: str = "") -> str:
+    """挑标签那一格的底部提示；``notice`` 是这一次没拉到名单时那一句，放在最前面。
+
+    默认那一份是 :data:`TAGS_PICKER_HINT`（键位 + 那两条如实告知）。
+    """
+    return f"{notice}\n{TAGS_PICKER_HINT}" if notice else TAGS_PICKER_HINT
+
+
 def priority_name(priority: int) -> str:
     """优先级那一格的读法（``0/1/3/5`` → 无 / 低 / 中 / 高）。"""
     return PRIORITY_NAMES.get(priority, PRIORITY_NAMES[0])

@@ -40,6 +40,8 @@ __all__ = [
     "BAR",
     "BLANK_MARK",
     "BLOCKED_GLYPH",
+    "CHECK_OFF",
+    "CHECK_ON",
     "BUILTIN_MARK",
     "CURSOR_BAR_MS",
     "CURSOR_MARK",
@@ -62,6 +64,7 @@ __all__ = [
     "NO_VALUE",
     "OVERDUE",
     "PAN_MS",
+    "PICKER_VISIBLE_ROWS",
     "PENDING",
     "PLAIN",
     "REMINDER_MARK",
@@ -210,6 +213,24 @@ U+2691，东亚宽度中性、rich 量 1 格。提醒只读（v2 不改它），
 SUBTASK_DONE_MARK = "☑"
 SUBTASK_TODO_MARK = "☐"
 """子任务的两种状态标记（只读显示：v2 不在客户端里勾子任务）。"""
+
+CHECK_ON = SUBTASK_DONE_MARK
+CHECK_OFF = SUBTASK_TODO_MARK
+"""多选那一列的两个字形（工单 #45）：与子任务那对**是同一对**（``☑`` / ``☐``），只是名字按用途取。
+
+两个名字指向同一个字符串，不是两份常量——宽度守卫（:data:`STRUCTURAL_GLYPHS`）只认那一份。
+取第二个名字是因为「标签挑中了没有」与「子任务做完了没有」是两件事：读标签那一列的人
+不该在代码里看到 ``SUBTASK_``。
+"""
+
+PICKER_VISIBLE_ROWS = 8
+"""多选那一格最多画几行（工单 #45）。
+
+再多就只画光标周围那一段、末尾补一句「还有 N 个未显示」
+（:func:`~dida.tui.messages.hidden_choices_message`）。不设上限的话，标签一多浮层就顶到
+``max-height: 80%`` 被裁掉——被裁的是**末尾那几行**，连底部那行提示一起，而且不报错。
+8 行在任何终端上都放得下（30 列的窄屏也一样）。
+"""
 
 BLOCKED_GLYPH = "⚠"
 """进不去的清单（``kind`` 是 NOTE 或没有写权限）的记号。"""
@@ -627,6 +648,22 @@ _FORM_CSS = """
 {name} ChoiceField {
     width: 100%;
     height: 1;
+}
+/* 多选那一格（#45）：一行一个选项，高度按选项数长（所以是 auto），上限由窗口自己管
+   （PICKER_VISIBLE_ROWS）。颜色照旧全部走 ANSI 槽位——Static 自己不带底色，这里显式按
+   浮层的面画一遍，免得将来某一次继承把主题变量那类真彩色带回来（名字不写在这里：
+   tests/test_architecture.py 的源码扫描连注释里的那几个名字一起拦，那是故意的）。
+   两条 scrollbar-size 是**关掉滚动条**：这一格不长出滚动条，也就不会画出滚动条那串
+   真彩色（app_css 给 CursorPage 盖那三条是同一个理由）。 */
+{name} MultiChoiceField {
+    width: 100%;
+    height: auto;
+    background: {surface};
+    color: {page};
+    text-wrap: nowrap;
+    text-overflow: ellipsis;
+    scrollbar-size-vertical: 0;
+    scrollbar-size-horizontal: 0;
 }
 """
 

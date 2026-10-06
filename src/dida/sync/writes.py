@@ -75,6 +75,12 @@ class WireCall(Enum):
     DELETE_TASK = "delete_task"
     """``DELETE .../task/{taskId}``，没有请求体。"""
 
+    MOVE_TASK = "move_task"
+    """``POST /open/v1/task/move``：**数组**请求体、``{id, etag}`` 数组响应（工单 #45）。
+
+    本仓库里唯一一个「请求体是数组」的端点，所以它单独一种调用形状（``:504``、``:516``）。
+    """
+
 
 @dataclass(frozen=True)
 class WriteBehaviour:
@@ -109,6 +115,13 @@ class WriteKind(Enum):
 
     DELETE = "delete"
     """删除：本地立刻摘掉快照，推送走 ``DELETE .../task/{taskId}``。"""
+
+    MOVE = "move"
+    """搬运：本地把 ``projectId`` 换成目标清单，推送走 ``POST /open/v1/task/move``（#45）。
+
+    **本地效果是 ``MERGE`` 而不是 ``REMOVE``**：那条任务一条都不少，换的只是它在哪个清单。
+    推成功之后全量刷新带回来的原文里 ``projectId`` 已经是新的了，两边对得上。
+    """
 
     @property
     def behaviour(self) -> WriteBehaviour:
@@ -145,10 +158,11 @@ _BEHAVIOUR: dict[WriteKind, WriteBehaviour] = {
     WriteKind.DELETE: WriteBehaviour(
         local=LocalEffect.REMOVE, wire=WireCall.DELETE_TASK, whole_row=True
     ),
+    WriteKind.MOVE: WriteBehaviour(local=LocalEffect.MERGE, wire=WireCall.MOVE_TASK),
 }
 """**一处**记全每种写的行为。加一种写只改这里（外加它要打的新端点形状）。
 
-四个成员一个不少：``tests/test_write_kind.py`` 会逐个访问这些属性，漏一行当场红。
+每个成员一个不少：``tests/test_write_kind.py`` 会逐个访问这些属性，漏一行当场红。
 """
 
 

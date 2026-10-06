@@ -29,17 +29,20 @@ from textual.containers import Vertical, VerticalScroll
 from textual.screen import ModalScreen
 from textual.widgets import Input, Static
 
-from dida.tui import theme
+from dida.tui import messages, theme
 from dida.tui.keys import QUIT_ACTION, QUIT_KEYS
 
 __all__ = [
     "FORM_HINT",
+    "MULTI_SEPARATOR",
     "ChoiceField",
     "ConfirmOverlay",
     "FormField",
     "FormOption",
     "FormOverlay",
     "MessageOverlay",
+    "MultiChoiceField",
+    "multi_values",
 ]
 
 # 浮层的全部外观只在 dida.tui.theme 一处（工单 #51）：这个文件从此不出现任何颜色值。
@@ -68,7 +71,23 @@ FORM_HINT = "Tab 换一格 / 选择框用左右方向键 / Enter 确认 / Esc �
 分隔符用 ASCII 的 ``/``、方向键写「左右方向键」而不是 ``←``/``→``：那两个字是东亚**歧义**
 宽度（rich 量 1 格、CJK 字体下终端可能画 2 格），浮层这一行没有对齐列，但同一条规矩在这里
 一样成立——#48 已经因为同样的理由把 ``↑↓`` 从帮助里拿掉了。
+
+挑标签那一格用的是另一行（:data:`dida.tui.messages.TAGS_PICKER_HINT`）：它还得说清
+「新建标签要回官方客户端」那件事（工单 #45 的验收标准 6）。
 """
+
+MULTI_SEPARATOR = "\x1f"
+"""多选那一格交回去时用的分隔符（ASCII 的**单元分隔符** US）。
+
+为什么不是逗号：标签名里可以有逗号（文档对 ``name`` 只限了长度、小写与 trim，
+``openapi-dida365.md:1620–1621``），拿一个可能出现在值里的字符当分隔符，``a,b`` 这一个
+标签与 ``a`` + ``b`` 两个标签就分不开了。US 是输入框里打不出来的控制字符，不可能是值的一部分。
+"""
+
+
+def multi_values(value: str) -> tuple[str, ...]:
+    """多选那一格交回来的那一串 → 挑中的那几个值（顺序就是它们在选项里的顺序）。"""
+    return tuple(part for part in value.split(MULTI_SEPARATOR) if part)
 
 
 @dataclass(frozen=True)
@@ -97,10 +116,18 @@ class FormField:
     """选择框的几档；空元组 = 文本框。"""
 
     value: str = ""
-    """当前值（文本框是原文，选择框是选中那一档的 ``value``）。
+    """当前值（文本框是原文，选择框是选中那一档的 ``value``，多选是分隔符连起来的一串）。
 
     认不出来的值**照原样留着**（:class:`ChoiceField` 会把它自己加成一档）：清单上那个
     手机端挑的颜色不在客户端这一档里时，改个名字不该顺手把它换掉。
+    """
+
+    multi: bool = False
+    """多选（工单 #45）：画成 :class:`MultiChoiceField`，交回去的是分隔符连起来的一串。
+
+    加这一种字段类型就是在这个壳子里加一个判断——**调用方给字段，不给控件**（这个文件的
+    模块文档里写的那条）。挑标签那一格用它；#36 的过滤条件里「清单范围 / 优先级 / 标签」
+    那几格要的也是它。
     """
 
     @property
@@ -160,6 +187,118 @@ class ChoiceField(Static):
         line.append(self._options[self._index].label, style=theme.HEADING)
         line.append(" >", style=theme.MUTED)
         self.update(line)
+
+
+class MultiChoiceField(Static):
+    """一格多选：焦点在它上面时 ``↑``/``↓`` 换一个选项、``space`` 打上或取消。
+
+    一行一个选项，行首两列：**光标**（``❯``）与**打上没有**（``☑`` / ``☐``）。两个列字形
+    都是宽度不含糊的（``len == 1``、rich 量 1 格、东亚宽度不是 A/W/F，见
+    ``tests/test_picker_fields.py`` 的守卫）——CJK 字体下整块不会歪（#37 在任务行那一列
+    立的规矩，照做不另发明）。
+
+    选项多于 :data:`~dida.tui.theme.PICKER_VISIBLE_ROWS` 时只画光标周围那一段，末尾补一句
+    「还有 N 个未显示」：**不静默地藏**——看不见的那几个照样走得过去（光标会把它们带进
+    窗口），但用户得知道下面还有。
+
+    与 :class:`ChoiceField` 同一条口径：``field.value`` 里认不出来的值自成一档，原样显示、
+    原样交回去（任务上已经打着的标签不在服务端那份名单里时，它照样看得见、去得掉）。
+    """
+
+    can_focus = True
+    """`Static` 默认不可聚焦，而这一格要能拿到方向键与空格。"""
+
+    BINDINGS = [
+        Binding("up", "previous", "上一个", show=False),
+        Binding("down", "next", "下一个", show=False),
+        Binding("space", "toggle", "打上/取消", show=False),
+    ]
+
+    def __init__(self, field: FormField) -> None:
+        super().__init__(id=f"field-{field.name}")
+        self.field = field
+        self._options = list(field.options)
+        self._chosen = set(multi_values(field.value))
+        for value in multi_values(field.value):
+            if value and value not in [option.value for option in self._options]:
+                self._options.append(FormOption(value, value))
+        self._cursor = 0
+        """光标停在第几个选项上（不是第几行——窗口会跟着它走）。"""
+
+        self._start = 0
+        """现在画的是从第几个选项开始的那一段（选项多于可见行数时才有意义）。"""
+
+        self._redraw()
+
+    @property
+    def value(self) -> str:
+        """现在打上的那几个值（与 ``Input.value`` / ``ChoiceField.value`` 同名）。
+
+        顺序就是选项顺序，不是「用户点选的先后」：同一份选择每次交回去都长一样，测试与
+        调用方都不必去猜顺序。
+        """
+        return MULTI_SEPARATOR.join(
+            option.value for option in self._options if option.value in self._chosen
+        )
+
+    def action_next(self) -> None:
+        """``↓``：下一个选项（到底了绕回第一个）。"""
+        if not self._options:
+            return
+        self._cursor = (self._cursor + 1) % len(self._options)
+        self._redraw()
+
+    def action_previous(self) -> None:
+        """``↑``：上一个选项。"""
+        if not self._options:
+            return
+        self._cursor = (self._cursor - 1) % len(self._options)
+        self._redraw()
+
+    def action_toggle(self) -> None:
+        """``space``：把光标下那一个打上或取消。"""
+        if not self._options:
+            return
+        value = self._options[self._cursor].value
+        if value in self._chosen:
+            self._chosen.discard(value)
+        else:
+            self._chosen.add(value)
+        self._redraw()
+
+    def _redraw(self) -> None:
+        """画窗口里那几行 + （藏了东西时）末尾那一句。
+
+        一行一个 :class:`~rich.text.Text`，光标那一行单独 ``stylize``：``Text.stylize``
+        不带范围时盖的是**整块**，所以不能先拼完整块再标一行。
+        """
+        if not self._options:
+            self.update(theme.styled(messages.NO_CHOICES_TEXT, theme.MUTED))
+            return
+        visible = theme.PICKER_VISIBLE_ROWS
+        if self._cursor < self._start:
+            self._start = self._cursor
+        elif self._cursor >= self._start + visible:
+            self._start = self._cursor - visible + 1
+        self._start = max(0, min(self._start, max(0, len(self._options) - visible)))
+        window = self._options[self._start : self._start + visible]
+        lines = Text()
+        for offset, option in enumerate(window):
+            if offset:
+                lines.append("\n")
+            here = self._start + offset == self._cursor
+            line = Text()
+            line.append(f"{theme.CURSOR_MARK if here else theme.BLANK_MARK} ")
+            line.append(theme.CHECK_ON if option.value in self._chosen else theme.CHECK_OFF)
+            line.append(f" {option.label}")
+            if here:
+                line.stylize(theme.SELECTED)
+            lines.append_text(line)
+        hidden = len(self._options) - len(window)
+        if hidden:
+            lines.append("\n")
+            lines.append(messages.hidden_choices_message(hidden), style=theme.MUTED)
+        self.update(lines)
 
 
 class FormOverlay(ModalScreen[dict[str, str] | None]):
@@ -231,16 +370,20 @@ class FormOverlay(ModalScreen[dict[str, str] | None]):
             box.border_title = self._title
             for field in self.fields:
                 yield Static(field.label, classes="overlay-label")
-                if field.is_choice:
+                if field.multi:
+                    yield MultiChoiceField(field)
+                elif field.is_choice:
                     yield ChoiceField(field)
                 else:
                     yield Input(value=field.value, id=f"field-{field.name}")
             yield Static(self._hint, classes="overlay-hint")
 
     def values(self) -> dict[str, str]:
-        """每一格现在的值，按字段名索引（文本框与选择框都读 ``.value``）。"""
+        """每一格现在的值，按字段名索引（文本框、选择框与多选都读 ``.value``）。"""
         return {
-            field.name: self.query_one(f"#field-{field.name}", (Input, ChoiceField)).value
+            field.name: self.query_one(
+                f"#field-{field.name}", (Input, ChoiceField, MultiChoiceField)
+            ).value
             for field in self.fields
         }
 

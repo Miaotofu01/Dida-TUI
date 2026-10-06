@@ -96,6 +96,15 @@ class TaskWriter(Protocol):
         """``DELETE /open/v1/project/{projectId}/task/{taskId}``。"""
         ...
 
+    async def move_task(
+        self, from_project_id: str, to_project_id: str, task_id: str
+    ) -> Sequence[Mapping[str, Any]]:
+        """``POST /open/v1/task/move``：把一条任务搬去另一个清单（工单 #45）。
+
+        请求体是**数组**、响应是 ``{id, etag}`` 的**数组**——本仓库唯一一个这样的端点。
+        """
+        ...
+
 
 class PushMixin:
 
@@ -165,6 +174,33 @@ class PushMixin:
         所以这次确认是唯一的防线，而它归 TUI：引擎这一层只保证「调用它就删」，不负责问。
         """
         self.write(task_id, kind=WriteKind.DELETE)
+
+    def move_task(self, task_id: str, *, to_list_id: str) -> None:
+        """写：把这条任务搬到另一个清单（``POST /open/v1/task/move``，工单 #45）。
+
+        **不是一次普通字段更新**：搬运有自己的端点、自己的数组请求体，所以它是
+        :class:`~dida.sync.writes.WriteKind` 里的一个成员，而不是 ``write(changes={"projectId": …})``
+        的另一种叫法（spec :230 明确要求走搬运端点）。
+
+        本地那一份**当场就换清单**（``projectId`` 盖进快照，读路径立刻把它画在新清单里），
+        推送排在事件循环上立刻跑，推不动就留在队列里退避重试——与其余几条写同一条口径。
+
+        ``to_list_id`` 与当前清单相同时**什么都不写**：那不是一次改动，凭空入队只会让状态栏
+        多出一个永远没有意义的数。本地没有这条任务的底稿时与 :meth:`write` 一样当场抛
+        :class:`~dida.sync.writes.UnknownTaskError`——``fromProjectId`` 只存在于那份底稿里，
+        拼不出请求的改动永远推不出去（工单 #25）。
+
+        **目标清单必须服务端已经见过**（本地刚建、还没推上去的清单 id 是本地临时的）：
+        搬过去会 404，而那条改动会永远留在队列里。挑选器因此只给
+        :meth:`~dida.sync.engine.SyncEngine.move_targets` 那一份（#45）。
+        """
+        payload = self._write_target().task_payload(task_id)
+        current = "" if payload is None else str(payload.get("projectId") or "")
+        if not current:
+            raise UnknownTaskError(task_id)
+        if current == to_list_id or not to_list_id:
+            return
+        self.write(task_id, changes={"projectId": to_list_id}, kind=WriteKind.MOVE)
 
     async def push_pending(self) -> int:
         """推一轮：把**到期**的待推送改动依次推给服务端，返回推成功的条数。
@@ -256,6 +292,15 @@ class PushMixin:
             await writer.complete_task(change.list_id, change.task_id)
         elif wire is WireCall.DELETE_TASK:
             await writer.delete_task(change.list_id, change.task_id)
+        elif wire is WireCall.MOVE_TASK:
+            # 搬运：``fromProjectId`` 是**入队那一刻**那条任务所在的清单（改动行上记着），
+            # ``toProjectId`` 是这次改动盖上去的 ``projectId``。请求体那一层再翻成文档的
+            # 数组形状——这里给的是「从哪到哪」，端点形状是客户端的事。
+            await writer.move_task(
+                change.list_id,
+                str(change.payload.get("projectId") or ""),
+                change.task_id,
+            )
         elif wire is WireCall.CREATE_TASK:
             # 新建才知道服务端给的 id，所以这一条推成功之后要顺手认领它（t15）。
             self._adopt_created(target, change, await writer.create_task(change.payload))

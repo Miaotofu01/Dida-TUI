@@ -56,8 +56,9 @@ from dida.tui.keys import (
     bindings_for,
     help_body,
 )
-from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay
+from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay, multi_values
 from dida.tui.pages import DetailPage, IndexPage, TasksPage
+from dida.tui.pages.detail import LIST_FIELD, PRIORITY_FIELD, TAGS_FIELD, picker_spec
 from dida.tui.pages.index import (
     LIST_COLOR_FIELD,
     LIST_NAME_FIELD,
@@ -545,6 +546,114 @@ class DidaApp(App[None]):
         if not self.is_running:
             return
         self.refresh_view()
+
+    # ---------------------------------------------------------------- 挑选型字段（#45）
+
+    async def on_detail_page_pick_requested(self, event: DetailPage.PickRequested) -> None:
+        """``enter`` 落在挑选型字段上：把选项凑齐，开那张**共用的**表单浮层（工单 #45）。
+
+        三格的选项各有各的来源，都在引擎那一侧：清单是 ``move_targets()``（真实清单、
+        进得去、服务端已经见过的那些），优先级是 ``messages.PRIORITY_NAMES`` 那张表，
+        标签是 ``tags()``。标签那一份还要**拉一次**（``load_tags``，``GET /open/v1/tag``）
+        ——那是这一格里唯一一次网络调用，所以拉不到时照旧开浮层（本地已知的那些照样挑得动），
+        只把「没拉到」写在浮层的提示里（浮层是模态的，状态栏在它底下，看不见）。
+        """
+        detail = self.engine.task_detail(event.task_id)
+        if detail is None:
+            return
+        notice = ""
+        if event.field == TAGS_FIELD:
+            try:
+                await self.engine.load_tags()
+            except DidaError as exc:
+                # 拉不到就说出来，而且**照旧开浮层**（本地已经见过的那些照样挑得动）；
+                # 这一句写在浮层的提示里，不是状态栏上——浮层是模态的，状态栏在它底下。
+                notice = messages.tags_load_failed_message(exc)
+            if not self.is_running:
+                return
+        spec = picker_spec(
+            event.field,
+            detail,
+            lists=self.engine.move_targets(),
+            tags=self.engine.tags(),
+            notice=notice,
+        )
+        if spec is None:
+            return
+        self.push_screen(
+            FormOverlay(title=spec.title, fields=spec.fields, hint=spec.hint),
+            partial(self._finish_pick, event.task_id, event.field),
+        )
+
+    async def _finish_pick(
+        self, task_id: str, field: str, values: dict[str, str] | None
+    ) -> None:
+        """挑选浮层关掉了：``None`` 是取消（一个字节都不写），否则按挑的那一份写出去。
+
+        三条路各自走该走的端点——**搬运不是一次普通字段更新**（``move_task``），优先级与
+        标签是普通更新（整份底稿带回去那件事由 ``update_task`` 的 ``snapshot=`` 管，
+        ``merge_snapshot`` 的既有策略）。写完照旧立刻推一轮、重画、把结果留在底部那一行：
+        与逐字段编辑（``on_detail_page_field_edited``）同一条规矩（验收标准 7）。
+        """
+        if values is None:
+            return
+        try:
+            wrote = self._apply_pick(task_id, field, values)
+        except UnknownTaskError:
+            self.refresh_view()
+            if self.is_running:
+                self.detail_page().show_save(messages.UNKNOWN_TASK_MESSAGE)
+            return
+        except DidaError as exc:
+            self.refresh_view()
+            if not self.is_running:
+                return
+            self.detail_page().show_save(messages.field_save_failed_message(exc))
+            return
+        if not wrote:
+            # 挑回原来那一档：没有改动就没有「立刻推送」这回事（队列里本来也不该多出一笔）。
+            return
+        await self.engine.push_pending()
+        if not self.is_running:
+            return
+        self.refresh_view()
+
+    def _apply_pick(self, task_id: str, field: str, values: dict[str, str]) -> bool:
+        """挑完的那一份怎么变成一次写（三条路各自的形状只在这一个地方）。
+
+        **挑回原来那一档 = 没改**（与逐字段编辑那条规矩同一条）：一笔都不写。写一笔没发生的
+        改动会进待推送队列，离线时状态栏那个数就为一个空操作亮着。清单那一路的「同一个清单」
+        由引擎自己挡（``move_task``），这里挡的是优先级与标签。
+
+        ``int(...)`` 那一下是**线上编码**：选项的值是 ``0/1/3/5``、标签是用户语言
+        （``messages.PRIORITY_NAMES``，唯一一张表）。表外的值不该出现（选项就是从那张表
+        生成的），认不出来就当没挑——不替服务端猜一个档位。
+
+        返回「真的写了一笔吗」：没改的那一条路连推送都不排（队列里不该多出一笔）。
+        """
+        detail = self.engine.task_detail(task_id)
+        if detail is None:
+            raise UnknownTaskError(task_id)
+        if field == LIST_FIELD:
+            if values[LIST_FIELD] == detail.list_id:
+                return False
+            self.engine.move_task(task_id, to_list_id=values[LIST_FIELD])
+            return True
+        if field == PRIORITY_FIELD:
+            picked = values[PRIORITY_FIELD]
+            if not picked.isdigit() or int(picked) == detail.priority:
+                return False
+            self.engine.write(task_id, changes={"priority": int(picked)})
+            return True
+        if field == TAGS_FIELD:
+            # 按**集合**比：选项顺序与任务上那一串的顺序不一定一样，而「改了没有」说的是
+            # 挑中的那几个标签变没变，不是它们排在第几个。
+            picked = multi_values(values[TAGS_FIELD])
+            if set(picked) == set(detail.tags):
+                return False
+            self.engine.write(task_id, changes={"tags": list(picked)})
+            return True
+        return False
 
     # ---------------------------------------------------------------- 任务的删除与顺延（#40）
 
