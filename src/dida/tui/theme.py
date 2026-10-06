@@ -46,10 +46,16 @@ __all__ = [
     "CURSOR_BAR_MS",
     "CURSOR_MARK",
     "CSS_ACCENT",
+    "CSS_BLOCK",
+    "CSS_BLOCK_GROUND",
+    "CSS_BLOCK_INK",
+    "CSS_BLOCK_STYLE",
     "CSS_EDGE",
+    "CSS_FOCUS",
     "CSS_PAGE",
     "CSS_QUIET",
     "CSS_ROLES",
+    "CSS_RULE_ROLES",
     "CSS_SURFACE",
     "CUSTOM_MARK",
     "DECORATION_GLYPHS",
@@ -166,7 +172,69 @@ CSS_EDGE = "ansi_bright_black"
 CSS_QUIET = "ansi_black"
 """滚动条：不引入新色相，只借槽 0 这一块石板。"""
 
-CSS_ROLES: Final = ("CSS_PAGE", "CSS_ACCENT", "CSS_SURFACE", "CSS_EDGE", "CSS_QUIET")
+# --- 两种强调：一块盖住字的**块**，一整格**聚焦**（工单 #58d） ------------------
+#
+# 两条都不挑颜色，理由是同一条算术：**app 不知道任何一个槽位长什么样**。
+# ``background: {accent}`` 配 ``color: {page}`` 在源码里看着正当（「跟随终端主题」），其实是把
+# 「槽 6」与「默认前景」当成已知亮度在用。Catppuccin Mocha 里两个都是浅色（``ansi_cyan`` =
+# ``#94e2d5``、默认前景 = ``#cdd6f4``），打进去的字与底色就糊成一片——那是 #58d 用户报的
+# 那张截图。终端唯一保证过可读的一对是**它自己的默认前景压在它自己的默认背景上**（它自己
+# 就是这么打字的），所以强调只能从那一对出发：要么交换它（块），要么把强调色当**墨**放在
+# 它上面（整格）。
+
+CSS_BLOCK_GROUND = CSS_PAGE
+"""块高亮的**底**：终端自己的背景（与页面同一个面）。"""
+
+CSS_BLOCK_INK = "ansi_default"
+"""块高亮的**墨**：终端自己的前景。与上面那条合成「终端自己的一对」。"""
+
+CSS_BLOCK_STYLE = "reverse"
+"""块高亮怎么成块：**反色**——交换上面那一对，而不是另挑一个槽位。
+
+``reverse`` 交换的是这一格**解析出来的**前景与背景：不先把那一对声明出来，交换的仍是继承
+来的颜色（表单里是槽 0 的面 + 默认前景），照样能在某个主题里撞车。声明成终端自己的一对
+之后，交换与主题无关了——对比度是对称的，终端保证过那一对读得出来，交换之后仍然读得出来。
+"""
+
+CSS_BLOCK: Final = (
+    f"background: {CSS_BLOCK_GROUND}; color: {CSS_BLOCK_INK}; text-style: bold reverse"
+)
+"""光标块与选中块的**整条声明组**：七个落点共用一条（工单 #58d）。
+
+七处 = ``#detail-input`` / ``#detail-text`` / ``#due-date`` / ``#due-time`` 各自的
+``input--cursor`` 与 ``input--selection``，加表单那个 ``Input`` 自己的一对。写成一个角色而
+不是七份抄写，是因为这是一件事：抄写就会漂，而漂出来的那一份正是 #58d 报的那一块——中间
+只有一个字符、跟着光标跑，糊掉的时候连「我打到哪儿了」都看不见。
+
+``bold`` 是原来光标块就有的字重（模块开头那条「层级不靠亮度」的第二个通道），一起搬进来，
+让七个落点**一模一样**。"""
+
+CSS_FOCUS: Final = f"background: {CSS_PAGE}; color: {CSS_ACCENT}; text-style: bold"
+"""聚焦的那一整格（表单的 ``Input:focus``）：**强调色当前景**，压在终端自己的背景上。
+
+与 :data:`CSS_BLOCK` 分开，是因为两者的活不一样：块一格宽、会动、里面只有一个字符，问题是
+「这个字符读不读得出来」；整格一直在、里面是用户正在读的那行字，问题是「你现在在哪一格」
+与「你打的字读不读得出来」。整格铺强调色的底就不成立了（同一条算术，见上面那段），所以
+强调色退到**前景**：这正是 app 唯一被读过一遍的强调用法（``SELECTED = "cyan bold"`` 的选中
+行、``RICH_ROLES`` 那一批，都压在页面那个面上），不是这次新发明的一对。
+
+``bold`` 与**底色的翻转**是信号强度的补偿：原来的聚焦信号是「整格实心强调色」，比一行变色
+强，而 #58d 改掉了那块实心。补偿有两条，都看得见——字重，以及底从槽 0 的面翻成终端自己的
+背景（一个字都没打的时候，七格里也只有这一格不是石板；两条都在
+``tests/test_create_task.py`` 里量）。"""
+
+CSS_RULE_ROLES: Final = ("CSS_BLOCK", "CSS_FOCUS")
+"""整条**声明组**的两个角色（不是单个颜色拼法）：上面那张表只管颜色，这两个是「一件事」。"""
+
+CSS_ROLES: Final = (
+    "CSS_PAGE",
+    "CSS_ACCENT",
+    "CSS_SURFACE",
+    "CSS_EDGE",
+    "CSS_QUIET",
+    "CSS_BLOCK_GROUND",
+    "CSS_BLOCK_INK",
+)
 """CSS 那一半的清单：守卫照着它查「是不是 ansi_* 拼法」。"""
 
 # ---------------------------------------------------------------------------
@@ -467,7 +535,10 @@ DetailPage #page-body {
    Textual 那两个输入框自带的样式用的是主题变量（surface / boost / border 这几个名字），
    它们是**真彩色**——不覆盖就等于把「跟随终端主题」在编辑态里丢掉，而且屏幕上看不出来
    （只有读 SGR 才发现）。所以边框、底色、光标块、选中块全部在这里改写成 ansi_*，
-   内层那几个类名（input--* / text-area--*）也逐一盖掉。 */
+   内层那几个类名（input--* / text-area--*）也逐一盖掉。
+
+   光标块与选中块四条**只写一个角色**（``{block}``，见 :data:`CSS_BLOCK`）：七处共用同一条
+   声明组，谁也别再单独挑颜色——58d 那块糊掉的字就是这么来的。 */
 #detail-edit {
     display: none;
     height: 1fr;
@@ -492,31 +563,17 @@ DetailPage #page-body {
 #detail-input:focus, #detail-text:focus {
     border: none;
 }
-#detail-input .input--cursor {
-    background: {accent};
-    color: {page};
-    text-style: bold;
-}
-#detail-input .input--selection {
-    background: {accent};
-    color: {page};
-}
+#detail-input .input--cursor { {block}; }
+#detail-input .input--selection { {block}; }
 #detail-input .input--placeholder, #detail-input .input--suggestion {
     color: ansi_default;
     text-style: dim;
 }
-#detail-text .text-area--cursor {
-    background: {accent};
-    color: {page};
-    text-style: bold;
-}
+#detail-text .text-area--cursor { {block}; }
 #detail-text .text-area--cursor-line {
     background: {page};
 }
-#detail-text .text-area--selection {
-    background: {accent};
-    color: {page};
-}
+#detail-text .text-area--selection { {block}; }
 #detail-text .text-area--gutter, #detail-text .text-area--cursor-gutter {
     color: ansi_default;
     background: {page};
@@ -554,15 +611,8 @@ DetailPage #page-body {
 #due-date:focus, #due-time:focus {
     border: none;
 }
-#due-date .input--cursor, #due-time .input--cursor {
-    background: {accent};
-    color: {page};
-    text-style: bold;
-}
-#due-date .input--selection, #due-time .input--selection {
-    background: {accent};
-    color: {page};
-}
+#due-date .input--cursor, #due-time .input--cursor { {block}; }
+#due-date .input--selection, #due-time .input--selection { {block}; }
 #due-date .input--placeholder, #due-time .input--placeholder,
 #due-date .input--suggestion, #due-time .input--suggestion {
     color: ansi_default;
@@ -599,6 +649,10 @@ def _fill(template: str) -> str:
     """把 CSS 模板里的 ``{page}`` / ``{accent}`` 这类占位符换成主题里的拼法。
 
     不用 ``str.format``：CSS 本身就是一堆花括号，转义之后没人读得下去。
+
+    最后两条与前面五条不是一类东西：前面换出来的是一个**颜色拼法**，这两条换出来的是整条
+    **声明组**（见 :data:`CSS_BLOCK` / :data:`CSS_FOCUS`）。放在同一张表里是有意的——七处块
+    高亮因此各自只有一行，写法上没有第二种可能。
     """
     out = template
     for name, value in (
@@ -607,6 +661,8 @@ def _fill(template: str) -> str:
         ("surface", CSS_SURFACE),
         ("edge", CSS_EDGE),
         ("quiet", CSS_QUIET),
+        ("block", CSS_BLOCK),
+        ("focus", CSS_FOCUS),
     ):
         out = out.replace("{" + name + "}", value)
     return out
@@ -644,11 +700,19 @@ _FORM_CSS = """
     background: {surface};
     color: {page};
 }
+/* 聚焦那一格：强调色当前景（工单 58d 改的，原来是整格铺强调色的底）。
+
+   选择器里那个 ``:focus`` 是**承重的**，不是修饰：Textual 给自己的 Input 写了
+   ``&:ansi > .input--cursor`` 那一套，`:ansi` 多算一个类，``{name} Input .input--cursor``
+   这样的写法与它同分（0,2,1），谁赢要看源码顺序——实测就是输，光标块会退回 Textual 的
+   ``ansi_white`` / ``ansi_black``（一对 app 没声明过的槽位）。多带一个 ``:focus`` 就压过
+   它（0,3,1），而光标块与选中块本来就只在聚焦时存在。 */
 {name} Input:focus {
     border: none;
-    background: {accent};
-    color: {page};
+    {focus};
 }
+{name} Input:focus .input--cursor { {block}; }
+{name} Input:focus .input--selection { {block}; }
 {name} ChoiceField {
     width: 100%;
     height: 1;
@@ -690,8 +754,12 @@ def form_css(name: str) -> str:
     而其中就有「自定义视图只存在这台机器上」那句必须被看见的实话。
 
     所以输入框改成一行高、去掉边框（``padding: 0 1`` 留一格缩进），聚焦的记号从边框换成
-    **强调色的底色**（槽 6）：七格里只有一格有底色，比原来那条细边更醒目，也不引入新色相。
-    代价是少了那一圈框；换来的是任何字段数的表单都排得下。
+    「七格里只有一格不是石板」：没聚焦的格子铺槽 0 的面（与浮层同色，看不见边界），聚焦那一格
+    换成终端自己的背景并带字重。代价是少了那一圈框；换来的是任何字段数的表单都排得下。
+
+    **#58d 改的是那一格的颜色**：原来是整格铺**强调色的底**（槽 6）——用户的主题里槽 6 与默认
+    前景都是浅色，打进去的字与底色糊成一片。现在整条在 :data:`CSS_FOCUS` 里，强调色退到前景，
+    信号强度的两条补偿也写在那里。
 
     ``width: 80%`` 是给输入框的：``overlay_css`` 的 ``width: auto`` 配一个 ``width: 100%``
     的子控件量不出宽度来（百分比要有个有宽度的容器参照）。80% 而不是更窄，是为了底部那行
