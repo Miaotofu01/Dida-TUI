@@ -599,6 +599,9 @@ class DetailPage(CursorPage):
         self._due_date_touched = False
         """用户动过日期那一格没有（清空也算动过）。程序化回填不算。"""
 
+        self._zone: tzinfo | None = None
+        """用户墙钟当前的时区（app 从注入的钟上取来，随 :meth:`show_detail` 递进来）。"""
+
     def compose(self) -> ComposeResult:
         """正文 + 装饰光标条（页面的那两块），加上这一页自己的两块：底部那一行 + 编辑器。
 
@@ -625,8 +628,16 @@ class DetailPage(CursorPage):
         """这一页正在说的是哪条任务（``o`` 要知道）。"""
         return self._task_id
 
-    def show_detail(self, detail: TaskDetail | None) -> None:
-        """铺开一条任务的字段；``None`` = 它已经不在本地缓存里了。"""
+    def show_detail(self, detail: TaskDetail | None, *, zone: tzinfo | None = None) -> None:
+        """铺开一条任务的字段；``None`` = 它已经不在本地缓存里了。
+
+        ``zone`` 是**用户墙钟当前的时区**，由 app 从注入的钟上取来（工单 #58 的 T1）。这一页
+        要把用户敲的 ``2026-03-15`` / ``18:00`` 理解成一个时刻，而任务本来没有截止时间时它
+        没有 offset 可借（见 :meth:`_zone_hint`）。页面自己**不读时钟**：``datetime.now()``
+        正是业务代码里被禁的那一个（README 与 docs/architecture.md 的硬规则，
+        ``tests/test_clock_seam.py`` 用 AST 守着），所以这一份只能是递进来的事实。
+        """
+        self._zone = zone
         previous = self._task_id
         self._task_id = None if detail is None else detail.task_id
         self._detail = detail
@@ -812,12 +823,13 @@ class DetailPage(CursorPage):
         """任务没有截止时间时，用哪一个时区理解用户敲的墙钟。
 
         有截止时间时不需要它——那一刻自己带着 offset（``due.due_change`` 的 ``reference``）。
-        没有的时候只能给一个本地时区：文档对 ``timeZone`` 字段写错会怎样一个字都没写
-        （api-shapes §D17），所以这里**不**把那个名字换算成 offset（那要一整个 tzdata，
-        而算错正是静默位移）。给不出来（``None``）就让 ``datetime`` 是 naive 的——
-        ``guards.api_date`` 会当场拒绝，而不是替它猜一个。
+        没有的时候只能给一个本地时区，而「本地」是**注入的钟**说的：app 把 ``zone`` 随
+        :meth:`show_detail` 递进来（工单 #58 的 T1），这一页自己不读时钟。文档对 ``timeZone``
+        字段写错会怎样一个字都没写（api-shapes §D17），所以这里**不**把那个名字换算成 offset
+        （那要一整个 tzdata，而算错正是静默位移）。给不出来（``None``）就让 ``datetime`` 是
+        naive 的——``guards.api_date`` 会当场拒绝，而不是替它猜一个。
         """
-        return datetime.now().astimezone().tzinfo
+        return self._zone
 
     def _due_draft(self) -> tuple[date | None, time | None]:
         """编辑器里这两格当前的内容 → （哪一天、哪一刻）；认不出来就抛 :class:`ValueError`。
