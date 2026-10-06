@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 from rich.cells import cell_len
+from textual import events
 from textual.containers import ScrollableContainer
 
 from dida.sync.engine import DidaError
@@ -402,6 +403,10 @@ async def test_the_user_scroll_keys_never_push_the_pan_track(layer: int):
     ``←`` / ``→`` 本来就不在 spec 的键位表里（清单层 ``n`` / ``e`` / ``d`` / ``enter``，任务层
     ``space`` / ``n`` / ``d`` / ``g`` / ``G`` / ``enter``），所以「什么都不做」就是它们该有的样子。
 
+    挡住它们的是 ``#stage`` 的 ``overflow-x: hidden``（``dida.tui.theme`` 那个 CSS 块里写了
+    为什么）——**不是**一张「哪些键要忽略」的清单，所以同一条路也堵住了滚轮与聚焦（下面两条
+    各测一半）。
+
     断的是外部行为：屏幕**逐字节不变**，且轨道停在原处（两层证据缺一不可——只断文本的话，
     页内自己横向挪一格也算通过）。
     """
@@ -427,11 +432,128 @@ async def test_the_user_scroll_keys_never_push_the_pan_track(layer: int):
             )
 
 
+WHEEL_INPUTS: tuple[tuple[str, type, dict[str, bool]], ...] = (
+    ("普通滚轮下", events.MouseScrollDown, {}),
+    ("普通滚轮上", events.MouseScrollUp, {}),
+    ("shift+滚轮下", events.MouseScrollDown, {"shift": True}),
+    ("shift+滚轮上", events.MouseScrollUp, {"shift": True}),
+    ("ctrl+滚轮下", events.MouseScrollDown, {"control": True}),
+    ("ctrl+滚轮上", events.MouseScrollUp, {"control": True}),
+    ("横向滚轮右", events.MouseScrollRight, {}),
+    ("横向滚轮左", events.MouseScrollLeft, {}),
+)
+"""鼠标那半边：纵轴两向、加 shift / ctrl 的横向那两向、以及倾斜滚轮（横轴）两向。
+
+``shift+滚轮`` 是最容易误触的一个（在 kitty 里滚列表时手滑按住 shift 就撞上），后果和 ``→``
+一模一样：页面挪一格、通栏细线少一格，多滚几次还能把轨道推到别的页面上。
+"""
+
+
+async def wheel(pilot, page, event: type, **modifiers: bool) -> None:
+    """把一次滚轮事件送到 ``page`` 上（指针就在那一页中间）。
+
+    ⚠ ``_post_mouse_events`` 是 Pilot 的**私有**方法，Textual 8.2.8 没有公开的滚轮模拟口
+    （``press`` / ``click`` / ``hover`` 都发不出滚轮事件）。用它而不是自己造事件对象，是因为
+    它替我们算好了坐标与 ``widget``，事件走的**就是真那条路**：先到指针底下那一页，那一页横向
+    滚不动，于是冒泡到轨道上。
+
+    「事件真的送到了」不靠这个函数的返回值（它比的是「指针底下那个控件是不是我点名的那个」，
+    而已知它会回 ``False``——见 ``test_..._when_the_track_is_scrollable_again`` 那条正对照）。
+    """
+    await pilot._post_mouse_events([event], widget=page, **modifiers)
+    await pilot.pause()
+
+
+@pytest.mark.parametrize("layer", [0, 1, 2])
+async def test_the_mouse_wheel_never_pushes_the_pan_track(layer: int):
+    """**纵轴、横轴、加不加修饰键，滚轮一律推不动轨道**（工单 #59 用户报的是键盘，这是同一半）。
+
+    用户输入不该推动平移轨道——不管那输入是键还是滚轮。三层各来一遍八种滚轮输入，断的还是
+    那两层证据：``Stage.scroll_offset.x`` 不变、屏幕逐字节不变。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await go_to_layer(pilot, app, layer)
+        stage = app.query_one("#stage", Stage)
+        parked = stage.scroll_offset.x
+        page = {0: app.index_page(), 1: app.tasks_page(), 2: app.detail_page()}[layer]
+
+        for label, event, modifiers in WHEEL_INPUTS:
+            before = screen_text(app)
+            await wheel(pilot, page, event, **modifiers)
+
+            assert stage.scroll_offset.x == parked, (
+                f"第 {layer} 层{label}，平移轨道从 {parked} 被推到了 {stage.scroll_offset.x}"
+            )
+            assert screen_text(app) == before, (
+                f"第 {layer} 层{label}，屏幕不该有任何变化：\n{screen_text(app)}"
+            )
+
+
+@pytest.mark.parametrize("layer", [0, 1, 2])
+async def test_a_focus_change_never_pushes_the_pan_track(layer: int):
+    """``tab``（Textual 的 ``focus_next``）也不许把轨道拖走（工单 #59，实测的第三条路）。
+
+    这一条比滚轮还狠：它一次挪**整整一页**。聚焦会「把那个控件滚进可见区」（
+    ``Screen.set_focus`` → ``scroll_to_center``），而 ``tab`` 聚焦的是**别层的页面**——
+    于是屏幕整个换了一页，而 ``app.layer`` 还在原来那一层，与 ``home`` 那个症状一模一样。
+
+    ``_show`` 早就用 ``focus(scroll_visible=False)`` 躲开过这一下（那次是把平移动画抹平），
+    这里断的是「躲不躲都推不动」。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await go_to_layer(pilot, app, layer)
+        stage = app.query_one("#stage", Stage)
+        parked = stage.scroll_offset.x
+
+        for _ in range(2):  # 聚焦会一层层往后走：多按一次看下一站
+            before = screen_text(app)
+            await pilot.press("tab")
+            await pilot.pause()
+
+            assert stage.scroll_offset.x == parked, (
+                f"第 {layer} 层按 tab，平移轨道从 {parked} 被推到了 {stage.scroll_offset.x}"
+            )
+            assert screen_text(app) == before, (
+                f"第 {layer} 层按 tab，屏幕不该有任何变化：\n{screen_text(app)}"
+            )
+
+
+async def test_the_wheel_reaches_the_track_when_the_track_is_scrollable_again():
+    """**正对照**：把轨道放回「用户可滚」的样子，同一个 ``shift+滚轮`` 立刻推得动它。
+
+    上面那几条断的是「什么都没发生」，而「什么都没发生」有两种可能：真的挡住了，或者事件根本
+    没送到。这条控制实验把两种可能分开——滚轮事件确实到了轨道上，挡住它的是那个「用户不可滚」
+    的开关（而且是**只有**那个开关：把它拧回去，同一个事件当场成功）。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=(100, 60)) as pilot:  # 高一点：正对照要真的滚得动
+        await pilot.pause()
+        stage = app.query_one("#stage", Stage)
+        page = app.index_page()
+
+        stage.styles.overflow_x = "scroll"
+        await pilot.pause()
+        assert stage.allow_horizontal_scroll, "拧回 scroll 之后轨道应当又能被用户滚"
+
+        before = stage.scroll_offset.x
+        await wheel(pilot, page, events.MouseScrollDown, shift=True)
+        assert stage.scroll_offset.x != before, (
+            f"滚轮事件没送到轨道上（x 还是 {before}）——上面那几条测试就是空的"
+        )
+
+
 def scroll_bindings() -> dict[str, str]:
     """Textual **自己那张表**里，每一个滚动键绑到哪个 action（``{'left': 'scroll_left', …}``）。
 
-    键位表不在这里抄第二遍：Textual 加一个新键、或者把某个 action 改名，下面两条守卫立刻
-    变红——而不是等用户又按一下看见页面滑走。
+    键位表不在这里抄第二遍：Textual 加一个新键或改一个 action，下面的对账立刻变红——而不是
+    等用户又按一下看见页面滑走。
     """
     bound: dict[str, str] = {}
     for binding in ScrollableContainer.BINDINGS:
@@ -440,31 +562,30 @@ def scroll_bindings() -> dict[str, str]:
     return bound
 
 
-def test_the_pan_track_neutralises_every_scroll_action_textual_binds():
-    """**复发守卫（形状级）**：Textual 绑到滚动上的每一个 action，这一层都得自己接住。
+async def test_the_pan_track_is_not_user_scrollable_at_all():
+    """**复发守卫（形状级）**：轨道在 Textual 自己眼里就不是个「用户能滚」的东西。
 
-    只修一次不够——平移轨道是个 ``HorizontalScroll``，谁把它继承来的那一层还回去，用户按
-    ``←`` / ``→`` / ``home`` 就又推得动它。所以这条断言问的不是「今天修好了没有」，而是
-    「Textual 那张表上的每一个滚动 action，``Stage`` 是不是都有自己的空操作」。
+    ``allow_horizontal_scroll`` 是 Textual 每一个用户滚动入口的总闸——滚动 action
+    （``action_scroll_left`` 开头就是 ``if not self.allow_horizontal_scroll: raise SkipAction``）、
+    滚轮处理器（``_on_mouse_scroll_down`` 里同一个条件）、指针拖动、以及聚焦时的
+    ``scroll_to_region``（不是 ``force`` 就把 x 抹成 0）。它由 ``overflow-x`` 决定。
 
-    它同时是那个**代价的哨兵**：空操作的名字是 Textual 的 action 名，Textual 哪天改名，几个
-    覆盖会静默失效（继承来的那一个又开始滚）。那时这条断言按**新名字**来找覆盖，当场变红。
+    所以这条断言比「逐个记住哪些键要挡住」强：**任何一个入口只要还开着这个闸，它就会问**
+    「用户还能滚这一轴吗」，而答案是「不能」——将来 Textual 再长出一个滚动入口也一样。
+    谁把 ``#stage`` 的 ``overflow-x`` 改回 ``scroll`` / ``auto``，这条当场变红。
 
-    查的是 ``Stage.__dict__``（**类**上），不是实例：实例名字空间里继承来的方法一直都在，
-    查那儿的话这条断言两边都绿，什么也证明不了（同一个坑见下面 ``_animate`` 那条）。
+    程序滚动走的是另一条路（``force=True``），所以它不受这个闸的限制——那半边由
+    ``test_every_layer_change_still_parks_the_track_on_that_layer`` 看着。
     """
-    actions = scroll_bindings()
-    assert actions, "Textual 的滚动键表是空的——这条守卫已经没有牙齿了，别再信它"
+    app = DidaApp(backend())
 
-    missing = sorted(
-        f"{action}（{key}）"
-        for key, action in actions.items()
-        if f"action_{action}" not in Stage.__dict__
-    )
-    assert not missing, (
-        "这些滚动 action 在 Stage 上没有被接住——用户的键又能推动平移轨道了："
-        f"{missing}。若 Textual 改了 action 名，就在 Stage 上按新名字补空操作。"
-    )
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        stage = app.query_one("#stage", Stage)
+        assert not stage.allow_horizontal_scroll, (
+            "平移轨道又能被用户滚了（#stage 的 overflow-x 是不是被改回 scroll / auto 了）："
+            "按 ← / →、滚轮、tab 都会把它推走"
+        )
 
 
 def test_the_only_scroll_keys_this_file_leaves_alone_are_the_pages_cursor_keys():
