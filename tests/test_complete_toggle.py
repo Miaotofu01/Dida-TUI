@@ -24,7 +24,7 @@ import pytest
 from dida.api.client import DidaApiClient
 from dida.api.errors import BatchRejectedError, DidaError
 from dida.storage.store import COMPLETED_STATUS, ChangeKind, Store
-from dida.sync.engine import SyncEngine
+from dida.sync.engine import Completion, SyncEngine, ViewDefinition
 from dida.testing import FakeBackend, FakeTransport, ManualClock
 from dida.tui import messages, theme
 from dida.tui.app import DidaApp
@@ -313,6 +313,42 @@ async def enter_the_list(pilot, app: DidaApp) -> None:
     await pilot.pause()
 
 
+RECENT_VIEW_ID = "recent"
+"""自建视图「最近完成」的 id（#36 验收标准里点名的那个例子）。"""
+
+
+def recently_completed_view() -> FakeBackend:
+    """一个自建视图「最近完成」：视图里**含已完成成员**（视图不是容器，成员由求值给）。"""
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id=PROJECT_ID)
+    fake.add_task("写周报", list_name=PROJECT_ID, id=TASK_ID, due=at(14, 18, 0))
+    fake.add_task(
+        "交水费",
+        list_name=PROJECT_ID,
+        id=COMPLETED_TASK_ID,
+        completed=True,
+        completed_at=at(14, 11, 0),
+    )
+    fake.add_view(
+        "最近完成",
+        id=RECENT_VIEW_ID,
+        completion=Completion.COMPLETED,
+        completed_days=7,
+    )
+    return fake
+
+
+async def enter_view(pilot, app: DidaApp, view_id: str) -> None:
+    """从清单列表页走进一个视图（光标从收集箱往下走到那一行，再 ``enter``）。"""
+    for _ in range(20):
+        if app.index_page().selected_id == view_id:
+            break
+        await pilot.press("j")
+    assert app.index_page().selected_id == view_id, f"没能把光标挪到视图 {view_id} 那一行上"
+    await pilot.press("enter")
+    await pilot.pause()
+
+
 async def test_space_completes_the_task_under_the_cursor_and_says_so():
     """任务列表页按 ``space`` 把未完成任务标记完成，并立即推送（验收标准 1、5、8）。
 
@@ -368,6 +404,62 @@ async def test_space_again_on_a_completed_task_turns_it_back_to_unfinished():
     assert fake.completed == [], "这一条已经完成了，不该再走完成那一半"
     assert messages.uncompleted_message("交水费") in text, f"按下去要有一句短暂的反馈：\n{text}"
     assert theme.DONE_MARK not in line_with(text, "交水费"), "它不再是已完成的样子了"
+
+
+async def test_space_on_a_completed_row_in_a_view_uncompletes_it_not_completes_it():
+    """视图里的已完成行：``space`` 走的是**取消完成**那一半（用户故事 42，工单 #58 的 S2）。
+
+    视图不是容器，它的成员由求值给：已完成的那条与未完成的**落在同一段里**（#36 的
+    「最近完成」这类自定义视图就是按完成状态筛出来的），而真实清单的已完成那几条在
+    读模型的已完成区里。所以「这一条算不算已完成」只能读**行上那一位**——按「它从哪一段
+    出来」判，视图这一边就会把做完的当成没做完，``space`` 于是朝反方向写：用户想取消完成，
+    发出去的却是「完成」。这一条断的就是那个方向。
+
+    做完了的那条在视图里也**可以停光标**（工单 #38）：不然这个键永远送不到它身上。
+    """
+    fake = recently_completed_view()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE, notifications=True) as pilot:
+        await pilot.pause()
+        await enter_view(pilot, app, RECENT_VIEW_ID)
+        assert app.tasks_page().selected_id == COMPLETED_TASK_ID, "光标该停在视图里那一条上"
+
+        await pilot.press("space")
+        await pilot.pause(0.2)
+        text = screen_text(app)
+
+    assert fake.uncompleted == [COMPLETED_TASK_ID], "视图里的已完成行按 space 要走取消完成"
+    assert fake.completed == [], "它已经完成了，不许再走完成那一半（方向反了就是写错）"
+    assert messages.uncompleted_message("交水费") in text, f"按下去要有一句短暂的反馈：\n{text}"
+
+
+async def test_space_on_a_finished_row_in_a_view_queues_the_uncomplete_not_a_second_complete(store):
+    """同一件事在真库上：队列里落下的是一条 ``UNCOMPLETE``，状态栏那个数照着走（工单 #58 的 S2）。
+
+    接缝二那一半——假后端只记下「哪一个方向被调了」，这一条看的是**真的写出去的是什么**：
+    一次取消完成在队列里留一条 ``UNCOMPLETE``，于是「待推送 1」说的是用户的意图。写错方向
+    时这里留下的是 ``COMPLETE``，屏幕上却什么都不会变（它本来就是完成的），用户永远发现不了。
+    """
+    seed(store, completed_task())
+    store.save_view(
+        ViewDefinition(
+            id=RECENT_VIEW_ID, name="最近完成", completion=Completion.COMPLETED, completed_days=7
+        )
+    )
+    engine = SyncEngine(clock=ManualClock(T0), day_end="24:00", source=store, push_on_change=False)
+    app = DidaApp(engine)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_view(pilot, app, RECENT_VIEW_ID)
+        await pilot.press("space")
+        await pilot.pause(0.2)
+
+    assert [change.kind for change in store.pending()] == [ChangeKind.UNCOMPLETE], (
+        "从视图里取消完成落下的必须是取消完成那一笔"
+    )
+    assert engine.status().pending_count == 1, "状态栏那个数立刻顶上（本地比服务端新）"
 
 
 async def test_space_in_a_focused_input_is_a_space_and_completes_nothing():
