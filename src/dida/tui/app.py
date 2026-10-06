@@ -14,7 +14,7 @@ TUI 只通过 :class:`~dida.sync.engine.Engine` 读写；分组、计数、逾�
 扩展的就是这一片。
 
 **外观一行都不在这里**：颜色、字形、间距、动效时长全在 :mod:`dida.tui.theme`（工单 #51）。
-这里只决定**什么时候**动（换层平移、光标条追赶、同步转圈、toast）。
+这里只决定**什么时候**动（换层平移、同步转圈、toast）。
 
 ⚠ **``await`` 之后动 DOM 的每一处都要先问 ``self.is_running``**（``_write_status`` /
 ``refresh_view`` 就是那两个口子）。这不是洁癖：``Timer._tick`` 会把回调里的异常吞给自己
@@ -285,8 +285,8 @@ class DidaApp(App[None]):
         调色板一眼都用不上；打开之后同一条 CSS 发出的是 ``\\x1b[36m``，由终端说了算。
 
         ``animations`` 是 ``auto|on|off`` 开关（ADR-0007 三）。不给就走 ``DIDA_ANIM``，
-        再不给就是 ``auto``：ssh 与低能力终端上自动关掉。关掉时换层不滑、光标条不飞，
-        屏幕一步到位。
+        再不给就是 ``auto``：ssh 与低能力终端上自动关掉。这是**换层平移**的闸（ADR-0008
+        四撤掉光标条之后，它是这一档动效唯一的用武之地）：关掉时换层不滑，屏幕一步到位。
         """
         super().__init__(ansi_color=True)
         self.engine = engine
@@ -317,12 +317,12 @@ class DidaApp(App[None]):
         """详细页那条任务的标题——路径的最后一段写它。"""
         self._animations = animations or theme.animations_setting(os.environ)
         self._motion = False
-        """这一台机器上到底动不动（``on_mount`` 里按开关与环境定一次）。
+        """这一台机器上换层动不动（``on_mount`` 里按开关与环境定一次）。
 
         ⚠ 名字**不能**是 ``_animate``：``App._animate`` 是 Textual 自己那个绑好的 animator
         （``App.animate()`` 调的就是它），盖掉之后 ``app.animate(...)`` 会抛
         ``TypeError: 'bool' object is not callable``——报错点在 Textual 的 ``app.py`` 里，离
-        现场很远。页面那一半同名的坑见 :class:`dida.tui.pages.base.CursorPage` 的 ``_motion``。
+        现场很远。页面自己不再有第二个动效开关（ADR-0008 四把光标条撤了）。
         """
         self._editing_list: str | None = None
         """正在改的是哪条清单（表单关掉时要用它；``None`` = 那一次是新建）。"""
@@ -349,14 +349,12 @@ class DidaApp(App[None]):
     def on_mount(self) -> None:
         """开屏：**先**把本地缓存画上屏，网络刷新排在事件循环上不等它（用户故事 3/4）。
 
-        外观的开关只在这里定一次：动效档位（``auto|on|off``）落到每张页面上——页面自己
-        不知道 ``auto`` 是什么意思，它只知道「动不动」。
+        动效的开关只在这里定一次：``auto|on|off`` 落到**换层平移**这一个地方（ADR-0008 四
+        撤掉光标条之后，页面自己不再有动效开关）。
         """
         self._motion = theme.animations_enabled(self._animations)
         if not self._motion:
             self.animation_level = "none"
-        for page in self._pages().values():
-            page.set_animate(self._motion)
         self._show(LAYER_INDEX)
         self.refresh_view()
         if self._refresh_on_start:

@@ -37,13 +37,11 @@ from rich.text import Text
 __all__ = [
     "ACCENT",
     "ANIMATIONS_MODES",
-    "BAR",
     "BLANK_MARK",
     "BLOCKED_GLYPH",
     "CHECK_OFF",
     "CHECK_ON",
     "BUILTIN_MARK",
-    "CURSOR_BAR_MS",
     "CURSOR_MARK",
     "CSS_ACCENT",
     "CSS_BLOCK",
@@ -132,9 +130,6 @@ PENDING = "bold reverse"
 HEADING = "bold"
 """分区标题 / 页面标题：字重。"""
 
-BAR = "on cyan"
-"""会追赶的那条装饰光标条：强调色实心两格。"""
-
 RICH_ROLES: Final = (
     "ACCENT",
     "SELECTED",
@@ -145,7 +140,6 @@ RICH_ROLES: Final = (
     "DONE",
     "PENDING",
     "HEADING",
-    "BAR",
 )
 """上面这些名字的清单：守卫照着它逐个查「是不是 ANSI 槽位」。"""
 
@@ -383,14 +377,10 @@ DECORATION_GLYPHS: Final = (ELLIPSIS, WORDMARK_ICON)
 # ---------------------------------------------------------------------------
 
 PAN_MS = 180
-"""换层的横向平移时长。"""
+"""换层的横向平移时长。
 
-CURSOR_BAR_MS = 120
-"""装饰性光标条追上选中的时长（验收标准写的上限就是 120ms）。
-
-**数据选中是瞬间到位的**，这条只是装饰：终端没法在两条之间画半格，所以「滑动」只能是
-一根独立的条子自己追。若让它承担选中，那 ~120ms 里用户看到的位置与实际选中不一致，
-按下 ``space`` 会打中另一条——那不是手感问题，是看起来像 bug 的正确性问题。
+换层平移是这一档动效**唯一**的落点：装饰光标条已被撤掉（工单 #62 / ADR-0008 四），
+光标行只有瞬时到位的 ``❯`` 与强调色。
 """
 
 SPINNER_DELAY_MS = 300
@@ -527,11 +517,6 @@ CursorPage {
 DetailPage #page-body {
     text-wrap: wrap;
     text-overflow: fold;
-}
-#cursor-bar {
-    width: 100%;
-    height: 1;
-    visibility: hidden;
 }
 /* 详细页底部那一行：钉在这一页自己的底边上（不是第三个 chrome 行——它跟着这一页走）。
 
