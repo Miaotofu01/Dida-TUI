@@ -471,13 +471,22 @@ def _constant_dicts(source: str) -> Iterator[tuple[int, dict[Any, Any]]]:
             yield node.lineno, pairs
 
 
+def _priority_tables_in(source: str) -> list[int]:
+    """这份源码里那些「``0/1/3/5`` → 无 / 低 / 中 / 高」的字典字面量在第几行。"""
+    return [
+        lineno
+        for lineno, pairs in _constant_dicts(source)
+        if set(pairs) == PRIORITY_CODES and set(pairs.values()) == PRIORITY_WORDS
+    ]
+
+
 def _priority_tables() -> dict[str, list[int]]:
-    """``src/dida`` 里那些「``0/1/3/5`` → 无 / 低 / 中 / 高」的字典字面量：模块 → 行号。"""
+    """``src/dida`` 里那些表的所在：模块（相对仓库根）→ 行号。"""
     found: dict[str, list[int]] = {}
     for path in sorted((ROOT / "src" / "dida").rglob("*.py")):
-        for lineno, pairs in _constant_dicts(path.read_text(encoding="utf-8")):
-            if set(pairs) == PRIORITY_CODES and set(pairs.values()) == PRIORITY_WORDS:
-                found.setdefault(str(path.relative_to(ROOT)), []).append(lineno)
+        lineno = _priority_tables_in(path.read_text(encoding="utf-8"))
+        if lineno:
+            found[str(path.relative_to(ROOT))] = lineno
     return found
 
 
@@ -492,6 +501,15 @@ def test_the_priority_vocabulary_is_written_down_once():
     assert list(_priority_tables()) == [PRIORITY_HOME], (
         f"优先级四档的中文写法只许在 {PRIORITY_HOME} 里写一次，别处 import 它"
     )
+
+
+def test_the_priority_table_guard_catches_a_second_copy():
+    """上一条守卫自己也要有人守：它认得出抄来的第二份（工单 #58 的 T3）。"""
+    assert _priority_tables_in('MARKS = {0: "无", 1: "低", 3: "中", 5: "高"}\n') == [1]
+    assert _priority_tables_in('MARKS = {5: "高", 3: "中", 1: "低", 0: "无"}\n') == [1], (
+        "换个次序也是同一张表，守卫不许漏"
+    )
+    assert _priority_tables_in('MARK_GLYPHS = {5: "!", 3: "~"}\n') == [], "别的字典不是这张表"
 
 
 def test_the_tui_reads_the_priority_vocabulary_through_the_engine():
@@ -524,6 +542,19 @@ def _module_functions(source: str) -> Iterator[tuple[str, int, str]]:
         yield node.name, node.lineno, ast.dump(ast.Module(body=body, type_ignores=[]))
 
 
+def _duplicate_function_bodies(sources: dict[str, str]) -> list[str]:
+    """这批源码里「同名的函数体出现在不止一个模块里」的那些，写成 ``名字: 甲 = 乙``。"""
+    seen: dict[tuple[str, str], list[str]] = {}
+    for name, source in sources.items():
+        for function, lineno, body in _module_functions(source):
+            seen.setdefault((function, body), []).append(f"{name}:{lineno}")
+    return [
+        f"{function}: {' = '.join(where)}"
+        for (function, _), where in sorted(seen.items())
+        if len({location.rsplit(":", 1)[0] for location in where}) > 1
+    ]
+
+
 def test_no_two_modules_define_the_same_function_body():
     """同名的函数体不许在两个模块里各写一份（工单 #58 的 T5）。
 
@@ -531,19 +562,26 @@ def test_no_two_modules_define_the_same_function_body():
     同函数体），而 ``push`` 本来就 import 了 ``writes``——那第二份是纯粹的重复。该往哪个方向
     收，看的是既有的 import 图：叶模块留着它，依赖方 import 它（反过来就是一个环）。
     """
-    seen: dict[tuple[str, str], list[str]] = {}
-    for path in sorted((ROOT / "src" / "dida").rglob("*.py")):
-        for name, lineno, body in _module_functions(path.read_text(encoding="utf-8")):
-            seen.setdefault((name, body), []).append(f"{path.relative_to(ROOT)}:{lineno}")
-    offenders = [
-        f"{name}: {' = '.join(where)}"
-        for (name, _), where in sorted(seen.items())
-        if len({location.rsplit(":", 1)[0] for location in where}) > 1
-    ]
+    sources = {
+        str(path.relative_to(ROOT)): path.read_text(encoding="utf-8")
+        for path in sorted((ROOT / "src" / "dida").rglob("*.py"))
+    }
 
-    assert offenders == [], (
+    assert _duplicate_function_bodies(sources) == [], (
         "同名的函数体在两个模块里各有一份——让其中一个 import 另一个，别再抄一遍：\n"
-        + "\n".join(offenders)
+        + "\n".join(_duplicate_function_bodies(sources))
+    )
+
+
+def test_the_duplicate_body_guard_catches_a_second_copy():
+    """上一条守卫自己也要有人守（工单 #58 的 T5）：抄一份当场红，只是文档不同不算抄。"""
+    copy = "def read(payload):\n    if not payload:\n        return None\n    return payload\n"
+    assert _duplicate_function_bodies({"a.py": copy, "b.py": copy}) == ["read: a.py:1 = b.py:1"]
+    assert _duplicate_function_bodies({"a.py": copy, "b.py": '"""说明。"""\n\n' + copy}) == [
+        "read: a.py:1 = b.py:3"
+    ], "文档字符串不同不影响判定：那是说明，不是行为"
+    assert _duplicate_function_bodies({"a.py": copy, "b.py": "def read(payload):\n    return payload\n"}) == [], (
+        "同名但行为不同的两个函数不是重复"
     )
 
 
@@ -578,3 +616,14 @@ def test_the_same_list_judgement_is_asked_of_the_engine_not_written_twice():
     assert _equality_with_attribute(source, "list_id") == [], (
         "界面自己判了「同一个清单」——这条判断归引擎（dida.sync.writes.is_a_move）"
     )
+
+
+def test_the_same_list_guard_catches_an_inlined_comparison():
+    """上一条守卫自己也要有人守（工单 #58 的 T6）：再写一遍那个比较当场红。"""
+    inlined = "if field == LIST_FIELD:\n    if values[LIST_FIELD] == detail.list_id:\n        return False\n"
+
+    assert _equality_with_attribute(inlined, "list_id") == [2]
+    assert _equality_with_attribute("self.engine.move_task(task_id, to_list_id=x)\n", "list_id") == [], (
+        "把 id 当参数传出去不是「自己判」"
+    )
+    assert _equality_with_attribute("if other.list_id == mine.list_id:\n    pass\n", "list_id") == [1]
