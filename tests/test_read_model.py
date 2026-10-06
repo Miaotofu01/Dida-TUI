@@ -141,8 +141,9 @@ def test_custom_view_rows_sit_between_the_builtin_views_and_the_real_lists():
     """自定义视图也是一行，排在内置视图之后、真实清单之前（用户故事 10）。"""
     backend = make_backend()
     backend.add_list("工作", id="work")
-    backend.add_task("交报告", list_name="work")
-    backend.add_view("高优先级", id="v1", task_ids=("t1",))
+    backend.add_task("交报告", list_name="work", priority=5)
+    # 视图摆的是**条件**（#36）：成员由那一条求值路径算，替身不再自己编一份成员名单。
+    backend.add_view("高优先级", id="v1", priorities=(5,))
 
     rows = backend.list_index()
 

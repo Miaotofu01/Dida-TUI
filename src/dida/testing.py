@@ -21,7 +21,12 @@ from typing import Any, Mapping, Sequence
 import httpx
 
 from dida.clock import Clock
-from dida.storage.store import COMPLETED_STATUS, UNCOMPLETED_STATUS, RefreshReport
+from dida.storage.store import (
+    COMPLETED_STATUS,
+    UNCOMPLETED_STATUS,
+    VIEW_ID_PREFIX,
+    RefreshReport,
+)
 from dida.sync.engine import (
     CompletedReport,
     ListRow,
@@ -30,7 +35,7 @@ from dida.sync.engine import (
     SyncStatus,
     TaskDetail,
     TaskList,
-    ViewRow,
+    ViewDefinition,
     WriteKind,
 )
 from dida.sync.lists import LOCAL_LIST_PREFIX
@@ -120,7 +125,7 @@ class InMemorySource:
 
         self._lists: dict[str, ListSnapshot] = {}
         self._tasks: dict[str, TaskSnapshot] = {}
-        self._views: dict[str, ViewRow] = {}
+        self._views: dict[str, ViewDefinition] = {}
         self._raw: dict[str, Mapping[str, Any]] = {}
         self._seq = 0
 
@@ -190,15 +195,18 @@ class InMemorySource:
         if raw is not None:
             self._raw[task_id] = {**raw, "status": status}
 
-    def add_view(self, name: str, *, id: str | None = None, task_ids: Sequence[str] = ()) -> ViewRow:
-        """加一条自定义视图行（#36）：``task_ids`` 是这一层算好的求值结果。
+    def add_view(self, name: str, *, id: str | None = None, **conditions: Any) -> ViewDefinition:
+        """加一个自定义视图（#36）：``conditions`` 就是 :class:`ViewDefinition` 的那几维。
 
-        替身不自己求值——过滤条件怎么算成一份任务列表是视图求值那一层的判断（#35/#36），
-        替身照收不误（与 ``set_subtasks`` 收成品行同一条口径）。
+        替身**不自己求值**——成员怎么算出来是视图求值那一层的判断（``evaluate_view``），
+        真引擎的读路径从这里读定义、当场求值。所以「这个视图选中了谁」在接缝一上与生产
+        走的是同一份实现（#39 的教训：替身自己编一份，测试就会静默断言成别的东西）。
         """
-        row = ViewRow(id=id if id is not None else name, name=name, task_ids=tuple(task_ids))
-        self._views[row.id] = row
-        return row
+        definition = ViewDefinition(
+            id=id if id is not None else name, name=name, **conditions
+        )
+        self._views[definition.id] = definition
+        return definition
 
     def add_task(
         self,
@@ -283,6 +291,34 @@ class InMemorySource:
             payload["reminders"] = list(snapshot.reminders)
         return payload
 
+    def view_definitions(self) -> tuple[ViewDefinition, ...]:
+        """自定义视图的**定义**（#36），按加进来的顺序。
+
+        与 ``Store.views()`` 同一口径：给定义不给成员——成员要「全量缓存 + 当前逻辑日」
+        才算得出来，替身与存储层一样不读时钟。
+        """
+        return tuple(self._views.values())
+
+    def view_definition(self, view_id: str) -> ViewDefinition | None:
+        """一个视图的定义；没加过就是 ``None``。"""
+        return self._views.get(view_id)
+
+    def save_view(self, definition: ViewDefinition) -> None:
+        """写下一行视图（新建与改都是覆盖式地写）；**位置照旧不动**（字典改已有的键
+        不会把它挪到末尾，与 ``Store.save_view`` 保住 ``position`` 是同一件事）。"""
+        self._views[definition.id] = definition
+
+    def drop_view(self, view_id: str) -> None:
+        """本地摘掉一行视图（只动这一行，一条任务都不碰）。"""
+        self._views.pop(view_id, None)
+
+    def new_view_id(self) -> str:
+        """一个还没被占用的本地视图 id（与 ``Store.new_view_id`` 同一个前缀与算法）。"""
+        index = 1
+        while f"{VIEW_ID_PREFIX}{index}" in self._views:
+            index += 1
+        return f"{VIEW_ID_PREFIX}{index}"
+
     def lists(self) -> tuple[ListSnapshot, ...]:
         return tuple(self._lists.values())
 
@@ -322,10 +358,6 @@ class InMemorySource:
         snapshot = replace(snapshot, **known) if known else snapshot
         self._tasks[task_id] = snapshot
         self._raw[task_id] = raw
-
-    def views(self) -> tuple[ViewRow, ...]:
-        """自定义视图行（#36 的本地库那一样；替身里是 :meth:`add_view` 摆的）。"""
-        return tuple(self._views.values())
 
     def tasks(self) -> tuple[TaskSnapshot, ...]:
         return tuple(self._tasks.values())
@@ -447,6 +479,18 @@ class FakeBackend:
         self.list_error: Exception | None = None
         """摆一个异常进去，清单的三种写就抛它（试 TUI 拿到结构化错误时的反应）。"""
 
+        self.created_views: list[ViewDefinition] = []
+        """``create_view(definition)`` 收到的每一笔，按顺序（#36）。"""
+
+        self.updated_views: list[ViewDefinition] = []
+        """``update_view(definition)`` 收到的每一笔，按顺序（#36）。"""
+
+        self.deleted_views: list[str] = []
+        """``delete_view(view_id)`` 收到的视图 id，按顺序（#36）。"""
+
+        self.view_error: Exception | None = None
+        """摆一个异常进去，视图的三种写就抛它（与 ``list_error`` 同一条口径）。"""
+
         self._subtasks: dict[str, tuple[SubtaskItem, ...]] = {}
         """摆进来的子任务，按任务 id 索引（t20）；:meth:`set_subtasks` 摆，读路径照给。"""
 
@@ -494,9 +538,9 @@ class FakeBackend:
     def add_list(self, name: str, **kwargs: Any) -> ListSnapshot:
         return self.source.add_list(name, **kwargs)
 
-    def add_view(self, name: str, *, id: str | None = None, task_ids: Sequence[str] = ()) -> ViewRow:
-        """摆一条自定义视图行（#36 的求值结果）：这个视图当前选中的那些任务 id。"""
-        return self.source.add_view(name, id=id, task_ids=task_ids)
+    def add_view(self, name: str, **conditions: Any) -> ViewDefinition:
+        """摆一个自定义视图（#36）：``conditions`` 就是 :class:`ViewDefinition` 的那几维。"""
+        return self.source.add_view(name, **conditions)
 
     def add_task(self, title: str, **kwargs: Any) -> TaskSnapshot:
         return self.source.add_task(title, **kwargs)
@@ -729,6 +773,40 @@ class FakeBackend:
         """摆了 ``list_error`` 就在记完这一笔之后抛它（引擎当场拒绝的那条路）。"""
         if self.list_error is not None:
             raise self.list_error
+
+    def create_view(self, definition: ViewDefinition) -> str:
+        """写：记下这一笔，**并且真的把它摆进内存缓存**（#36）。
+
+        与 :meth:`create_list` 同一条口径：清单列表页上「建完立刻多出一行」正是这张工单的
+        验收标准，只记录的话接缝一根本测不到那句话。
+
+        实际落库**委托给真引擎**（``self._engine``）：视图那条写路径不需要网络也不需要
+        客户端，替身没有理由再抄一遍「分配 id + 覆盖式写一行」——抄一遍就会与生产漂移。
+        """
+        self.created_views.append(definition)
+        self._raise_view_error()
+        return self._engine.create_view(definition)
+
+    def update_view(self, definition: ViewDefinition) -> None:
+        """写：记下这一笔，并改内存缓存里那一行（位置照旧不动）。"""
+        self.updated_views.append(definition)
+        self._raise_view_error()
+        self._engine.update_view(definition)
+
+    def delete_view(self, view_id: str) -> None:
+        """写：记下这一笔，并从内存缓存里摘掉那一行（**一条任务都不碰**）。"""
+        self.deleted_views.append(view_id)
+        self._raise_view_error()
+        self._engine.delete_view(view_id)
+
+    def view_definition(self, view_id: str) -> ViewDefinition | None:
+        """读：委托给真引擎（本地库里那一行定义；没建过就是 ``None``）。"""
+        return self._engine.view_definition(view_id)
+
+    def _raise_view_error(self) -> None:
+        """摆了 ``view_error`` 就在记完这一笔之后抛它（引擎当场拒绝的那条路）。"""
+        if self.view_error is not None:
+            raise self.view_error
 
     def set_subtasks(self, task_id: str, *items: SubtaskItem) -> None:
         """摆一条任务的子任务（t20）：右栏渲染与勾选测试的输入。
