@@ -490,15 +490,18 @@ class Store:
         还欠一个真 id」。建完就回 ``201`` 空 body 的那条路若把它算进去，用户会看到状态栏挂着
         一个永远不动的「待推送 1」——而那条清单其实早就建好了。等用户真改了名字，那一笔会
         换成普通的 ``UPDATE``，照旧算数。
+
+        **算不算由词表说了算**（#57 的检查 8）：:attr:`~dida.sync.lists.ListWriteKind.counts_as_pending`
+        一处分类，加一种记录时不会在这里被默默归错类（默认是「算」，保守的那一侧）。
         """
-        row = self._db.execute(
-            """
-            SELECT (SELECT COUNT(*) FROM pending_changes)
-                 + (SELECT COUNT(*) FROM pending_list_changes WHERE kind <> ?) AS n
-            """,
-            (ListWriteKind.AWAIT_ID.value,),
-        ).fetchone()
-        return int(row["n"])
+        counted = self._db.execute("SELECT COUNT(*) AS n FROM pending_changes").fetchone()
+        task_changes = int(counted["n"])
+        list_changes = sum(
+            1
+            for row in self._db.execute("SELECT kind FROM pending_list_changes")
+            if ListWriteKind(row["kind"]).counts_as_pending
+        )
+        return task_changes + list_changes
 
     def record_attempt(
         self,
@@ -559,21 +562,39 @@ class Store:
         一笔改动发不发得出去，所以它是词汇，不是存储层的实现细节。
 
         服务端建好之后才给真 id，而「建完立刻出现在清单列表页」是 ADR-0002 的手感要求。
-        取最小的空号而不是计数器：上一次没推成功的那一行还占着它的号，重开也不会撞上它
-        （撞上就是两条清单合成一条，用户刚建的那条不见了）。
+        取最小的空号而不是计数器：上一次没推成功的那一行还占着它的号，重开也不会撞上它。
+
+        **占着号的有两处**（#57）：``lists`` 里那一行，以及队列里还挂着它记录的那些 id
+        （:meth:`_held_local_list_ids`）。只看行是不够的——一行可以**在记录还在的时候**被剪掉
+        （服务端索引里找不到它、而它又没有「还没到服务端的改动」，见 :meth:`_prune_lists`），
+        那个号就从行那一侧空了出来；再发一次就是两条清单用同一个临时 id，而按 id 找记录的
+        地方会挑错**一条**，最坏是拿另一条清单的名字去删服务端上的一行（#57 的探针）。
+
+        所以规矩一句话：**临时 id 的所有权跟着记录走**——记录还在，这个号就不许再发。
+        行的寿命与记录的寿命因此可以不一样长（剪枝只剪行），而号永远是安全的。
         """
-        rows = self._db.execute(
-            "SELECT id FROM lists WHERE id LIKE ?", (f"{LOCAL_LIST_PREFIX}%",)
-        ).fetchall()
         used = {
-            int(str(row["id"])[len(LOCAL_LIST_PREFIX) :])
-            for row in rows
-            if str(row["id"])[len(LOCAL_LIST_PREFIX) :].isdigit()
+            int(value[len(LOCAL_LIST_PREFIX) :])
+            for value in self._held_local_list_ids()
+            if value[len(LOCAL_LIST_PREFIX) :].isdigit()
         }
         number = 1
         while number in used:
             number += 1
         return f"{LOCAL_LIST_PREFIX}{number}"
+
+    def _held_local_list_ids(self) -> set[str]:
+        """本地临时 id 的**全部**占用者：``lists`` 里的行 + 队列里的记录（#57）。
+
+        「这是不是本地临时 id」只在 :func:`~dida.sync.lists.is_local_list_id` 一处判断
+        （这里不写 ``LIKE`` 之类第二条判据），所以两张表先各取一列、在 Python 这边筛。
+        """
+        values = {str(row["id"]) for row in self._db.execute("SELECT id FROM lists")}
+        values |= {
+            str(row["list_id"])
+            for row in self._db.execute("SELECT list_id FROM pending_list_changes")
+        }
+        return {value for value in values if is_local_list_id(value)}
 
     def enqueue_list(
         self,
@@ -899,12 +920,19 @@ class Store:
         剪枝读的是这一条：一条 ``AWAIT_ID``（建好了、在等真 id）的本地行如果在服务端的索引里
         找不到，说明那条清单**本来就不存在了**（在别处被删了），本地这行是个影子——剪掉它才对。
         而真正的改动（建 / 改 / 删还没出去）必须留着，否则剪掉的是用户刚做的那一下。
+
+        **哪一种算「真正的改动」由词表说了算**（#57 的检查 8）：
+        :attr:`~dida.sync.lists.ListWriteKind.holds_its_row` 一处分类，加一种记录时不会在这里
+        被默默归错类（默认是「留住行」，保守的那一侧）。
+
+        ⚠ 剪掉那一行**不代表**那条记录也没了：记录还在原地等认领，并且**仍然占着那个临时
+        id**（:meth:`new_local_list_id` 两处一起看，#57）——行的寿命与记录的寿命可以不一样长，
+        但号永远有主。
         """
-        row = self._db.execute(
-            "SELECT 1 FROM pending_list_changes WHERE list_id = ? AND kind <> ? LIMIT 1",
-            (list_id, ListWriteKind.AWAIT_ID.value),
-        ).fetchone()
-        return row is not None
+        rows = self._db.execute(
+            "SELECT kind FROM pending_list_changes WHERE list_id = ?", (list_id,)
+        ).fetchall()
+        return any(ListWriteKind(row["kind"]).holds_its_row for row in rows)
 
     def _has_pending_list_change(self, list_id: str) -> bool:
         """这条清单上还有没有没推成功的改动（#42）。
