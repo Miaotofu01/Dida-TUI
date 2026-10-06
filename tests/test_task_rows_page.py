@@ -398,6 +398,38 @@ async def test_a_task_completed_more_than_seven_days_ago_does_not_take_the_scree
     assert "八天前做完的" not in text
 
 
+async def test_the_completed_rows_on_screen_follow_the_normal_sort_key():
+    """真实清单的已完成段在屏幕上也按正常排序键排（工单 #64 验收标准 1、3）。
+
+    两条的完成时刻与截止时间是**反的**：「晚截止的」刚做完，「早截止的」更早完成。按完成
+    时刻倒序（旧行为）屏幕上是 晚截止的 / 早截止的；按正常排序键是 早截止的 / 晚截止的。
+    两条都仍要沉在未完成那条下面。
+    """
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_task("没做完的", list_name="work", id="t1", due=at(14, 18, 0))
+    fake.add_task(
+        "晚截止的", list_name="work", id="t2", due=at(20, 9, 0),
+        completed=True, completed_at=at(14, 12, 0),
+    )
+    fake.add_task(
+        "早截止的", list_name="work", id="t3", due=at(16, 9, 0),
+        completed=True, completed_at=at(14, 10, 0),
+    )
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_work(pilot, app)
+        rows = lines(screen_text(app))
+
+    def row_of(needle: str) -> int:
+        return next(i for i, line in enumerate(rows) if needle in line)
+
+    assert row_of("早截止的") < row_of("晚截止的"), "已完成段要按截止时间升序，不是完成时刻倒序"
+    assert row_of("没做完的") < row_of("早截止的"), "已完成的仍要沉在未完成下面"
+
+
 # ------------------------------------------------------------------ 光标跨刷新
 
 

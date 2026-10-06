@@ -34,13 +34,14 @@ from dida.sync.engine import (
     UnknownViewError,
     ViewDefinition,
     builtin_view_definitions,
+    completed_section,
     evaluate_view,
     parse_view_form,
     view_form_values,
     view_from_payload,
     view_payload,
 )
-from dida.sync.view import TaskSnapshot
+from dida.sync.view import ListSnapshot, TaskSnapshot
 from dida.sync.views import (
     COMPLETED_DAYS_CHOICES,
     COMPLETION_CHOICES,
@@ -173,6 +174,36 @@ def test_the_completion_time_dimension_keeps_only_the_recently_completed():
     )
 
     assert set(titles(evaluate(recent, tasks))) == {"今天做完的", "三天前做完的", "六天前做完的"}
+
+
+def test_completed_rows_in_a_view_follow_the_same_key_as_the_real_list_completed_section():
+    """视图里的已完成行与真实清单的已完成段**同一条规矩**（工单 #64 验收标准 2，用户故事 155/156）。
+
+    这一对任务专门把差别摆出来：一条有截止时间（03-20）、优先级 0，另一条没有截止时间、
+    优先级 5。真实清单的已完成段按 ``row_sort_key``（有日期的在前）排成 Z/A；视图的成员
+    此前走 ``order_key`` 的已完成那一档，那一档把「有没有日期」这一位丢了，于是按优先级排成
+    A/Z——同一个集合两套顺序。用户故事 155 要的是一条规矩，所以两条路都得是 Z/A。
+    """
+    done = ViewDefinition(id="done", name="最近完成", completion=Completion.COMPLETED)
+    tasks = (
+        task("Z 有日期", due=at(20, 9), completed=True, completed_at=at(14, 10)),
+        task("A 无日期", priority=5, completed=True, completed_at=at(14, 15)),
+    )
+
+    real_list = [
+        item.title
+        for item in completed_section(
+            tasks,
+            [ListSnapshot(id="work", name="工作")],
+            now=T0,
+            day_end="24:00",
+            window_hours=168,
+        ).items
+    ]
+    from_view = titles(evaluate(done, tasks))
+
+    assert real_list == ["Z 有日期", "A 无日期"], "有截止时间的排在没截止时间的前面"
+    assert from_view == real_list, "视图里换了一套顺序——同一条规矩才对"
 
 
 def test_the_completion_window_walks_the_logical_day_at_the_boundary():
