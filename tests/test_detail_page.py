@@ -1338,6 +1338,70 @@ async def test_esc_after_deleting_the_date_that_was_there_is_a_clear():
     assert theme.NO_VALUE in field_row(text, "截止"), field_row(text, "截止")
 
 
+async def test_the_due_editor_takes_the_zone_from_the_injected_clock_not_the_machine():
+    """任务还没有截止时间时，用户敲的墙钟按**注入的钟**那个时区理解（工单 #58 的 T1）。
+
+    README 与架构文档的硬规则：「现在」只能来自注入的时钟，业务代码不许调 ``datetime.now()``
+    ——这一页曾经用它查本地时区，于是写出去的那一刻跟着**跑测试的机器**走。替身这只钟故意
+    摆在 -05:00（与这台机器的 +08:00 不同）：页面要是还去读真实时钟，那一刻会带 +0800。
+
+    只有「本来没有截止时间」的任务才需要这个时区——有截止时间时那一刻自己带着 offset
+    （``due.due_change`` 的 ``reference``），所以这条任务的日期不能有。
+    """
+    else_where = timezone(timedelta(hours=-5))
+    fake = FakeBackend(clock=ManualClock(datetime(2026, 3, 14, 12, 3, tzinfo=else_where)))
+    fake.add_list("工作", id="work")
+    fake.add_task("没有日期的任务", list_name="work", id="t2")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to_the_due_field(pilot, app)
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press(*"2026-03-20")
+        await pilot.press("enter")  # 日期这一格 → 轮到时刻
+        await pilot.pause()
+        await pilot.press(*"08:15")
+        await pilot.press("enter")  # 时刻这一格 → 这一笔出去
+        await pilot.pause()
+
+    assert fake.rescheduled_due == [datetime(2026, 3, 20, 8, 15, tzinfo=else_where)], (
+        f"写出去的那一刻没跟着注入的钟走：{fake.rescheduled_due}"
+    )
+
+
+async def test_esc_with_an_incomplete_time_writes_nothing_and_stays():
+    """``esc`` 撞上认不出来的时刻：与认不出来的日期同一套（草稿第二种状态的另一半）。
+
+    ``18`` 不是一个 ``HH:MM``，而用户可能正打到一半。这一下既不该替他把 ``18`` 猜成 18:00
+    （「绝不猜」是这一页的既定口径），也不该悄悄收起——编辑器留在原地，下面那一行说清是
+    哪一格不认。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to_the_due_field(pilot, app)
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("enter")  # 日期这一格提交 → 轮到时刻
+        await pilot.pause()
+        await pilot.press(*clear(5))  # 清掉回填的 18:00
+        await pilot.press(*"18")
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+        still_editing = app.detail_page().query_one("#due-time").display
+
+    assert fake.rescheduled == [], f"认不出来的时刻不该写出去：{fake.rescheduled_due}"
+    assert "不是一个时刻" in text, f"该说清是时刻那一格不认：\n{text}"
+    assert still_editing, "拦下之后编辑器要留在原地，别把用户敲的东西丢掉"
+
+
 async def test_the_due_editor_writes_out_an_explicit_null_shape(tmp_path):
     """清空日期那一笔请求体的形状：显式 ``dueDate: null``（验收标准 3 + 9，接缝二）。
 
