@@ -67,10 +67,18 @@ def snapshot(
     completed_at: datetime | None,
     completed: bool = True,
     list_id: str = "work",
+    due: datetime | None = None,
+    priority: int = 0,
 ) -> TaskSnapshot:
     """缓存里的一条任务快照。"""
     return TaskSnapshot(
-        id=id, title=title, list_id=list_id, completed=completed, completed_at=completed_at
+        id=id,
+        title=title,
+        list_id=list_id,
+        due=due,
+        priority=priority,
+        completed=completed,
+        completed_at=completed_at,
     )
 
 
@@ -198,8 +206,8 @@ def test_the_window_cutoff_is_a_pure_function_of_now_and_the_hours():
 def test_the_completed_section_keeps_only_the_last_seven_days():
     """更早完成的不占屏幕（用户故事：已完成只显示最近 7 天）。
 
-    这里只问**留下了哪些**——顺序自 #64 起是正常排序键的事，由
-    :func:`test_the_completed_section_sorts_by_the_normal_key_not_by_completion_time` 单独钉。
+    留下的两条都没有截止时间、优先级也一样，顺序由标题断开（六 U+516D < 刚 U+521A）——
+    **不是**完成时刻倒序（工单 #64 把那个倒序拿掉了）。
     """
     section = completed_section(
         [
@@ -213,27 +221,7 @@ def test_the_completed_section_keeps_only_the_last_seven_days():
         window_hours=168,
     )
 
-    assert {item.title for item in section.items} == {"刚刚做完的", "六天前做完的"}
-
-
-def completed_row(
-    id: str,
-    title: str,
-    *,
-    completed_at: datetime,
-    due: datetime | None = None,
-    priority: int = 0,
-) -> TaskSnapshot:
-    """已完成区排序用的一条快照：完成时刻、截止时间、优先级各摆各的。"""
-    return TaskSnapshot(
-        id=id,
-        title=title,
-        list_id="work",
-        due=due,
-        priority=priority,
-        completed=True,
-        completed_at=completed_at,
-    )
+    assert [item.title for item in section.items] == ["六天前做完的", "刚刚做完的"]
 
 
 def test_the_completed_section_sorts_by_the_normal_key_not_by_completion_time():
@@ -244,8 +232,8 @@ def test_the_completed_section_sorts_by_the_normal_key_not_by_completion_time():
     """
     section = completed_section(
         [
-            completed_row("t1", "甲", completed_at=at(14, 14, 0), due=at(20, 9, 0)),
-            completed_row("t2", "乙", completed_at=at(14, 13, 0), due=at(16, 9, 0)),
+            snapshot("t1", "甲", completed_at=at(14, 14, 0), due=at(20, 9, 0)),
+            snapshot("t2", "乙", completed_at=at(14, 13, 0), due=at(16, 9, 0)),
         ],
         [ListSnapshot(id="work", name="工作")],
         now=T0,
@@ -264,8 +252,8 @@ def test_a_completed_task_without_a_due_date_sinks_below_one_that_has_a_due_date
     """
     section = completed_section(
         [
-            completed_row("t1", "Z 有日期", completed_at=at(14, 10, 0), due=at(20, 9, 0)),
-            completed_row("t2", "A 无日期", completed_at=at(14, 15, 0), priority=5),
+            snapshot("t1", "Z 有日期", completed_at=at(14, 10, 0), due=at(20, 9, 0)),
+            snapshot("t2", "A 无日期", completed_at=at(14, 15, 0), priority=5),
         ],
         [ListSnapshot(id="work", name="工作")],
         now=T0,
