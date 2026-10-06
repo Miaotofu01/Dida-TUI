@@ -415,12 +415,12 @@ def line_with(text: str, needle: str) -> str:
 
 
 async def enter_view(pilot, app: DidaApp, view_id: str) -> None:
-    """从清单列表页走进一个视图：光标从收集箱往下走到那一行，再 ``enter``。"""
+    """从清单列表页走进一个视图：光标从收集箱往下走到那一行，再 ``→``。"""
     for _ in range(10):
         if app.index_page().selected_id == view_id:
             break
         await pilot.press("j")
-    await pilot.press("enter")
+    await pilot.press("right")
     await pilot.pause()
 
 
@@ -497,13 +497,13 @@ async def test_rows_in_a_view_show_their_list_name_and_rows_in_a_list_do_not():
         in_view = line_with(screen_text(app), "交报告")
         assert "工作" in in_view, "视图不是容器：这一行要写出它属于哪个清单"
 
-        await pilot.press("escape")
+        await pilot.press("left")
         await pilot.pause()
         for _ in range(10):
             if app.index_page().selected_id == "work":
                 break
             await pilot.press("j")
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         in_list = line_with(screen_text(app), "交报告")
         assert "工作" not in in_list, "清单里的行不重复写清单名（抬头已经写着它了）"

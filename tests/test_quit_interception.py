@@ -183,7 +183,7 @@ async def test_a_quit_key_over_the_help_overlay_does_not_stack_a_second_prompt()
 
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
-        await pilot.press("question_mark")
+        await pilot.press("h")
         await pilot.pause()
         assert "键位" in screen_text(app), "先确认帮助浮层真的开着"
 
@@ -205,7 +205,7 @@ async def test_cancelling_from_the_help_overlay_leaves_the_help_overlay_up():
 
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
-        await pilot.press("question_mark")
+        await pilot.press("h")
         await pilot.pause()
         await pilot.press("ctrl+c")
         await pilot.pause()

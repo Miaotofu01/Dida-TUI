@@ -281,7 +281,7 @@ async def open_the_today_view(pilot, app) -> None:
     """落在「今天」那一屏上（层二），光标在它的第一条任务上。"""
     await pilot.pause()
     await move_cursor_to(pilot, app.index_page(), "today")
-    await pilot.press("enter")
+    await pilot.press("right")
     await pilot.pause()
 
 
@@ -301,17 +301,17 @@ async def test_editing_the_boundary_in_the_config_file_takes_effect_without_a_re
         await open_the_today_view(pilot, app)
         await move_cursor_to(pilot, app.tasks_page(), "late")  # 昨晚收尾
         before_tasks = screen_text(app)
-        await pilot.press("enter")  # 详细页：截止那一格是逾期判定的读数
+        await pilot.press("right")  # 详细页：截止那一格是逾期判定的读数
         await pilot.pause()
         before_detail = screen_text(app)
-        await pilot.press("escape")
+        await pilot.press("left")
         await pilot.pause()
 
         write_day_end(path, "04:00")
         await app.push_tick()
         await pilot.pause()
         after_tasks = screen_text(app)
-        await pilot.press("enter")  # 光标还在同一条上，直接再看一次详细页
+        await pilot.press("right")  # 光标还在同一条上，直接再看一次详细页
         await pilot.pause()
         after_detail = screen_text(app)
 
@@ -364,7 +364,7 @@ async def test_the_cursor_stays_on_its_task_across_the_recompute(tmp_path):
         await pilot.pause()
         text = screen_text(app)
         on_tasks = app.tasks_page().selected_id
-        await pilot.press("escape")
+        await pilot.press("left")
         await pilot.pause()
         on_index = app.index_page().selected_id
 

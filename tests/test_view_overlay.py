@@ -243,7 +243,7 @@ async def test_entering_the_new_view_shows_the_filtered_tasks():
         await pilot.pause()
         name = await new_high_priority_view(pilot, app)
         await move_cursor_to(pilot, app.index_page(), name)
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         inside = screen_text(app)
 
@@ -276,7 +276,7 @@ async def test_the_recently_completed_example_can_be_built_from_the_form():
         await pilot.press("enter")
         await pilot.pause()
         await move_cursor_to(pilot, app.index_page(), "zuijinwancheng")
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         inside = screen_text(app)
 
@@ -354,7 +354,7 @@ async def test_e_opens_the_conditions_prefilled_and_the_change_takes_effect_at_o
         await pilot.pause()
         after = row_of(screen_text(app), name)
 
-        await pilot.press("enter")  # 进这个视图，看到的就是新的成员
+        await pilot.press("right")  # 进这个视图，看到的就是新的成员
         await pilot.pause()
         inside = screen_text(app)
 
@@ -396,7 +396,7 @@ async def test_d_asks_once_and_y_deletes_the_view_without_touching_any_task():
         after_yes = screen_text(app)
 
         await move_cursor_to(pilot, app.index_page(), "工作")
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         work = screen_text(app)
 
@@ -481,7 +481,7 @@ async def test_the_list_scope_takes_several_list_names_and_filters_the_members()
         await pilot.press("enter")
         await pilot.pause()
         await move_cursor_to(pilot, app.index_page(), "fanwei")
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         inside = screen_text(app)
 

@@ -104,7 +104,7 @@ def backend() -> FakeBackend:
 
 
 async def open_work(app: DidaApp, pilot) -> None:
-    """把光标从收集箱走到「工作」上，``enter`` 进层二（任务列表页）。
+    """把光标从收集箱走到「工作」上，``→`` 进层二（任务列表页）。
 
     不按行数走：光标走到哪一行是清单列表页自己的事（收集箱在它前面），这里只认 id。
     """
@@ -113,7 +113,7 @@ async def open_work(app: DidaApp, pilot) -> None:
             break
         await pilot.press("j")
     assert app.index_page().selected_id == "work", "光标没能走到「工作」那一行"
-    await pilot.press("enter")
+    await pilot.press("right")
     await pilot.pause()
 
 

@@ -67,7 +67,7 @@ async def open_container(pilot, page, row_id: str) -> None:
         await pilot.press("j")
     else:
         raise AssertionError(f"光标没能走到 {row_id} 上，停在 {page.selected_id}")
-    await pilot.press("enter")
+    await pilot.press("right")
     await pilot.pause()
 
 

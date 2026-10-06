@@ -116,7 +116,7 @@ async def enter_work(pilot, app: DidaApp) -> None:
         if app.index_page().selected_id == "work":
             break
         await pilot.press("j")
-    await pilot.press("enter")
+    await pilot.press("right")
     await pilot.pause()
 
 
@@ -158,23 +158,23 @@ async def test_the_breadcrumb_is_the_navigation_path_you_walked():
             if app.index_page().selected_id == "work":
                 break
             await pilot.press("j")
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         inside = lines(screen_text(app))[0]
         assert "清单列表页" in inside and "工作" in inside, "进了清单，路径上要多一段"
         assert inside.count("▸") == 2, "两段路径"
 
-        await pilot.press("enter")  # 进第一条任务的详细页
+        await pilot.press("right")  # 进第一条任务的详细页
         await pilot.pause()
         detail = lines(screen_text(app))[0]
         assert detail.count("▸") == 3, "第三层：三段路径"
         assert "写周报" in detail, "最后一段就是这条任务"
 
-        await pilot.press("escape")
+        await pilot.press("left")
         await pilot.pause()
         back = lines(screen_text(app))[0]
 
-    assert back.count("▸") == 2, "esc 出栈，路径跟着退回去"
+    assert back.count("▸") == 2, "← 出栈，路径跟着退回去"
     assert "写周报" not in back
 
 
@@ -241,7 +241,7 @@ async def test_a_rule_spans_the_page_and_never_ends_in_an_ellipsis(width: int):
         index = screen_text(app)
         await enter_work(pilot, app)
         tasks = screen_text(app)
-        await pilot.press("enter")  # 层三标题下面也有一条细线
+        await pilot.press("right")  # 层三标题下面也有一条细线
         await pilot.pause()
         detail = screen_text(app)
 
@@ -350,7 +350,7 @@ async def test_changing_layer_pans_horizontally_and_lands_aligned():
                 break
             await pilot.press("j")
         offsets = await sample_while(
-            lambda: pilot.press("enter"), lambda: heading_column(screen_text(app))
+            lambda: pilot.press("right"), lambda: heading_column(screen_text(app))
         )
         await pilot.pause(0.3)
         settled = screen_text(app)
@@ -361,8 +361,6 @@ async def test_changing_layer_pans_horizontally_and_lands_aligned():
 
 
 USER_SCROLL_KEYS = (
-    "left",
-    "right",
     "home",
     "end",
     "pageup",
@@ -372,9 +370,21 @@ USER_SCROLL_KEYS = (
 )
 """**用户按下去不许推动平移轨道**的那些键。
 
-前六个是工单 #59 点名的；后两个是 Textual 的滚动键表里剩下的两个横向那半边——实测它们同样
-推得动轨道（``page_left`` / ``page_right`` 一次挪一整屏），工单那张表漏了它们。``up`` / ``down``
+工单 #59 点名的六个横向键里，``←`` / ``→`` 从工单 #65 起归了**导航**（见
+:data:`NAVIGATION_KEYS`），所以不在这份名单里；剩下这四个照样一个都不许推动轨道——实测
+``page_left`` / ``page_right`` 一次挪一整屏，比 ``←`` / ``→`` 还狠。``up`` / ``down``
 不在这里：它们是页面自己的光标键（与 ``j`` / ``k`` 同一条绑定），按下去本该动光标。
+"""
+
+NAVIGATION_KEYS = ("left", "right")
+"""交给**导航**的那两个键（工单 #65）：``→`` 进下一层、``←`` 回上一层。
+
+它们本来住在 Textual 的滚动键表里（``ScrollableContainer`` 的 ``scroll_left`` /
+``scroll_right``）：三个导航页的绑定表在页面上把它们换成了 ``enter`` / ``back``，焦点控件
+那一层就截住了。**清单列表页没有 ``left`` 这一条**（那里无处可退，用户故事 124），所以
+``←`` 仍旧落到 ``scroll_left`` 上——实测它什么都不做（``VerticalScroll`` 的
+``overflow-x`` 是 hidden），``tests/test_pages.py::test_left_on_the_index_page_does_nothing``
+钉着这一点。
 """
 
 
@@ -383,25 +393,22 @@ async def go_to_layer(pilot, app: DidaApp, layer: int) -> None:
     if layer:
         await enter_work(pilot, app)
     if layer >= 2:
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
 
 
 @pytest.mark.parametrize("layer", [0, 1, 2])
 async def test_the_user_scroll_keys_never_push_the_pan_track(layer: int):
-    """``←`` ``→`` ``home`` ``end`` ``pageup`` ``pagedown``＋``ctrl+pageup`` / ``ctrl+pagedown``
+    """``home`` ``end`` ``pageup`` ``pagedown`` ＋ ``ctrl+pageup`` / ``ctrl+pagedown``
     在三层上**什么都不做**（工单 #59）。
 
     平移是**程序驱动**的（``show()`` 与 ``on_resize()`` 调 ``scroll_to``），不是用户滚的：
     轨道是个真能横向滚动的容器，于是继承了 Textual 的滚动键位——一按就挪一格，那条铺满整幅的
-    规则线当场少一格；在第一层按 ``→`` 还会露出下一页的一条边。``home`` 更糟：在详细页按下去
-    视图跳到第一页的位置，而 app 仍然认为你在第三层——屏幕和状态彻底对不上。
+    规则线当场少一格。``home`` 更糟：在详细页按下去视图跳到第一页的位置，而 app 仍然认为你在
+    第三层——屏幕和状态彻底对不上。``page_left`` / ``page_right`` 一次挪一整屏，比谁都狠。
 
-    最后那两个键工单那张表没列：它们是同一个族剩下的两个横向键（``page_left`` / ``page_right``），
-    实测一次挪一整屏，比 ``←`` / ``→`` 还狠。
-
-    ``←`` / ``→`` 本来就不在 spec 的键位表里（清单层 ``n`` / ``e`` / ``d`` / ``enter``，任务层
-    ``space`` / ``n`` / ``d`` / ``g`` / ``G`` / ``enter``），所以「什么都不做」就是它们该有的样子。
+    ``←`` / ``→`` **不在这条里**：工单 #65 起它们是导航键（``→`` 进下一层、``←`` 回上一层），
+    按下去本来就该换层——它们那半边归 :data:`NAVIGATION_KEYS` 的说明管。
 
     挡住它们的是 ``#stage`` 的 ``overflow-x: hidden``（``dida.tui.theme`` 那个 CSS 块里写了
     为什么）——**不是**一张「哪些键要忽略」的清单，所以同一条路也堵住了滚轮与聚焦（下面两条
@@ -584,18 +591,19 @@ async def test_the_pan_track_is_not_user_scrollable_at_all():
         stage = app.query_one("#stage", Stage)
         assert not stage.allow_horizontal_scroll, (
             "平移轨道又能被用户滚了（#stage 的 overflow-x 是不是被改回 scroll / auto 了）："
-            "按 ← / →、滚轮、tab 都会把它推走"
+            "滚轮、tab、home / end 都会把它推走"
         )
 
 
 def test_the_only_scroll_keys_this_file_leaves_alone_are_the_pages_cursor_keys():
-    """``up`` / ``down`` 是**页面自己的光标键**，其余滚动键一个都不许漏。
+    """``up`` / ``down`` 是**页面自己的光标键**、``←`` / ``→`` 是**导航键**，其余一个都不许漏。
 
     每一条守卫都得有个「谁在看这张表」的对账：Textual 哪天往族里加一个新键，这条变红，
-    逼着下一个人去看它是「真的推不动」（那就加进 :data:`USER_SCROLL_KEYS`）还是「另有主人」。
+    逼着下一个人去看它是「真的推不动」（那就加进 :data:`USER_SCROLL_KEYS`）还是「另有主人」
+    （``up`` / ``down`` 与 #65 的 ``←`` / ``→`` 就是后者）。
     """
     bound = set(scroll_bindings())
-    watched = set(USER_SCROLL_KEYS) | {"up", "down"}
+    watched = set(USER_SCROLL_KEYS) | set(NAVIGATION_KEYS) | {"up", "down"}
 
     assert bound == watched, (
         "Textual 的滚动键表变了："
@@ -694,13 +702,13 @@ async def test_every_layer_change_still_parks_the_track_on_that_layer():
         parked("开屏", LAYER_INDEX)
         await enter_work(pilot, app)  # 0 → 1
         parked("enter 进任务列表页", LAYER_TASKS)
-        await pilot.press("enter")  # 1 → 2
+        await pilot.press("right")  # 1 → 2
         await pilot.pause()
         parked("enter 进任务详细页", LAYER_DETAIL)
-        await pilot.press("escape")  # 2 → 1
+        await pilot.press("left")  # 2 → 1
         await pilot.pause()
         parked("esc 回任务列表页", LAYER_TASKS)
-        await pilot.press("escape")  # 1 → 0
+        await pilot.press("left")  # 1 → 0
         await pilot.pause()
         parked("esc 回清单列表页", LAYER_INDEX)
 
@@ -755,7 +763,7 @@ async def test_animations_off_switches_layers_in_one_frame():
                 break
             await pilot.press("j")
         frames = await sample_while(
-            lambda: pilot.press("enter"), lambda: task_offset(screen_text(app))
+            lambda: pilot.press("right"), lambda: task_offset(screen_text(app))
         )
         await pilot.pause(0.2)
         settled = task_offset(screen_text(app))
@@ -793,7 +801,7 @@ async def test_the_animations_switch_is_reachable_from_the_environment(monkeypat
                     break
                 await pilot.press("j")
             return await sample_while(
-                lambda: pilot.press("enter"), lambda: offset(screen_text(app))
+                lambda: pilot.press("right"), lambda: offset(screen_text(app))
             )
 
     moving = await frames_for("on")

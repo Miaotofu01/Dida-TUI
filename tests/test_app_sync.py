@@ -214,7 +214,7 @@ async def test_r_refreshes_pushes_and_pulls_the_completed_stream(tmp_path):
         text = screen_text(app)
 
         open_work_list(app)
-        await pilot.press("enter")  # 刷新带回来的那条任务，进清单就能看见
+        await pilot.press("right")  # 刷新带回来的那条任务，进清单就能看见
         await pilot.pause()
         inside = screen_text(app)
 
