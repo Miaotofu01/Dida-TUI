@@ -32,6 +32,7 @@ from dida.sync.engine import (
 )
 from dida.sync.rows import completed_window_start, row_sort_key
 from dida.sync.view import ListSnapshot, TaskSnapshot
+from dida.sync.views import ViewDefinition, due_window_of, implied_due_for
 from dida.testing import InMemorySource, ManualClock
 from dida.tui import theme
 from dida.tui.pages.tasks import completed_line, task_line
@@ -483,23 +484,56 @@ def test_the_read_model_says_which_date_a_view_implies_for_a_new_task():
     assert engine.tasks_in("work").implied_due is None, "清单不隐含日期"
 
 
-def test_a_custom_view_does_not_imply_a_date_yet():
-    """**自建**视图（#36）不隐含日期——这是 #39 故意定的边界，不是漏掉的一条。
+def test_a_custom_view_with_the_same_due_window_implies_the_same_date():
+    """隐含日期跟着视图的**定义**走，不跟着它的身份走（#58 的 S1、用户故事 35）。
 
-    这里摆的还是一条**最像「今天」**的自建视图（截止窗口就是「今天到期」，与内置「今天」
-    的 ``last=0`` 一样）：它仍然不隐含日期。理由不是「自建的不算」，而是它的定义
-    （``ViewDefinition``）**没有随** ``TaskList`` 上来——``container_tasks`` 手里只有
-    ``ViewRow``（id / 名字 / 成员），要按它的条件推日期得再从本地库那份定义接一条线
-    （#36 的接缝）。所以今天的行为是：在内置「今天」里建会自动带上今天，在自建视图里建
-    **不带日期**（落点仍然是收集箱）。要改这条边界，先决定「自建视图的条件算不算隐含」
-    ——那时这条测试跟着改，而不是被静默改掉。
+    内置「今天」与一个用户自建的、截止窗口**一模一样**的视图（表单里就是「今天到期（含
+    逾期）」那一档，``DueWindow(first=None, last=0)``）必须给同一个答案：内置与自定义视图
+    走的是同一条求值路径，而「这个视图隐不隐含日期」是**定义**的语义、不是「它是不是内置」
+    的语义。按 id 在三个内置定义里查的那一版会让自建的拿到 ``None``——同一屏里两种行为，
+    用户看不出为什么。
+
+    期望值是测试直接给出的 ``at(14)``，不是照 ``logical_day`` 再算一遍。
     """
     source = work_source()
-    source.add_view("今天到期", id="mine", due=DueWindow(first=0, last=0))
+    source.add_view("今天到期", id="mine", due=DueWindow(first=None, last=0))
     engine = engine_with(source)
 
-    assert engine.tasks_in("mine").shows_list_name is True, "自建视图仍然不是容器"
-    assert engine.tasks_in("mine").implied_due is None, "但不隐含日期（#39 的边界）"
+    assert engine.tasks_in("today").implied_due == at(14), "内置「今天」隐含那个逻辑日"
+    assert engine.tasks_in("mine").implied_due == at(14), (
+        "自建视图只要窗口一样，答案就得一样（判断跟着定义走）"
+    )
+    assert engine.tasks_in("mine").implied_due == engine.tasks_in("today").implied_due, (
+        "两种视图的答案必须逐字相同"
+    )
+
+
+@pytest.mark.parametrize(
+    ("preset", "implies_today"),
+    [
+        ("any", False),  # 不限：连截止时间都不看
+        ("today", True),  # 今天到期（含逾期）：今天就是它最新的那一天
+        ("next7", False),  # 最近七天：今天只是七分之一，挑哪一天都是替用户做决定
+        ("overdue", False),  # 已逾期：今天不在窗口里，带上去的新任务当场不在这一屏
+        ("undated", False),  # 无日期：这一屏要的正是**没有**日期的任务
+    ],
+)
+def test_every_due_preset_says_what_it_implies_for_a_new_task(preset, implies_today):
+    """表单那五档截止条件**逐档**说清隐含什么（#58 的 S1 把这条规则写下来）。
+
+    规则只有一句：**今天在这个窗口里，而且今天就是它最新的那一天**（``last == 0``）才隐含
+    一个日期——隐含的是当前逻辑日那一个日期标记（当天 00:00，全天任务那个写法）。所以
+    「今天到期（含逾期）」隐含今天，其余四档都不隐含，各自的理由写在上面那张表里。
+
+    这是**纯函数**那一半：定义直接给，不经过引擎、不经过界面。
+    """
+    definition = ViewDefinition(
+        id=f"custom-{preset}", name=f"自定义 {preset}", due=due_window_of(preset)
+    )
+
+    implied = implied_due_for(definition, now=T0, day_end="24:00")
+
+    assert implied == (at(14) if implies_today else None)
 
 
 def test_the_implied_date_follows_the_logical_day_not_the_natural_one():
@@ -512,6 +546,20 @@ def test_the_implied_date_follows_the_logical_day_not_the_natural_one():
     engine = SyncEngine(clock=ManualClock(at(15, 2, 0)), day_end="04:00", source=source)
 
     assert engine.tasks_in("today").implied_due == at(14), "凌晨两点仍是逻辑日 03-14"
+
+
+def test_the_implied_date_of_a_custom_view_follows_the_logical_day_too():
+    """自建的那一份也一样按逻辑日算（#58 的 S1）：同一句话不许在两种视图上分岔。
+
+    窗口一样只是第一半——「哪一天」也得是同一个逻辑日，所以日界换到 04:00、凌晨两点进来，
+    自建视图与内置「今天」仍要给同一天。
+    """
+    source = work_source()
+    source.add_view("今天到期", id="mine", due=DueWindow(first=None, last=0))
+    engine = SyncEngine(clock=ManualClock(at(15, 2, 0)), day_end="04:00", source=source)
+
+    assert engine.tasks_in("mine").implied_due == at(14), "凌晨两点仍是逻辑日 03-14"
+    assert engine.tasks_in("mine").implied_due == engine.tasks_in("today").implied_due
 
 
 # ------------------------------------------------------------------ 窄终端：丢弃顺序
