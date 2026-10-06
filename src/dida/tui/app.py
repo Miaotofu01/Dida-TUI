@@ -122,6 +122,22 @@ class Stage(HorizontalScroll):
     换层 = 平移不是装饰：``enter`` 压栈、``esc`` 出栈本来就是**导航栈**（GLOSSARY 的
     「导航路径」），左右平移正是这个语义的标准表达。页面底色必须不透明（:data:`CSS_PAGE`），
     否则滑走的那块会漏出后面的东西。
+
+    ## 它是**程序驱动**的，用户按不动它（工单 #59）
+
+    它同时是个真能横向滚动的容器（实测 ``virtual_size`` 300×28、``container_size`` 100×28、
+    ``max_scroll_x`` 200），于是继承了 Textual 的滚动键位。用户一按 ``←`` / ``→`` 就把它推动
+    一格：那条铺满整幅的规则线当场少一格，第一层按 ``→`` 还会露出下一页的一条边；``home``
+    最糟——详细页上按下去，视图跳到第一页的位置而 app 仍然认为你在第三层，**屏幕和状态对不上**。
+
+    所以下面这十个 action 在这一层全部是空操作。**盖 action 而不是盖键位**：任何键——Textual
+    今天绑的、以后新加的——只要落到这些 action 上就再也推不动它。代价是这里写下了 Textual 的
+    action 名字：它哪天改名，这些覆盖会**静默失效**（继承来的那一个又开始滚），所以
+    ``tests/test_visual_identity.py`` 里那条守卫按 **Textual 自己的绑定表**算出这十个名字，
+    改名当场变红，而不是等用户又看见页面滑走。
+
+    为什么不是「别用 :class:`HorizontalScroll`」：``show()`` / ``on_resize()`` 的 ``scroll_to``
+    与三页并排的版式都建在它上面，换掉它不是修一个缺陷，是把 ADR-0007 的平移重做一遍。
     """
 
     def show(self, index: int, *, animate: bool = True) -> None:
@@ -141,6 +157,41 @@ class Stage(HorizontalScroll):
 
     _index = 0
     """当前该对齐在第几页；``show()`` 记下来，宽度变了由 :meth:`on_resize` 用它重算。"""
+
+    # ------------------------------------------------- 用户的滚动键在这一层到此为止
+    #
+    # 这十个是 ``ScrollableContainer.BINDINGS``（Textual 8.2.8）绑到滚动上的全部 action。
+    # 全部空转：轨道只由 :meth:`show` 与 :meth:`on_resize` 挪，用户按什么都一样。
+
+    def action_scroll_up(self) -> None:
+        """``up``：在这里什么都不做（页面自己的 ``k`` / ``↑`` 才是光标键）。"""
+
+    def action_scroll_down(self) -> None:
+        """``down``：在这里什么都不做（页面自己的 ``j`` / ``↓`` 才是光标键）。"""
+
+    def action_scroll_left(self) -> None:
+        """``left``：不推轨道——``←`` / ``→`` 本来就不在 spec 的键位表里。"""
+
+    def action_scroll_right(self) -> None:
+        """``right``：不推轨道（同上）。"""
+
+    def action_scroll_home(self) -> None:
+        """``home``：**最坏的那一个**——它会把你送回第一页而不改导航栈。"""
+
+    def action_scroll_end(self) -> None:
+        """``end``：不推轨道（同上）。"""
+
+    def action_page_up(self) -> None:
+        """``pageup``：不推轨道（它是纵向的，这一层纵向本来就没得滚）。"""
+
+    def action_page_down(self) -> None:
+        """``pagedown``：不推轨道（同上）。"""
+
+    def action_page_left(self) -> None:
+        """``ctrl+pageup``：``page_left`` 一次挪一整屏，同样不许。"""
+
+    def action_page_right(self) -> None:
+        """``ctrl+pagedown``：``page_right`` 同上。"""
 
 
 def top_line(path: Sequence[str]) -> Text:
