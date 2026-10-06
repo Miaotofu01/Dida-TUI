@@ -29,6 +29,7 @@ from dida.sync.writes import (
     is_addressable_task,
     is_local_list_id,
     is_local_task_id,
+    project_in,
 )
 
 if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能在这里 import
@@ -64,18 +65,6 @@ def _is_due(change: PendingChange, now: datetime) -> bool:
     「到点」是 ``<=``：注入的钟刚好走到 ``next_retry_at`` 时就算到期。
     """
     return change.next_retry_at is None or change.next_retry_at <= now
-
-
-def _project_in(payload: object) -> str | None:
-    """这一笔改动点名的**目标**清单（``{"projectId": …}``），没提就是 ``None``。
-
-    只有搬运会在 payload 里带 ``projectId``，而它要说清搬**到哪去**——那边同样可能是一条
-    还没推出去的清单。形状认不出来就当「没提」（与读路径对脏数据的口径一致，不猜）。
-    """
-    if not isinstance(payload, Mapping):
-        return None
-    named = payload.get("projectId")
-    return None if named is None else str(named)
 
 
 def _unaddressable(
@@ -217,7 +206,7 @@ class PushMixin:
         if snapshot is None or not snapshot.get("projectId"):
             raise UnknownTaskError(task_id)
         project = str(snapshot["projectId"])
-        target_project = _project_in(changes)
+        target_project = project_in(changes)
         if not is_addressable_task(
             task_id, kind, project_id=project, target_project_id=target_project
         ):
@@ -388,7 +377,7 @@ class PushMixin:
             raise _unaddressable(
                 change.task_id,
                 project=change.list_id,
-                target_project=_project_in(change.payload),
+                target_project=project_in(change.payload),
             )
         if wire is WireCall.UPDATE_TASK:
             await writer.update_task(

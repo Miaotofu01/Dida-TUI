@@ -501,3 +501,47 @@ def test_the_tui_reads_the_priority_vocabulary_through_the_engine():
     字典」（推导式、``dict(...)``、逐项抄）。断的是**同一个对象**，所以只有真的转出来才过。
     """
     assert messages.PRIORITY_NAMES is engine.PRIORITY_NAMES
+
+
+def _module_functions(source: str) -> Iterator[tuple[str, int, str]]:
+    """模块级函数 → ``(名字, 行号, 函数体的形状)``；文档字符串不算（那是说明，不是行为）。
+
+    只扫**模块级**：类体里那一堆 ``def …: ...`` 是 Protocol / mixin 的声明桩，同名同形是
+    故意的（``Engine.move_task`` 与 ``PushMixin.move_task`` 就是一对），拿它们报重复只会
+    教人关掉这条守卫。
+    """
+    for node in ast.parse(source).body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = list(node.body)
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            body = body[1:]
+        yield node.name, node.lineno, ast.dump(ast.Module(body=body, type_ignores=[]))
+
+
+def test_no_two_modules_define_the_same_function_body():
+    """同名的函数体不许在两个模块里各写一份（工单 #58 的 T5）。
+
+    ``_project_in`` 曾在 ``sync/push.py`` 与 ``sync/writes.py`` 里逐字相同（同名、同签名、
+    同函数体），而 ``push`` 本来就 import 了 ``writes``——那第二份是纯粹的重复。该往哪个方向
+    收，看的是既有的 import 图：叶模块留着它，依赖方 import 它（反过来就是一个环）。
+    """
+    seen: dict[tuple[str, str], list[str]] = {}
+    for path in sorted((ROOT / "src" / "dida").rglob("*.py")):
+        for name, lineno, body in _module_functions(path.read_text(encoding="utf-8")):
+            seen.setdefault((name, body), []).append(f"{path.relative_to(ROOT)}:{lineno}")
+    offenders = [
+        f"{name}: {' = '.join(where)}"
+        for (name, _), where in sorted(seen.items())
+        if len({location.rsplit(":", 1)[0] for location in where}) > 1
+    ]
+
+    assert offenders == [], (
+        "同名的函数体在两个模块里各有一份——让其中一个 import 另一个，别再抄一遍：\n"
+        + "\n".join(offenders)
+    )

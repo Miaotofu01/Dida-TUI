@@ -60,6 +60,7 @@ __all__ = [
     "is_local_id",
     "is_local_list_id",
     "is_local_task_id",
+    "project_in",
 ]
 
 LOCAL_LIST_PREFIX = "local-list-"
@@ -346,7 +347,7 @@ def is_addressable(change: PendingChange) -> bool:
         change.task_id,
         change.kind,
         project_id=change.list_id,
-        target_project_id=_project_in(change.payload),
+        target_project_id=project_in(change.payload),
     )
 
 
@@ -385,13 +386,20 @@ def is_addressable_task(
     return not is_local_id(task_id)
 
 
-def _project_in(payload: object) -> str | None:
+def project_in(payload: object) -> str | None:
     """一笔改动里点名的**目标**清单（``{"projectId": …}``），没提就是 ``None``。
 
     只有搬运（``MOVE``）会在 payload 里带 ``projectId``：改期 / 完成 / 删除的请求体里都没有
     它（``status`` 不是写字段，``dueDate`` 那一类也不点清单）。认不出来的形状当「没提」——
     与读路径对脏数据的口径一致，不猜。
+
+    **两个时刻各问一次，实现只有这一份**（工单 #58 的 T5）：写入那一侧拼改动时问一次
+    （:meth:`~dida.sync.push.PushMixin.write`），推送循环里问一次
+    （:func:`is_addressable`，以及 ``PushMixin._send`` 归因失败时）。它曾经在
+    :mod:`dida.sync.push` 里逐字又写了一份——``push`` 本来就 import 这一层，所以那第二份
+    是纯粹的重复，而重复是会漂的：一边改了形状、另一边没改，只有真走到那条路才炸。
     """
+
     if not isinstance(payload, Mapping):
         return None
     named = payload.get("projectId")
