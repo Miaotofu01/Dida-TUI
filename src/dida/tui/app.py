@@ -29,6 +29,7 @@ TUI 只通过 :class:`~dida.sync.engine.Engine` 读写；分组、计数、逾�
 from __future__ import annotations
 
 import os
+from datetime import date
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Sequence
 
@@ -211,6 +212,7 @@ class DidaApp(App[None]):
         refresh_on_start: bool = False,
         push_tick_seconds: float | None = None,
         animations: str | None = None,
+        day_boundary: Callable[[], str | None] | None = None,
     ) -> None:
         """``open_url`` 是**注入**的浏览器开手（工单 #19）。
 
@@ -222,6 +224,11 @@ class DidaApp(App[None]):
         产品行为由组合根按 ``config.toml`` 决定（``dida.bootstrap`` 传 ``refresh_on_start=``
         与 ``PUSH_TICK_SECONDS``）。这里不写死默认值，是为了让「直接 new 一个 app」的测试
         不必先接上客户端与存储——后台同步需要一个真引擎才跑得起来。
+
+        ``day_boundary`` 是**重新读出当前日界的那只手**（工单 #46）：组合根把配置文件的读手
+        （``dida.config.DayEndReader.current``）交给它，app 在两处问它——周期泵那一秒一次的
+        心跳、以及用户按 ``r``。它回 ``None``（配置读不了）就沿用引擎里那个。不给就是
+        「没有人能告诉我新的日界」：直接 new 一个 app 的测试不必为此准备一个配置文件。
 
         ``ansi_color=True`` 是**跟随终端主题**那一条决定的落点（ADR-0007 一）：Textual 默认
         会把每个 ``ansi_*`` 改写成 Monokai 的真彩色（``ansi_cyan`` → ``#58D1EB``），用户的
@@ -236,6 +243,13 @@ class DidaApp(App[None]):
         self._open_url = open_url
         self._refresh_on_start = refresh_on_start
         self._push_tick_seconds = push_tick_seconds
+        self._day_boundary = day_boundary
+        """重读当前日界的那只手（工单 #46）；``None`` = 没人能告诉它新的日界。"""
+        self._view_day: date | None = None
+        """屏幕上那些行是按**哪一个逻辑日**算出来的（工单 #46）。
+
+        它是「这一屏过期了没有」的凭据：钟自己走过边界时配置一个字节都没变，只有把这一屏
+        是哪一天记下来，心跳才分得清「还是同一天」与「已经翻篇了」。``None`` = 还没画过。"""
         self._push_timer: Timer | None = None
         """周期泵的定时器句柄（工单 #21）：``on_unmount`` 里拿它把泵停掉。
 
@@ -389,6 +403,39 @@ class DidaApp(App[None]):
 
     # ---------------------------------------------------------------- 重画
 
+    def reload_day_boundary(self) -> bool:
+        """重新问一次当前日界；屏幕跟不上了就按新的逻辑日重画（工单 #46）。返回「重画过没有」。
+
+        「逻辑日改了立刻生效」有**两条**路，两条都在这里收口，因为它们要挂的是同一个时机：
+
+        - 配置里改了边界值——外部事件（用户在另一个窗口里改），没人通知得了这个进程；
+        - 钟自己走过了边界——终端里挂一夜，早上那一屏就是按昨天算的。
+
+        那个时机是**两个键的最前面**：:meth:`push_tick`（周期泵那一秒一次的心跳）与
+        :meth:`action_refresh`（``r``），都在任何网络调用之前。第二条尤其靠这一点——
+        ``_sync()`` 里的重画在 ``else:``（同步成功）那一支里，刷新抛 :class:`DidaError` 时
+        一次都不跑，而收尾的 ``update_status()`` 照样按新逻辑日写状态栏。于是「没网的时候按了
+        一下 ``r``」得到的正是那个自相矛盾的屏幕：状态栏是新日子，列表还是旧成员。
+
+        **滚过那条不在下面那个 ``None`` 判断后面**：它不是配置事件，一个没建读手的 app
+        （``day_boundary=None``）照样得发现它。
+
+        配置读不到（``None``）时沿用引擎里那个日界：界面不崩，也不替用户按默认值来。
+
+        **光标不归这次重画管**：各页按行 id 把它认回原来那一行（``CursorPage.set_rows``），
+        所以重算不会把人踢回第一行（验收标准 3）。
+        """
+        boundary_moved = False
+        if self._day_boundary is not None:
+            day_end = self._day_boundary()
+            if day_end is not None:
+                boundary_moved = self.engine.set_day_end(day_end)
+        rolled_over = self._view_day is not None and self.engine.logical_day() != self._view_day
+        if not (boundary_moved or rolled_over):
+            return False
+        self.refresh_view()
+        return True
+
     def refresh_view(self) -> None:
         """读引擎的三种读形状，重画在屏上的那几层与状态栏。
 
@@ -400,6 +447,10 @@ class DidaApp(App[None]):
         """
         if not self.is_running:
             return
+        # 先记下「这一屏是哪一天的」，再画行：反过来的话，边界正好在这几句里跨过去时，会记下
+        # 一个比行更新的日子，那一屏就永远没人认领了（心跳以为它是最新的，见
+        # :meth:`reload_day_boundary`）。记早了最多多画一次，记晚了就是一屏昨天的东西。
+        self._view_day = self.engine.logical_day()
         rows = self.engine.list_index()
         self.index_page().show_lists(rows)
         self._container_title = (
@@ -1052,7 +1103,12 @@ class DidaApp(App[None]):
         先什么都不说，超过阈值（:data:`~dida.tui.theme.SPINNER_DELAY_MS`）才出现转圈，
         完成或失败用 toast 说一句。真正的活儿在事件循环上跑，界面不因为等网络而卡住
         （引擎那条 ``refresh()`` 是 async 的就是为这个）。
+
+        顺带问一次日界（工单 #46）：「现在再看一眼」这句话里，配置改过、钟自己走过了边界，都
+        算在内——而且这是那条检查**唯一不依赖周期泵**的触发。它跑在这里、任何网络调用之前，
+        所以这一轮同步成不成功都与它无关（``_sync()`` 里的重画在 ``else:`` 成功分支里）。
         """
+        self.reload_day_boundary()
         self.start_sync(announce=True)
 
     def start_sync(self, *, announce: bool = False) -> None:
@@ -1184,9 +1240,14 @@ class DidaApp(App[None]):
         间隔只决定**什么时候看一眼**，到没到点依然由引擎那口注入的钟判定：所以测试可以把
         钟摆到任意一刻，再直接 ``await app.push_tick()``，不必等真实时间。
 
+        **这一跳也是 app 唯一的心跳**，所以日界在这里顺带问一次（工单 #46）：两条路都是外部
+        事件——用户在另一个窗口里改配置、钟自己走过了边界——没人通知得了这个进程，定期看一眼
+        是唯一零操作的做法。三件事共用一跳不冲突：一个本地队列查询、两条纯算术。
+
         ``await`` 之后那一次状态栏重画走 :meth:`update_status` → :meth:`_write_status`：
         关窗时它整个丢掉，但**这一笔推送已经落下去了**——界面没了不代表用户那一下不算数。
         """
+        self.reload_day_boundary()
         await self.engine.push_pending()
         self.update_status()
 

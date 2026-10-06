@@ -17,6 +17,7 @@
   是 token 落盘的唯一途径。
 - :func:`config_path` / :func:`load_config` / :func:`save_config` —— 位置、读、写。
 - :func:`needs_token` —— 首次运行的信号。
+- :class:`DayEndReader` —— 配置里那个「一天结束的时刻」，跟着文件走（工单 #46 的重读路径）。
 
 细节与理由见 ``docs/adr/0003-config-canonical-day-end-and-verified-token.md``。
 本模块由 t03 落地；t07 扩展客户端时不要动这里的失败分类。
@@ -162,6 +163,39 @@ def save_config(config: Config, path: Path | None = None) -> None:
     with os.fdopen(handle, "w", encoding="utf-8") as stream:
         stream.write(tomli_w.dumps(data))
     os.chmod(path, 0o600)
+
+
+class DayEndReader:
+    """配置文件里那个「一天结束的时刻」，**跟着文件走**（工单 #46 的重读路径）。
+
+    启动时读一次配置、把 ``day_end`` 烤进引擎，从前的下场是：用户在配置里改完边界值，界面
+    一直按旧的算，只能重启。重读需要一个**每次都问得出当前值**的口子，就是这里。
+
+    ``current()`` 回答「现在文件里写的是什么」：每次都重新读一遍。这不是浪费——要读的是一个
+    一百来字节的本地文件，而调用方是 app 那条 1 秒一次的心跳；相比之下「先比 ``stat`` 再决定
+    要不要解析」省下的那点时间，换来的是一类静默的漏读（改动落在上一次 ``stat`` 的同一个
+    时钟粒度里就再也看不见了）。**值有没有变**由下游判断（``SyncEngine.set_day_end`` 会说），
+    这里只管读。
+    """
+
+    def __init__(self, path: Path | None = None) -> None:
+        self._path = config_path() if path is None else path
+
+    def current(self) -> str | None:
+        """现在配置里写着的 ``day_end``；读不了就是 ``None``（调用方沿用上一次那个日界）。
+
+        「读不了」的几种情形都算 ``None``，而且**都不出声**：文件不在（不替用户建一份默认的
+        ——那是启动时 :func:`load_config` 的事，不是一秒问一次的读手该干的）、TOML 写坏了、
+        值非法或键不认识（:class:`ConfigError` 一族）、打开就失败（``OSError``：权限、悬空的
+        软链、路径上根本不是个文件）。抛出去的下场是：用户手改到一半保存一次，界面就当场崩
+        掉——而这东西是挂在定时器上的。
+        """
+        if not self._path.exists():
+            return None
+        try:
+            return load_config(self._path).day_end
+        except (ConfigError, OSError):
+            return None
 
 
 class Credentials:

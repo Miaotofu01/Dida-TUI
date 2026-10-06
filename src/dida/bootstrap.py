@@ -43,7 +43,7 @@ from dida.api.client import DEFAULT_BASE_URL, DidaApiClient
 from dida.api.errors import NetworkError
 from dida.api.transport import HttpxTransport, Transport
 from dida.clock import Clock, SystemClock
-from dida.config import Config, Credentials, config_path, load_config, needs_token
+from dida.config import Config, Credentials, DayEndReader, config_path, load_config, needs_token
 from dida.storage.store import Store
 from dida.sync.engine import SyncEngine
 from dida.tui.app import DidaApp
@@ -173,18 +173,26 @@ def build_app(
     transport: Transport | None = None,
     db_path: Path | None = None,
     open_url: Callable[[str], bool] = open_in_browser,
+    config_file: Path | None = None,
 ) -> DidaApp:
-    """组装 app：引擎 + 两项启动策略（``refresh_on_start``、周期泵的间隔）。
+    """组装 app：引擎 + 三项启动策略（``refresh_on_start``、周期泵的间隔、**日界的重读**）。
 
     策略放在组合根而不是 ``DidaApp`` 的默认值里：产品行为由 ``config.toml`` 决定，
     而直接 new 一个 app 的测试不该被迫先接上客户端与存储。
+
+    ``config_file`` 是**跟着走**的那个配置文件（工单 #46）：给了它，app 就会在心跳与 ``r``
+    上重读里面的 ``day_end``，改完不必重启。不给就是「没有文件可跟」——测试直接递一个
+    ``Config`` 进来时，不该被指到 ``~/.config/dida-tui/config.toml`` 上去（那份文件握着
+    用户的 token）；生产那条路（:func:`main`）永远把它给上。
     """
     config = load_config() if config is None else config
+    reader = None if config_file is None else DayEndReader(config_file)
     return DidaApp(
         build_engine(clock, config=config, transport=transport, db_path=db_path),
         open_url=open_url,
         refresh_on_start=config.refresh_on_start,
         push_tick_seconds=PUSH_TICK_SECONDS,
+        day_boundary=None if reader is None else reader.current,
     )
 
 
@@ -243,4 +251,4 @@ def main() -> None:
             raise SystemExit(_unreachable_message(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - 首次运行只有这一条出口：说清楚再退
             raise SystemExit(f"凭据没验证通过：{exc}\n再运行一次 dida 重新粘贴。") from exc
-    build_app(config=config).run()
+    build_app(config=config, config_file=config_path()).run()

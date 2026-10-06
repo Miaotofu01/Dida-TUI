@@ -15,7 +15,7 @@ from __future__ import annotations
 import json
 from collections import deque
 from dataclasses import dataclass, replace
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from typing import Any, Mapping, Sequence
 
 import httpx
@@ -620,8 +620,20 @@ class FakeBackend:
         """读：委托给真引擎（详情页的字段，含原文里我们不认识的那些）。"""
         return self._engine.task_detail(task_id)
 
+    def set_day_end(self, day_end: str) -> bool:
+        """配置：换掉日界（工单 #46）——读路径全都委托给真引擎，这一处也一样。
+
+        界面上的「今天」、逾期判定与状态栏那一格都是这台真引擎算的，所以日界必须换在它身上：
+        替身自己记一个值，屏幕说的就会跟引擎说的不一样。
+        """
+        return self._engine.set_day_end(day_end)
+
     def status(self) -> SyncStatus:
         return self._engine.status()
+
+    def logical_day(self) -> date:
+        """读：现在是哪个逻辑日（工单 #46 的心跳）——同样委托真引擎，替身不自己算一份。"""
+        return self._engine.logical_day()
 
     def complete(self, task_id: str) -> None:
         """写：记下这一笔，**并且真的把它标成完成**（工单 #38）。

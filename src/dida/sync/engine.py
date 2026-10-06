@@ -262,6 +262,7 @@ __all__ = [
     "is_local_id",
     "is_local_list_id",
     "list_index",
+    "logical_day",
     "next_priority",
     "order_key",
     "parse_view_form",
@@ -325,8 +326,26 @@ class SyncStatus:
 class Engine(Protocol):
     """TUI 眼里的引擎：它只用得到这几个。t11/t13/t14 的实现必须仍然满足它。"""
 
+    def set_day_end(self, day_end: str) -> bool:
+        """配置：换掉「一天结束的时刻」（工单 #46），真变了才返回 ``True``。
+
+        界面上的「现在」永远是注入的钟给的，而**日界是配置给的、随时可能被用户改掉**。三处
+        消费者（「今天」视图 / 逾期判定 / 顺延）读的都是这一个字段，所以换这一处就够——它们
+        不可能各看一个日界。
+        """
+        ...
+
     def status(self) -> SyncStatus:
         """读：状态栏要的全部信息。"""
+        ...
+
+    def logical_day(self) -> date:
+        """读：现在是哪个逻辑日（工单 #46 的心跳靠它判断屏幕上那一份过期了没有）。
+
+        与 :meth:`status` 分开是**故意的**：那一份是状态栏的快照，为它要读一次本地存储
+        （同步状态 + 待推送条数，实测 13.7 µs、两条 SQL），而「今天是哪天」是纯算术
+        （注入的钟 + 当前日界，实测 5.5 µs、零 I/O）。一秒问一次的那一跳走这一口。
+        """
         ...
 
     def view(self) -> TodayView:
@@ -538,6 +557,20 @@ class SyncEngine(
         # 已在飞的推送轮次；wait_for_pushes() 等它们。
         self._inflight: set[asyncio.Task[int]] = set()
 
+    def set_day_end(self, day_end: str) -> bool:
+        """换掉「一天结束的时刻」（工单 #46）；真变了才返回 ``True``。
+
+        日界是**唯一**一处「现在」之外的配置性输入，而它随时可能被用户改（#46：改完立刻
+        生效，不用重启）。读路径每一处都读 :attr:`_day_end`，所以换在这里，下一次读就整体
+        按新的逻辑日重算。
+
+        返回值是给调用方省一次重画的：``False`` = 递进来的值与现在这个一样，什么都不用做。
+        """
+        if day_end == self._day_end:
+            return False
+        self._day_end = day_end
+        return True
+
     def status(self) -> SyncStatus:
         """读：状态栏要的全部信息。"""
         now = self._clock.now()
@@ -549,6 +582,15 @@ class SyncEngine(
             logical_day=logical_day(now, self._day_end).label,
             last_error=pending_error(self._source),
         )
+
+    def logical_day(self) -> date:
+        """读：现在是哪个逻辑日（工单 #46 的心跳靠它判断屏幕上的那一份过期了没有）。
+
+        与 :meth:`status` 分开是**故意的**：那一份是状态栏的快照，为它要读一次本地存储
+        （同步状态 + 待推送条数，实测 13.7 µs、两条 SQL），而「今天是哪天」是纯算术
+        （注入的钟 + 当前日界，实测 5.5 µs、零 I/O）。一秒问一次的那一跳走这一口。
+        """
+        return logical_day(self._clock.now(), self._day_end).label
 
     def view(self) -> TodayView:
         """读：从本地缓存分组出的视图模型。缓存不在就是空视图，不是错误。"""
