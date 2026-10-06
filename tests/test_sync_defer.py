@@ -1,6 +1,6 @@
 """顺延（t13）：``g`` 到下一个逻辑日、``G`` 到下周同一天。
 
-接缝是引擎的公开入口 ``defer()``（写）与 ``view()`` / ``task_payload()``（看），接真的
+接缝是引擎的公开入口 ``defer()``（写）与 ``tasks_in()`` / ``task_payload()``（看），接真的
 ``Store``（t08）与真的 ``DidaApiClient``（t07，网络钉在接缝二上），「现在」来自注入的钟。
 
 钉死的规矩（工单 #13 + GLOSSARY 的「顺延」）：
@@ -21,7 +21,7 @@ import pytest
 from dida.api.client import DidaApiClient
 from dida.api.errors import NetworkError
 from dida.storage.store import ChangeKind, Store
-from dida.sync.engine import GroupKind, SyncEngine
+from dida.sync.engine import SyncEngine
 from dida.logical_day import logical_day
 from dida.testing import FakeTransport, InMemorySource, ManualClock
 
@@ -107,11 +107,10 @@ def test_deferring_at_2am_lands_on_the_next_logical_day(store):
     ]
 
     clock.set(at(15, 9, 0))  # 用户醒了：逻辑日是 03-15
-    groups = {group.kind: group for group in engine.view().groups}
-    assert GroupKind.OVERDUE not in groups, "顺延过的任务不许判成逾期"
-    assert [(item.title, item.due_text) for item in groups[GroupKind.TODAY].items] == [
-        ("写周报", "今天 23:00")
-    ]
+    items = engine.tasks_in("work").items
+    assert [(item.title, item.overdue, item.due_text) for item in items] == [
+        ("写周报", False, "今天 23:00")
+    ], "顺延过的任务不许判成逾期，而且要读作今天"
 
 
 def test_a_task_due_in_the_small_hours_lands_inside_the_next_logical_day(store):
@@ -134,7 +133,7 @@ def test_a_task_due_in_the_small_hours_lands_inside_the_next_logical_day(store):
     )
 
     clock.set(at(15, 9, 0))  # 逻辑日 03-15
-    items = [item for group in engine.view().groups for item in group.items]
+    items = engine.tasks_in("work").items
     assert [(item.title, item.due_text) for item in items] == [("夜跑", "今天 02:00")]
 
 
@@ -170,7 +169,7 @@ def test_deferring_an_all_day_task_moves_its_date_marker(store):
     assert store.task_payload("t1")["isAllDay"] is True, "全天标记本身不动"
 
     clock.set(at(15, 9, 0))  # 逻辑日 03-15：这条全天任务读作今天
-    items = [item for group in engine.view().groups for item in group.items]
+    items = engine.tasks_in("work").items
     assert [(item.title, item.due_text) for item in items] == [("交房租", "今天")]
 
 

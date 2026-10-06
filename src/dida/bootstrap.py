@@ -1,4 +1,4 @@
-"""组合根：把七个模块拼成一个 app。
+"""组合根：把模块拼成一个 app（模块表与依赖方向见 docs/architecture.md，那里也不写数目）。
 
 TUI 自己不 import 存储与 API 客户端，只拿 :class:`~dida.sync.engine.SyncEngine`；
 接线发生在这一层。``dida`` 命令与 ``python -m dida`` 都走这里。
@@ -15,6 +15,23 @@ TUI 自己不 import 存储与 API 客户端，只拿 :class:`~dida.sync.engine.
 
 from __future__ import annotations
 
+import os
+
+# ⚠ 这一行必须在**下面那个 import 块上面**：关掉 kitty 键盘协议推送（ADR-0006、用户故事 115）。
+#
+# ``textual.constants.DISABLE_KITTY_KEY`` 是个 ``Final[bool]``，在 ``textual.constants`` 第一次
+# 被 import 时读一次就冻住了（``textual/constants.py:116``）——所以写在 ``main()`` 里就太晚了：
+# 那时 TUI（连带 ``textual``）已经 import 完。本文件下面 ``from dida.tui.app import …`` 正是
+# 整个进程第一处拉到 ``textual`` 的 import，这里就是最后能设的位置。
+#
+# 开着它的代价是输入法一次上屏超过四个汉字会变成乱码：那一段 CSI-u 有 78 字节，超过解析器
+# 32 字符的阈值，于是整串被逐字符重发（见 notes/terminal-input-evidence.md）。本客户端不依赖
+# ``ctrl+enter``，所以这个代价是零。
+#
+# ``setdefault``：外面显式设过就听外面的。真正的输入法上屏是**手测**项，自动化只能钉到
+# 「常量是 True」这一层。
+os.environ.setdefault("TEXTUAL_DISABLE_KITTY_KEY", "1")
+
 import asyncio
 import getpass
 from collections.abc import Callable
@@ -26,14 +43,25 @@ from dida.api.client import DEFAULT_BASE_URL, DidaApiClient
 from dida.api.errors import NetworkError
 from dida.api.transport import HttpxTransport, Transport
 from dida.clock import Clock, SystemClock
-from dida.config import Config, Credentials, config_path, load_config, needs_token
+from dida.config import Config, Credentials, DayEndReader, config_path, load_config, needs_token
 from dida.storage.store import Store
 from dida.sync.engine import SyncEngine
-from dida.tui.app import PUSH_TICK_SECONDS, DidaApp
+from dida.tui.app import DidaApp
 from dida.tui.escape import open_in_browser
 
 STORE_FILENAME = "cache.sqlite3"
 """本地副本的文件名：与 ``config.toml`` 同一个目录（spec 只写死了配置的位置）。"""
+
+PUSH_TICK_SECONDS = 1.0
+"""周期泵的间隔（工单 #21）：每秒问一次「有没有到点该重试的待推送改动」。
+
+这是 t10 明确留给界面层的那件事——退避算得再准，也得有人**定期**来问一句。间隔只决定
+「什么时候看一眼」，到没到点依然由引擎那口注入的钟判定（见 ``DidaApp.push_tick``）。1 秒的
+粒度对「按完 x 断网了、网络回来自动补上」这个体验足够，而每秒一次本地队列查询是免费的。
+
+它是**策略**，所以住在组合根（#34 从 ``dida.tui.app`` 搬过来的）：装配线在这里把它交给
+app，而 app 自己不写死一个默认值——直接 new 一个 app 的测试不该被迫挂上一个每秒跳的定时器。
+"""
 
 PASTE_PROMPT = "粘贴滴答清单的 API Token（输入不回显；网页版「设置 > 账户 > API Token」）："
 """首次运行的提示语。token 本身由用户输入，这一句里没有任何凭据。"""
@@ -145,18 +173,26 @@ def build_app(
     transport: Transport | None = None,
     db_path: Path | None = None,
     open_url: Callable[[str], bool] = open_in_browser,
+    config_file: Path | None = None,
 ) -> DidaApp:
-    """组装 app：引擎 + 两项启动策略（``refresh_on_start``、周期泵的间隔）。
+    """组装 app：引擎 + 三项启动策略（``refresh_on_start``、周期泵的间隔、**日界的重读**）。
 
     策略放在组合根而不是 ``DidaApp`` 的默认值里：产品行为由 ``config.toml`` 决定，
     而直接 new 一个 app 的测试不该被迫先接上客户端与存储。
+
+    ``config_file`` 是**跟着走**的那个配置文件（工单 #46）：给了它，app 就会在心跳与 ``r``
+    上重读里面的 ``day_end``，改完不必重启。不给就是「没有文件可跟」——测试直接递一个
+    ``Config`` 进来时，不该被指到 ``~/.config/dida-tui/config.toml`` 上去（那份文件握着
+    用户的 token）；生产那条路（:func:`main`）永远把它给上。
     """
     config = load_config() if config is None else config
+    reader = None if config_file is None else DayEndReader(config_file)
     return DidaApp(
         build_engine(clock, config=config, transport=transport, db_path=db_path),
         open_url=open_url,
         refresh_on_start=config.refresh_on_start,
         push_tick_seconds=PUSH_TICK_SECONDS,
+        day_boundary=None if reader is None else reader.current,
     )
 
 
@@ -215,4 +251,4 @@ def main() -> None:
             raise SystemExit(_unreachable_message(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - 首次运行只有这一条出口：说清楚再退
             raise SystemExit(f"凭据没验证通过：{exc}\n再运行一次 dida 重新粘贴。") from exc
-    build_app(config=config).run()
+    build_app(config=config, config_file=config_path()).run()

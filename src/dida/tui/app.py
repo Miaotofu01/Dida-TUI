@@ -1,273 +1,260 @@
-"""今日执行台的三栏外壳。
+"""外壳：组装、三层页面的进出、状态栏、同步泵、退出流——**这是一个薄 app**。
 
-TUI 只通过 :class:`~dida.sync.engine.Engine` 读写；分组、排序、逾期判定、截止时间
-读法全部留在引擎里，这里只把视图模型画出来，不做任何业务判断。
+一栏、三层页面（ADR-0004）：启动落在清单列表页，``→`` 向下、``←`` 向上。三层各是
+一个控件（:mod:`dida.tui.pages`），这里管的是**它们之间的进出**：谁在屏上、焦点在哪、
+光标从哪来、``o`` 说的是哪条任务。
 
-一启动就读本地缓存渲染（:meth:`DidaApp.refresh_view`）——网络不是这一屏的前置条件。
+TUI 只通过 :class:`~dida.sync.engine.Engine` 读写；分组、计数、逾期判定、截止时间读法
+全部留在引擎里，页面只把引擎给的成品画出来。一启动就读本地缓存渲染——网络不是这一屏的
+前置条件（用户故事 3/4）。
+
+留在这里的是**组装与生命周期**：``__init__`` / ``compose`` / ``on_mount``、上下两行的
+分工（顶栏说「你在哪」、状态栏说「数据怎么样」）、同步泵（``r`` 与周期重试）、三层进出、
+以及退出流。按 wave-plan 的约定，#34 之后 #46（逻辑日立刻生效）与 #47（退出拦截）各自
+扩展的就是这一片。
+
+**外观一行都不在这里**：颜色、字形、间距、动效时长全在 :mod:`dida.tui.theme`（工单 #51）。
+这里只决定**什么时候**动（换层平移、同步转圈、toast）。
+
+⚠ **``await`` 之后动 DOM 的每一处都要先问 ``self.is_running``**（``_write_status`` /
+``refresh_view`` 就是那两个口子）。这不是洁癖：``Timer._tick`` 会把回调里的异常吞给自己
+的 handler，于是「关窗那一刻回来晚了」的那一次会以**拆屏期**的报错冒出来，离现场很远。
+``App._shutdown`` 先置 ``_running = False``、然后才 await ``_close_all()``（拆 widget），
+所以 ``is_running`` 这一个判断足以关掉那个窗口——这是 Textual 8.2.8 的**内部次序**，不是
+写在文档里的契约：**升级 Textual 之后要重新核实这一条**（见 ``notes/progress.md`` 的
+"pump teardown race"）。Textual 8.2.8 也没有 ``Shutdown`` 事件，``on_unmount`` 是唯一
+可用的收尾钩子。
 """
 
 from __future__ import annotations
 
-from typing import Callable
+import os
+from datetime import date
+from functools import partial
+from typing import TYPE_CHECKING, Callable, Sequence
 
+from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.containers import Horizontal
-from textual.events import Resize
-from textual.widgets import Footer
+from textual.containers import HorizontalScroll
+from textual.widgets import Static
 
-from dida.sync.engine import AuthError, DidaError, Engine, TaskItem, UnknownTaskError, filter_groups
-from dida.tui.escape import open_in_browser, task_url
-from dida.tui.panes import (
-    ConfirmScreen,
-    DetailPane,
-    DetailScreen,
-    FilterInput,
-    HelpScreen,
-    ListPane,
-    ListsScreen,
-    QuickAddInput,
-    RescheduleInput,
-    StatusBar,
-    SubtaskPane,
-    TaskPane,
-    detail_body,
-    format_status,
-    key_help_body,
-    lists_body,
+from dida.sync.engine import (
+    DidaError,
+    Engine,
+    INBOX_ID,
+    ListKind,
+    ListRow,
+    SyncStatus,
+    TaskDetail,
+    UnknownTaskError,
+    ViewDefinition,
+    ViewFormProblem,
+    is_a_move,
+    is_list_edit,
+    is_view_edit,
+    parse_view_form,
 )
+from dida.tui import messages, theme
+from dida.tui.escape import open_in_browser, task_url
+from dida.tui.keys import (
+    GLOBAL,
+    LAYER_DETAIL,
+    LAYER_INDEX,
+    LAYER_TASKS,
+    LAYER_TITLES,
+    bindings_for,
+    help_body,
+)
+from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay, multi_values
+from dida.tui.pages import DetailPage, IndexPage, TasksPage
+from dida.tui.pages.detail import LIST_FIELD, PRIORITY_FIELD, TAGS_FIELD, picker_spec
+from dida.tui.pages.index import (
+    KIND_VIEW,
+    LIST_COLOR_FIELD,
+    LIST_NAME_FIELD,
+    NEW_KIND_FIELD,
+    list_form_fields,
+    list_scope_ids,
+    list_write_refusal,
+    new_kind_fields,
+    view_form_fields,
+    view_form_hint,
+    view_write_refusal,
+)
+from dida.tui.pages.tasks import NEW_TASK_TITLE_FIELD, new_task_form_fields
 
-FLASH_SECONDS = 0.45
-"""完成后那一行高亮多久：够看清这一下生效了，又不至于拖住下一次分诊。"""
+if TYPE_CHECKING:  # 只为了标注周期泵那个句柄，运行时用不到
+    from textual.timer import Timer
 
-NO_DATE_MESSAGE = "没写日期：改期要说清改到哪一天，可以写「明天」或「3-15」"
-"""改期输入框里一个日期都没写时的话。新建可以没有日期，改期不行——那等于什么都没改。"""
-
-UNKNOWN_TASK_MESSAGE = "没有改成：这条任务已经不在本地缓存里了，刷新之后再试一次"
-"""引擎拒绝写入（本地没有这条任务的底稿，工单 #25）时的话：如实说没改成。"""
-
-NO_TITLE_MESSAGE = "没写标题：新建至少得有个标题，日期、优先级、标签都可以写在标题后面"
-"""新建输入框里只有日期/优先级/标签、一个字的标题都没有时的话。任务得有名字。"""
-
-UNKNOWN_DELETE_MESSAGE = "没有删：这条任务已经不在本地缓存里了"
-"""删除没有底稿时的话（工单 #16）。
-
-与改期那句分开写：这里**不能**说「刷新之后再试一次」——刷新会把它拉回来，看着像删掉了
-其实没有；而删除这条路径上「本来就没这条」与「删掉了」必须一眼分得清。
-"""
-
-
-SUBTASK_ELSEWHERE_MESSAGE = "这条任务在别处改过：子任务已按服务端为准"
-"""重读发现任务在别处被改过时的话（工单 #20）。
-
-ADR-0002 的规矩：服务端权威可以覆盖本地，但**覆盖必须被用户看见**。这句话就是那个
-「看见」——不说的话，用户在手机上改的子任务会在这一屏上悄悄消失，而且没有任何痕迹。
-"""
-
-SUBTASK_GONE_MESSAGE = "这个子任务在服务端已经没有了：已按服务端为准"
-"""重读回来的那一份里已经没有这个子任务（别处删掉了）：以服务端为准，什么都没写回去。"""
-
-UNKNOWN_SUBTASK_MESSAGE = "没有勾成：这条任务已经不在本地缓存里了，刷新之后再试一次"
-"""引擎拒绝写入（本地没有这条任务的底稿，工单 #25）时的话：如实说没勾成。"""
-
-SUBTASK_READ_FAILED_MESSAGE = "没勾成：读不到服务端，待会儿再试一次"
-"""写前重读失败（断网、凭据被拒、服务端拒绝）时的话（工单 #20）。
-
-重读失败就没有「写回」可言，所以这一句必须说出来，而不是静默什么都不做：用户按了
-``t``，屏幕上却什么都没发生，他会以为勾上了。"""
-
-
-SYNCING_MESSAGE = "同步中…"
-"""按下 ``r`` 之后、同步落地之前状态栏里的话（工单 #21）。
-
-只给**手动**同步用：用户主动按了键，得先有个「它动了」的信号；启动时那次后台刷新不写它，
-否则每次开屏都会闪一下这句。"""
-
-PUSH_TICK_SECONDS = 1.0
-"""周期泵的间隔（工单 #21）：每秒问一次「有没有到点该重试的待推送改动」。
-
-这是 t10 明确留给这一层的那件事——退避算得再准，也得有人**定期**来问一句。间隔只决定
-「什么时候看一眼」，到没到点依然由引擎那口注入的钟判定（见
-:meth:`~dida.tui.app.DidaApp.push_tick`）。1 秒的粒度对「按完 x 断网了、网络回来自动补上」
-这个体验足够，而每秒一次本地队列查询是免费的。"""
+__all__ = [
+    "DidaApp",
+    "PENDING_STYLE",
+    "Stage",
+    "StatusBar",
+    "TopBar",
+    "format_status",
+    "status_line",
+    "top_line",
+]
 
 SYNC_GROUP = "sync"
 """同步 worker 的组名：``exclusive=True`` 靠它保证同时只有一轮同步在跑。"""
 
+PENDING_STYLE = theme.PENDING
+"""待推送数量非零时的高亮（用户故事 100）。
 
-def overwritten_message(count: int) -> str:
-    """服务端盖掉本地改动时的话（工单 #21，用户故事 59）。
-
-    ADR-0002 的规矩：服务端权威可以覆盖本地，但**覆盖必须被用户看见**。这一句就是那个
-    「看见」——不说的话，用户刚做过的改动会在这一屏上悄悄变回服务端那一份。
-    被待推送改动豁免挡回去的那些不算：用户的改动还在，没有任何东西被盖掉。
-    """
-    return f"{count} 处本地改动被覆盖"
-
-
-def refresh_failed_message(error: DidaError) -> str:
-    """同步失败时状态栏里的话：凭据失效与其它失败分开说（工单 #21，用户故事 6）。
-
-    「凭据失效」必须直接引导重新粘贴 token：说成笼统的网络失败，用户会去查网络，
-    而问题在他那把过期或被吊销的 token 上（t03 的 ``Credentials`` 提供了那条重新粘贴的路）。
-    """
-    if isinstance(error, AuthError):
-        return f"凭据失效，请重新粘贴 token：{error}"
-    return f"同步失败：{error}"
-
-
-def completed_failed_message(error: DidaError) -> str:
-    """已完成流没拉到，但全量刷新与推送已经落地时的话（工单 #21）。
-
-    这里**不能**说成整次同步都失败了：未完成任务那一份是新的，只有「已完成 N 项」还是旧的。
-    """
-    return f"已完成流没拉到：{error}"
-
-
-def quit_prompt(pending: int) -> str:
-    """待推送改动还在时退出的话（工单 #21，用户故事 58）。
-
-    必须说出**有几处**：只说「还有改动没推」用户不知道是刚按的那一下，还是攒了一整天的十几笔。
-    也必须说清退出之后它们去哪儿——**不能**说「就丢了」。
-
-    待推送改动落在本地库的 ``pending_changes`` 表里（t08），进程结束不等于它们没了：下次
-    启动时 ``push_tick`` 的周期泵会照退避到点的时间接着推（t21），实测过一次——断网写一笔、
-    退出、重开同一个库，``push_pending()`` 把它推了出去。这里要说的因此是「留在本地、下次
-    接着补推」；吓唬用户说丢了，是拿一句不真的话换他一次犹豫。
-    """
-    return (
-        f"还有 {pending} 处改动没推上去。\n"
-        "退出不会丢：它们留在本地，下次打开 dida 接着补推。\n\n"
-        "y 仍然退出 · n / Esc 留下"
-    )
-
-
-NO_BROWSER_PREFIX = "打不开浏览器：把这条链接自己粘到浏览器里 "
-"""没有浏览器可用时那句话的开头（工单 #19）。
-
-与 :func:`no_browser_message` 分开写：测试要断的是「出声了没有」，而那句话后面还挂着
-一条随时会变的 URL。措辞里**不假装**有桌面客户端可以切——ADR-0002 已核实官方客户端
-不接受任务深链，所以这里只有浏览器这一条路。
+十六色的名字只有一个出处（:mod:`dida.tui.theme`），这里留一个别名给老读者。
 """
 
 
-def no_browser_message(url: str) -> str:
-    """没有浏览器可用时状态栏里的话：说清楚打不开，并把 URL 原样给人抄（工单 #19）。
+class TopBar(Static):
+    """顶栏：词标 + 当前导航路径（GLOSSARY 的「顶栏」：它说「你在哪」）。"""
 
-    这里**绝不能**静默：完成在服务端不可逆（ADR-0002），``o`` 是它的补偿，按下去什么都
-    没发生比吵一句坏得多。也不说「重试一下就好」——``webbrowser`` 找不到浏览器时重试
-    还是找不到，用户该做的是自己把这条链接粘走。
+
+class StatusBar(Static):
+    """状态栏：已同步时刻、待推送数量（非零时高亮）、当前逻辑日。
+
+    它与顶栏是分工关系（ADR-0007 四）：**顶栏说「你在哪」，状态栏说「数据怎么样」**。
     """
-    return f"{NO_BROWSER_PREFIX}{url}"
 
 
-def delete_prompt(title: str) -> str:
-    """删除确认浮层上的那句话（工单 #16）。
+class Stage(HorizontalScroll):
+    """三层页面并排停在这里；换层就是把它横向滚过一整屏。
 
-    措辞是这一屏最要紧的一行字：**不许暗示还能找回来**。滴答清单 Open API 里没有
-    undelete、没有回收站、没有「已删除」列表（``api-contracts.md``），所以这里只说删了
-    就没有了，绝不说「可恢复」「稍后可找回」「已移入回收站」——那种话会让用户在按 ``y``
-    的时候以为还有退路，而实际上没有。
+    换层 = 平移不是装饰：``→`` 压栈、``←`` 出栈本来就是**导航栈**（GLOSSARY 的
+    「导航路径」），左右平移正是这个语义的标准表达。页面底色必须不透明（:data:`CSS_PAGE`），
+    否则滑走的那块会漏出后面的东西。
+
+    ## 它是**程序驱动**的，用户推不动它（工单 #59）
+
+    它是个真能横向滚动的容器（实测 ``virtual_size`` 300×28、``container_size`` 100×28、
+    ``max_scroll_x`` 200），于是继承了一整套用户滚动入口。实测三条路都能把它推走，而且都是
+    「屏幕和状态对不上」那一类：
+
+    - **滚动键**（``←`` / ``→`` / ``home`` / ``end`` / ``ctrl+pageup``…）：挪一格，那条铺满
+      整幅的规则线当场少一格；``home`` 在详细页直接跳回第一页，而 app 仍认为你在第三层。
+    - **滚轮**：普通滚轮不动（这一轴纵向没得滚），但 ``shift`` / ``ctrl`` / 横向倾斜滚轮
+      走的是 ``scroll_*`` **方法**（``Widget._on_mouse_scroll_down`` → ``_scroll_right_for_pointer``），
+      照样推得动——而这正是滚列表时最容易手滑撞上的那个手势。
+    - **聚焦**：``tab`` 去聚焦**别层的页面**，Textual 出于好意把那个控件「滚进可见区」
+      （``Screen.set_focus`` → ``scroll_to_center``），一次就把轨道拖走**整整一页**。
+
+    **挡住它们的不是一张键位清单，而是让这一轴对用户不可滚**：``#stage`` 的
+    ``overflow-x: hidden``（:func:`dida.tui.theme.app_css`，那里的注释写了为什么）。于是
+    ``allow_horizontal_scroll`` 为假，上面三个入口在 Textual 自己那一层就不成立——action
+    开头就 ``SkipAction``、滚轮处理器连条件都不进、``scroll_to_region`` 把 x 抹成 0。
+    这比逐个记住哪些键要挡住强：**将来 Textual 再长出一个滚动入口也一并挡着**，而
+    ``tests/test_visual_identity.py`` 里那条守卫断言的是这个总闸本身（谁把 ``overflow-x``
+    改回 ``scroll`` / ``auto``，它当场变红）。
+
+    程序滚动走的是同一个闸上的正当口子：:meth:`show` 与 :meth:`on_resize` 用
+    ``scroll_to(force=True)``——``force`` 就是「我知道这一轴不许用户滚，但这是我自己要滚」。
+
+    为什么不是「别用 :class:`HorizontalScroll`」：``scroll_to`` 与三页并排的版式都建在它
+    上面，换掉它不是修一个缺陷，是把 ADR-0007 的平移重做一遍。滚动条那条路本来就是关着的
+    （``scrollbar-size-*`` 都是 0，何况现在 overflow 也不是 scroll 了）。
+
+    ## 它自己也**不是个焦点目标**（工单 #60）
+
+    轨道上没有键位（``j`` / ``→`` / … 全在页面上），可它继承了 ``ScrollableContainer``
+    的 ``can_focus = True``，于是 ``tab`` 会在它身上停一站。聚焦它什么也不会发生，却让焦点
+    离开了页面——而页面才是按键该去的地方：``_show`` 每次都把焦点交给当前那一页，用户按下
+    去的键就该落在那一页上。所以这里把 ``can_focus`` 关掉。
     """
-    return f"删除「{title}」？\n删掉就找不回来了，滴答清单没有回收站。\n\ny 确认删除 · n / Esc 取消"
+
+    can_focus = False
+    """轨道不给聚焦：换层时 ``_show`` 会把焦点交给**页面**，而这一格自己没有键位（工单 #60）。"""
+
+    def show(self, index: int, *, animate: bool = True) -> None:
+        """把第 ``index`` 页滑到眼前（``animate=False`` 就是直接到）。
+
+        ``force=True`` 是**承重的**：这一轴对用户不可滚（见类文档），不加 force 的话
+        ``scroll_to`` 会把 x 丢掉——换层就再也不动了。
+        """
+        self._index = index
+        target = float(index * self.size.width)
+        if not animate or self.size.width <= 0:
+            self.scroll_to(x=target, animate=False, immediate=True, force=True)
+        else:
+            self.scroll_to(
+                x=target,
+                animate=True,
+                duration=theme.PAN_MS / 1000,
+                easing="out_cubic",
+                force=True,
+            )
+
+    def on_resize(self) -> None:
+        """窗口宽度变了：每一页的位置跟着变，得把当前那一页重新对齐（不滑，也不加动效）。"""
+        index = getattr(self, "_index", 0)
+        if self.size.width > 0:
+            self.scroll_to(x=float(index * self.size.width), animate=False, immediate=True, force=True)
+
+    _index = 0
+    """当前该对齐在第几页；``show()`` 记下来，宽度变了由 :meth:`on_resize` 用它重算。"""
 
 
-WIDE_MIN_WIDTH = 110
-"""三栏常驻的最小列数（工单 #18）。"""
+def top_line(path: Sequence[str]) -> Text:
+    """顶栏那一行：词标 + 导航路径。
 
-MEDIUM_MIN_WIDTH = 80
-"""收掉左栏的最小列数：比这更窄就连清单也进浮层。"""
-
-
-def pane_tier(width: int) -> str:
-    """按终端列数分档（工单 #18）：``wide`` / ``medium`` / ``narrow``。
-
-    - ``wide``（≥110）：三栏常驻。
-    - ``medium``（80–109）：收起右栏，``Enter`` 以浮层打开详情。
-    - ``narrow``（<80）：再收起左栏，清单也进浮层。
-
-    纯函数：宽度进来、档位出去。分档是布局的事，跟终端里有什么数据无关，所以它在这里
-    而不是在引擎里——也不需要在测试里开一个 app 才能问「95 列算哪一档」。
+    颜色只进 span（``Text().append(style=…)``）：``Text("dida", style="cyan")`` 会走 Textual
+    的 CSS 颜色解析，把真彩色偷偷放回来（``theme`` 的模块文档里写了这条坑）。
     """
-    if width >= WIDE_MIN_WIDTH:
-        return "wide"
-    if width >= MEDIUM_MIN_WIDTH:
-        return "medium"
-    return "narrow"
+    line = Text()
+    line.append(f" {theme.WORDMARK_ICON} dida", style=f"{theme.ACCENT} {theme.HEADING}")
+    for index, segment in enumerate(path):
+        line.append(f"  {theme.BUILTIN_MARK}  ", style=theme.MUTED)
+        line.append(segment, style=theme.HEADING if index == len(path) - 1 else theme.MUTED)
+    return line
+
+
+def status_line(status: SyncStatus, *, spinner: str = "") -> Text:
+    """状态栏那一行：待推送非零时那一段高亮，其余不变。
+
+    措辞一个字都没改（``GLOSSARY.md``：已同步 / 待推送 / 逻辑日）——加的是**非零时高亮**
+    这一个信号：那个数说明本地比服务端新（ADR-0002 的豁免代价），看不见它就会以为
+    「按了就是发出去了」。
+
+    ``spinner`` 是同步超过阈值之后才出现的那一帧（默认空串 = 平时一个字都不多）。
+    """
+    logical_day = status.logical_day.strftime("%m-%d") if status.logical_day else "—"
+    last_refresh = status.last_refresh_at.strftime("%H:%M") if status.last_refresh_at else "—"
+    text = Text(f"{spinner}{'同步中 · ' if spinner else ''}已同步 {last_refresh} · ")
+    text.append(f"待推送 {status.pending_count}", style=PENDING_STYLE if status.pending_count else "")
+    text.append(f" · 逻辑日 {logical_day}")
+    return text
+
+
+def format_status(status: SyncStatus) -> str:
+    """状态栏那一行的**纯文本**（措辞的唯一来源还是 :func:`status_line`）。"""
+    return status_line(status).plain
+
+
+def save_line(status: SyncStatus) -> str:
+    """详细页底部那一行的纯文本：**这一下到底出去没有**（用户故事 65 + 81）。
+
+    三种读法，一个都不许含糊：推不出去就带**具体**原因（断网、凭据失效、服务端拒绝的原话），
+    队列里还有改动就报数，都没有才是「已保存」。只说一句「保存失败」的话，用户不知道该刷新、
+    该重连、还是该重新粘 token——那是三种完全不同的下一步。
+    """
+    if status.last_error:
+        return messages.field_save_failed_message(status.last_error)
+    if status.pending_count:
+        return messages.pending_message(status.pending_count)
+    return messages.saved_message()
 
 
 class DidaApp(App[None]):
-    """三栏 + 状态栏。"""
+    """一栏 + 三层页面 + 状态栏。"""
 
-    ENABLE_COMMAND_PALETTE = False  # 命令面板会抢键；键位帮助归 t18
+    ENABLE_COMMAND_PALETTE = False  # 命令面板会抢键；键位帮助是 h
+    BINDINGS = bindings_for(GLOBAL)
+    """全局那几条（退出 / 同步 / 浏览器 / 帮助）。各层自己的键在各自的页面上——
+    所以 ``h`` 列出来的、以及 footer 上显示的，都是**当前这一层真正能按的**那些。"""
 
-    # 非 priority：焦点在输入框里时 q 应当是普通字符（t15/t17 的输入框）
-    BINDINGS = [
-        Binding("q", "quit", "退出"),
-        # 完成在服务端不可逆（ADR-0002）：x 在主键区下面那一行，与 j/k 隔着整行。防误按
-        # 是这个动作唯一的补偿；footer 上带标签显示，看得见才按得准。
-        Binding("x", "complete", "完成"),
-        # 键位表这一格是两个键：``x`` / ``Space``，做的是同一个「完成」。防误按的理由与 x
-        # 一字不差：它不在栏位的光标键位组里（j/k/↑/↓），也**不是** priority 绑定——焦点
-        # 在输入框里时空格仍然是空格（t15/t17 的新建、改期、过滤输入）。footer 上不重复
-        # 出现第二次：一个动作一行，两个键的说明都在键位帮助表里。
-        Binding("space", "complete", "完成", show=False),
-        Binding("g", "defer", "顺延"),
-        Binding("G", "defer_week", "顺延一周"),
-        Binding("e", "reschedule", "改期"),
-        Binding("a", "quick_add", "新建"),
-        # 删除是这一屏唯一不可挽回的动作：服务端没有 undelete、没有回收站（api-contracts.md），
-        # 所以 `d` 不直接删，先弹一次确认（t16）。
-        Binding("d", "delete", "删除"),
-        Binding("p", "priority", "优先级"),
-        Binding("/", "filter", "过滤"),
-        # 逃生舱（t19）：把光标下那一条交给系统浏览器。完成在服务端不可逆（ADR-0002），
-        # 官方客户端又不接受任务深链，所以按错之后唯一能走的路就是这个键。
-        Binding("o", "open", "浏览器"),
-        # 手动同步（t21）：全量刷新 + 推待推送改动 + 拉已完成流，一次做完。断网时它只是
-        # 如实报一句，缓存照旧读、改动照旧排队——这一屏不因为没网就不能用。
-        Binding("r", "refresh", "同步"),
-        # 子任务（t20）：s 把焦点移到右栏那份子任务列表上，t 在那里勾选。
-        Binding("s", "subtasks", "子任务"),
-        # 右栏详情的开合（t18）。三档语义一致：右栏在屏上就收放它，收起了就弹浮层。
-        # 不抢输入框：焦点在 Input 里时 Enter 归 Input（提交），到不了这里。
-        Binding("enter", "toggle_detail", "详情"),
-        # 清单浮层（t18）。窄档（<80 列）左栏不在屏上，清单只能从这里看；
-        # 更宽的两档左栏本来就在，这个键照样能开——同一个键在哪里都做同一件事。
-        Binding("l", "lists", "清单"),
-        # 键位帮助（t18）。footer 只显示得下头几个键，这张表才是找键的地方。
-        Binding("question_mark", "help", "帮助"),
-    ]
-
-    _tier = "wide"
-    """当前宽度档位（工单 #18）：``wide`` / ``medium`` / ``narrow``。``on_mount`` 与
-    ``on_resize`` 各算一次。"""
-
-    _detail_open = True
-    """右栏详情是不是开着。``Enter`` 开合它（工单 #18）：宽档下它决定右栏在不在屏上，
-    更窄的两档里它不参与布局——那两档的详情走浮层。尺寸变化后保留这个姿势，不重置。"""
-    CSS = """
-    #panes {
-        height: 1fr;
-    }
-    Pane {
-        border: round ansi_cyan;
-        height: 1fr;
-    }
-    #list-pane {
-        width: 20;
-    }
-    #task-pane {
-        width: 1fr;
-    }
-    #detail-pane {
-        width: 34;
-    }
-    #status-bar {
-        height: 1;
-        color: ansi_cyan;
-    }
-    """
+    CSS = theme.app_css()
+    """外观**一个来源**（:mod:`dida.tui.theme`）：页面底色、顶栏/状态栏、浮层、toast、
+    滚动条全在那里。这个类里一行颜色都不写。"""
 
     def __init__(
         self,
@@ -276,71 +263,955 @@ class DidaApp(App[None]):
         open_url: Callable[[str], bool] = open_in_browser,
         refresh_on_start: bool = False,
         push_tick_seconds: float | None = None,
+        animations: str | None = None,
+        day_boundary: Callable[[], str | None] | None = None,
     ) -> None:
         """``open_url`` 是**注入**的浏览器开手（工单 #19）。
 
-        生产默认值 :func:`~dida.tui.escape.open_in_browser` 会真的叫起系统浏览器；测试
-        塞一个假的进来，于是「交给浏览器的是哪条 URL」能当场断言，而没有一个标签页被
-        打开。它回 ``False`` 或抛异常都表示这台机器上开不了浏览器。
+        生产默认值 :func:`~dida.tui.escape.open_in_browser` 会真的叫起系统浏览器；测试塞一个
+        假的进来，于是「交给浏览器的是哪条 URL」能当场断言，而没有一个标签页被打开。它回
+        ``False`` 或抛异常都表示这台机器上开不了浏览器。
 
         ``refresh_on_start`` 与 ``push_tick_seconds`` 是**策略**，默认都不开（工单 #21）：
         产品行为由组合根按 ``config.toml`` 决定（``dida.bootstrap`` 传 ``refresh_on_start=``
         与 ``PUSH_TICK_SECONDS``）。这里不写死默认值，是为了让「直接 new 一个 app」的测试
         不必先接上客户端与存储——后台同步需要一个真引擎才跑得起来。
+
+        ``day_boundary`` 是**重新读出当前日界的那只手**（工单 #46）：组合根把配置文件的读手
+        （``dida.config.DayEndReader.current``）交给它，app 在两处问它——周期泵那一秒一次的
+        心跳、以及用户按 ``r``。它回 ``None``（配置读不了）就沿用引擎里那个。不给就是
+        「没有人能告诉我新的日界」：直接 new 一个 app 的测试不必为此准备一个配置文件。
+
+        ``ansi_color=True`` 是**跟随终端主题**那一条决定的落点（ADR-0007 一）：Textual 默认
+        会把每个 ``ansi_*`` 改写成 Monokai 的真彩色（``ansi_cyan`` → ``#58D1EB``），用户的
+        调色板一眼都用不上；打开之后同一条 CSS 发出的是 ``\\x1b[36m``，由终端说了算。
+
+        ``animations`` 是 ``auto|on|off`` 开关（ADR-0007 三）。不给就走 ``DIDA_ANIM``，
+        再不给就是 ``auto``：ssh 与低能力终端上自动关掉。这是**换层平移**的闸（ADR-0008
+        四撤掉光标条之后，它是这一档动效唯一的用武之地）：关掉时换层不滑，屏幕一步到位。
         """
-        super().__init__()
+        super().__init__(ansi_color=True)
         self.engine = engine
         self._open_url = open_url
         self._refresh_on_start = refresh_on_start
         self._push_tick_seconds = push_tick_seconds
-        self._query = ""
-        """当前生效的过滤词（空串 = 不过滤）。框里的原文由 :class:`FilterInput` 拿着。"""
+        self._day_boundary = day_boundary
+        """重读当前日界的那只手（工单 #46）；``None`` = 没人能告诉它新的日界。"""
+        self._view_day: date | None = None
+        """屏幕上那些行是按**哪一个逻辑日**算出来的（工单 #46）。
+
+        它是「这一屏过期了没有」的凭据：钟自己走过边界时配置一个字节都没变，只有把这一屏
+        是哪一天记下来，心跳才分得清「还是同一天」与「已经翻篇了」。``None`` = 还没画过。"""
+        self._push_timer: Timer | None = None
+        """周期泵的定时器句柄（工单 #21）：``on_unmount`` 里拿它把泵停掉。
+
+        ``set_interval`` 回一个 ``Timer``，丢掉它就没有第二个人能停这一跳——关窗之后
+        它还挂在事件循环上。``None`` 表示泵没开（策略没给间隔）或者已经停了。"""
+        self._layer = LAYER_INDEX
+        """当前在屏上的是哪一层（``h`` 与 ``o`` 都按它说话）。"""
+        self._container_id: str | None = None
+        """当前打开的是哪个容器（清单或视图的 id）；``None`` = 还没进过任何一层。"""
+        self._detail_task_id: str | None = None
+        """详细页正在说的是哪条任务。"""
+        self._container_title: str | None = None
+        """当前容器（清单或视图）的**名字**——顶栏那段路径要写它。"""
+        self._detail_title: str | None = None
+        """详细页那条任务的标题——路径的最后一段写它。"""
+        self._animations = animations or theme.animations_setting(os.environ)
+        self._motion = False
+        """这一台机器上换层动不动（``on_mount`` 里按开关与环境定一次）。
+
+        ⚠ 名字**不能**是 ``_animate``：``App._animate`` 是 Textual 自己那个绑好的 animator
+        （``App.animate()`` 调的就是它），盖掉之后 ``app.animate(...)`` 会抛
+        ``TypeError: 'bool' object is not callable``——报错点在 Textual 的 ``app.py`` 里，离
+        现场很远。页面自己不再有第二个动效开关（ADR-0008 四把光标条撤了）。
+        """
+        self._editing_list: str | None = None
+        """正在改的是哪条清单（表单关掉时要用它；``None`` = 那一次是新建）。"""
+
+        self._editing_view: str | None = None
+        """正在改的是哪个自定义视图（#36）；``None`` = 那一次是新建视图。"""
+        self._announce_sync = False
+        """这一轮同步要不要用 toast 报完成——``r`` 要，启动刷新不要（那会每次开屏都弹一下）。"""
+        self._spinning = False
+        self._spinner_frame = 0
+        self._spinner_timer: Timer | None = None
+        self._spin_delay_timer: Timer | None = None
+
+    # ---------------------------------------------------------------- 组装
 
     def compose(self) -> ComposeResult:
-        # 新建输入框：默认收起，按 a 才出现。它在三栏**上面**——它不瞄准任何一条任务，
-        # 而 e 的改期框在下面（改的是光标下那一条）。两者共用同一套语法。
-        yield QuickAddInput(id="quick-add-input")
-        with Horizontal(id="panes"):
-            yield ListPane(id="list-pane")
-            yield TaskPane(id="task-pane")
-            yield DetailPane(id="detail-pane")
-        # 改期输入框：默认收起，按 e 才出现（新建输入框归 t15，在顶部）
-        yield RescheduleInput(id="reschedule-input")
-        # 过滤框：默认收起，按 / 才出现
-        yield FilterInput(id="filter-input")
-        yield Footer()
+        yield TopBar(id="top-bar")
+        with Stage(id="stage"):
+            yield IndexPage(id=LAYER_INDEX)
+            yield TasksPage(id=LAYER_TASKS)
+            yield DetailPage(id=LAYER_DETAIL)
         yield StatusBar(id="status-bar")
 
     def on_mount(self) -> None:
-        self._apply_tier(self.size.width)
+        """开屏：**先**把本地缓存画上屏，网络刷新排在事件循环上不等它（用户故事 3/4）。
+
+        动效的开关只在这里定一次：``auto|on|off`` 落到**换层平移**这一个地方（ADR-0008 四
+        撤掉光标条之后，页面自己不再有动效开关）。
+        """
+        self._motion = theme.animations_enabled(self._animations)
+        if not self._motion:
+            self.animation_level = "none"
+        self._show(LAYER_INDEX)
         self.refresh_view()
-        self.query_one(TaskPane).focus()  # 一进来 j/k 就能过任务；Tab 换到左栏
-        # 本地缓存**先**上屏，网络从来不挡第一屏（用户故事 3）：刷新排在事件循环上，
-        # 它回来之前 j/k 已经在动了。
         if self._refresh_on_start:
             self.start_sync()
         if self._push_tick_seconds is not None:
             # 重试队列的泵（t21）：写失败时改动留在队列里，退避到点了得有谁来推它。
-            self.set_interval(self._push_tick_seconds, self.push_tick)
+            # 句柄留着，关窗时好把它停掉（on_unmount）——泵的开关归这一层管。
+            self._push_timer = self.set_interval(self._push_tick_seconds, self.push_tick)
 
-    # ---------------------------------------------------------------- 同步（t21）
+    def on_unmount(self) -> None:
+        """关窗：把周期泵停掉——app 都拆了，没有人再需要它问那句「到点了没有」。
+
+        停掉只挡得住**后面**的跳；已经在飞的那一次要等 ``await`` 回来才算数，那由
+        :meth:`_write_status` 与 :meth:`refresh_view` 的「屏幕还在不在」守着。两半都要：
+        只停定时器关不掉已经跨过 ``await`` 的那一次。
+        """
+        if self._push_timer is not None:
+            self._push_timer.stop()
+            self._push_timer = None
+        self._stop_spinner()
+
+    # ---------------------------------------------------------------- 三层进出
+
+    @property
+    def layer(self) -> str:
+        """当前在屏上的是哪一层。"""
+        return self._layer
+
+    def index_page(self) -> IndexPage:
+        return self.query_one(IndexPage)
+
+    def tasks_page(self) -> TasksPage:
+        return self.query_one(TasksPage)
+
+    def detail_page(self) -> DetailPage:
+        return self.query_one(DetailPage)
+
+    def _pages(self) -> dict[str, IndexPage | TasksPage | DetailPage]:
+        """三层各是哪个控件，按层名索引。"""
+        return {
+            LAYER_INDEX: self.index_page(),
+            LAYER_TASKS: self.tasks_page(),
+            LAYER_DETAIL: self.detail_page(),
+        }
+
+    def _show(self, layer: str) -> None:
+        """把这一层滑到眼前，并把焦点交给它（``j``/``k``/``→`` 立刻能用）。
+
+        三层**都在 DOM 里**、并排停在 :class:`Stage` 上：它们的行与光标因此原样留着，
+        ``←`` 回去时用户看到的就是他离开时那一行（用户故事 20/62）。换层是横向平移——
+        ``→`` 压栈、``←`` 出栈本来就是导航栈（ADR-0007 三）。
+        """
+        previous = self._layer
+        self._layer = layer
+        page = self._pages()[layer]
+        self._write_top()
+        self._stage().show(self._layer_index(layer), animate=self._motion and layer != previous)
+        # ``scroll_visible=False``：#59 **之前**它是承重的——Textual 交焦点时默认会把那个控件
+        # **立刻**滚进可见区，而这一页正好是整个舞台（平移就是把它滑过来），那一下会把动画
+        # 当场抹平。现在 ``#stage`` 的 ``overflow-x`` 关成了 ``hidden``，横向根本滚不动，
+        # 于是它**已经不是**动画的保障（实测 2×2：闸开着时 ``True`` 照样有 9 帧动画）。
+        # 留着它是第二道保险：闸若被改回 ``scroll``，动画与输入会一起坏。
+        page.focus(scroll_visible=False)
+        # 切回来时光标不止要「还在那一行」，还要看得见（#34 的验收标准 8）。
+        page.scroll_cursor_into_view()
+
+    def _stage(self) -> Stage:
+        return self.query_one("#stage", Stage)
+
+    @staticmethod
+    def _layer_index(layer: str) -> int:
+        """这一层是并排三页里的第几页（顺序就是 ``compose`` 的顺序）。"""
+        return (LAYER_INDEX, LAYER_TASKS, LAYER_DETAIL).index(layer)
+
+    def open_container(self, container_id: str) -> None:
+        """进层二：某个清单或视图里的任务（``→``）。"""
+        self._container_id = container_id
+        self._detail_task_id = None
+        self.refresh_view()
+        self._show(LAYER_TASKS)
+
+    def open_detail(self, task_id: str) -> None:
+        """进层三：一条任务的详细页（任务列表页上按 ``→``）。"""
+        self._detail_task_id = task_id
+        self.refresh_view()
+        self._show(LAYER_DETAIL)
+
+    def back_to_index(self) -> None:
+        """回层一（任务列表页上按 ``←``）——光标照旧停在他进来的那一行。"""
+        self._detail_task_id = None
+        self._show(LAYER_INDEX)
+
+    def back_to_tasks(self) -> None:
+        """回层二（详细页上按 ``←``）——光标照旧停在他进来的那条任务上。"""
+        self._show(LAYER_TASKS)
+
+    # ---------------------------------------------------------------- 重画
+
+    def reload_day_boundary(self) -> bool:
+        """重新问一次当前日界；屏幕跟不上了就按新的逻辑日重画（工单 #46）。返回「重画过没有」。
+
+        「逻辑日改了立刻生效」有**两条**路，两条都在这里收口，因为它们要挂的是同一个时机：
+
+        - 配置里改了边界值——外部事件（用户在另一个窗口里改），没人通知得了这个进程；
+        - 钟自己走过了边界——终端里挂一夜，早上那一屏就是按昨天算的。
+
+        那个时机是**两个键的最前面**：:meth:`push_tick`（周期泵那一秒一次的心跳）与
+        :meth:`action_refresh`（``r``），都在任何网络调用之前。第二条尤其靠这一点——
+        ``_sync()`` 里的重画在 ``else:``（同步成功）那一支里，刷新抛 :class:`DidaError` 时
+        一次都不跑，而收尾的 ``update_status()`` 照样按新逻辑日写状态栏。于是「没网的时候按了
+        一下 ``r``」得到的正是那个自相矛盾的屏幕：状态栏是新日子，列表还是旧成员。
+
+        **滚过那条不在下面那个 ``None`` 判断后面**：它不是配置事件，一个没建读手的 app
+        （``day_boundary=None``）照样得发现它。
+
+        配置读不到（``None``）时沿用引擎里那个日界：界面不崩，也不替用户按默认值来。
+
+        **光标不归这次重画管**：各页按行 id 把它认回原来那一行（``CursorPage.set_rows``），
+        所以重算不会把人踢回第一行（验收标准 3）。
+        """
+        boundary_moved = False
+        if self._day_boundary is not None:
+            day_end = self._day_boundary()
+            if day_end is not None:
+                boundary_moved = self.engine.set_day_end(day_end)
+        rolled_over = self._view_day is not None and self.engine.logical_day() != self._view_day
+        if not (boundary_moved or rolled_over):
+            return False
+        self.refresh_view()
+        return True
+
+    def refresh_view(self) -> None:
+        """读引擎的三种读形状，重画在屏上的那几层与状态栏。
+
+        三层都重画（不在屏上的那两层也重画）：它们的行是**同一份缓存**算出来的，只画在屏
+        上的那一层，切回去时会看到一屏过期的东西。光标不归这里管——各页按**行 id** 把光标
+        认回原来那一行（用户故事 21/57：刷新不许把人踢回第一行）。
+
+        屏幕已经拆掉时整体是空操作（关窗中，这一次回来晚了，见 :meth:`_write_status`）。
+        """
+        if not self.is_running:
+            return
+        # 先记下「这一屏是哪一天的」，再画行：反过来的话，边界正好在这几句里跨过去时，会记下
+        # 一个比行更新的日子，那一屏就永远没人认领了（心跳以为它是最新的，见
+        # :meth:`reload_day_boundary`）。记早了最多多画一次，记晚了就是一屏昨天的东西。
+        self._view_day = self.engine.logical_day()
+        rows = self.engine.list_index()
+        self.index_page().show_lists(rows)
+        self._container_title = (
+            None if self._container_id is None else self._container_name(rows, self._container_id)
+        )
+        if self._container_id is not None:
+            self.tasks_page().show_tasks(
+                self.engine.tasks_in(self._container_id), name=self._container_title or ""
+            )
+        if self._detail_task_id is not None:
+            detail = self.engine.task_detail(self._detail_task_id)
+            self._detail_title = None if detail is None else detail.title
+            # 时区提示走**注入的钟**：``status().checked_at`` 就是那只钟给的时刻，它的
+            # ``tzinfo`` 是用户墙钟当前的时区。详细页要把用户敲的日期与时刻理解成一个时刻，
+            # 而它自己不读时钟（README：「业务代码不许调 datetime.now()」，#58 的 T1）。
+            self.detail_page().show_detail(detail, zone=self.engine.status().checked_at.tzinfo)
+        self.update_status()
+        self._write_top()
+
+    @staticmethod
+    def _container_name(rows: tuple[ListRow, ...], container_id: str) -> str:
+        """容器在标题里写什么：引擎给的清单名；认不出来（远端刚删掉）就照原样写 id。"""
+        row = next((item for item in rows if item.id == container_id), None)
+        return row.name if row is not None else container_id
+
+    def update_status(self) -> None:
+        """把引擎的状态刷进状态栏与详细页底部那一行。数据变化后都调它。
+
+        两处说的是两件事（ADR-0007 四）：状态栏说「数据怎么样」（已同步 / 待推送 / 逻辑日），
+        详细页那一行说「你刚才那一下出去没有」。同一个 ``status()`` 读出来的两份读法，
+        所以它们永远不会互相矛盾。
+        """
+        status = self.engine.status()
+        self._write_status(status_line(status, spinner=self._spinner()))
+        self._write_save_line(save_line(status))
+
+    def _write_save_line(self, text: str) -> None:
+        """把详细页底部那一行写掉——与状态栏同一条规矩：**先问屏幕还在不在**。
+
+        它由 ``await`` 之后的那几次重画调到（逐字段编辑那一条路正好是跨 ``await`` 的），
+        关窗时页面已经拆了，再往它上面写就是 ``NoMatches``。
+        """
+        if not self.is_running:
+            return
+        self.detail_page().show_save(text)
+
+    def _write_top(self) -> None:
+        """把当前导航路径刷进顶栏（GLOSSARY 的「导航路径」：它是走出来的，不是猜的）。"""
+        if not self.is_running:
+            return
+        self.query_one(TopBar).update(top_line(self.nav_path()))
+
+    def nav_path(self) -> tuple[str, ...]:
+        """当前导航路径：清单列表页 → 任务列表页 → 任务详细页，最多三级。
+
+        第一段是**页面**（它只有三种），后面两段是走在那一页上的**东西**：容器名与任务名。
+        「你在哪」在详细页的答案就是「在哪条任务上」，所以最后一段写的是它。
+        """
+        index = LAYER_TITLES[LAYER_INDEX]
+        if self._layer == LAYER_TASKS:
+            return (index, self._container_title or LAYER_TITLES[LAYER_TASKS])
+        if self._layer == LAYER_DETAIL:
+            return (
+                index,
+                self._container_title or LAYER_TITLES[LAYER_TASKS],
+                self._detail_title or LAYER_TITLES[LAYER_DETAIL],
+            )
+        return (index,)
+
+    def _write_status(self, message: str | Text) -> None:
+        """把一句话写进状态栏——TUI 里状态栏的**唯一**写入口。
+
+        关窗时丢掉它：``await`` 回来的路上 app 可能已经拆了（用户按 ``q``、或者 ``run_test``
+        收尾），那一刻 widget 已经不在 DOM 里，再往状态栏写就是 ``NoMatches``。周期泵正好
+        撞在这个窗口上（工单 #41 观察到的偶发红，属地归 #34）；凡是 ``await`` 之后写状态栏
+        的路都走这里，省得每处各记一次。
+
+        只在**屏幕已经不在跑**时放过：app 还在跑时状态栏不见了仍然是 bug，照旧让
+        ``NoMatches`` 冒出去，不吞。
+        """
+        if not self.is_running:
+            return
+        self.query_one(StatusBar).update(message)
+
+    # ---------------------------------------------------------------- 页面消息
+
+    def on_index_page_entered(self, event: IndexPage.Entered) -> None:
+        """清单列表页上按了 ``→``：进这个容器。"""
+        self.open_container(event.container_id)
+
+    def on_index_page_refused(self, event: IndexPage.Refused) -> None:
+        """按 ``→`` 进一个进不去的清单：如实说一句，不进下一层。"""
+        self._write_status(event.message)
+
+    def on_tasks_page_entered(self, event: TasksPage.Entered) -> None:
+        """任务列表页上按了 ``→``：进这条任务的详细页。"""
+        self.open_detail(event.task_id)
+
+    def on_tasks_page_back(self, event: TasksPage.Back) -> None:
+        """任务列表页上按了 ``←``：回清单列表页。"""
+        self.back_to_index()
+
+    def on_tasks_page_toggle_complete(self, event: TasksPage.ToggleComplete) -> None:
+        """任务列表页上按了 ``space``：完成 / 取消完成（工单 #38）。
+
+        两个方向都是**乐观写**（ADR-0002）：本地当场生效、立即推送，界面不等网络。
+        ``event.completed`` 是按下那一刻读模型里的状态，所以「取消完成」这条路的判据是
+        服务端的 ``status``，不是这一层记的什么东西。
+
+        引擎当场拒绝（本地已经没有这条任务的底稿，工单 #25）时如实说一句——按下去什么都
+        不发生，用户会以为它成了。**这一条路没有 ``await``**：``complete`` / ``uncomplete``
+        都是同步的（推送排在事件循环上，写的人当场返回），所以写完之后碰 DOM 不需要
+        「先问 ``is_running``」那道守卫；重画与 toast 各自还有一道，见它们的说明。
+        """
+        try:
+            if event.completed:
+                self.engine.uncomplete(event.task_id)
+            else:
+                self.engine.complete(event.task_id)
+        except DidaError as exc:
+            self._write_status(messages.toggle_complete_failed_message(exc))
+            return
+        self.refresh_view()
+        self._notify_step(
+            messages.uncompleted_message(event.title)
+            if event.completed
+            else messages.completed_message(event.title)
+        )
+
+    def on_detail_page_back(self, event: DetailPage.Back) -> None:
+        """详细页上按了 ``←``：回任务列表页。"""
+        self.back_to_tasks()
+
+    # ---------------------------------------------------------------- 新建任务（#39）
+
+    def on_tasks_page_new_task(self, event: TasksPage.NewTask) -> None:
+        """``n``：开「只填标题」的表单（字段见 :func:`~dida.tui.pages.tasks.new_task_form_fields`）。"""
+        self.push_screen(
+            FormOverlay(title="新建任务", fields=new_task_form_fields()),
+            self._finish_new_task,
+        )
+
+    def _finish_new_task(self, values: dict[str, str] | None) -> None:
+        """表单关掉了：按填的标题建一条（空标题不建，如实说一句）。
+
+        ``None`` 那条分支从 #66 起走不到了（表单没有「取消」，``Esc`` 就是保存），留着只是
+        防御——调用方按交回来那一份值判断，这一层不认识表单的键位。
+
+        落点与隐含日期都**读读模型**（:meth:`~dida.sync.engine.Engine.tasks_in`）：
+
+        - 真实清单里建 → 落在当前打开的这个清单里（用户故事 45）；
+        - 视图里建 → 落在收集箱（``INBOX_ID``，视图不是容器），视图隐含的日期
+          （``TaskList.implied_due``，「今天」才有）跟着带上（用户故事 35）。
+
+        「这个容器是不是视图」只在一处判（``TaskList.shows_list_name``），这一层不自己认识
+        视图——两处各判一次就是两处会漂。
+        """
+        if values is None:
+            return
+        title = values.get(NEW_TASK_TITLE_FIELD, "").strip()
+        if not title:
+            self._write_status(messages.NO_TITLE_MESSAGE)
+            return
+        container = self._container_id
+        if container is None:
+            return
+        task_list = self.engine.tasks_in(container)
+        destination = INBOX_ID if task_list.shows_list_name else container
+        try:
+            self.engine.create(
+                title,
+                destination,
+                due=task_list.implied_due,
+                # 隐含日期写成**全天**任务的日期标记：「今天」的意思是「今天要做」，
+                # 不是某个时刻（那个逻辑日自己怎么算由引擎给，这一层不算日期）。
+                all_day=task_list.implied_due is not None,
+            )
+        except DidaError as exc:
+            self._write_status(messages.create_failed_message(exc))
+            return
+        self.refresh_view()
+
+    async def on_detail_page_due_changed(self, event: DetailPage.DueChanged) -> None:
+        """详细页上提交了截止时间：**改期 / 清除**立刻写出去（工单 #44）。
+
+        与 :meth:`on_detail_page_field_edited` 同一条路（乐观写 + 立刻推 + 刷新），只是这一笔
+        的形状是 ``{dueDate, isAllDay}``：走引擎的 ``reschedule``——它只动这两个字段，整份
+        底稿照旧回写（重复规则、时区、陌生字段一个不丢）。
+
+        ``event.due is None`` 是**清除**：写显式的 ``dueDate: null``，任务变回「没有日期」。
+        写失败与逐字段编辑那一侧同一套说法（用户故事 81）：本地没有底稿的拒绝用现成那句，
+        其余带上引擎/服务端说的具体原因。
+        """
+        try:
+            self.engine.reschedule(event.task_id, due=event.due, all_day=event.all_day)
+        except UnknownTaskError:
+            self.refresh_view()
+            if self.is_running:
+                self.detail_page().show_save(messages.UNKNOWN_TASK_MESSAGE)
+            return
+        except DidaError as exc:
+            self.refresh_view()
+            if not self.is_running:
+                return
+            self.detail_page().show_save(messages.field_save_failed_message(exc))
+            return
+        await self.engine.push_pending()
+        if not self.is_running:
+            return
+        self.refresh_view()
+
+    async def on_detail_page_field_edited(self, event: DetailPage.FieldEdited) -> None:
+        """详细页上改完一个字段：**立刻写出去**，并把结果留在那一页底部（工单 #43）。
+
+        乐观写（``write``）：本地当场生效、推送排到事件循环上立刻跑——用户按完 ``esc`` 不等
+        网络。后面那一次 ``push_pending`` 是**等这一笔落地**的确定性那一次（队列只有一条，
+        两次推送不会重复发），它回来之后底部那一行才知道该写「已保存」还是「待推送（N）」。
+
+        写失败分两种，两种都说出**具体**原因（用户故事 81）：引擎当场拒绝（本地没有这条任务
+        的底稿）在这里接住，用 ``messages`` 里那一句现成的话；推不出去（断网、服务端拒绝）
+        由引擎记在队列上，下一次 :meth:`update_status` 会把它读出来。
+        """
+        try:
+            self.engine.write(event.task_id, changes={event.field: event.value})
+        except UnknownTaskError:
+            # 「这条任务已经不在本地缓存里了，刷新之后再试一次」——本地没有底稿是一种**说得出
+            # 名字**的拒绝，不该混进「保存失败」那一类里（那条留给服务端与网络说的话）。
+            self.refresh_view()
+            if self.is_running:
+                self.detail_page().show_save(messages.UNKNOWN_TASK_MESSAGE)
+            return
+        except DidaError as exc:
+            self.refresh_view()
+            if not self.is_running:
+                return
+            self.detail_page().show_save(messages.field_save_failed_message(exc))
+            return
+        await self.engine.push_pending()
+        if not self.is_running:
+            return
+        self.refresh_view()
+
+    # ---------------------------------------------------------------- 挑选型字段（#45）
+
+    async def on_detail_page_pick_requested(self, event: DetailPage.PickRequested) -> None:
+        """``enter`` 落在挑选型字段上：把选项凑齐，开那张**共用的**表单浮层（工单 #45）。
+
+        三格的选项各有各的来源，都在引擎那一侧：清单是 ``move_targets()``（真实清单、
+        进得去、服务端已经见过的那些），优先级是 ``PRIORITY_NAMES`` 那张表（它经引擎的
+        公开面转出：``messages.PRIORITY_NAMES``，本体的家在 ``dida.sync.view``，工单 #58），
+        标签是 ``tags()``。标签那一份还要**拉一次**（``load_tags``，``GET /open/v1/tag``）
+        ——那是这一格里唯一一次网络调用，所以拉不到时照旧开浮层（本地已知的那些照样挑得动），
+        只把「没拉到」写在浮层的提示里（浮层是模态的，状态栏在它底下，看不见）。
+        """
+        detail = self.engine.task_detail(event.task_id)
+        if detail is None:
+            return
+        notice = ""
+        if event.field == TAGS_FIELD:
+            try:
+                await self.engine.load_tags()
+            except DidaError as exc:
+                # 拉不到就说出来，而且**照旧开浮层**（本地已经见过的那些照样挑得动）；
+                # 这一句写在浮层的提示里，不是状态栏上——浮层是模态的，状态栏在它底下。
+                notice = messages.tags_load_failed_message(exc)
+            if not self.is_running:
+                return
+        spec = picker_spec(
+            event.field,
+            detail,
+            lists=self.engine.move_targets(),
+            tags=self.engine.tags(),
+            notice=notice,
+        )
+        if spec is None:
+            return
+        self.push_screen(
+            FormOverlay(title=spec.title, fields=spec.fields, hint=spec.hint),
+            partial(self._finish_pick, event.task_id, event.field),
+        )
+
+    async def _finish_pick(
+        self, task_id: str, field: str, values: dict[str, str] | None
+    ) -> None:
+        """挑选浮层关掉了：按挑的那一份写出去（``None`` 从 #66 起走不到，表单没有「取消」）。
+
+        三条路各自走该走的端点——**搬运不是一次普通字段更新**（``move_task``），优先级与
+        标签是普通更新（整份底稿带回去那件事由 ``update_task`` 的 ``snapshot=`` 管，
+        ``merge_snapshot`` 的既有策略）。写完照旧立刻推一轮、重画、把结果留在底部那一行：
+        与逐字段编辑（``on_detail_page_field_edited``）同一条规矩（验收标准 7）。
+        """
+        if values is None:
+            return
+        try:
+            wrote = self._apply_pick(task_id, field, values)
+        except UnknownTaskError:
+            self.refresh_view()
+            if self.is_running:
+                self.detail_page().show_save(messages.UNKNOWN_TASK_MESSAGE)
+            return
+        except DidaError as exc:
+            self.refresh_view()
+            if not self.is_running:
+                return
+            self.detail_page().show_save(messages.field_save_failed_message(exc))
+            return
+        if not wrote:
+            # 挑回原来那一档：没有改动就没有「立刻推送」这回事（队列里本来也不该多出一笔）。
+            return
+        await self.engine.push_pending()
+        if not self.is_running:
+            return
+        self.refresh_view()
+
+    def _apply_pick(self, task_id: str, field: str, values: dict[str, str]) -> bool:
+        """挑完的那一份怎么变成一次写（三条路各自的形状只在这一个地方）。
+
+        **挑回原来那一档 = 没改**（与逐字段编辑那条规矩同一条）：一笔都不写，也**不排推送**。
+        写一笔没发生的改动会进待推送队列，离线时状态栏那个数就为一个空操作亮着。
+
+        清单那一路的「同一个清单」**由引擎自己挡**（``move_task`` 里问
+        :func:`dida.sync.writes.is_a_move`）——下面这一行问的是**同一个函数**，不是又写一遍
+        那个比较：判据只有一份，两个时刻各问一次（与 ``is_addressable_task`` 同一个形状）。
+        这里非问不可，是因为 ``move_task`` 回不了话（它的签名是 ``-> None``），不问就会为一次
+        根本没发生的改动推一轮（``tests/test_picker_fields.py`` 钉着那句 ``pushes == 0``）；
+        工单 #58 的 T6 之前，这里确实是自己又比了一遍，而注释还写着「由引擎自己挡」。
+        优先级与标签那两档是**界面自己的**判断：``write()`` 不做同值收敛，所以只有这里能挡。
+
+        ``int(...)`` 那一下是**线上编码**：选项的值是 ``0/1/3/5``、标签是用户语言
+        （``PRIORITY_NAMES``，唯一一张表——本体的家在 ``dida.sync.view``，经引擎的公开面
+        转出成 ``messages.PRIORITY_NAMES``，所以这句话现在是真的，工单 #58）。表外的值不该
+        出现（选项就是从那张表生成的），认不出来就当没挑——不替服务端猜一个档位。
+
+        返回「真的写了一笔吗」：没改的那一条路连推送都不排（队列里不该多出一笔）。
+        """
+        detail = self.engine.task_detail(task_id)
+        if detail is None:
+            raise UnknownTaskError(task_id)
+        if field == LIST_FIELD:
+            if not is_a_move(detail.list_id, values[LIST_FIELD]):
+                return False
+            self.engine.move_task(task_id, to_list_id=values[LIST_FIELD])
+            return True
+        if field == PRIORITY_FIELD:
+            picked = values[PRIORITY_FIELD]
+            if not picked.isdigit() or int(picked) == detail.priority:
+                return False
+            self.engine.write(task_id, changes={"priority": int(picked)})
+            return True
+        if field == TAGS_FIELD:
+            # 按**集合**比：选项顺序与任务上那一串的顺序不一定一样，而「改了没有」说的是
+            # 挑中的那几个标签变没变，不是它们排在第几个。
+            picked = multi_values(values[TAGS_FIELD])
+            if set(picked) == set(detail.tags):
+                return False
+            self.engine.write(task_id, changes={"tags": list(picked)})
+            return True
+        return False
+
+    # ---------------------------------------------------------------- 任务的删除与顺延（#40）
+
+    def on_tasks_page_delete(self, event: TasksPage.Delete) -> None:
+        """``d``：删光标那条任务——**先如实问一句**，``y`` 才真的删（验收标准 1、3）。
+
+        确认文案在 :func:`dida.tui.messages.delete_prompt`：整份官方文档里没有回收站、没有
+        undelete、也没有「已删除」列表（``api-shapes.md`` §A6），所以那一句话不许承诺任何恢复
+        ——这次确认就是全部的防线。删掉的那条任务本地当场摘掉、推送走 ``DELETE``。
+        """
+        detail = self.engine.task_detail(event.task_id)
+        if detail is None:
+            return
+        self.push_screen(
+            ConfirmOverlay(messages.delete_prompt(detail.title), title="删除任务"),
+            partial(self._finish_delete_task, event.task_id),
+        )
+
+    def _finish_delete_task(self, task_id: str, confirmed: bool | None) -> None:
+        """删除确认关掉了：只有 ``True`` 才真的删（``n`` / ``Esc`` 与 ``None`` 都不动）。"""
+        if not confirmed:
+            return
+        try:
+            self.engine.delete(task_id)
+        except DidaError as exc:
+            self._write_status(messages.delete_failed_message(exc))
+            return
+        self.refresh_view()
+
+    def on_tasks_page_defer(self, event: TasksPage.Defer) -> None:
+        """``g`` / ``G``：顺延 ``days`` 个逻辑日，**截止时间以外的字段一个都不动**（验收标准 4–7）。
+
+        落点由引擎按注入的日界算（``sync/schedule.py``），这一层不重算日期、也不经过任何日期
+        解析。没有截止时间的任务引擎不动它——顺延不凭空给一条任务长出一个日期来，所以这里
+        没有「当场失败」要报的那种情况（引擎那一支没有可抛的结构化错误）。
+        """
+        self.engine.defer(event.task_id, days=event.days)
+        self.refresh_view()
+
+    # ---------------------------------------------------------------- 清单 / 视图的建 / 改 / 删（#42 / #36）
+
+    def on_index_page_new_list(self, event: IndexPage.NewList) -> None:
+        """``n``：**先问一句「清单还是视图」**（#36 的验收标准 1），再开对应的那张表单。
+
+        两种东西后面完全是两回事：清单是服务端的容器（建了要推上去），视图只是一组只存在
+        本机的过滤条件。问一句比猜一个默认值好——猜错了用户会建出一个自己没想要的东西，
+        而且视图建错了在手机上还找不到它。
+        """
+        self.push_screen(
+            FormOverlay(
+                title="新建什么？",
+                fields=new_kind_fields(),
+                hint=messages.NEW_KIND_HINT,
+            ),
+            self._finish_kind_form,
+        )
+
+    def _finish_kind_form(self, values: dict[str, str] | None) -> None:
+        """「清单还是视图」答完了：开对应的表单（``None`` 从 #66 起走不到，表单没有「取消」）。"""
+        if values is None:
+            return
+        if values.get(NEW_KIND_FIELD) == KIND_VIEW:
+            self._open_view_form(None)
+        else:
+            self._open_list_form(None)
+
+    def on_index_page_edit_list(self, event: IndexPage.EditList) -> None:
+        """``e``：改光标那一行——清单给清单那张表单，自建视图给条件表单（#36）。"""
+        row = self.index_page().row(event.row_id)
+        if row is None:
+            return
+        refusal = self._refusal_for(row)
+        if refusal is not None:
+            self._write_status(refusal)
+            return
+        if row.kind is ListKind.LIST:
+            self._open_list_form(row.id)
+        else:
+            self._open_view_form(row.id)
+
+    def on_index_page_delete_list(self, event: IndexPage.DeleteList) -> None:
+        """``d``：删光标那一行——**先如实问一句**，``y`` 才真的删（验收标准 3、4、5）。
+
+        清单与视图各问各的：删清单那句说「它里面的任务会怎样文档没写」（核实过，见
+        :func:`dida.tui.messages.delete_list_prompt`），删视图那句说「不会动任何任务」
+        ——视图只是一组过滤条件，这一句是能保证的（#36）。
+        """
+        row = self.index_page().row(event.row_id)
+        if row is None:
+            return
+        refusal = self._refusal_for(row)
+        if refusal is not None:
+            self._write_status(refusal)
+            return
+        if row.kind is ListKind.LIST:
+            self.push_screen(
+                ConfirmOverlay(messages.delete_list_prompt(row.name), title="删除清单"),
+                partial(self._finish_delete_list, row.id),
+            )
+        else:
+            self.push_screen(
+                ConfirmOverlay(messages.delete_view_prompt(row.name), title="删除视图"),
+                partial(self._finish_delete_view, row.id),
+            )
+
+    def _refusal_for(self, row: ListRow) -> str | None:
+        """这一行改不动 / 删不掉时的那句话；清单行走 #42 那份判断，视图行走 #36 那份。
+
+        两份判断各自只有一处（``pages/index.py`` 的两个 ``*_write_refusal``）：清单那三种
+        改不动的行与视图那一种（内置视图）理由完全不同，合成一句就会说出「没有写权限」这种
+        对视图毫无意义的理由。
+        """
+        if row.kind is ListKind.LIST:
+            return list_write_refusal(row)
+        return view_write_refusal(row)
+
+    def _open_list_form(self, row_id: str | None) -> None:
+        """开清单表单：``row_id`` 是 ``None`` 就是新建，否则是改那一行。
+
+        改不动的行（收集箱、没有写权限的清单）在这里就挡住并说清是哪一种——表单
+        开出来再拒绝，用户会以为自己填错了什么。
+        """
+        row = None if row_id is None else self.index_page().row(row_id)
+        if row_id is not None:
+            if row is None:
+                return
+            refusal = list_write_refusal(row)
+            if refusal is not None:
+                self._write_status(refusal)
+                return
+        self._editing_list = None if row is None else row.id
+        self.push_screen(
+            FormOverlay(
+                title="新建清单" if row is None else f"改「{row.name}」",
+                fields=list_form_fields(row),
+            ),
+            self._finish_list_form,
+        )
+
+    def _open_view_form(
+        self, view_id: str | None, values: dict[str, str] | None = None
+    ) -> None:
+        """开视图的条件表单：``view_id`` 是 ``None`` 就是新建，否则是改那一个。
+
+        ``values`` 是**用户刚填的那一份**：表单被拒（认不出的清单名之类）之后重新打开时
+        原样还给他——七个格子重填一遍是这一屏最不该有的惩罚。
+        """
+        definition = None if view_id is None else self.engine.view_definition(view_id)
+        if view_id is not None and definition is None:
+            # 那一行已经不在了（另一次删除、刷新之后没了）：什么都不开，也不假装改成功。
+            self._write_status(messages.UNKNOWN_VIEW_MESSAGE)
+            return
+        self._editing_view = view_id
+        self.push_screen(
+            FormOverlay(
+                title="新建视图" if definition is None else f"改「{definition.name}」",
+                fields=view_form_fields(
+                    definition, rows=self.index_page().rows(), values=values
+                ),
+                hint=view_form_hint(),
+            ),
+            self._finish_view_form,
+        )
+
+    def _finish_list_form(self, values: dict[str, str] | None) -> None:
+        """清单表单关掉了：按填的那一份建 / 改（``None`` 从 #66 起走不到，表单没有「取消」）。
+
+        颜色是空串就**不发** ``color`` 字段（那是「默认」，不是「清空」）；名字空着则
+        什么都不做，只如实说一句。
+
+        改的那一路先问 :func:`dida.sync.engine.is_list_edit`：交回来的那一份与本地那一行
+        **逐字段相同**就不是一次改动，引擎一个字都不用写（#66 的验收标准 3 / 用户故事 134）。
+        ``esc`` 从 #66 起是「保存并退出」，所以「开了表单又没改」这条路真的会走到。判据只有
+        引擎那一份，这里问的是**同一个**函数——与 :meth:`_apply_pick` 问 ``is_a_move``
+        同一个形状（接缝一上的假后端自己实现写路径，界不问就会为一次没发生的改动记下一笔）。
+        """
+        if values is None:
+            return
+        name = values.get(LIST_NAME_FIELD, "").strip()
+        if not name:
+            self._write_status(messages.EMPTY_LIST_NAME_MESSAGE)
+            return
+        color = values.get(LIST_COLOR_FIELD) or None
+        editing = self._editing_list
+        self._editing_list = None
+        try:
+            if editing is None:
+                self.engine.create_list(name, color=color)
+            else:
+                row = self.index_page().row(editing)
+                if row is not None and not is_list_edit(
+                    current_name=row.name,
+                    current_color=row.color,
+                    name=name,
+                    color=color,
+                ):
+                    return
+                self.engine.update_list(editing, name=name, color=color)
+        except DidaError as exc:
+            self._write_status(messages.list_write_failed_message(exc))
+            return
+        self.refresh_view()
+
+    def _finish_view_form(self, values: dict[str, str] | None) -> None:
+        """视图表单关掉了：把那一份值读成定义再落本地库（``None`` 从 #66 起走不到）。
+
+        读不成定义时（认不出的清单名、永远筛不出任务的组合）**不保存**，把理由写进状态栏
+        并把用户填的那一份原样还回表单里——七个格子重填一遍是这一屏最不该有的惩罚。
+
+        改的那一路先问 :func:`dida.sync.engine.is_view_edit`：读出来的定义与本地那一行
+        **逐字段相同**就不是一次改动，本地那一行不重写（#66 的验收标准 3）。判据只有引擎那
+        一份，这里问的是**同一个**函数——与清单那条、以及 :meth:`_apply_pick` 问
+        ``is_a_move`` 同一个形状。
+        """
+        if values is None:
+            return
+        editing = self._editing_view
+        parsed = parse_view_form(
+            values,
+            view_id=editing or "",
+            lists=list_scope_ids(self.index_page().rows()),
+        )
+        if isinstance(parsed, ViewFormProblem):
+            self._write_status(messages.view_form_problem(parsed))
+            self._open_view_form(editing, values=dict(values))
+            return
+        assert isinstance(parsed, ViewDefinition)
+        self._editing_view = None
+        try:
+            if editing is None:
+                self.engine.create_view(parsed)
+            else:
+                current = self.engine.view_definition(editing)
+                if current is not None and not is_view_edit(current, parsed):
+                    return
+                self.engine.update_view(parsed)
+        except DidaError as exc:
+            self._write_status(messages.view_write_failed_message(exc))
+            return
+        self.refresh_view()
+
+    def _finish_delete_list(self, list_id: str, confirmed: bool | None) -> None:
+        """删除确认关掉了：只有 ``True`` 才真的删（``n`` / ``Esc`` 与 ``None`` 都不动）。"""
+        if not confirmed:
+            return
+        try:
+            self.engine.delete_list(list_id)
+        except DidaError as exc:
+            self._write_status(messages.list_write_failed_message(exc))
+            return
+        self.refresh_view()
+
+    def _finish_delete_view(self, view_id: str, confirmed: bool | None) -> None:
+        """删视图那一次确认：只有 ``True`` 才真的删，而删的**只是那一行**（#36）。
+
+        视图是一组过滤条件，不是容器：它「里面」的任务本来就在各自的清单里，所以这里一条
+        任务都不动——验收标准「删视图不删任务」说的就是这一行代码。
+        """
+        if not confirmed:
+            return
+        try:
+            self.engine.delete_view(view_id)
+        except DidaError as exc:
+            self._write_status(messages.view_write_failed_message(exc))
+            return
+        self.refresh_view()
+
+    # ---------------------------------------------------------------- 当前任务 / 浏览器（工单 #19）
+
+    def current_task_id(self) -> str | None:
+        """当前这一层说的「这条任务」是谁。
+
+        任务列表页是光标下那一条，详细页是它正在说的那一条，清单列表页没有任务
+        （``o`` 在那里什么都不做——空屏上按键不该报错）。
+        """
+        if self._layer == LAYER_TASKS:
+            return self.tasks_page().selected_id
+        if self._layer == LAYER_DETAIL:
+            return self.detail_page().task_id
+        return None
+
+    def action_open(self) -> None:
+        """``o``：把当前任务交给系统浏览器（工单 #19）。
+
+        **只有浏览器这一条路。** ADR-0002 的「逃生舱的确切形态（已核实）」记着：官方桌面
+        客户端不接受任务深链（``dida365://`` 不存在、Linux 的 ``.desktop`` 没注册协议处理器、
+        主进程也不处理 argv），能做出来的就是厂商自己在「复制任务链接」里生成的那条网页版
+        路由。所以这里不试任何 ``xxx://``，也不假装能切到桌面 App。
+
+        URL 由 :func:`~dida.tui.escape.task_url` 拼（纯函数，含收集箱那条字面量替换）；清单
+        id 取自引擎给的详情——TUI 不做判断，只把已经有的事实交出去。
+
+        交不出去时**必须出声**：完成在服务端不可逆，这个键是它的补偿，静默失败比吵一句坏
+        得多。两种失败（开手回 ``False``、开手当场抛）报同一句话，并且把 URL 原样给人抄。
+        """
+        detail = self._current_detail()
+        if detail is None:
+            return
+        url = task_url(detail.list_id, detail.task_id)
+        try:
+            opened = self._open_url(url)
+        except Exception:  # noqa: BLE001 - 找不到浏览器的机器不该把整个界面带走
+            opened = False
+        if not opened:
+            self._write_status(messages.no_browser_message(url))
+
+    def _current_detail(self) -> TaskDetail | None:
+        """当前任务的那一份详情（引擎给的成品），没有就是 ``None``。"""
+        if self._layer == LAYER_DETAIL:
+            task_id = self.detail_page().task_id
+        else:
+            task_id = self.current_task_id()
+        if task_id is None:
+            return None
+        return self.engine.task_detail(task_id)
+
+    # ---------------------------------------------------------------- 帮助（工单 #18 / #48）
+
+    def action_help(self) -> None:
+        """``h``：当前这一层的键位帮助（跟着绑定表走，不是手抄一份）。"""
+        self.push_screen(MessageOverlay(help_body(self._layer)))
+
+    # ---------------------------------------------------------------- 同步泵（t21）
 
     def action_refresh(self) -> None:
-        """``r``：手动同步——全量刷新 + 推待推送改动 + 拉已完成流（用户故事 53）。
+        """``r``：手动同步——全量刷新 + 推待推送改动 + 拉已完成流。
 
-        先写「同步中…」再排 worker：用户按了键，得有个「它动了」的信号；真正的活儿在
-        事件循环上跑，界面不因为等网络而卡住（引擎那条 ``refresh()`` 是 async 的就是为这个）。
+        用户按了键得有反馈，但**不是**靠改状态栏那一行字符串（那正是本票要去掉的）：按下去
+        先什么都不说，超过阈值（:data:`~dida.tui.theme.SPINNER_DELAY_MS`）才出现转圈，
+        完成或失败用 toast 说一句。真正的活儿在事件循环上跑，界面不因为等网络而卡住
+        （引擎那条 ``refresh()`` 是 async 的就是为这个）。
+
+        顺带问一次日界（工单 #46）：「现在再看一眼」这句话里，配置改过、钟自己走过了边界，都
+        算在内——而且这是那条检查**唯一不依赖周期泵**的触发。它跑在这里、任何网络调用之前，
+        所以这一轮同步成不成功都与它无关（``_sync()`` 里的重画在 ``else:`` 成功分支里）。
         """
-        self.query_one(StatusBar).update(SYNCING_MESSAGE)
-        self.start_sync()
+        self.reload_day_boundary()
+        self.start_sync(announce=True)
 
-    def start_sync(self) -> None:
+    def start_sync(self, *, announce: bool = False) -> None:
         """把一轮同步排到事件循环上（不等它）。``r`` 与启动刷新都走这里。
 
-        ``exclusive=True``：连按 ``r`` 不会让两轮同步叠在一起（同一份缓存被两个协程交替
-        写）。协程 worker 跑在事件循环**同一根线程**上，t08 的 sqlite 连接有线程亲和，
-        所以这里不能改成 ``thread=True``。
+        ``exclusive=True``：连按 ``r`` 不会让两轮同步叠在一起（同一份缓存被两个协程交替写）。
+        协程 worker 跑在事件循环**同一根线程**上，sqlite 连接有线程亲和，所以这里不能改成
+        ``thread=True``。
+
+        ``announce`` 决定这一轮要不要用 toast 报完成：``r`` 要（用户按了键，他在等一个回声），
+        启动刷新不要——每天早上开屏弹一下是噪音，那一行的「已同步 HH:MM」本来就是记录。
         """
+        self._announce_sync = announce
+        self._arm_spinner()
         self.run_worker(self._sync(), group=SYNC_GROUP, exclusive=True, description="同步")
 
     async def _sync(self) -> None:
@@ -348,465 +1219,177 @@ class DidaApp(App[None]):
 
         三件事各报各的失败，而且**不假装做过**：全量刷新失败（断网、凭据失效）时后面两件
         不做——同一个网络问题会让它们一起失败，白跑两趟；已完成流失败时前两件已经落地，
-        照旧重画，只是把「没拉到」说出来。缓存从头到尾都在：这一屏不因为没网就不能用
-        （用户故事 62）。
+        照旧重画，只是把「没拉到」说出来。缓存从头到尾都在：这一屏不因为没网就不能用。
+
+        三处 ``await`` 之后动界面的地方都不是裸写：状态栏走 :meth:`_write_status`、重画走
+        :meth:`refresh_view`，两边都认得「关窗了」。
+
+        「说一句」的话（失败、覆盖告知）**攒到最后**才写：它们比「数据怎么样」更该留在屏幕
+        上，而收尾那一次重画（把转圈收掉）会覆盖状态栏——顺序反了就会把话吞掉。
         """
+        message: str | None = None
         try:
             report = await self.engine.refresh()
         except DidaError as exc:
-            self.query_one(StatusBar).update(refresh_failed_message(exc))
-            return
-        # 队列里那些到点的改动顺手推一轮：`r` 是用户能按的那个「现在再试一次」。
-        await self.engine.push_pending()
-        try:
-            await self.engine.refresh_completed()
-        except DidaError as exc:
-            completed_failed: DidaError | None = exc
+            message = messages.refresh_failed_message(exc)
+            self._notify_failed(message)
         else:
-            completed_failed = None
-        self.refresh_view()
-        # 覆盖告知排在最后：服务端真的盖掉了用户的东西，这句话比什么都该留在屏幕上
-        # （ADR-0002）。被待推送改动挡回去的不算——那些改动还在，没有被盖掉。
-        if report.overwritten:
-            self.query_one(StatusBar).update(overwritten_message(len(report.overwritten)))
-        elif completed_failed is not None:
-            self.query_one(StatusBar).update(completed_failed_message(completed_failed))
+            # 队列里那些到点的改动顺手推一轮：`r` 是用户能按的那个「现在再试一次」。
+            pushed = await self.engine.push_pending()
+            try:
+                await self.engine.refresh_completed()
+            except DidaError as exc:
+                completed_failed: DidaError | None = exc
+            else:
+                completed_failed = None
+            self.refresh_view()
+            # 覆盖告知排在最后：服务端真的盖掉了用户的东西，这句话比什么都该留在屏幕上
+            # （ADR-0002）。被待推送改动挡回去的不算——那些改动还在，没有被盖掉。
+            if report.overwritten:
+                message = messages.overwritten_message(len(report.overwritten))
+            elif completed_failed is not None:
+                message = messages.completed_failed_message(completed_failed)
+            elif self._announce_sync:
+                self._notify_done(
+                    f"已推送 {pushed} 处改动" if pushed else "本地已是最新"
+                )
+        finally:
+            self._stop_spinner()
+            self.update_status()
+        if message is not None:
+            self._write_status(message)
+
+    # ---------------------------------------------------------------- 瞬时反馈：转圈与 toast
+
+    def _arm_spinner(self) -> None:
+        """排一个「阈值到了再看一眼」的定时器——大多数同步在这里之前就结束了。"""
+        self._stop_spinner()
+        self._spin_delay_timer = self.set_timer(
+            theme.SPINNER_DELAY_MS / 1000, self._maybe_spin
+        )
+
+    def _maybe_spin(self) -> None:
+        """阈值到点：这一轮同步**还在跑**才开始转（跑完了就什么都不显示）。"""
+        self._spin_delay_timer = None
+        if not self.is_running:
+            return
+        self._spinning = True
+        self._spinner_frame = 0
+        self._spinner_timer = self.set_interval(1 / 12, self._tick_spinner)
+        self.update_status()
+
+    def _tick_spinner(self) -> None:
+        self._spinner_frame += 1
+        self.update_status()
+
+    def _stop_spinner(self) -> None:
+        """收掉转圈与它的两个定时器（关窗时也走这里）。"""
+        for timer in (self._spin_delay_timer, self._spinner_timer):
+            if timer is not None:
+                timer.stop()
+        self._spin_delay_timer = None
+        self._spinner_timer = None
+        self._spinning = False
+        self._spinner_frame = 0
+
+    def _spinner(self) -> str:
+        """状态栏上当前那一帧（没在转就是空串——平时一个字都不多）。"""
+        if not self._spinning:
+            return ""
+        return theme.SPINNER_FRAMES[self._spinner_frame % len(theme.SPINNER_FRAMES)]
+
+    def _notify_done(self, message: str) -> None:
+        """完成 = **原生 toast**（``App.notify()``），不是改状态栏那一行字符串。"""
+        if not self.is_running:
+            return
+        self.notify(message, title="同步完成", timeout=3)
+
+    def _notify_failed(self, message: str) -> None:
+        """失败也走 toast；状态栏那一份照留——它是留在屏幕上的记录。"""
+        if not self.is_running:
+            return
+        self.notify(message, title="同步失败", severity="error", timeout=6)
+
+    def _notify_step(self, message: str) -> None:
+        """一笔写当场生效的短暂回声（用户故事 43：完成 / 取消完成要有反馈）。
+
+        toast 自己会走（``timeout`` 就是那个「短暂」），所以它不占状态栏那一行——那一行说的是
+        「数据怎么样」（已同步 / 待推送 / 逻辑日，GLOSSARY），不该被一次按键挤掉。推送要是
+        失败了，那条改动留在队列里、状态栏那个「待推送 N」照旧顶上：两句话说的是两件事，
+        都是真的。
+        """
+        if not self.is_running:
+            return
+        self.notify(message, timeout=2)
 
     async def push_tick(self) -> None:
         """推一轮**到点**的待推送改动（工单 #21 的周期泵；也是测试的确定性入口）。
 
-        t10 把退避、``next_retry_at`` 都做好了，缺的是「谁来定期问一句到点了没有」——
-        就是这里。间隔只决定**什么时候看一眼**，到没到点依然由引擎那口注入的钟判定：
-        所以测试可以把钟摆到任意一刻，再直接 ``await app.push_tick()``，不必等真实时间。
-        网络等待跑在事件循环的同一根线程上（t08 的线程亲和）。
+        退避、``next_retry_at`` 都在引擎里，缺的是「谁来定期问一句到点了没有」——就是这里。
+        间隔只决定**什么时候看一眼**，到没到点依然由引擎那口注入的钟判定：所以测试可以把
+        钟摆到任意一刻，再直接 ``await app.push_tick()``，不必等真实时间。
+
+        **这一跳也是 app 唯一的心跳**，所以日界在这里顺带问一次（工单 #46）：两条路都是外部
+        事件——用户在另一个窗口里改配置、钟自己走过了边界——没人通知得了这个进程，定期看一眼
+        是唯一零操作的做法。三件事共用一跳不冲突：一个本地队列查询、两条纯算术。
+
+        ``await`` 之后那一次状态栏重画走 :meth:`update_status` → :meth:`_write_status`：
+        关窗时它整个丢掉，但**这一笔推送已经落下去了**——界面没了不代表用户那一下不算数。
         """
+        self.reload_day_boundary()
         await self.engine.push_pending()
         self.update_status()
 
+    # ---------------------------------------------------------------- 退出流（t21 / #47）
+
     async def action_quit(self) -> None:
-        """``q``：还有待推送改动时先拦一下（工单 #21，用户故事 58）。
+        """``q`` 与 ``Ctrl+C``：还有待推送改动时先拦一下（用户故事 101 / 工单 #47）。
 
-        用户按 ``q`` 的意图通常是「我干完了」，而屏幕底下那个数可能是「我按了 ``x``，但网断了」
-        ——待推送改动只存在于本地（ADR-0002 的豁免代价），进程一结束就没了，而服务端并不知道
-        用户做过什么。所以这里**多问一句**，并且把「有几处」写在浮层上。
+        用户按退出键的意图通常是「我干完了」，而屏幕底下那个数可能是「我按了 x，但网断了」
+        ——待推送改动只存在本地（ADR-0002 的豁免代价），进程一结束这一屏就没了，而服务端
+        并不知道用户做过什么。所以这里**多问一句**，并且把「有几处」写在浮层上。
 
-        浮层已经开着时什么都不做：连按 ``q`` 不该叠出一摞确认框。没有待推送改动就照旧直接退
-        （``q`` 即结束，spec 的单进程规矩）。
+        **两个键走同一个判断**：它们绑在同一个动作上（``keys.py`` 全局那一层的 :class:`Key`），
+        所以这里分不出、也不该分出 ``q`` 与 ``Ctrl+C``。这一条在本票之前不成立：Textual 8.2.8
+        把 ``Ctrl+C`` 绑在它自己的 ``help_quit`` 上（弹一句「按 q 退出」，**不退出**）——那是
+        框架的另一条退出路径，谁也不保证它永远只是弹一句话。两条路合成一条之后，这个分歧
+        没有了，而「按了退出键却没被拦」这条静默丢改动的后门也一并关掉。
+
+        **这里不需要 ``is_running`` 守卫，理由要写下来**（不是「忘了加」）：本方法跨过
+        ``push_screen`` 之后**没有任何一行再碰 DOM**，而 ``push_screen`` 自己是同步的、
+        ``App.exit()`` 也是同步的。真正的 ``await`` 在调用方（``_dispatch_action`` 的
+        ``await invoke(...)``），那时这一帧已经做完了。:meth:`_finish_quit` 同理，见它自己的
+        说明。
         """
         pending = self.engine.status().pending_count
         if not pending:
+            # 没有待推送改动就照旧直接退（``q`` 即结束，spec 的单进程规矩）。
             self.exit()
             return
-        if isinstance(self.screen, ConfirmScreen):
-            return
-        self.push_screen(ConfirmScreen(quit_prompt(pending)), self._finish_quit)
-
-    def _finish_quit(self, confirmed: bool | None) -> None:
-        """退出浮层关掉了：只有 ``True`` 才真的退（``n`` / ``Esc`` 与 ``None`` 都留下）。"""
-        if confirmed:
-            self.exit()
-
-    # ---------------------------------------------------------------- 窄屏降级（t18）
-
-    def on_resize(self, event: Resize) -> None:
-        """窗口换了大小就重新分档（验收标准 #7：不用重启）。
-
-        拖动窗口、切分屏、Rotate 手机终端都会走到这里。分档只看宽度，所以重新分一次
-        是幂等的——档位没变时 :meth:`_apply_tier` 也不动屏幕上的东西。
-
-        宽度取 ``event.size`` 而**不是** ``self.size``：事件派发到这儿的时候 app 自己的
-        尺寸还没更新，读 ``self.size`` 拿到的是上一档的宽度，于是拖窄之后一直停在旧档位。
-        """
-        self._apply_tier(event.size.width)
-
-    def _apply_tier(self, width: int) -> None:
-        """按 ``width`` 列把三栏收放到位（工单 #18）。
-
-        右栏在 ``wide`` 档由 :attr:`_detail_open` 决定（``Enter`` 开合）；在更窄的两档
-        一律收起来，``Enter`` 改成弹浮层——所以窄档下这里显示的是 ``False``，浮层归
-        :meth:`action_toggle_detail` 管。
-        """
-        self._tier = pane_tier(width)
-        self.query_one("#list-pane").display = self._tier != "narrow"
-        self.query_one("#detail-pane").display = self._tier == "wide" and self._detail_open
-
-    def action_complete(self) -> None:
-        """完成光标下的任务并立即推送（`x`）。
-
-        ADR-0002：服务端**没有**「取消完成」接口，这一次按键是不可撤销的事实，所以这里
-        只做一条路——交给引擎（乐观写 + 立即推送 + 进重试队列），不做任何本地的反向操作。
-
-        完成之后分两步走：先让这一行亮一下（``flash``），再按本地结果重画（真引擎下这一行
-        已经不在未完成里了）。两步都在这根线程上，读的都是同一份本地状态。
-        """
-        task_id = self.query_one(TaskPane).selected_task_id
-        if task_id is None:  # 空屏上按 x：什么都不做，不是错误
-            return
-        self.engine.complete(task_id)
-        self.query_one(TaskPane).flash(task_id)
-        self.set_timer(FLASH_SECONDS, self._settle_after_complete)
-
-    def _settle_after_complete(self) -> None:
-        """收起高亮，并按引擎的当前视图重画。定时器到点就调这一次。"""
-        self.query_one(TaskPane).flash(None)
-        self.refresh_view()
-
-    def refresh_view(self) -> None:
-        """读引擎的视图模型，重画三栏与状态栏。t09/t10/t11 在数据变化后调用。
-
-        当前的过滤词在这里生效：筛是引擎那份纯函数（:func:`~dida.sync.view.filter_groups`）
-        干的，TUI 只是把筛过的分区交给中栏——所以刷新、完成、改期之后过滤都不会掉，
-        光标也不会落到一个已经被筛掉的任务上。
-        """
-        view = self.engine.view()
-        self.query_one(ListPane).render_lists(view.lists)
-        self.query_one(TaskPane).render_groups(
-            filter_groups(view.groups, self._query),
-            view.completed,
-            empty=TaskPane.NO_MATCH_TEXT if self._query else None,
-        )
-        self.update_status()
-
-    def update_status(self) -> None:
-        """把引擎的状态刷进状态栏。t05/t09/t21 在数据变化后调用。"""
-        self.query_one(StatusBar).update(format_status(self.engine.status()))
-
-    def action_defer(self) -> None:
-        """``g``：把光标下那条任务顺延到下一个逻辑日。"""
-        self._defer(days=1)
-
-    def action_defer_week(self) -> None:
-        """``G``：顺延到下周同一天（同一个星期几）。"""
-        self._defer(days=7)
-
-    def _defer(self, *, days: int) -> None:
-        """顺延光标下那条任务，然后重画。
-
-        落点由引擎按逻辑日算（TUI 不碰日界）；光标下没有任务就什么都不做——空屏上按键
-        不该报错。``days`` 是逻辑日数：``g`` 1 天、``G`` 7 天。
-        """
-        task_id = self.query_one(TaskPane).selected_task_id
-        if task_id is None:
-            return
-        self.engine.defer(task_id, days=days)
-        self.refresh_view()
-
-    # ---------------------------------------------------------------- 改期（t14）
-
-    def action_reschedule(self) -> None:
-        """``e``：打开改期输入框（工单 #14）。
-
-        光标下没有任务就什么都不做——空屏上按键不该报错（与 ``x``/``g`` 同一条口径）。
-        瞄准的是**按下 e 那一刻**光标下那条任务：输入框拿到焦点之后 j/k 都成了文本，
-        不再移动光标，所以这一次改期永远落在那一条上。
-        """
-        task_id = self.query_one(TaskPane).selected_task_id
-        if task_id is None:
-            return
-        self.query_one(RescheduleInput).open(task_id)
-
-    def on_reschedule_input_submitted(self, event: RescheduleInput.Submitted) -> None:
-        """改期输入框按了 ``Enter``：先解析，再决定提不提交（工单 #14）。
-
-        三条规矩：
-
-        - **非空 ``diagnostics`` 一律提示、绝不提交**。不按 code 名单挑着报：``invalid_date``
-          与 #23 的 ``duplicate_priority`` 一样重要——「13-45」被当成标题的一部分静默吞掉，
-          用户三天后才发现任务没有日期，正是「如实呈现」要消灭的那类安静错误。
-        - 一个日期都没写（``due is None``）也拒绝：改期不写日期等于什么都没改。新建可以没有
-          日期，改期不行。
-        - 引擎拒绝写入（本地已经没有这条任务的底稿，#25）时如实说一句「没有改成」，不崩、
-          也不拿一个猜来的清单 id 硬发。
-
-        被拒绝时输入框留在原地、原文一个字不删——用户改一改再按 Enter 就行。
-        """
-        box = self.query_one(RescheduleInput)
-        parsed = self.engine.plan(event.text)
-        if parsed.diagnostics:
-            box.show_message("；".join(item.message for item in parsed.diagnostics))
-            return
-        if parsed.due is None:
-            box.show_message(NO_DATE_MESSAGE)
-            return
-        try:
-            self.engine.reschedule(event.task_id, due=parsed.due, all_day=parsed.all_day)
-        except UnknownTaskError:
-            box.show_message(UNKNOWN_TASK_MESSAGE)
-            return
-        box.close()
-        self.query_one(TaskPane).focus()
-        self.refresh_view()
-
-    # ---------------------------------------------------------------- 新建（t15）
-
-    def action_quick_add(self) -> None:
-        """``a``：打开顶部新建输入框（工单 #15）。
-
-        不瞄准任何一条任务，所以光标在哪都无所谓——空屏上按 ``a`` 照样能建。
-        """
-        self.query_one(QuickAddInput).open()
-
-    def on_quick_add_input_submitted(self, event: QuickAddInput.Submitted) -> None:
-        """新建输入框按了 ``Enter``：先解析，再决定建不建（工单 #15）。
-
-        与改期同一条规矩：**非空 ``diagnostics`` 一律提示、绝不提交**，而且不按 code
-        名单挑着报——``invalid_date`` 与 #23 的 ``duplicate_priority`` 一样重要。新建这条
-        路上它更重：静默建出一个没有日期的任务，服务端还会顺手清掉重复规则，是双重错误，
-        用户三天后在手机上才发现这一条根本不是自己写的样子。
-
-        标题全是空的也不行（整行只写了「明天 !高」）：任务总得有个名字。
-
-        被拒绝时输入框留在原地、原文一个字不删——用户改一改再按 Enter 就行。
-        """
-        box = self.query_one(QuickAddInput)
-        parsed = self.engine.plan(event.text)
-        if parsed.diagnostics:
-            box.show_message("；".join(item.message for item in parsed.diagnostics))
-            return
-        if not parsed.title:
-            box.show_message(NO_TITLE_MESSAGE)
-            return
-        # 解析出来的四样东西原样交给引擎：TUI 不重算日期、不重排优先级、不动标签。
-        self.engine.create(
-            parsed.title,
-            due=parsed.due,
-            all_day=parsed.all_day,
-            priority=parsed.priority,
-            tags=parsed.tags,
-        )
-        box.close()
-        # 写完必须重画：新建是**多出一条**任务，引擎的视图已经变了，但栏位还端着旧的一份。
-        # 少了这一行，任务确实建了、也进了队列，屏幕上却看不见——t14 的改期路径里有这一步
-        # （见 on_reschedule_input_submitted），这里当初漏了，整套测试是在与兄弟工单合并后
-        # 才把它照出来的。
-        self.refresh_view()
-        self.query_one(TaskPane).focus()
-
-    # ---------------------------------------------------------------- 删除（t16）
-
-    def action_delete(self) -> None:
-        """``d``：先问一句，确认了才删（工单 #16）。
-
-        光标下没有任务就什么都不做——空屏上按键不该报错（与 ``x``/``g``/``e`` 同一条口径）。
-
-        **确认是这里唯一的防线**：滴答清单的 Open API 里没有 undelete、没有回收站、也没有
-        「已删除」列表，删掉就是删掉了。所以瞄准的是按下 ``d`` 那一刻光标下那条任务，
-        提示语里点名是哪一条（``title``），而删除动作只发生在浮层回来 ``True`` 的时候。
-        """
-        pane = self.query_one(TaskPane)
-        task_id = pane.selected_task_id
-        if task_id is None:
+        if self._confirming_quit():
+            # 连按退出键不该叠出一摞确认框——已经问过就不必再问。
             return
         self.push_screen(
-            ConfirmScreen(delete_prompt(pane.selected_title or task_id)),
-            lambda confirmed: self._finish_delete(task_id, confirmed),
+            ConfirmOverlay(messages.quit_prompt(pending), title="仍然退出"), self._finish_quit
         )
 
-    def _finish_delete(self, task_id: str, confirmed: bool | None) -> None:
-        """浮层关掉了：只有 ``True`` 才写。
+    def _confirming_quit(self) -> bool:
+        """退出浮层已经开着了吗。
 
-        ``False``（``n``/``Esc``）与 ``None`` 都什么都不做——取消必须一点痕迹都不留：
-        没有待推送改动、本地快照照旧、没有请求发出去。引擎拒绝写入（本地已经没有这条任务
-        的底稿，#25）时如实说一句，不崩，也不拿一个猜来的清单 id 硬发。
+        看**整摞** screen，不是只看顶上那一块：确认框上面还能再盖一层（``h`` 的帮助浮层
+        就盖得住它），而那时 ``self.screen`` 是**最上面**那一块——只比它一块就会再叠一个
+        确认框出来。这个口子是真的：浮层是模态的，键位解析在它那儿就截断了，
+        :meth:`action_quit` 照样会跑到。
         """
-        if not confirmed:
-            return
-        try:
-            self.engine.delete(task_id)
-        except UnknownTaskError:
-            self.query_one(StatusBar).update(UNKNOWN_DELETE_MESSAGE)
-            return
-        self.refresh_view()
-    # ---------------------------------------------------------------- 优先级（t17）
+        return any(isinstance(screen, ConfirmOverlay) for screen in self.screen_stack)
 
-    def action_priority(self) -> None:
-        """``p``：把光标下那条任务的优先级推进一档（无 → 低 → 中 → 高 → 无）。
+    def _finish_quit(self, confirmed: bool | None) -> None:
+        """退出浮层关掉了：只有 ``True`` 才真的退（``n`` / ``Esc`` 与 ``None`` 都留下）。
 
-        推进哪一档由引擎定：线上编码 ``0/1/3/5`` 是 API 的事实，TUI 不认识优先级取值，
-        只说「推进这一条」（与 ``x`` / ``g`` 一样）。光标下没有任务就什么都不做——
-        空屏上按键不该报错。
+        本方法**一行 DOM 都不碰**（``exit()`` 是同步的，它只是排一条 ``ExitApp``），所以它
+        不需要「``await`` 之后先问 ``is_running``」那道守卫——那条规矩管的是**碰 DOM** 的
+        地方。这一句是写给下一个来改它的人的：往这里加任何 ``query_one`` / ``update`` 之
+        前，先把守卫补上。
         """
-        task_id = self.query_one(TaskPane).selected_task_id
-        if task_id is None:
-            return
-        self.engine.cycle_priority(task_id)
-        self.refresh_view()
-
-    # ---------------------------------------------------------------- 模糊过滤（t17）
-
-    def action_filter(self) -> None:
-        """``/``：打开过滤框，对当前列表做模糊过滤。"""
-        self.query_one(FilterInput).open()
-
-    def on_filter_input_changed(self, event: FilterInput.Changed) -> None:
-        """框里的字变了：立刻按它重画（边打边筛，不必按 Enter）。"""
-        self._query = event.query
-        self.refresh_view()
-
-    def on_filter_input_cancelled(self) -> None:
-        """``Esc``：清空过滤、恢复完整列表，焦点还给任务列。"""
-        self._query = ""
-        self.refresh_view()
-        self.query_one(TaskPane).focus()
-
-    def on_task_pane_selection_changed(self, event: TaskPane.SelectionChanged) -> None:
-        """光标换了一条任务：右栏跟着换（过滤期间因此不会指着一个被筛掉的任务）。"""
-        self.query_one(DetailPane).show(event.item)
-        self._show_subtasks(event.item)
-
-    # ---------------------------------------------------------------- 逃生舱（t19）
-
-    def action_open(self) -> None:
-        """``o``：把光标下那条任务交给系统浏览器（工单 #19）。
-
-        **只有浏览器这一条路。** ADR-0002 的「逃生舱的确切形态（已核实）」记着：官方
-        桌面客户端不接受任务深链（``dida365://`` 不存在、Linux 的 ``.desktop`` 没注册
-        协议处理器、主进程也不处理 argv），能做出来的就是厂商自己在「复制任务链接」里
-        生成的那条网页版路由。所以这里不试任何 ``xxx://``，也不假装能切到桌面 App。
-
-        URL 由 :func:`~dida.tui.escape.task_url` 拼（纯函数，含收集箱那条字面量替换），
-        清单 id 取**光标下那一条**的：TUI 不做判断，只把视图模型里已经有的事实交出去。
-
-        光标下没有任务就什么都不做——空屏上按键不该报错（与 ``x``/``g``/``e`` 同一条口径）。
-
-        交不出去时**必须出声**：完成在服务端不可逆，这个键是它的补偿，静默失败比吵一句
-        坏得多。两种失败都报同一句话（状态栏），并且把 URL 原样给人抄——``webbrowser``
-        找不到浏览器时抛 ``webbrowser.Error``，``open()`` 回 ``False`` 也是一种失败。
-        """
-        item = self.query_one(TaskPane).selected_item
-        if item is None:
-            return
-        url = task_url(item.list_id, item.task_id)
-        try:
-            opened = self._open_url(url)
-        except Exception:
-            # 开手当场抛（``webbrowser.Error`` 就是这一种）：按上面那条规矩如实说，
-            # 不让一个找不到浏览器的机器把整个界面带走。
-            opened = False
-        if not opened:
-            self.query_one(StatusBar).update(no_browser_message(url))
-
-    # ---------------------------------------------------------------- 子任务（t20）
-
-    def _show_subtasks(self, item: TaskItem | None) -> None:
-        """把右栏那份子任务列表指到 ``item`` 上（工单 #20）。
-
-        子任务数组存在**任务原文**里，读它要走引擎（``engine.subtasks``）：TUI 不认识
-        ``items``，也不认识 ``status`` 那对取值。光标没指着任务时给空的一份——右栏就是
-        没有子任务可显示，不是错误。
-        """
-        self._subtask_pane().show(
-            None if item is None else item.task_id,
-            () if item is None else self.engine.subtasks(item.task_id),
-        )
-
-    def _subtask_pane(self) -> SubtaskPane:
-        """右栏那份子任务列表；**第一次要用时才挂进详情栏**（工单 #20）。
-
-        延迟挂载而不是写在 ``compose`` 里，图的是两件事：
-
-        - 它排在详情栏自己那块内容**后面**（``mount`` 是追加），屏幕上就是「任务行，然后
-          子任务」，与 mockup 一致；
-        - 详情栏的排版归 t18，这一份不必去动 ``DetailPane`` 的定义，详情栏一收起它跟着
-          收起（它就是详情栏的孩子）。
-        """
-        found = self.query(SubtaskPane)
-        if found:
-            return found.first()
-        pane = SubtaskPane(id="subtask-pane")
-        self.query_one(DetailPane).mount(pane)
-        return pane
-
-    def action_subtasks(self) -> None:
-        """``s``：把焦点交给右栏那份子任务列表（工单 #20）。
-
-        光标下那条任务没有子任务时什么都不做——空屏上按键不该报错（与 ``x``/``g``/``e``
-        同一条口径）。已经在里面时再按一次就是出来：``s`` 是这一处的进出键，不用去记
-        ``Esc``（``Esc`` 也行，那是 :meth:`on_subtask_pane_dismissed`）。
-        """
-        pane = self._subtask_pane()
-        if pane.has_focus:
-            self.query_one(TaskPane).focus()
-            return
-        if not pane.count:
-            return
-        pane.arm()  # 它平时不在焦点链里（Tab 只在清单栏与任务列之间转）
-        pane.focus()
-
-    async def on_subtask_pane_toggled(self, event: SubtaskPane.Toggled) -> None:
-        """子任务列表按了 ``t``：交给引擎——**先重读该任务，再只写这一次改动**（工单 #20）。
-
-        重读是一次网络调用，所以这一条要 ``await``：写回必须建立在它带回来的底稿上，
-        没有底稿的写回会把别处改过的子任务一起抹掉（这正是本工单要挡的那件事）。
-
-        重读发现任务在别处被改过时，引擎按服务端那一份落地并报 ``changed_elsewhere``，
-        这里**必须说出来**（状态栏那一句）：服务端权威可以覆盖，但覆盖要看得见（ADR-0002）。
-
-        重画的是右栏这一份（引擎已经把重读回来的那一份给回来了），**不重画整个视图**：
-        中栏那些行不会因为一个子任务变了而变，而重画会把任务列的光标推回第一行——用户
-        正在这条任务上连着勾子任务，勾一个就跳走是没法用的。状态栏照旧要刷（待推送数量
-        会变）。
-        """
-        try:
-            report = await self.engine.toggle_subtask(event.task_id, event.subtask_id)
-        except UnknownTaskError:
-            self.query_one(StatusBar).update(UNKNOWN_SUBTASK_MESSAGE)
-            return
-        except DidaError:
-            # 重读那一步失败（网络断了、凭据被拒、服务端拒绝）：引擎的失败一律是结构化
-            # 错误，这里如实说一句，不让一个断网的机器把整个界面带走。
-            self.query_one(StatusBar).update(SUBTASK_READ_FAILED_MESSAGE)
-            return
-        self._subtask_pane().show(report.task_id, report.items)
-        self.update_status()
-        if not report.written:
-            self.query_one(StatusBar).update(SUBTASK_GONE_MESSAGE)
-        elif report.changed_elsewhere:
-            self.query_one(StatusBar).update(SUBTASK_ELSEWHERE_MESSAGE)
-
-    def on_subtask_pane_dismissed(self) -> None:
-        """子任务列表按了 ``Esc``：焦点回任务列。"""
-        self.query_one(TaskPane).focus()
-    # ---------------------------------------------------------------- 详情开合（t18）
-
-    def action_toggle_detail(self) -> None:
-        """``Enter``：开合右栏详情（工单 #18，验收标准 #4）。
-
-        三档一个语义、两种落地：
-
-        - 右栏**在屏上**（≥110 列）：就地收起 / 显示。收起是用户自己按的，是一时的姿势，
-          所以尺寸变化不重置它（与已完成区的展开同一条口径）。
-        - 右栏**不在屏上**（<110 列）：把当前任务的详情作为浮层弹出来；再按一次 ``Enter``
-          由 :class:`~dida.tui.panes.DetailScreen` 自己收起来（``Esc`` 也一样）。
-
-        浮层里的内容是**按下那一刻**光标下那条的详情：浮层是模态的，j/k 到不了任务列，
-        所以它不会在开着的时候偷偷换成别的任务。
-        """
-        if isinstance(self.screen, DetailScreen):
-            self.screen.dismiss(None)
-            return
-        if self._tier == "wide":
-            self._detail_open = not self._detail_open
-            self.query_one("#detail-pane").display = self._detail_open
-            return
-        item = self.query_one(TaskPane).selected_item
-        self.push_screen(DetailScreen(detail_body(item)))
-
-    def action_lists(self) -> None:
-        """``l``：把清单作为浮层打开（工单 #18，验收标准 #3）。
-
-        窄档（<80 列）左栏不在屏上，清单只能从这里看；更宽的两档左栏本来就在，按 ``l``
-        也开同一个浮层——一个键到哪里都做同一件事，不必记两套。
-
-        内容取引擎的清单摘要（与左栏同一份 ``view().lists``）：左栏这会儿可能正被收起，
-        但数据一直在引擎里，浮层不是第二份缓存。
-        """
-        self.push_screen(ListsScreen(lists_body(self.engine.view().lists)))
-
-    def action_help(self) -> None:
-        """``?``：打开键位帮助浮层（工单 #18，验收标准 #6）。
-
-        表在 :data:`~dida.tui.panes.KEY_HELP`：帮助里少了哪个键，是那张表少了一行，
-        不是这里少了一段布局。``Esc`` 与 ``Enter`` 都能关掉它（浮层自己的绑定）。
-        """
-        self.push_screen(HelpScreen(key_help_body()))
+        if confirmed and self.is_running:
+            self.exit()

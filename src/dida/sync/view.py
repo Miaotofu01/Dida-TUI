@@ -1,39 +1,43 @@
 """同步引擎对外的视图模型与纯函数。
 
-引擎的读路径只暴露这里定义的类型：TUI 拿到的是**已经判断好**的东西——
-哪条任务属于哪个区、截止时间读作什么、优先级标记长什么样——它自己不做判断。
+引擎的读路径只暴露这里定义的类型：TUI 拿到的是**已经判断好**的东西——截止时间读作什么、
+优先级标记长什么样、这一行算不算逾期、这一行算不算已完成——它自己不做判断。
 
 两组类型：
 
 - 输入（缓存 → 引擎）：:class:`ListSnapshot` / :class:`TaskSnapshot` / :class:`SyncState`，
   :class:`ViewSource` 是它们的只读入口，t08 的 ``Store`` 实现它。
-- 输出（引擎 → TUI）：:class:`TodayView` / :class:`TaskGroup` / :class:`TaskItem` /
-  :class:`ListSummary`。
+- 输出（引擎 → TUI）：:class:`TaskItem` / :class:`CompletedItem` / :class:`CompletedSection`
+  / :class:`SubtaskItem`——三种读形状（清单索引 / 某个容器的任务列表 / 单条任务的详情）
+  的行在 :mod:`dida.sync.read` 里组装，这里只提供这一行的字段与它们各自的读法。
 
 函数都是纯的：「现在」与 ``day_end`` 一律从参数进来，逻辑日判定交给
-:mod:`dida.logical_day`，这里不重算任何日界。分区与排序的规矩：
+:mod:`dida.logical_day`，这里不重算任何日界。排序的规矩只有一条（:func:`by_due` →
+:func:`dida.sync.rows.row_sort_key`）：逾期置顶 → 截止时间升序 → 优先级降序 → 没有截止
+时间的排在有截止时间的后面 → 已完成的沉底。服务端的 ``sortOrder`` 一律不看。
 
-- 逾期区置顶：有截止时间、且早于当前逻辑日的开始时刻。
-- 今日区：截止时间落在当前逻辑日区间内 ``[start, end)``。
-- 收集箱无日期区：没有截止时间的任务（读作「—」），排在今日**之后**。它自成一区的理由有两层：
-  「今天要做完什么」这句话不该收留一件还没定日子的任务（story 23 要求这两者一眼可分），
-  而分诊看的是「有没有日期」、不是「在哪个清单」——按清单拆开会让收集箱之外的无日期任务
-  重新混回今日区，或者干脆从这一屏消失。
-- 未来（下一个逻辑日起）的任务不属于这张「今日」视图；已完成的也不属于。
-- 区内先按截止时间升序，没有截止时间的排在同区有截止时间的后面（按标题）。
+**v1 那条读路径在 #58 里删掉了**：``TodayView`` 与它硬编码的三个分区（逾期 / 今日 /
+收集箱无日期）、左栏的 ``ListSummary`` 徽标、以及 ``/`` 的模糊过滤（``fuzzy_match`` /
+``filter_groups``）都只为那个「今日执行台」服务，spec 要求读模型重写、模糊过滤不迁移。
+v2 的三种读形状在 :mod:`dida.sync.read`，没有哪一种认识「今天」这个分区。
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta
-from enum import Enum
+from datetime import date, datetime
 from typing import Any, Mapping, Protocol, Sequence
 
 from dida.logical_day import logical_day
+from dida.sync.rows import completed_window_start, row_order_tail, row_sort_key
 
-NO_DUE_TEXT = "—"
-"""没有截止时间的读法；与「今天」一眼可分。"""
+NO_DUE_TEXT = "-"
+"""没有截止时间的读法；与「今天」一眼可分。
+
+原来是 ``—``（U+2014）：rich 量它 1 格，而它的东亚宽度是**歧义**——zh_CN 的终端可能画
+2 格，一旦它进了对齐列（截止时间那一列）整列就歪。换成 ASCII 的连字符：任何 locale 下
+都是 1 格，形状仍然是「一道短横」。
+"""
 
 INBOX_ID = "inbox"
 """收集箱在 API 里的 projectId 别名。"""
@@ -41,34 +45,23 @@ INBOX_ID = "inbox"
 INBOX_NAME = "收集箱"
 
 
-class GroupKind(Enum):
-    """中栏的分区身份。"""
-
-    OVERDUE = "overdue"
-    TODAY = "today"
-    INBOX_UNDATED = "inbox_undated"
-    """没有截止时间的那些：收集箱里等着分诊的一堆（story 16）。"""
-
-
-GROUP_ORDER: tuple[GroupKind, ...] = (GroupKind.OVERDUE, GroupKind.TODAY, GroupKind.INBOX_UNDATED)
-"""中栏的区序（接口契约的顺序）：逾期置顶 → 今日 → 收集箱无日期。
-
-已完成区在中栏**底部**，由 :func:`completed_section` 单独给，不在这个序列里。
-"""
-
-_GROUP_TITLES = {
-    GroupKind.OVERDUE: "逾期",
-    GroupKind.TODAY: "今日",
-    GroupKind.INBOX_UNDATED: "收集箱无日期",
-}
-
-
 @dataclass(frozen=True)
 class ListSnapshot:
-    """缓存里的一条清单（API 叫 project）。"""
+    """缓存里的一条清单（API 叫 project）：只有事实，没有判断。
+
+    ``color`` / ``group_id`` / ``kind`` / ``permission`` 是服务端 ``Project`` 上的字段
+    （``kind`` 是 ``TASK`` / ``NOTE``，``permission`` 是 ``write`` / ``read`` / ``comment``），
+    清单索引页要用它们标出「装不了任务的」「改不动的」那些行（用户故事 23 / 24）。
+    ``is_inbox`` 是客户端认出来的收集箱那一行——服务端的清单索引里没有它（实测）。
+    """
 
     id: str
     name: str
+    color: str | None = None
+    group_id: str | None = None
+    kind: str | None = None
+    permission: str | None = None
+    is_inbox: bool = False
 
 
 @dataclass(frozen=True)
@@ -91,17 +84,29 @@ class TaskSnapshot:
     """完成时刻（服务端的 ``completedTime``）；本地刚完成、服务端还没认过的那些是 ``None``。"""
 
     desc: str = ""
-    """服务端的 ``desc``：这条任务的**描述**（工单 #20 的右栏要常驻显示它）。"""
+    """服务端的 ``desc``：GLOSSARY 里它是**备注**（详情页「备注」那一行画的就是它）。"""
 
     content: str = ""
-    """服务端的 ``content``：这条任务的**备注/正文**。
+    """服务端的 ``content``：GLOSSARY 里它是**描述**。
 
-    ``api-contracts.md`` 的 ``Task`` 字段表里 ``desc`` 与 ``content`` 是两个字面不同的字段：
-    描述归描述、备注归备注，这里不合并、也不互相兜底——详情栏两行各画各的。
+    ``desc`` 与 ``content`` 是两个字面不同的字段，这里不合并、也不互相兜底——详情页两行
+    各画各的，改一个不会覆盖另一个。**v1 把这两个标反了**（描述当成 ``desc``），这份
+    spec 纠正它：描述 = ``content``、备注 = ``desc``（``GLOSSARY.md`` 的「任务」一节，
+    翻转的落点在 :func:`dida.tui.pages.detail.fields_of`）。
     """
 
     tags: tuple[str, ...] = ()
     """服务端的 ``tags``：标签名，按服务端给的顺序。"""
+
+    repeat_flag: str = ""
+    """服务端的 ``repeatFlag``（重复规则原文，如 ``RRULE:FREQ=WEEKLY``）。
+
+    任务行只需要「是不是重复任务」（空串 = 不是），规则原文照旧原样留着——它只读，而且
+    回写时一个字都不许动（spec 的「改期绝不触碰重复规则」）。
+    """
+
+    reminders: tuple[str, ...] = ()
+    """服务端的 ``reminders``（提醒触发器原文）：行里只读「有没有提醒」，不改。"""
 
 
 @dataclass(frozen=True)
@@ -129,15 +134,6 @@ class ViewSource(Protocol):
 
 
 @dataclass(frozen=True)
-class ListSummary:
-    """左栏一行：清单 + 未完成条数徽标。"""
-
-    id: str
-    name: str
-    unfinished: int
-
-
-@dataclass(frozen=True)
 class TaskItem:
     """中栏一行，字段都已经是可以直接画的成品。"""
 
@@ -151,11 +147,19 @@ class TaskItem:
     all_day: bool
     due_text: str
 
+    overdue: bool = False
+    """逾期了没有（逻辑日判定，见 :func:`is_overdue`）。
+
+    日期判断全在引擎这一层（架构规则：TUI 拿到的是已经判断好的成品），所以「标红」这件事
+    的颜色由 TUI 决定、**位**由这里给：TUI 自己拿截止时间去比会写出第二份日期比较，那正是
+    全天任务与 ``04:00`` 边界上会各错一次的地方。
+    """
+
     desc: str = ""
-    """描述，原样来自快照（TUI 不解析它）。"""
+    """**备注**，原样来自快照（TUI 不解析它；术语表：备注 = ``desc``）。"""
 
     content: str = ""
-    """备注/正文，原样来自快照。"""
+    """**描述**，原样来自快照（术语表：描述 = ``content``）。"""
 
     tags_text: str = ""
     """标签的成品读法（``#工作 #季度``，见 :func:`format_tags`）。
@@ -163,23 +167,19 @@ class TaskItem:
     没有标签就是空串——「这一行要不要画」由这个空串回答，详情栏不自己判断有没有标签。
     """
 
+    repeat_flag: str = ""
+    """服务端的 ``repeatFlag``：非空就是重复任务（行里画一个重复标记）。"""
 
-@dataclass(frozen=True)
-class TaskGroup:
-    """中栏一个区：身份 + 标题（由身份定）+ 行。"""
+    reminders: tuple[str, ...] = ()
+    """服务端的 ``reminders``：非空就是有提醒（行里画一个提醒标记）。"""
 
-    kind: GroupKind
-    items: tuple[TaskItem, ...]
+    completed: bool = False
+    """这条任务已完成。
 
-    @property
-    def title(self) -> str:
-        """分区标题，如「逾期」。"""
-        return _GROUP_TITLES[self.kind]
-
-    @property
-    def count(self) -> int:
-        """分区条数，显示在标题上。"""
-        return len(self.items)
+    「已完成沉底」要在**读模型**这一层成立，不能只靠界面把两段拼起来：视图的成员是混的
+    （自定义视图的过滤条件里就有完成状态这一维），一个含已完成成员的视图会把做完的任务
+    插在未完成中间。判定只看 ``status``（工单 #37 / spec 的「本地判定已完成」）。
+    """
 
 
 @dataclass(frozen=True)
@@ -205,34 +205,52 @@ class CompletedSection:
 
     @property
     def count(self) -> int:
-        """窗口内完成的条数，显示在「已完成 N 项」上。"""
+        """窗口内完成的条数（列表底部那一段有几行）。
+
+        **屏幕上没有一处显示它**：那一段直接画行，而「已完成 N 项」那条分隔行是 spec 明确
+        不要的（#64）。这个数只被测试用来断「这一段里应当有几条」。
+        """
         return len(self.items)
 
 
-@dataclass(frozen=True)
-class TodayView:
-    """整屏要的数据：左栏清单与中栏分区（含底部的已完成区）。"""
-
-    lists: tuple[ListSummary, ...]
-    groups: tuple[TaskGroup, ...]
-    completed: CompletedSection = CompletedSection()
-
-
 def priority_mark(priority: int) -> str:
-    """优先级标记：高 ``!``、中 ``~``、低与无 ``·``。"""
-    return {5: "!", 3: "~"}.get(priority, "·")
+    """优先级标记：高 ``!``、中 ``~``、低与无 ``.``。
+
+    三个字形都必须是宽度无歧义的（``tests/test_task_row_model.py`` 守着）。低优先级原来是
+    ``·``（U+00B7，东亚**歧义**宽度）——rich 量 1 格而终端可能画 2 格，于是每一行都比终端
+    实际画的宽一格。
+
+    **列表行里已经不画它了**（#63）：任务行首那一列是勾选框 ``☐`` / ``☑``，只说「做完没有」，
+    优先级只留在详细页的字段与挑选器里（排序仍然按它）。它曾经是整行的第一列。
+    """
+    return {5: "!", 3: "~"}.get(priority, ".")
 
 
 PRIORITY_CYCLE: tuple[int, ...] = (0, 1, 3, 5)
 """四个档位的**线上编码**，按 ``p`` 键的循环顺序：无 → 低 → 中 → 高。"""
 
 
+PRIORITY_NAMES: dict[int, str] = {0: "无", 1: "低", 3: "中", 5: "高"}
+"""四个档位的**用户语言**（GLOSSARY：无 / 低 / 中 / 高），键是上面的线上编码。
+
+**这是这张表唯一的家**（工单 #58 的 T3）。它原来在 ``tui/messages.py`` 与
+``sync/views.py`` 各写了一份，而界面的注释还把其中一份称作「唯一一张表」——两处实现、
+一句假话。它只能住在 sync 这一侧：``dida/tui/`` 只许 import ``dida.sync.engine``
+（``tests/test_architecture.py`` 的允许表），而 ``sync/`` 永远不 import ``tui/``，
+所以视图表单（:mod:`dida.sync.views`）与界面（经引擎的公开面）都得 import 这一份。
+
+**次序是承重的**：``views.py`` 把「一条改动里点了哪些档」倒过来查它（``by_label``），
+而界面的挑选器是按这里的插入顺序画四档的（无 → 低 → 中 → 高），所以次序照用户读的顺序写，
+**不要**改成「高 → 无」。表外的取值读作「无」（与 :func:`priority_mark` 同一条口径）。
+"""
+
+
 def next_priority(priority: int) -> int:
     """``p`` 的下一档：无 → 低 → 中 → 高 → 无，值都是 API 的线上编码 ``0/1/3/5``。
 
-    稠密的 ``1/2/3`` 是**日期解析器的档位序号**（用户写的 ``!1``/``!2``/``!3``），不是要
-    发给服务端的取值：``!3`` 是「高」，对应线上的 ``5``。两套编码只在这一处相接，
-    ``!5`` 那种写法仍然是诊断（见 :mod:`dida.date_parser`）。
+    稠密的 ``1/2/3`` 是 v1 那套日期输入语法的档位序号（用户写的 ``!1``/``!2``/``!3``），
+    不是要发给服务端的取值：``!3`` 是「高」，对应线上的 ``5``——v2 作废了那套语法，所以
+    这里只剩线上编码这一套。
 
     认不出来的取值（服务端给了表外的数）当作「无」：``priority_mark`` 本来就把它们读作
     ``·``，从那儿往前推一档正好是「低」。
@@ -269,57 +287,13 @@ def task_item(snapshot: TaskSnapshot, names: dict[str, str], *, now: datetime, d
         due=snapshot.due,
         all_day=snapshot.all_day,
         due_text=format_due(snapshot.due, all_day=snapshot.all_day, now=now, day_end=day_end),
+        overdue=is_overdue(snapshot, today=logical_day(now, day_end).label, day_end=day_end),
         desc=snapshot.desc,
         content=snapshot.content,
         tags_text=format_tags(snapshot.tags),
-    )
-
-
-def summarize_lists(lists: Sequence[ListSnapshot], tasks: Sequence[TaskSnapshot]) -> tuple[ListSummary, ...]:
-    """左栏：每条清单一个未完成条数徽标，顺序照缓存给的来。"""
-    unfinished: dict[str, int] = {}
-    for snapshot in tasks:
-        if not snapshot.completed:
-            unfinished[snapshot.list_id] = unfinished.get(snapshot.list_id, 0) + 1
-    return tuple(
-        ListSummary(id=item.id, name=item.name, unfinished=unfinished.get(item.id, 0)) for item in lists
-    )
-
-
-def group_tasks(
-    tasks: Sequence[TaskSnapshot],
-    lists: Sequence[ListSnapshot],
-    *,
-    now: datetime,
-    day_end: str,
-) -> tuple[TaskGroup, ...]:
-    """未完成任务 → 分区，按 :data:`GROUP_ORDER` 排：逾期 → 今日 → 收集箱无日期。
-
-    空区不出现在结果里。分区只在这里做：TUI 拿到的是已经分好区的成品，它自己不判断
-    「这条算不算今天」。
-    """
-    label = logical_day(now, day_end).label
-    names = list_names(lists)
-    buckets: dict[GroupKind, list[TaskItem]] = {kind: [] for kind in GROUP_ORDER}
-    for snapshot in tasks:
-        if snapshot.completed:
-            continue
-        if snapshot.due is None:
-            kind = GroupKind.INBOX_UNDATED
-        else:
-            day = due_day(snapshot.due, all_day=snapshot.all_day, day_end=day_end)
-            if day < label:
-                kind = GroupKind.OVERDUE
-            elif day == label:
-                kind = GroupKind.TODAY
-            else:
-                continue  # 未来的任务不属于「今日」
-        buckets[kind].append(task_item(snapshot, names, now=now, day_end=day_end))
-
-    return tuple(
-        TaskGroup(kind=kind, items=tuple(_by_due(buckets[kind])))
-        for kind in GROUP_ORDER
-        if buckets[kind]
+        repeat_flag=snapshot.repeat_flag,
+        reminders=snapshot.reminders,
+        completed=snapshot.completed,
     )
 
 
@@ -331,6 +305,21 @@ def due_day(due: datetime, *, all_day: bool, day_end: str) -> date:
     按 00:00 这个时刻去套偏移会把它整天挪到前一个逻辑日。
     """
     return due.date() if all_day else logical_day(due, day_end).label
+
+
+def is_overdue(snapshot: TaskSnapshot, *, today: date, day_end: str) -> bool:
+    """这条任务逾期了没有：有截止时间、且落在当前逻辑日**之前**（用户故事 25 / 87）。
+
+    判据是逻辑日（:func:`due_day`），不是裸的时刻比较：``day_end = "04:00"`` 时当天
+    03:00 属于昨天，它逾期；而当天 00:00 那个全天标记属于今天，它不逾期。全天任务因此
+    不会因为边界配在半夜就被算成逾期（那是 ``due_day`` 已经分好的事，这里不重写第二份）。
+
+    已完成的不算逾期：一条做完的任务不该在「今天」里被标红（它压根不该在那个视图里——
+    三个内置视图都只收未完成的）。
+    """
+    if snapshot.completed or snapshot.due is None:
+        return False
+    return due_day(snapshot.due, all_day=snapshot.all_day, day_end=day_end) < today
 
 
 def format_due(due: datetime | None, *, all_day: bool, now: datetime, day_end: str) -> str:
@@ -357,48 +346,35 @@ def format_due(due: datetime | None, *, all_day: bool, now: datetime, day_end: s
     return f"{word} {due.strftime('%H:%M')}"
 
 
-def _by_due(items: list[TaskItem]) -> list[TaskItem]:
-    """有截止时间的按时间升序在前，没有的按标题排在后面。"""
-    dated = sorted((item for item in items if item.due is not None), key=lambda item: (item.due, item.title))
-    undated = sorted((item for item in items if item.due is None), key=lambda item: (item.title, item.task_id))
-    return dated + undated
+def by_due(items: Sequence[TaskItem]) -> list[TaskItem]:
+    """按 spec 的排序链排：截止时间升序 → 优先级降序 → 无日期在后 → 已完成沉底。
 
-
-# ------------------------------------------------------------------ 模糊过滤（t17）
-
-
-def fuzzy_match(query: str, title: str) -> bool:
-    """``query`` 是不是 ``title`` 的**有序子序列**（大小写不敏感）。
-
-    子序列而不是子串：中文标题里隔着字也认（``写报`` 命中 ``写周报``），这才是「模糊」；
-    顺序仍然算数（``报写`` 不命中）。空查询命中一切——那就是「没有过滤」。
+    键在 :func:`dida.sync.rows.row_sort_key`（纯函数，直接测）：这一份与「今天」那一屏、
+    某个容器的任务列表、以及视图求值用的是同一个顺序——**客户端统一重排**，服务端的
+    ``sortOrder`` 一律不看（spec 的「一个已知的、故意的取舍」）。
     """
-    if not query:
-        return True
-    rest = iter(title.casefold())
-    return all(char in rest for char in query.casefold())
-
-
-def filter_groups(groups: Sequence[TaskGroup], query: str) -> tuple[TaskGroup, ...]:
-    """按查询筛掉不命中的行；整组都不命中就整组不留。
-
-    只筛未完成任务的那两区（中栏）；底部的已完成区不在 ``groups`` 里，折叠着也不参与光标。
-    留下来的行保持引擎给的顺序——排序是引擎的事，这里只做筛。
-
-    组标题上的条数是 ``len(items)``（:class:`TaskGroup.count`），所以整组筛空必须整组丢掉：
-    留下一个「今日 · 3 项」的空标题，就是在骗人。空查询原样返回，``Esc`` 因此就是「恢复
-    完整列表」。
-    """
-    if not query:
-        return tuple(groups)
-    return tuple(
-        TaskGroup(kind=group.kind, items=kept)
-        for group in groups
-        if (kept := tuple(item for item in group.items if fuzzy_match(query, item.title)))
-    )
+    return sorted(items, key=row_sort_key)
 
 
 # ------------------------------------------------------------------ 已完成流（t12）
+
+
+def _completed_row_key(snapshot: TaskSnapshot) -> tuple:
+    """已完成段一行的位置：借 :func:`dida.sync.rows.row_order_tail`（不重写它）。
+
+    只取「已完成」那一位**之后**的那一段：进到这一段里的每一行都是已完成的（见
+    :func:`completed_section` 的过滤条件），那一位在这里恒定，省掉它不改变顺序。
+
+    这一层以前还包着一个 ``_CompletedRowFacts`` 适配器，只为把快照上的 ``id`` 摆成排序键认的
+    ``task_id``；#64 之后排序键那一段有了自己的名字（:func:`row_order_tail`），适配器整个
+    删掉了——按名字传参，不需要一个只差一个字段名的类型。
+    """
+    return row_order_tail(
+        due=snapshot.due,
+        priority=snapshot.priority,
+        title=snapshot.title,
+        task_id=snapshot.id,
+    )
 
 
 def completed_section(
@@ -409,47 +385,57 @@ def completed_section(
     day_end: str,
     window_hours: int,
 ) -> CompletedSection:
-    """已完成区：窗口 ``[now - window_hours, …]`` 内完成的任务，最近的排在最前。
+    """已完成区：窗口 ``[now - window_hours, …]`` 内完成的任务，按正常排序键排。
 
     「完成于何时」只认服务端的 ``completedTime``（``completed_at``），不认本地那条
-    ``status``：那是 ADR-0001 里唯一能被服务端过滤的变化时间戳，也是这条流唯一有意义的
-    排序与过滤依据。本地刚按了完成、服务端还没认过的任务因此不会出现在这里——它要等
-    下一次已完成流把它带着真正的完成时刻带回来。没有上界：服务端时钟快一点不该让用户
-    刚做完的任务消失。
+    ``status``：那是 ADR-0001 里唯一能被服务端过滤的变化时间戳，也是这条流的唯一窗口依据。
+    本地刚按了完成、服务端还没认过的任务因此不会出现在这里——它要等下一次已完成流把它
+    带着真正的完成时刻带回来。没有上界：服务端时钟快一点不该让用户刚做完的任务消失。
+
+    **顺序不是完成时刻倒序**（工单 #64）：与未完成段同一套键
+    （:func:`dida.sync.rows.row_sort_key`，截止升序 → 优先级降序 → 无日期在后），
+    「已完成沉底」是那个键的第一个元组位——它管的是未完成段那一侧，这一段里它恒定。
+    所以刚做完的一条不会因为「刚」就跳到段首，它落在它自己的位置上。
 
     纯函数：「现在」与窗口大小都从参数进来，这一层不读时钟（t12 的窗口由引擎按注入的
     配置给）。
     """
-    window_start = now - timedelta(hours=window_hours)
+    window_start = completed_window_start(now, window_hours)
     names = list_names(lists)
-    rows = [
-        CompletedItem(
-            task_id=snapshot.id,
-            title=snapshot.title,
-            list_name=names.get(snapshot.list_id, snapshot.list_id),
-            completed_at=snapshot.completed_at,
-            completed_text=format_due(
-                snapshot.completed_at, all_day=False, now=now, day_end=day_end
-            ),
-        )
+    kept = [
+        snapshot
         for snapshot in tasks
         if snapshot.completed
         and snapshot.completed_at is not None
         and snapshot.completed_at >= window_start
     ]
     return CompletedSection(
-        items=tuple(sorted(rows, key=lambda row: (row.completed_at, row.title), reverse=True))
+        items=tuple(
+            CompletedItem(
+                task_id=snapshot.id,
+                title=snapshot.title,
+                list_name=names.get(snapshot.list_id, snapshot.list_id),
+                completed_at=snapshot.completed_at,
+                completed_text=format_due(
+                    snapshot.completed_at, all_day=False, now=now, day_end=day_end
+                ),
+            )
+            for snapshot in sorted(kept, key=_completed_row_key)
+        )
     )
 
 
 # ------------------------------------------------------------------ 子任务（t20）
 
-SUBTASK_NORMAL_STATUS = 0
 SUBTASK_COMPLETED_STATUS = 1
-"""子任务的完成状态是**另一对**取值（``api-contracts.md``）：Normal ``0`` / Completed ``1``。
+"""子任务「勾上了」的那个 ``status``（``api-contracts.md``）：Normal ``0`` / Completed ``1``。
 
 不是任务级那一对 ``-1/0/2``：拿 ``status == 1`` 判任务完成是错的，拿 ``status == 2``
-判子任务完成同样是错的。两对取值只在这里相接，别处一律用这两个常量。
+判子任务完成同样是错的。两对取值只在这里相接。
+
+「没勾上」的 ``0`` 不再有自己的常量：写路径（勾选 / 取消勾选）在 #58 里删掉了（spec 的
+「子任务只看不勾」），读这一半只认「是不是 1」，其余取值一律读作没勾上
+（:func:`subtask_completed`，与 ``priority`` 同一口径）。
 """
 
 

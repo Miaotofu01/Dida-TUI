@@ -10,4 +10,5 @@ Textual 8.2.8 在 Linux 主驱动上默认向终端推 kitty 键盘协议的 `CS
 - 键位表只用 Textual 官方 FAQ 的「万能键面」：字母、数字、F1–F10、`space`、`enter`、方向键、`Ctrl`、`Shift`。`ctrl+enter`、`ctrl+shift+*`、`alt+方向键` 一律不依赖。
 - 这一条**只在 Textual 8.2.8 上必要**。上游修掉 textual#6721 之后可以重新评估；在那之前，升级 Textual 时要把中文输入当成一条验收项重跑。
 - 同一批不可靠的键，实现时不要再引入：`alt+enter` 在 8.2.8 上会塌缩成 `enter`（textual#6663），`shift+backspace` 在报告独立修饰符的终端上无效（textual#6612），`ctrl+enter` 在大多终端里与 `enter` 是同一个字节 `0x0D`。
+- **这条决定现在有守卫了**（#48）：`dida.tui.keys.unreliable_reason()` 一处判定哪些键收不到（判据就是上面那几条实测），`tests/test_keymap.py` 拿它断键位表、三张页面与两个浮层**没有**绑这种键。断的是「表里没有」，不是「它有处理器」——`Binding("ctrl+enter", …)` 构造得出来，派发一个 `ctrl+enter` 事件时也真的会触发，所以后者在真终端里永远绿。**改这个函数之前，先把那几条实测重跑一遍。**
 - `space` 不是万能的：`Input` / `TextArea` 拿到焦点时它会被当字符吞掉，app 级绑定静默失效。所以「完成」键只在任务列表页有效——那一页没有输入框抢焦点。

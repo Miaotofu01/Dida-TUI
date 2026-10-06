@@ -1,0 +1,782 @@
+"""挑选型字段（工单 #45）：所属清单 / 优先级 / 标签。
+
+两个既定接缝都用：
+
+- **接缝二**（真引擎 + 真库 + 可注入的 HTTP 传输）钉**搬运的请求形状**与「搬完之后
+  读路径上这条任务在哪」——那两件事是网络与本地库这一侧的事实，替身说了不算。
+- **接缝一**（内存 ``FakeBackend`` + ``run_test()`` pilot）钉三个挑选浮层的**外部行为**：
+  按了什么键、屏幕上出现了什么、写出去的是哪一笔。
+
+只断外部行为：不断控件树、不断内部状态对象、不断渲染字符串里的颜色码。
+"""
+
+from __future__ import annotations
+
+import json
+import re
+import unicodedata
+from datetime import datetime, timedelta, timezone
+
+import httpx
+import pytest
+
+from dida.api.client import DidaApiClient
+from dida.api.errors import DidaError, MalformedResponseError
+from dida.storage.store import Store
+from dida.sync.engine import SyncEngine
+from dida.testing import FakeBackend, FakeTransport, ManualClock
+from dida.tui import messages, theme
+from dida.tui.app import DidaApp
+from dida.tui.pages.detail import LIST_PICKER_TITLE, PRIORITY_PICKER_TITLE, TAGS_PICKER_TITLE
+from rich.cells import cell_len
+from support import screen_sgr, screen_text
+
+TZ = timezone(timedelta(hours=8))
+T0 = datetime(2026, 3, 14, 12, 3, tzinfo=TZ)
+WIDE = (100, 30)
+
+TITLE = "交季度报告"
+
+
+@pytest.fixture(autouse=True)
+def a_colour_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
+    """摘掉 shell 的 ``NO_COLOR``：否则 ``App`` 会挂一层 Monochrome，样式断言全部假绿。
+
+    颜色断言必须**在 app 构造之前**摘（#35 的教训：渲染之前摘已经晚了）。
+    """
+    monkeypatch.delenv("NO_COLOR", raising=False)
+CONTENT = "记得附上上周的对比数据"
+DESC = "先问一下财务再发"
+
+
+# ------------------------------------------------------------------ 接缝二：搬运的请求形状
+
+
+async def test_the_move_request_is_a_json_array_and_the_response_is_an_id_etag_array():
+    """``POST /open/v1/task/move`` 的两个形状陷阱（工单 #45 补的那两条）。
+
+    请求体**顶层是数组**、每项三个字段都必填（``openapi-dida365.md:504``、``:508–510``）；
+    响应是 ``{id, etag}`` 的数组（``:516``），**不是**被搬的那条 Task。
+    """
+    transport = FakeTransport(json=[{"id": "t1", "etag": "43p2zso1"}])
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    results = await client.move_task("work", "life", "t1")
+
+    request = transport.last_request
+    assert request.method == "POST"
+    assert str(request.url) == "https://api.dida365.com/open/v1/task/move"
+    assert request.headers["Authorization"] == "Bearer tok-123"
+    assert transport.last_json == [
+        {"fromProjectId": "work", "toProjectId": "life", "taskId": "t1"}
+    ], "顶层必须是数组，不是对象"
+    assert results == [{"id": "t1", "etag": "43p2zso1"}]
+
+
+async def test_a_move_response_that_is_a_task_object_is_rejected_as_bad_shape():
+    """响应按 ``{id, etag}`` 的**数组**解析：给一条 Task 对象是坏形状，不是「搬好了」。"""
+    transport = FakeTransport(json={"id": "t1", "title": TITLE})
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    with pytest.raises(MalformedResponseError):
+        await client.move_task("work", "life", "t1")
+
+
+async def test_a_move_that_answers_201_with_no_body_is_a_success():
+    """``201 → No Content``（``:517``）是成功形状：空响应体不是坏数据。"""
+    transport = FakeTransport()
+    transport.enqueue(httpx.Response(201))
+    client = DidaApiClient(token="tok-123", transport=transport)
+
+    assert await client.move_task("work", "life", "t1") == []
+
+
+# ------------------------------------------------------------------ 接缝二：搬完人真的换了清单
+
+
+def real_engine(tmp_path, transport, *, lists=None, tasks=None) -> SyncEngine:
+    """接缝二：真引擎 + 真库 + 打给假服务端的真客户端（``test_detail_page.py`` 那一套）。
+
+    搬运的**请求形状**与「搬完之后读路径上这条任务在哪」都是网络与本地库这一侧的事实，
+    替身说了不算——``FakeBackend`` 的写只记录，读路径上的搬家效果在它那里根本不存在。
+    """
+    store = Store(tmp_path / "dida.sqlite3")
+    store.apply_refresh(
+        lists=lists
+        if lists is not None
+        else [
+            {"id": "work", "name": "工作", "sortOrder": 0},
+            {"id": "life", "name": "生活", "sortOrder": 1},
+        ],
+        tasks=tasks
+        if tasks is not None
+        else [{"id": "t1", "projectId": "work", "title": TITLE, "status": 0}],
+    )
+    return SyncEngine(
+        clock=ManualClock(T0),
+        source=store,
+        client=DidaApiClient(token="tok", transport=transport),
+    )
+
+
+async def test_moving_a_task_goes_to_the_move_endpoint_not_an_ordinary_field_update(tmp_path):
+    """搬运打的是搬运端点，**不是**把它当成一次普通的字段更新（验收标准 2）。
+
+    两个形状一起钉：顶层是数组、每项三个字段（``:504``、``:508–510``）；而且这次推送里
+    **一个** ``POST /open/v1/task/{taskId}`` 都没有——那正是「当成字段更新」的样子。
+    """
+    transport = FakeTransport(json=[{"id": "t1", "etag": "43p2zso1"}])
+    engine = real_engine(tmp_path, transport)
+
+    engine.move_task("t1", to_list_id="life")
+    await engine.push_pending()
+
+    urls = [str(request.url) for request in transport.requests]
+    assert urls == ["https://api.dida365.com/open/v1/task/move"], f"搬运走错了端点：{urls}"
+    assert transport.last_json == [
+        {"fromProjectId": "work", "toProjectId": "life", "taskId": "t1"}
+    ]
+
+
+async def test_after_the_move_the_target_list_has_the_task_and_the_source_list_does_not(tmp_path):
+    """搬完**在读路径上**断言：目标清单里有它、原清单里没有（验收标准 8）。
+
+    断的不是本地某个集合，而是两层页面真正读的那两个口子（``tasks_in`` 与详情页的清单名）
+    ——本地集合对了而读路径没变，屏幕上就还是原来的样子。
+    """
+    transport = FakeTransport(json=[{"id": "t1", "etag": "43p2zso1"}])
+    engine = real_engine(tmp_path, transport)
+
+    engine.move_task("t1", to_list_id="life")
+    await engine.push_pending()
+
+    assert [item.task_id for item in engine.tasks_in("life").items] == ["t1"], "目标清单里没有这条任务"
+    assert [item.task_id for item in engine.tasks_in("work").items] == [], "原清单里还留着这条任务"
+    detail = engine.task_detail("t1")
+    assert detail is not None and detail.list_name == "生活", "详情页那一格还写着原清单"
+
+
+async def test_a_task_moves_both_ways_between_the_inbox_and_a_real_list(tmp_path):
+    """收集箱与真实清单之间**双向**可搬（验收标准 3）。
+
+    文档对这一节里的收集箱一个字都没提（``:497–548``），所以这里不替它写一条「文档说」；
+    能钉的是**形状**：收集箱那一行带的是什么 id，搬过去就发什么 id（本测试用的就是
+    ``move_targets()`` 真正会给挑选器的那个 id），回来时再搬一次。
+    """
+    transport = FakeTransport(json=[{"id": "t1", "etag": "e1"}])
+    engine = real_engine(
+        tmp_path,
+        transport,
+        tasks=[{"id": "t1", "projectId": "inbox", "title": TITLE, "status": 0}],
+    )
+    inbox_id = next(row.id for row in engine.move_targets() if row.is_inbox)
+
+    engine.move_task("t1", to_list_id="work")
+    await engine.push_pending()
+    assert [item.task_id for item in engine.tasks_in("work").items] == ["t1"], "搬出收集箱没成"
+    assert engine.task_detail("t1").list_name == "工作"
+
+    engine.move_task("t1", to_list_id=inbox_id)
+    await engine.push_pending()
+    assert [item.task_id for item in engine.tasks_in(inbox_id).items] == ["t1"], "搬回收集箱没成"
+    assert [item.task_id for item in engine.tasks_in("work").items] == []
+
+    assert [json.loads(request.content) for request in transport.requests] == [
+        [{"fromProjectId": "inbox", "toProjectId": "work", "taskId": "t1"}],
+        [{"fromProjectId": "work", "toProjectId": inbox_id, "taskId": "t1"}],
+    ], "两次搬运的请求体不是文档那个数组形状"
+
+
+async def test_moving_a_task_to_the_list_it_is_already_in_writes_nothing(tmp_path):
+    """搬去它已经在的那个清单 = **没改**：请求一个都不发，队列也不多一笔。
+
+    凭空入队一笔「同一个清单之间搬」只会让状态栏那个数多一个没有意义的数；服务端那边
+    更没人知道该怎么理解它。
+    """
+    transport = FakeTransport(json=[{"id": "t1", "etag": "e1"}])
+    engine = real_engine(tmp_path, transport)
+
+    engine.move_task("t1", to_list_id="work")
+    await engine.push_pending()
+
+    assert transport.requests == [], f"已经在那个清单里，不该发请求：{transport.requests}"
+    assert engine.status().pending_count == 0, "队列里多了一笔永远不需要的改动"
+
+
+async def test_a_list_the_server_has_not_seen_is_never_offered_as_a_move_target(tmp_path):
+    """本地刚建、还没推上去的清单**不**当搬运目标（#53/#54 是同一类）。
+
+    它的 id 是本地临时的（服务端没见过），拿它当 ``toProjectId`` 会 404，而那条改动
+    **永远推不出去**——状态栏那个数从此一直非零，读起来像「等一下就好」。判据是队列里
+    还有没有这一行的 ``CREATE``：推成功、认领了服务端的 id 之后它就该出现在可选里。
+    """
+    transport = FakeTransport(json={"id": "srv-1", "name": "新清单", "sortOrder": 0})
+    engine = real_engine(tmp_path, transport)
+
+    local_id = engine.create_list("新清单")
+
+    assert local_id in {row.id for row in engine.list_index()}, "本地那一行本来就该在清单索引里"
+    assert local_id not in {row.id for row in engine.move_targets()}, (
+        "服务端还没见过的清单被当成了搬运目标"
+    )
+
+    await engine.push_pending()  # 新建推成功：本地那一行认领服务端的 id
+
+    offered = {row.id for row in engine.move_targets()}
+    assert local_id not in offered
+    assert "srv-1" in offered, "服务端认过的清单该能当搬运目标"
+
+
+# ------------------------------------------------------------------ 接缝二：标签列表从哪儿来
+
+
+async def test_the_tag_picker_loads_the_names_from_the_tag_endpoint(tmp_path):
+    """标签列表来自 ``GET /open/v1/tag``——``list_tags`` 从此有了生产调用方（工单 #45）。
+
+    ``OpenTag`` 的 ``name`` 是标识符（小写、trimmed），任务上 ``tags`` 数组里装的也是名字，
+    所以挑选用的是它；``label`` 只是显示形式（文档要求它小写之后必须等于 ``name``）。
+    """
+    transport = FakeTransport(
+        json=[
+            {"name": "work", "label": "Work", "sortOrder": 0},
+            {"name": "urgent", "label": "urgent", "sortOrder": 1},
+        ]
+    )
+    engine = real_engine(tmp_path, transport)
+
+    names = await engine.load_tags()
+
+    request = transport.last_request
+    assert request.method == "GET"
+    assert str(request.url) == "https://api.dida365.com/open/v1/tag"
+    assert names == ("work", "urgent")
+    assert engine.tags() == ("work", "urgent")
+
+
+async def test_a_tag_already_on_a_cached_task_stays_pickable_when_the_list_cannot_be_fetched(tmp_path):
+    """拉不到标签列表时，本地任务上已经打着的标签**照样挑得动**（断网也不能卡住取消）。
+
+    拉不到是**说出来**的（结构化错误照旧往外抛，调用方去说），不是假装「你没有标签」：
+    一条任务上已经有的标签必须留在可挑的那一份里，否则断网时「取消一个标签」无路可走。
+    """
+    transport = FakeTransport()
+    transport.enqueue(httpx.ConnectError("连不上服务器"))
+    engine = real_engine(
+        tmp_path,
+        transport,
+        tasks=[
+            {
+                "id": "t1",
+                "projectId": "work",
+                "title": TITLE,
+                "status": 0,
+                "tags": ["季度"],
+            }
+        ],
+    )
+
+    with pytest.raises(DidaError) as caught:
+        await engine.load_tags()
+
+    assert "连不上服务器" in str(caught.value)
+    assert engine.tags() == ("季度",)
+
+
+# ------------------------------------------------------------------ 接缝一：三个挑选浮层
+
+
+def backend() -> FakeBackend:
+    """一份够用的缓存：两个清单、一条在「工作」里、带优先级与两个标签的任务。"""
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_list("生活", id="life")
+    fake.add_task(
+        TITLE,
+        list_name="work",
+        id="t1",
+        due=T0.replace(hour=18, minute=0),
+        priority=5,
+        content=CONTENT,
+        desc=DESC,
+        tags=("工作", "季度"),
+    )
+    return fake
+
+
+def field_row(text: str, label: str) -> str:
+    """字段列表里 ``label`` 那一行（行首那两格是光标记号，所以从第三格认起）。"""
+    for line in text.splitlines():
+        if line[2:].startswith(label):
+            return line
+    raise AssertionError(f"字段列表里没有「{label}」那一行：\n{text}")
+
+
+async def enter_detail(pilot, app: DidaApp) -> None:
+    """走进「工作」清单的第一条任务的详细页，光标停在标题那一格上。"""
+    for _ in range(20):
+        if app.index_page().selected_id == "work":
+            break
+        await pilot.press("j")
+    await pilot.press("right")
+    await pilot.pause()
+    await pilot.press("right")
+    await pilot.pause()
+
+
+async def walk_to(pilot, app: DidaApp, key: str) -> None:
+    """把详细页的光标走到某一格上（``j`` 一次一个字段）。"""
+    for _ in range(20):
+        if app.detail_page().selected_id == key:
+            return
+        await pilot.press("j")
+    raise AssertionError(f"光标没能走到 {key} 上，停在 {app.detail_page().selected_id}")
+
+
+async def test_the_list_field_offers_my_lists_and_moving_really_moves_the_task():
+    """``enter`` 落在「清单」上开挑选浮层，挑一个 → 任务**真的搬过去**（验收标准 1）。
+
+    屏幕上两头都断：字段列表里那一行换成了新清单名，而写出去的是**搬运**（``fake.moved``），
+    不是一次普通字段更新（``fake.writes`` 里一笔都不该有）。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "list")
+        await pilot.press("enter")
+        await pilot.pause()
+        picker = screen_text(app)
+        await pilot.press("right")  # 工作 → 生活（选项顺序就是引擎给的清单索引）
+        await pilot.pause()
+        picked = screen_text(app)
+        await pilot.press("enter")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert "搬到哪个清单" in picker, f"开出来的不是挑选浮层：\n{picker}"
+    assert "< 工作 >" in picker, f"挑选器没有停在当前清单上：\n{picker}"
+    assert "< 生活 >" in picked, f"右方向键没有换到另一个清单：\n{picked}"
+    assert fake.moved == [("t1", "life")], f"任务没有搬过去：{fake.moved}"
+    assert fake.writes == [], f"搬运不该走普通字段更新：{fake.writes}"
+    assert "生活" in field_row(after, "清单"), f"搬完那一格还写着原清单：\n{after}"
+
+
+async def test_the_inbox_is_offered_as_a_move_target_too():
+    """收集箱也在可选里（验收标准 3 的一半：真实清单 → 收集箱）。
+
+    收集箱那一行是客户端自己补的，它的 id 是服务端返回的那一串（不是字面量 ``inbox``）；
+    挑选器给的就是引擎 ``move_targets()`` 那一份，所以这里搬过去发的是那个 id。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "list")
+        await pilot.press("enter")
+        await pilot.pause()
+        picker = screen_text(app)
+        await pilot.press("left")  # 工作 → 收集箱（收集箱置顶）
+        await pilot.pause()
+        picked = screen_text(app)
+        await pilot.press("enter")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert "< 工作 >" in picker, f"挑选器没有停在当前清单上：\n{picker}"
+    assert "< 收集箱 >" in picked, f"左方向键没有换到收集箱：\n{picked}"
+    assert fake.moved == [("t1", "inbox")], f"没有搬进收集箱：{fake.moved}"
+    assert "收集箱" in field_row(after, "清单"), f"搬完那一格没变：\n{after}"
+
+
+async def test_escape_saves_the_picked_list_just_like_enter():
+    """``esc`` 在挑选浮层里也是**保存**：挑中的那个清单当场搬过去（#66 / ADR-0008 二）。
+
+    这一层没有文本框，``q`` 在表单里本来就不绑（#42 的决定，继承不重定），出口只有 ``Esc``
+    与 ``Ctrl+C``——``Esc`` 现在与 ``Enter`` 落到同一个确认上，交回的是挑中的那一档。写出去
+    的仍然是**搬运**（``moved``），不是一次普通字段更新（``writes``）。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "list")
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("right")  # 工作 → 生活
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert fake.moved == [("t1", "life")], "Esc 交回挑中的那一档，任务真的搬过去"
+    assert fake.writes == [], "搬运不是一次普通字段更新"
+    assert "搬到哪个清单" not in text, f"浮层没有关掉：\n{text}"
+    assert "生活" in field_row(text, "清单"), f"搬完那一格没跟着变：\n{text}"
+
+
+def picked_option(text: str) -> str:
+    """挑选器上现在写着哪一档（``< 中 >``）——选择框一行只画当前那一档。"""
+    match = re.search(r"< (.+?) >", text)
+    if match is None:
+        raise AssertionError(f"屏幕上没有挑选项：\n{text}")
+    return match.group(1)
+
+
+async def test_the_priority_field_offers_the_four_levels_and_writes_the_wire_code():
+    """优先级能在**无 / 低 / 中 / 高**之间改（验收标准 4）：屏幕上是四档用户语言，
+    写出去的是线上编码。
+
+    四档的名字是 spec 用户故事 73 那几个字（不是照抄实现里那张表）；``0/1/3/5`` 是线上编码，
+    **不进文案**——所以这里逐个走一遍，看到的只许是那四个汉字。
+    """
+    fake = backend()  # 优先级 5（高）
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "priority")
+        await pilot.press("enter")
+        await pilot.pause()
+        opened = picked_option(screen_text(app))
+        walked = []
+        for _ in range(3):
+            await pilot.press("left")
+            await pilot.pause()
+            walked.append(picked_option(screen_text(app)))
+        await pilot.press("right")  # 无 → 低（左右都能换档）
+        await pilot.pause()
+        back = picked_option(screen_text(app))
+        await pilot.press("enter")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert opened == "高", f"挑选器没有停在当前那一档上：{opened!r}"
+    assert walked == ["中", "低", "无"], f"四档不是按顺序排的：{walked}"
+    assert back == "低", "右方向键换不回去"
+    assert fake.writes == [("t1", {"priority": 1})], f"写出去的不是线上编码：{fake.writes}"
+    assert "低" in field_row(after, "优先级"), f"改完那一格没变：\n{after}"
+
+
+def tag_line(text: str, name: str) -> str:
+    """挑选器里 ``name`` 那个标签那一行（``☑`` / ``☐`` 那一列就是它）。"""
+    for line in text.splitlines():
+        if name in line and (theme.CHECK_ON in line or theme.CHECK_OFF in line):
+            return line
+    raise AssertionError(f"挑选器里没有「{name}」这个标签：\n{text}")
+
+
+def tag_marked(text: str, name: str) -> bool:
+    """挑选器里 ``name`` 那个标签现在打上了没有。"""
+    return theme.CHECK_ON in tag_line(text, name)
+
+
+def cursor_on(text: str, name: str) -> bool:
+    """挑选器里的光标现在停在 ``name`` 那个标签上（``❯`` 那一列）。"""
+    return theme.CURSOR_MARK in tag_line(text, name)
+
+
+async def test_the_tag_field_picks_from_existing_tags_and_says_new_ones_come_from_the_official_client():
+    """标签从**已有的**里多选打上（验收标准 5），并**如实告知**新建标签要回官方客户端（6）。
+
+    断三件事：打开这一格才去拉一次标签列表；``space`` 打上、``↑``/``↓`` 换一个、``Enter``
+    把挑中的那一份写出去；底部那行提示里写着「这个客户端不做新建标签」——**不是**「接口
+    做不到」（``POST /open/v1/tag`` 是文档里有的端点，那是范围决定，不是能力上限）。
+    """
+    fake = backend()  # 任务上已经打着 工作 / 季度
+    fake.set_tags("工作", "季度", "紧急")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "tags")
+        await pilot.press("enter")
+        await pilot.pause()
+        picker = screen_text(app)
+        await pilot.press("space")  # 取消「工作」
+        await pilot.press("down", "down")  # 工作 → 季度 → 紧急
+        await pilot.pause()
+        walked = screen_text(app)
+        await pilot.press("space")  # 打上「紧急」
+        await pilot.pause()
+        toggled = screen_text(app)
+        await pilot.press("enter")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert fake.tag_loads == 1, "打开挑标签那一格时才拉一次标签列表"
+    assert tag_marked(picker, "工作") and tag_marked(picker, "季度"), f"任务上已有的标签没打上：\n{picker}"
+    assert not tag_marked(picker, "紧急"), f"没打过的标签不该是打上的：\n{picker}"
+    assert tag_marked(walked, "季度") and not tag_marked(walked, "紧急"), f"↓ 没有换到下一个：\n{walked}"
+    assert tag_marked(toggled, "紧急"), f"space 没有把「紧急」打上：\n{toggled}"
+    assert fake.writes == [("t1", {"tags": ["季度", "紧急"]})], f"写出去的不是挑中的那一份：{fake.writes}"
+    assert "季度" in field_row(after, "标签") and "紧急" in field_row(after, "标签"), f"改完那一格没变：\n{after}"
+    for line in messages.TAGS_PICKER_HINT.splitlines():
+        assert line in picker, f"提示里少了这一句「{line}」：\n{picker}"
+    assert "这个客户端不做" in picker, f"文案说成了接口做不到：\n{picker}"
+
+
+async def test_a_tag_list_that_cannot_be_fetched_is_said_out_loud_and_local_tags_stay_pickable():
+    """拉不到标签列表时**说出来**，而且本地已经见过的标签照样挑得动（验收标准 5）。
+
+    悄悄换成空列表就是「你没有标签」，那是对用户说假话；而任务上已经打着的标签必须留在
+    可挑的那一份里，否则断网时「取消一个标签」无路可走。
+    """
+    fake = backend()
+    fake.tag_error = DidaError("连不上服务器")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "tags")
+        await pilot.press("enter")
+        await pilot.pause()
+        picker = screen_text(app)
+
+    assert messages.tags_load_failed_message(DidaError("连不上服务器")) in picker, (
+        f"没拉到标签列表没有说出来：\n{picker}"
+    )
+    assert "连不上服务器" in picker, f"没说清是哪一种失败：\n{picker}"
+    assert tag_marked(picker, "工作") and tag_marked(picker, "季度"), f"本地已有的标签挑不动：\n{picker}"
+
+
+async def test_every_pick_is_pushed_at_once_and_the_bottom_line_stays():
+    """三个字段都遵循「改完立刻推送 + 底部常驻状态」（验收标准 7）。
+
+    三笔各走各的端点，但收尾是同一件事：还在详细页上、推送**已经**发生过了（不是等离开
+    这一页才发），而底部那一行照旧常驻写着「已保存 / 待推送（N）」。
+    """
+    fake = backend()
+    fake.set_tags("工作", "季度", "紧急")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        pushes = []
+        for key in ("list", "priority", "tags"):
+            await walk_to(pilot, app, key)
+            before = fake.pushes
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("right" if key != "tags" else "space")
+            await pilot.press("enter")
+            await pilot.pause()
+            pushes.append(fake.pushes - before)
+        text = screen_text(app)
+
+    assert pushes == [1, 1, 1], f"有一次挑完没有立刻推：{pushes}"
+    assert messages.saved_message() in text, f"底部那一行不见了：\n{text}"
+    assert fake.moved and fake.writes, f"三笔没有各走各的路：{fake.moved} / {fake.writes}"
+
+
+async def test_a_long_tag_list_shows_a_window_and_says_how_many_are_hidden():
+    """标签多到一屏放不下时只画一段，并**说清还有几个没画**（不静默地藏）。
+
+    光标照样走得过去：看不见的那几个会被它带进窗口。藏起来的那几个如果不说，用户会以为
+    自己的标签只剩这几个了。
+    """
+    fake = backend()  # 任务上已经有 工作 / 季度 两个
+    staged = tuple(f"tag{i}" for i in range(10))
+    fake.set_tags(*staged)
+    total = len(staged) + 2
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "tags")
+        await pilot.press("enter")
+        await pilot.pause()
+        opened = screen_text(app)
+        # 一路往下走，直到光标落到一个**一开始没画出来**的标签上（窗口要跟着它走）。
+        for _ in range(total):
+            await pilot.press("down")
+            await pilot.pause()
+            if any(
+                "tag9" in line and theme.CURSOR_MARK in line
+                for line in screen_text(app).splitlines()
+            ):
+                break
+        walked = screen_text(app)
+
+    shown = [
+        line
+        for line in opened.splitlines()
+        if theme.CHECK_ON in line or theme.CHECK_OFF in line
+    ]
+    assert len(shown) == theme.PICKER_VISIBLE_ROWS, f"画出来的行数不是窗口大小：\n{opened}"
+    assert messages.hidden_choices_message(total - theme.PICKER_VISIBLE_ROWS) in opened, (
+        f"没说清还有几个没画出来：\n{opened}"
+    )
+    assert cursor_on(walked, "tag9"), f"光标走不到看不见的那几个上：\n{walked}"
+
+
+async def test_a_picker_with_no_tags_at_all_still_opens_and_says_where_to_make_one():
+    """一个标签都没有时这一格照样开，而且**正是最该说那句话的时候**（验收标准 6）。
+
+    「没有可选项」加上「新建标签要回官方客户端」两句缺一不可：只有前一句，用户会以为
+    这个客户端坏了。
+    """
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_task(TITLE, list_name="work", id="t1")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "tags")
+        await pilot.press("enter")
+        await pilot.pause()
+        picker = screen_text(app)
+
+    assert messages.NO_CHOICES_TEXT in picker, f"没说清这一格是空的：\n{picker}"
+    assert "这个客户端不做新建标签" in picker, f"没说清要去哪儿建：\n{picker}"
+
+
+async def test_escape_saves_the_tag_picker_while_the_multi_select_has_focus():
+    """``Esc`` 在多选那一格上也是**保存**，焦点在它身上时照样到得了（#66 / ADR-0008 二）。
+
+    这一层没有文本框，``q`` 在表单里本来就不绑（字母归输入框，继承不重定）——出口只有
+    ``Esc`` 与 ``Ctrl+C``。键必须绑在**浮层**上：浮层开着时 app 的绑定够不着（#47 实测）。
+    存下去的是**只动过的那一格**：这一笔里没有别的字段，任务上两个标签去掉了一个。
+    """
+    fake = backend()  # 任务上已经打着 工作 / 季度
+    fake.set_tags("工作", "季度")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "tags")
+        await pilot.press("enter")
+        await pilot.pause()
+        opened = screen_text(app)
+        focused = app.focused
+        await pilot.press("space")  # 光标停在第一档「工作」上，把它取消
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert focused is not None and focused.id == "field-tags", "焦点不在多选那一格上"
+    assert "Enter 或 Esc 保存" in opened, f"底部那行提示说的是新语义：\n{opened}"
+    assert fake.writes == [("t1", {"tags": ["季度"]})], (
+        f"Esc 交回打上的那几个标签，而且只写标签这一格：{fake.writes}"
+    )
+    assert "季度" in field_row(text, "标签"), f"回到字段列表，那一格跟着变了：\n{text}"
+
+
+async def test_ctrl_c_still_quits_from_the_multi_select():
+    """``Ctrl+C`` 在多选那一格上照旧是**退出**（#42 的决定，继承不重定）。
+
+    有待推送改动时先问一句，所以「屏幕上出现了那句确认」就是「它真的走到了 app 的退出」。
+    """
+    fake = backend()
+    fake.set_tags("工作", "季度")
+    fake.set_sync_state(pending_count=1)
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "tags")
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert "仍然退出" in text, f"多选那一格上 Ctrl+C 没有走到退出：\n{text}"
+
+
+async def test_the_picker_leaks_no_truecolour():
+    """挑选浮层里一个真彩色都不能有（ADR-0007 一）。
+
+    多选那一格是这一票**新挂的控件**：它漏真彩色时不会有任何别的测试变红（#43 的实测交接
+    写着这件事——那些 ``ansi_*`` 覆盖是绑在控件 id 上的，没有渲染级断言）。所以这一条真把
+    浮层挂起来、用一个真彩色控制台读一遍屏幕字节：``38;2;`` / ``48;2;`` 一个都不许有。
+    """
+    fake = backend()
+    fake.set_tags("工作", "季度", "紧急")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to(pilot, app, "tags")
+        await pilot.press("enter")
+        await pilot.pause()
+        emitted = screen_sgr(app)
+
+    assert "38;2;" not in emitted, f"多选那一格漏了真彩色前景：\n{emitted[:400]}"
+    assert "48;2;" not in emitted, f"多选那一格漏了真彩色背景：\n{emitted[:400]}"
+
+
+def test_the_multi_select_columns_use_unambiguous_width_glyphs():
+    """多选那一列的字形宽度钉死（#37 在任务行那一列立的规矩，照做不另发明）。
+
+    ``❯``（光标）与 ``☑``/``☐``（打上没有）都进**对齐的列**：rich 量 1 格而终端画 2 格的话，
+    整块在 CJK 字体下歪一格。三个判据一起断，缺一个都拦不住（``☰`` 是 rich 量 2 格、
+    ``·`` 是 rich 量 1 格但东亚歧义）。
+    """
+    for glyph in (theme.CURSOR_MARK, theme.CHECK_ON, theme.CHECK_OFF):
+        assert len(glyph) == 1, f"{glyph!r} 不是一个字形"
+        assert cell_len(glyph) == 1, f"{glyph!r} 在 rich 那里不是 1 格"
+        assert unicodedata.east_asian_width(glyph) not in "AWF", f"{glyph!r} 的东亚宽度含糊"
+
+
+def test_the_picker_copy_uses_no_ambiguous_width_glyphs():
+    """这一票新写的字里不许出现东亚**歧义**宽度的字形（#48 在帮助正文上立的同一条规矩）。
+
+    浮层是 ``width: auto``——宽度正由最宽那行算出来（#48 实测：抬头那四个 ``─`` 让框从
+    右边框上溢出去）。提示里那两个方向键因此写成「上下方向键」，不是 ``↑↓``。
+    """
+    texts = [
+        messages.TAGS_PICKER_HINT,
+        messages.NO_CHOICES_TEXT,
+        messages.hidden_choices_message(3),
+        messages.tags_load_failed_message("连不上服务器"),
+        LIST_PICKER_TITLE,
+        PRIORITY_PICKER_TITLE,
+        TAGS_PICKER_TITLE,
+    ]
+    offenders = [
+        (text, char)
+        for text in texts
+        for char in text
+        if unicodedata.east_asian_width(char) == "A"
+    ]
+    assert offenders == [], f"挑选浮层的字里出现了歧义宽度的字形：{offenders}"
+
+
+async def test_a_pick_that_changes_nothing_writes_nothing():
+    """挑回原来那一档 = **没改**：一笔都不写（与逐字段编辑那条规矩同一条）。
+
+    写一笔没发生的改动不是「多带了一笔」：它会进待推送队列（ADR-0002 的豁免代价），
+    离线时状态栏那个数会为一个空操作亮着——用户读到的是「我改了什么还没上去」。
+    """
+    fake = backend()
+    fake.set_tags("工作", "季度", "紧急")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        for key in ("list", "priority", "tags"):
+            await walk_to(pilot, app, key)
+            await pilot.press("enter")
+            await pilot.pause()
+            await pilot.press("enter")  # 什么都不挑，直接确认
+            await pilot.pause()
+
+    assert fake.moved == [], f"挑回原清单也搬了一次：{fake.moved}"
+    assert fake.writes == [], f"挑回原来那一档也写了一笔：{fake.writes}"
+    assert fake.pushes == 0, f"没改却推了一轮：{fake.pushes}"

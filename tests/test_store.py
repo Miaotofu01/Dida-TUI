@@ -7,6 +7,7 @@
 
 from __future__ import annotations
 
+import sqlite3
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -51,6 +52,58 @@ def test_lists_land_and_are_readable(store):
     assert store.list_records()[0].group_id == "g1"
 
 
+def test_list_rows_carry_the_project_kind_and_permission(store):
+    """``Project.kind`` 与 ``permission`` 要落库、读得出来（用户故事 23 / 24）。
+
+    清单索引页靠这两样标出「装不了任务的」（``NOTE``）与「改不动的」（``permission`` 不是
+    ``write``）那些行——v1 的库把这两个字段整个丢掉了（连列都没有）。
+    """
+    store.apply_refresh(
+        lists=[project(kind="NOTE", permission="read"), project(id="p2", name="生活")], tasks=[]
+    )
+
+    rows = {item.id: item for item in store.lists()}
+
+    assert (rows["p1"].kind, rows["p1"].permission) == ("NOTE", "read")
+    assert (rows["p2"].kind, rows["p2"].permission) == (None, None), "服务端没给就是不知道"
+    assert (store.list_records()[0].kind, store.list_records()[0].permission) == ("NOTE", "read")
+
+
+def test_an_older_cache_gets_the_new_list_columns(tmp_path):
+    """v1 时代的库没有这两列：开库时补上（``CREATE TABLE IF NOT EXISTS`` 不给已有的表加列）。
+
+    用户手上就是这样一个库，所以这条 ``ALTER TABLE`` 路径是必须存在的，不是锦上添花。
+    """
+    path = tmp_path / "dida.sqlite3"
+    with sqlite3.connect(path) as db:
+        db.execute(
+            "CREATE TABLE lists (id TEXT PRIMARY KEY, name TEXT NOT NULL, color TEXT,"
+            " sort_order INTEGER, group_id TEXT, is_inbox INTEGER NOT NULL DEFAULT 0)"
+        )
+
+    opened = Store(path)
+    try:
+        opened.apply_refresh(lists=[project(kind="NOTE", permission="read")])
+        row = opened.lists()[0]
+        assert (row.kind, row.permission) == ("NOTE", "read")
+    finally:
+        opened.close()
+
+
+def test_a_task_without_a_project_id_is_not_guessed_into_the_inbox(store):
+    """缺失的 ``projectId`` **不许**再被猜成字面量 ``inbox``（#33 明令去掉的那条）。
+
+    收集箱的真实 id 是每账户不同的一串，猜出来的字面量跟它一条都对不上——左栏徽标是 0、
+    清单名也对不上，而且不报错。所以这里读作「不知道在哪个清单」（空串），原文里也不凭空
+    多出一个 ``projectId`` 字段。
+    """
+    store.apply_refresh(tasks=[{"id": "t1", "title": "不知道在哪个清单", "status": 0}])
+
+    assert store.tasks()[0].list_id == ""
+    assert "projectId" not in (store.task_payload("t1") or {})
+
+
+
 def test_task_snapshot_keeps_server_fields_the_client_does_not_know(store):
     """未知字段留在快照里，回写时才能一并带回（spec 的静默失败陷阱之一）。"""
     store.apply_refresh(
@@ -70,6 +123,37 @@ def test_task_snapshot_keeps_server_fields_the_client_does_not_know(store):
     assert payload["title"] == "写周报"
     assert payload["focusSummaries"] == [{"n": 1}]
     assert payload["someFieldTheClientNeverHeardOf"] == {"nested": [1, 2]}
+
+
+def test_a_refresh_carries_desc_content_and_tags_onto_the_snapshot(store):
+    """服务端原文里的 ``desc`` / ``content`` / ``tags`` 落到快照的同名字段上。
+
+    深模块的那条路是：``TaskSnapshot``（缓存里的事实）→ ``TaskItem``（引擎算好的成品）→
+    右栏。这一条钉的是头一段——期望的**字段名**来自 ``api-contracts.md`` 的 ``Task`` 字段表。
+
+    它刻意不碰中文标签（「描述」「备注」各对应哪一个字段）：v1 把两者标反了，翻过来的地方
+    在详情页那一层（``GLOSSARY.md`` 说 描述=``content``、备注=``desc``；#43 已落地，见
+    ``tests/test_detail_page.py`` 那条描述/备注各画各的）。哪一边是哪一边与「服务端给的
+    东西有没有原样落进快照」是两件事，这一条只管后者。原本钉在
+    ``test_detail_description.py`` 里（#32 搬出来的）。
+    """
+    store.apply_refresh(
+        lists=[project(name="工作")],
+        tasks=[
+            task(
+                title="写周报",
+                desc="本周的三件事",
+                content="记得附上上周的对比数据",
+                tags=["工作", "季度"],
+            )
+        ],
+    )
+
+    snapshot = next(item for item in store.tasks() if item.id == "t1")
+
+    assert snapshot.desc == "本周的三件事"
+    assert snapshot.content == "记得附上上周的对比数据"
+    assert snapshot.tags == ("工作", "季度")
 
 
 def test_tasks_expose_the_view_source_snapshot(store):
