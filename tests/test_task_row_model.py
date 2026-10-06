@@ -256,6 +256,26 @@ def test_the_completed_section_sorts_by_the_normal_key_not_by_completion_time():
     assert [item.title for item in section.items] == ["乙", "甲"]
 
 
+def test_a_completed_task_without_a_due_date_sinks_below_one_that_has_a_due_date():
+    """没有截止时间的排在有截止时间的后面（工单 #64 验收标准 1 的那条链）。
+
+    无日期的「A 无日期」完成得更晚、优先级也更高——按完成时刻倒序或按优先级它都会排在最
+    前。正常排序键把「有没有日期」摆在优先级之前，所以它沉到「Z 有日期」后面。
+    """
+    section = completed_section(
+        [
+            completed_row("t1", "Z 有日期", completed_at=at(14, 10, 0), due=at(20, 9, 0)),
+            completed_row("t2", "A 无日期", completed_at=at(14, 15, 0), priority=5),
+        ],
+        [ListSnapshot(id="work", name="工作")],
+        now=T0,
+        day_end="24:00",
+        window_hours=168,
+    )
+
+    assert [item.title for item in section.items] == ["Z 有日期", "A 无日期"]
+
+
 # ------------------------------------------------------------------ 已完成流：按状态过滤
 
 
