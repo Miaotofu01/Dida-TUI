@@ -17,7 +17,7 @@ from dida.sync.engine import LIST_COLORS
 from dida.testing import FakeBackend, ManualClock
 from dida.tui import messages
 from dida.tui.app import DidaApp
-from dida.tui.overlays import FormField, FormOption, FormOverlay
+from dida.tui.overlays import FORM_HINT, FormField, FormOption, FormOverlay
 from dida.tui.pages.index import INBOX_MARK, LIST_MARK
 from support import screen_text
 
@@ -131,8 +131,13 @@ async def test_the_colour_can_be_picked_with_the_arrow_keys():
     assert fake.created_lists == [("book", LIST_COLORS[0].value)]
 
 
-async def test_escape_cancels_the_form_without_writing_anything():
-    """``esc`` 关掉表单：一个字节都不写（验收标准 5 的同一条口径）。"""
+async def test_escape_saves_the_form_just_like_enter():
+    """``esc`` 是**保存并退出**：交回填好的那一份，清单真的建出来（ADR-0008 二）。
+
+    这一条原来是 ``test_escape_cancels_the_form_without_writing_anything``（「Esc 取消，
+    一个字节都不写」）；ADR-0008 第二节把浮层的语义翻了过来——编辑态没有「取消」，文本框里
+    ``Enter`` 与 ``Esc`` 落到同一个确认上（``Input`` 的 ``submit`` 送的就是这个）。
+    """
     fake = backend()
     app = DidaApp(fake)
 
@@ -147,9 +152,9 @@ async def test_escape_cancels_the_form_without_writing_anything():
         await pilot.pause()
         after = screen_text(app)
 
-    assert fake.created_lists == [], "取消就是取消"
-    assert "shopping" not in after
-    assert "工作" in row_of(after, "工作"), "浮层关掉，回到下面那一层"
+    assert fake.created_lists == [("shopping", None)], "Esc 交回改好的值，不是取消"
+    assert LIST_MARK in row_of(after, "shopping"), "浮层关掉，新建的清单就在下面那一层上"
+    assert "工作" in row_of(after, "工作"), "回到清单列表页"
 
 
 async def test_a_list_without_a_name_is_not_created():
@@ -210,6 +215,63 @@ async def test_the_form_shell_takes_whatever_fields_the_row_needs():
     assert "清单范围" in rendered and "关键词" in rendered
     assert field_value(rendered, "清单范围") == "< 生活 >", "字段自带的当前值要显示出来"
     assert handed_back == [{"scope": "life", "keyword": "ab"}]
+
+
+async def test_the_form_shell_has_no_cancel_escape_hands_the_values_back():
+    """壳子这一层钉住新语义：``Esc`` 交回的是**那一份值**，不是 ``None``（ADR-0008 二）。
+
+    「编辑态没有取消」在接缝上就是这一句：不管按的是 ``Enter`` 还是 ``Esc``，浮层交给调用方
+    的都是一份 ``{字段名: 值}``。``None`` 这条路不存在之后，调用方那句「``None`` 就是取消」
+    永远收不到东西——想放弃刚打的字只能自己改回去（ADR-0008 记下了这个代价）。
+    """
+    app = DidaApp(backend())
+    handed_back: list[dict[str, str] | None] = []
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        app.push_screen(
+            FormOverlay(
+                title="视图条件",
+                fields=(
+                    FormField(
+                        name="scope",
+                        label="清单范围",
+                        options=(FormOption("work", "工作"), FormOption("life", "生活")),
+                        value="life",
+                    ),
+                    FormField(name="keyword", label="关键词"),
+                ),
+            ),
+            handed_back.append,
+        )
+        await pilot.pause()
+        await pilot.press("tab")
+        await pilot.press(*"ab")
+        await pilot.press("escape")
+        await pilot.pause()
+
+    assert handed_back == [{"scope": "life", "keyword": "ab"}], "Esc 交回那一份值，不是 None"
+
+
+async def test_the_form_hint_describes_the_new_keys():
+    """底部那行提示写的是新语义：``Esc`` 是保存，屏幕上没有「Esc 取消」这半句（ADR-0008 二）。
+
+    提示是这一层唯一的说明书（浮层模态，``?`` 的键位表不看编辑态），所以它必须与真按下去的
+    键一致——写着「取消」而按下去是保存，比没有提示更坏。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("n")
+        await pilot.pause()
+        await pilot.press("enter")  # 先答「清单还是视图」
+        await pilot.pause()
+        form = screen_text(app)
+
+    assert FORM_HINT in form, "底部那行提示就在表单里"
+    assert "Esc 保存" in form, "提示说的是保存"
+    assert "Esc 取消" not in form, "「取消」已经从这一屏上消失了"
 
 
 # ------------------------------------------------------------------ e：改名字与颜色
@@ -381,6 +443,9 @@ async def test_the_form_keeps_the_keyboard_while_it_is_open():
     所以这几条必须在**浮层真的挂着、输入框真的拿到焦点**时按（下面的 ``app.focused``
     断言就是把这件事钉住）。``q`` 必须是一个字母（清单可以叫 ``quizzes``），而 ``Input``
     的绑定里没有 ``escape``，所以 Esc 照样到达浮层。
+
+    ``Esc`` 从 #66 起是**保存并退出**（ADR-0008 二），所以最后那一下交出去的是刚打的 ``q``
+    ——「按 q 没退出、按 Esc 才走」两件事在这里一次断清。
     """
     fake = backend()
     app = DidaApp(fake)
@@ -403,7 +468,8 @@ async def test_the_form_keeps_the_keyboard_while_it_is_open():
     assert focused is not None and focused.id == "field-name", "输入框拿到焦点，才谈得上「谁吃键」"
     assert typed == "q", "q 打进名字那一格——没有变成退出"
     assert still_open, "``q`` 没有把 app 带走"
-    assert "工作" in row_of(back, "工作"), "Esc 是出口：回到清单列表页"
+    assert fake.created_lists == [("q", None)], "Esc 是出口，而且交出去的正是那一格里的 q"
+    assert "工作" in row_of(back, "工作"), "Esc 之后回到清单列表页"
 
 
 async def test_ctrl_c_still_quits_from_the_form_in_every_state():
@@ -448,7 +514,7 @@ async def test_ctrl_c_still_quits_from_the_form_in_every_state():
 
         await pilot.press("n")
         await pilot.pause()
-        await pilot.press("escape")  # 关掉表单
+        await pilot.press("escape")  # Esc 保存：名字还空着被挡下，浮层照旧关掉（#66）
         await pilot.pause()
         await move_cursor_to(pilot, app.index_page(), "work")
         await pilot.press("e")  # 3. 输入框里那整个名字是选中的

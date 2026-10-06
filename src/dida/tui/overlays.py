@@ -65,8 +65,12 @@ FORM_QUIT_BINDINGS = [
   「用户有没有选中文字」行事。表单里 Ctrl+C 因此**永远是退出**，代价是没有 Ctrl+C 复制。
 """
 
-FORM_HINT = "Tab 换一格 / 选择框用左右方向键 / Enter 确认 / Esc 取消 / Ctrl+C 退出"
+FORM_HINT = "Tab 换一格 / 选择框用左右方向键 / Enter 或 Esc 保存 / Ctrl+C 退出"
 """表单底部那行提示：写的都是终端一定传得上来的键（spec 的键位表）。
+
+**``Esc`` 与 ``Enter`` 是同一个结果**（保存），所以这一行不再有「取消」那半句——这正是
+#66 改的那件事（ADR-0008 二）。表单里想放弃刚打的字只能自己改回去；这一行提示不该写一个
+按下去不存在的出口。
 
 分隔符用 ASCII 的 ``/``、方向键写「左右方向键」而不是 ``←``/``→``：那两个字是东亚**歧义**
 宽度（rich 量 1 格、CJK 字体下终端可能画 2 格），浮层这一行没有对齐列，但同一条规矩在这里
@@ -351,7 +355,7 @@ class FormOverlay(ModalScreen[dict[str, str] | None]):
         # 退出键必须**绑在这一层**：浮层的键位解析截断在最后一个浮层控件上，app 的绑定在
         # 浮层开着时够不着（#47 实测）。表单只取其中不是字母的那些，理由见 FORM_QUIT_BINDINGS。
         *FORM_QUIT_BINDINGS,
-        Binding("escape", "cancel", "取消", show=False),
+        Binding("escape", "confirm", "保存", show=False),
         Binding("enter", "confirm", "确认"),
     ]
 
@@ -392,12 +396,8 @@ class FormOverlay(ModalScreen[dict[str, str] | None]):
         self.action_confirm()
 
     def action_confirm(self) -> None:
-        """``Enter``：交回填好的这一份。"""
+        """``Enter`` / ``Esc``：交回填好的这一份（**没有「取消」**，ADR-0008 二）。"""
         self.dismiss(self.values())
-
-    def action_cancel(self) -> None:
-        """``Esc``：取消，交回 ``None``（一个字节都不写）。"""
-        self.dismiss(None)
 
 QUIT_BINDINGS = [Binding(key, f"app.{QUIT_ACTION}", "退出", show=False) for key in QUIT_KEYS]
 """浮层上的退出键（工单 #47）——转发到 **app 上那一个** :meth:`~dida.tui.app.DidaApp.action_quit`。
