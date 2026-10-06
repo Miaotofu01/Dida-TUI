@@ -534,6 +534,35 @@ class DidaApp(App[None]):
             return
         self.refresh_view()
 
+    async def on_detail_page_due_changed(self, event: DetailPage.DueChanged) -> None:
+        """详细页上提交了截止时间：**改期 / 清除**立刻写出去（工单 #44）。
+
+        与 :meth:`on_detail_page_field_edited` 同一条路（乐观写 + 立刻推 + 刷新），只是这一笔
+        的形状是 ``{dueDate, isAllDay}``：走引擎的 ``reschedule``——它只动这两个字段，整份
+        底稿照旧回写（重复规则、时区、陌生字段一个不丢）。
+
+        ``event.due is None`` 是**清除**：写显式的 ``dueDate: null``，任务变回「没有日期」。
+        写失败与逐字段编辑那一侧同一套说法（用户故事 81）：本地没有底稿的拒绝用现成那句，
+        其余带上引擎/服务端说的具体原因。
+        """
+        try:
+            self.engine.reschedule(event.task_id, due=event.due, all_day=event.all_day)
+        except UnknownTaskError:
+            self.refresh_view()
+            if self.is_running:
+                self.detail_page().show_save(messages.UNKNOWN_TASK_MESSAGE)
+            return
+        except DidaError as exc:
+            self.refresh_view()
+            if not self.is_running:
+                return
+            self.detail_page().show_save(messages.field_save_failed_message(exc))
+            return
+        await self.engine.push_pending()
+        if not self.is_running:
+            return
+        self.refresh_view()
+
     async def on_detail_page_field_edited(self, event: DetailPage.FieldEdited) -> None:
         """详细页上改完一个字段：**立刻写出去**，并把结果留在那一页底部（工单 #43）。
 

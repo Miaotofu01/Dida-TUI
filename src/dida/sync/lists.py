@@ -9,6 +9,30 @@
   与它自己的队列表（``pending_list_changes``）。**硬塞进任务那套**的下场是把 ``list_id``
   写进 ``task_id`` 那一列——一个字段两个意思，读的人第一步就错。
 
+## 四条不变量（#54 之后）
+
+**这四条不是清单专属的形状**：任务的写路径上是同一个洞（#53 的「认领了但没把队列里的改动带走」，
+#39 的「排在一条还没成真的新建后面」），同一套不变量对它一样成立——差别只在第 3 条：任务的
+标题不是身份，按标题对回来太弱，所以任务那条路自愈（下一次全量刷新把真 id 那行写回来、
+把临时那行剪掉）。清单这边多一步按名字认领，是因为服务端建完清单**不回 id** 这条路真的会走到。
+
+`POST /open/v1/project` 的响应表里两种成功都写着（``200 → Project`` / ``201 → No Content``），
+所以「建好了、但服务端没回 id」不是边角情况。落在那个状态上的一行如果还照旧排队，之后每一次
+改名与删除都会打到一个**服务端从没见过的 id** 上——404、永远重试，而删掉的那条下一次刷新
+还会回来。所以四条一起成立才没有这个洞：
+
+1. **不可寻址的 id 不许发请求**：带着 :data:`LOCAL_LIST_PREFIX` 的 id 服务端没见过，改 / 删
+   打到它上面只会得到一个 404。:func:`is_addressable` 是这个判断唯一的地方。（新建是例外：
+   ``POST /open/v1/project`` 的 URL 里没有 id。）
+2. **一条还没成真的新建，拥有这一行唯一的队列记录**：后来的改名**并进**它（改名 = 改请求体里
+   的 ``name``），而不是在它后面排第二条改动——排上去也发不出去。
+3. **认领是单独一步**：新建成功却没拿到 id 时，那一条记录换成 :attr:`ListWriteKind.AWAIT_ID`
+   （一份**认领记录**，不是要发的请求体），下一次全量刷新拿服务端的清单集把它**按名字**对回来。
+   只在**唯一**的时候认：同名的新行只有一条、等着的记录也只有一条；分不清就一个都不动，等下一次。
+4. **删一条还没认领的清单不许把它丢掉**：服务端那行**已经存在**，只是我们不知道它的 id。本地
+   先把那一行摘掉，队列里留一笔「认领之后立刻删」——不留的话，刷新就会把「已经删掉的清单」
+   又写回来（#42 的验收标准 7）。
+
 ## 三个决定
 
 **新建用本地临时 id。** 服务端建好之后才给真 id，而「建完立刻出现在清单列表页」是
@@ -44,13 +68,15 @@ from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_chec
 
 from dida.api.errors import DidaError
 from dida.sync.push import backoff_delay
-from dida.sync.view import ViewSource
+from dida.sync.view import ListSnapshot, ViewSource
+from dida.sync.writes import LOCAL_LIST_PREFIX, is_local_list_id
 
 if TYPE_CHECKING:  # storage 反过来 import 本模块（与 dida.sync.writes 同一条规矩）
-    from dida.storage.store import PendingListChange
+    from dida.storage.store import PendingListChange, RefreshReport
 
 __all__ = [
     "LIST_COLORS",
+    "LOCAL_LIST_PREFIX",
     "ListColor",
     "ListLocalEffect",
     "ListWire",
@@ -58,7 +84,17 @@ __all__ = [
     "ListWriteTarget",
     "ProjectWriter",
     "UnknownListError",
+    "is_addressable",
+    "is_local_list_id",
 ]
+
+# ``LOCAL_LIST_PREFIX`` 与 ``is_local_list_id`` 是**转发**，不是定义（#39 / #54 的裁定：
+# 「这个 id 服务端见过没有」这条形状判断全仓库只许有一处）。定义处是 :mod:`dida.sync.writes`
+# ——那是叶模块，谁先 import 都行；反过来把定义留在**这一层**会成环：本模块一 import 就跑
+# ``from dida.sync.push import backoff_delay``，而 ``push`` 要
+# ``from dida.sync.writes import ...``（实测：四个入口全部
+# ``ImportError: cannot import name ... from partially initialized module``）。
+# 名字在这里转出来，是为了让 ``from dida.sync.lists import LOCAL_LIST_PREFIX`` 这一族读法照旧。
 
 
 class ListLocalEffect(Enum):
@@ -78,6 +114,9 @@ class ListWire(Enum):
     UPDATE_PROJECT = "update_project"
     DELETE_PROJECT = "delete_project"
 
+    NONE = "none"
+    """不发任何请求：这一种改动不是「要发出去的东西」，而是一份**记录**（见 ``AWAIT_ID``）。"""
+
 
 @dataclass(frozen=True)
 class ListBehaviour:
@@ -94,6 +133,18 @@ class ListWriteKind(Enum):
     UPDATE = "list_update"
     DELETE = "list_delete"
 
+    AWAIT_ID = "list_await_id"
+    """新建**成功了**，但服务端没回 id（``201 No Content``）：这一行还欠一个真 id（#54）。
+
+    这一种的 ``payload`` **不是**要发出去的请求体，而是一份**认领记录**：当时发出去的名字
+    （``sentName``）、当时那份颜色（``sentColor``）、以及建之前本地就认得的那些 id
+    （``knownIds``——按名字对的时候要把它们排除掉，不然「我本来就有一张同名清单」会被认成
+    刚建的那一条）。认领发生在下一次全量刷新（:meth:`ListMixin._identify_created_lists`）。
+
+    ``wire`` 是 :attr:`ListWire.NONE`：它从来不发请求，所以也**不算**进「待推送」那个数
+    （建都建好了，用户没有欠服务端什么；等他真改了名字，那一笔会换成普通的 ``UPDATE``）。
+    """
+
     @property
     def local(self) -> ListLocalEffect:
         """本地那一行怎么变（存储层读这个，不读成员名）。"""
@@ -109,6 +160,7 @@ _BEHAVIOUR: dict[ListWriteKind, ListBehaviour] = {
     ListWriteKind.CREATE: ListBehaviour(local=ListLocalEffect.SAVE, wire=ListWire.CREATE_PROJECT),
     ListWriteKind.UPDATE: ListBehaviour(local=ListLocalEffect.SAVE, wire=ListWire.UPDATE_PROJECT),
     ListWriteKind.DELETE: ListBehaviour(local=ListLocalEffect.DROP, wire=ListWire.DELETE_PROJECT),
+    ListWriteKind.AWAIT_ID: ListBehaviour(local=ListLocalEffect.SAVE, wire=ListWire.NONE),
 }
 """**一处**记全每种清单写的行为（与 :mod:`dida.sync.writes` 的 ``_BEHAVIOUR`` 同一条规矩）。"""
 
@@ -138,6 +190,25 @@ LIST_COLORS: tuple[ListColor, ...] = (
 所以这不是「照文档抄下来的一张表」。清单上已经有的颜色（手机端挑的）照原样显示、照原样
 回写，不会因为不在这一档里就被换掉。
 """
+
+
+def is_addressable(change: PendingListChange) -> bool:
+    """这一笔清单改动现在**发得出去**吗（#54）。
+
+    三类不发的：
+
+    - :attr:`ListWriteKind.AWAIT_ID` —— 它不是一笔要发的改动，是一份「还没认领」的记录；
+    - 改 / 删一个**本地临时 id** —— 服务端没有那个清单，打过去只会 404、然后永远重试；
+    - （新建不在此列：``POST /open/v1/project`` 的 URL 里没有 id，它照发。）
+
+    发不出去不等于丢掉：它留在队列里（状态栏那个数照旧算它），等认领拿到真 id 之后自然
+    变得可寻址。
+    """
+    if change.kind.wire is ListWire.NONE:
+        return False
+    if change.kind is ListWriteKind.CREATE:
+        return True
+    return not is_local_list_id(change.list_id)
 
 
 class UnknownListError(DidaError):
@@ -270,11 +341,44 @@ class ListMixin:
             changes["name"] = name
         if color is not None:
             changes["color"] = color
+        if is_local_list_id(list_id):
+            self._fold_into_unclaimed(target, list_id, current=current, changes=changes)
+            return
         target.enqueue_list(
             list_id=list_id,
             kind=ListWriteKind.UPDATE,
             payload=changes,
             now=self._clock.now(),
+            local={**current, **changes},
+        )
+        self._push_now()
+
+    def _fold_into_unclaimed(
+        self,
+        target: ListWriteTarget,
+        list_id: str,
+        *,
+        current: Mapping[str, Any],
+        changes: Mapping[str, Any],
+    ) -> None:
+        """把一次改名**并进**「这一行还没被服务端认领」的那条队列记录里（#54）。
+
+        临时 id 是不可寻址的（:func:`is_addressable`），所以排在它后面的第二条改动一辈子都
+        发不出去。并进去之后，这一行仍然只有一条队列记录：新建还没发出去时它照旧是那条新建
+        （发的就是改名之后的那一份）；已经建好、在等 id 时它换成一次普通的改名——那一笔
+        **算进**待推送，因为它确实是用户刚做、还没到服务端的改动。
+        """
+        pending = _unclaimed_change(target, list_id)
+        if pending is None:
+            raise UnknownListError(list_id)  # 不该发生：临时 id 的行一定有它那条记录
+        target.amend_list_change(
+            pending.id,
+            kind=(
+                ListWriteKind.CREATE
+                if pending.kind is ListWriteKind.CREATE
+                else ListWriteKind.UPDATE
+            ),
+            payload={**pending.payload, **changes},
             local={**current, **changes},
         )
         self._push_now()
@@ -286,8 +390,12 @@ class ListMixin:
         文档没写，所以本地一条都不动——猜「一起删了」或猜「搬去收集箱」都是编事实。
         """
         target = self._list_target()
-        if target.list_payload(list_id) is None:
+        current = target.list_payload(list_id)
+        if current is None:
             raise UnknownListError(list_id)
+        if is_local_list_id(list_id):
+            self._park_delete(target, list_id)
+            return
         target.enqueue_list(
             list_id=list_id,
             kind=ListWriteKind.DELETE,
@@ -295,6 +403,127 @@ class ListMixin:
             now=self._clock.now(),
         )
         self._push_now()
+
+    def _park_delete(self, target: ListWriteTarget, list_id: str) -> None:
+        """删一条**还没被认领**的清单（#54）：那一笔删除只能等 id 到手才发得出去。
+
+        服务端那行**已经存在**（新建成功了），我们只是不知道它的 id——所以既不能现在删
+        （没有 id 可删），也不能把这一笔丢掉（丢掉的话服务端那行还在，下一次刷新就把它写回来，
+        屏幕上就是「删掉的清单又回来了」）。本地先把那一行摘掉，队列里留一笔带着**认领记录**
+        的删除：认领之后它就是一笔普通的删除（:meth:`_identify_created_lists`）。
+
+        新建**还没发出去**时是另一格：那一条留着照发（它可能已经到过服务端、只是回执没回来），
+        删除排在它后面——认领（不管是 200 的直接认领还是 201 的按名字认领）会把两笔一起挪到
+        真 id 上。
+        """
+        pending = _unclaimed_change(target, list_id, include_delete=False)
+        record = _identify_record(target, pending)
+        if record.get("sentName") is None:
+            # 认不出这一行建出去时叫什么（队列记录不全，旧版本留下的状态）：用本地那一行现在
+            # 的名字兜底。认领是**唯一才认**，对不上就等下一次，不会认错。
+            record["sentName"] = (target.list_payload(list_id) or {}).get("name")
+        if pending is not None and pending.kind is not ListWriteKind.CREATE:
+            # 新建已经发出去了（在等 id；用户在等的时候还改过名也一样）：**这一条**记录改成
+            # 删除，本地那一行摘掉。一行只留一条记录——留两条同名的，认领那一步就分不清谁是谁，
+            # 于是永远不动。
+            target.amend_list_change(pending.id, kind=ListWriteKind.DELETE, payload=record)
+            target.drop_list(list_id)
+        else:
+            target.enqueue_list(
+                list_id=list_id,
+                kind=ListWriteKind.DELETE,
+                payload=record,
+                now=self._clock.now(),
+            )
+        self._push_now()
+
+    async def refresh(self) -> RefreshReport:
+        """全量刷新，然后**认领**（#54）。
+
+        认领排在刷新**之后**不是随手定的：那一次刷新刚把服务端的清单集写进本地库，认领要的
+        正是「服务端现在有哪些行」这件事实——所以它一个网络请求都不用多发。两次之间没有渲染，
+        所以「服务端那行刚被写进来、又被认领摘掉」这件事用户看不见（被删掉的那条清单因此
+        不会在屏幕上闪一下）。
+        """
+        report = await super().refresh()  # type: ignore[misc]
+        self._identify_created_lists()
+        return report
+
+    def _identify_created_lists(self) -> int:
+        """把「建好了、但服务端没回 id」的清单认回来（#54），返回认了几条。
+
+        钥匙是**当时发出去的名字**（``sentName``）：服务端那一行现在就叫这个名字。认定的规矩
+        只有一条——**唯一才认**：
+
+        - 服务端那边同名的新行只有一条；
+        - 等着的记录也只有一条（两条同名的记录说明本地建过两条同名的，分不清谁是谁）；
+        - 「新」= 不在 ``knownIds`` 里。本来就有一张同名清单的用户，不能因为名字一样就把
+          自己那张老清单认成刚建的这一条。
+
+        分不清就一条都不动、等下一次全量刷新（宁可不动，也不许认错）。
+        """
+        target = self._source
+        if not isinstance(target, ListWriteTarget):
+            return 0
+        parked = [item for item in target.pending_lists() if not is_addressable(item)]
+        if not parked:
+            return 0
+        rows = tuple(target.lists())
+        identified = 0
+        for change in sorted(parked, key=lambda item: item.id):
+            name = change.payload.get("sentName") or _name_of(rows, change.list_id)
+            if not name:
+                continue
+            known = set(change.payload.get("knownIds") or ())
+            candidates = [
+                row
+                for row in rows
+                if row.name == name and row.id not in known and not is_local_list_id(row.id)
+            ]
+            waiting = [
+                item
+                for item in parked
+                if (item.payload.get("sentName") or _name_of(rows, item.list_id)) == name
+            ]
+            if len(candidates) != 1 or len(waiting) != 1:
+                continue
+            identified += self._identify(target, change, candidates[0])
+        return identified
+
+    @staticmethod
+    def _identify(
+        target: ListWriteTarget, change: PendingListChange, row: ListSnapshot
+    ) -> int:
+        """认一条：把这一行的队列记录挪到服务端那个 id 上，并按它的意思办（#54）。"""
+        if change.kind is ListWriteKind.DELETE:
+            # 服务端那行还在（我们正是靠它认出的 id），而用户已经把它删了：认领要顺手把
+            # 刷新刚写进来的那一行**摘掉**，否则屏幕上就是「删掉的清单又回来了」。
+            # 删除本身留着，认领之后它就是一笔普通的删除，下一次推送去删。
+            target.identify_list(local_id=change.list_id, real_id=row.id, remove=True)
+            return 1
+        if change.kind is ListWriteKind.AWAIT_ID:
+            # 建出去的那一份就是用户要的：真 id 那一行刷新已经写进来了，这里只要合上。
+            target.identify_list(local_id=change.list_id, real_id=row.id)
+            target.resolve_list(change.id)
+            return 1
+        # 改名并进来的那一笔：本地先显示用户要的那一份（不然屏幕上会闪一下服务端的旧名字），
+        # 记录留着——认领之后它是一笔普通的改名，下一次推送去改。
+        desired = {
+            key: value
+            for key, value in change.payload.items()
+            if key in ("name", "color") and value is not None
+        }
+        server = target.list_payload(row.id) or {}
+        target.identify_list(
+            local_id=change.list_id,
+            real_id=row.id,
+            row={**server, **desired, "id": row.id},
+        )
+        if all(server.get(key) == value for key, value in desired.items()):
+            # 服务端那一份就是用户要的那一份（比如改了一圈又改回原名）：这一笔没有什么要发的，
+            # 认领之后直接出队——少发一个什么都不改的请求。
+            target.resolve_list(change.id)
+        return 1
 
     async def push_pending(self) -> int:
         """推一轮：**先清单那几种，再交给任务那一份**（两边共用引擎那一把推送锁）。
@@ -315,7 +544,8 @@ class ListMixin:
         **每一笔都重新取一次队列**（不是先取一份快照再遍历）：新建推成功会把这一条清单排在
         后面的改动挪到服务端给的 id 上（``Store.adopt_created_list``），同一轮里紧接着的那
         一笔必须看见新的 id。循环一定会停：每一轮要么删掉一行、要么把它的 ``next_retry_at``
-        推到将来（于是它不再是「到期的第一笔」）。
+        推到将来、要么让它变成**不可寻址**（新建回了 201 空 body，那一笔成了认领记录）——
+        三种结果都让它不再是「到期的第一笔」。
         """
         target = self._list_target()
         writer = self._list_writer()
@@ -327,14 +557,17 @@ class ListMixin:
                     (
                         item
                         for item in target.pending_lists()
-                        if item.next_retry_at is None or item.next_retry_at <= now
+                        # 发不出去的（认领记录、打在临时 id 上的改 / 删）不挑：挑了就只会
+                        # 得到 404，或者干脆什么都不该做——它们等认领，不在这里等重试。
+                        if is_addressable(item)
+                        and (item.next_retry_at is None or item.next_retry_at <= now)
                     ),
                     None,
                 )
                 if change is None:
                     return pushed
                 try:
-                    await self._send_list(writer, target, change)
+                    resolved = await self._send_list(writer, target, change)
                 except DidaError as exc:
                     target.record_list_attempt(
                         change.id,
@@ -342,17 +575,28 @@ class ListMixin:
                         next_retry_at=now + backoff_delay(change.attempts),
                     )
                     continue
-                target.resolve_list(change.id)
+                if resolved:
+                    target.resolve_list(change.id)
+                # 请求确实发出去了就算推过：新建回了 201 空 body 也算——服务端已经收下了，
+                # 只是没告诉我们它给那一行起了什么 id。
                 pushed += 1
 
     async def _send_list(
         self, writer: ProjectWriter, target: ListWriteTarget, change: PendingListChange
-    ) -> None:
-        """把一条待推送的清单改动交给客户端。失败是结构化错误，照旧往外抛（由调用方退避）。"""
+    ) -> bool:
+        """把一条待推送的清单改动交给客户端；返回值 = 这一条**可以出队了**吗。
+
+        失败照旧是结构化错误，往外抛（由调用方退避）。新建成功但服务端没回 id 时返回
+        ``False``：那一笔已经发出去了，但这一行还欠一个真 id，记录得留着（#54）。
+        """
         wire = change.kind.wire
         if wire is ListWire.CREATE_PROJECT:
             # 新建才知道服务端给的 id，所以这一条推成功之后要顺手认领它。
-            self._adopt_created_list(target, change, await writer.create_project(change.payload))
+            created = await writer.create_project(change.payload)
+            if not isinstance(created, Mapping) or not created.get("id"):
+                self._park_created(target, change)
+                return False
+            self._adopt_created_list(target, change, created)
         elif wire is ListWire.UPDATE_PROJECT:
             await writer.update_project(
                 change.list_id,
@@ -369,6 +613,40 @@ class ListMixin:
                 target.save_list({**local, **change.payload})
         else:
             await writer.delete_project(change.list_id)
+        return True
+
+    def _park_created(self, target: ListWriteTarget, change: PendingListChange) -> None:
+        """新建成功了、但服务端没回 id（``201 No Content``，文档允许的两种成功之一，#54）。
+
+        这一行**还欠一个真 id**，所以那一条记录留在这里、换成 :attr:`ListWriteKind.AWAIT_ID`
+        ——一份认领记录（当时发出去的名字 + 建之前本地认得的那些 id），下一次全量刷新拿服务端的
+        清单集把它对回来。
+
+        **不能**把这一笔当成成功出队：出队之后这一行就停在临时 id 上，之后每一次改名与删除都会
+        打到一个服务端没见过的 id 上、永远推不出去。
+        """
+        record: dict[str, Any] = {
+            "sentName": change.payload.get("name"),
+            "sentColor": change.payload.get("color"),
+            "knownIds": _known_list_ids(target),
+        }
+        superseded = next(
+            (
+                item
+                for item in target.pending_lists()
+                if item.list_id == change.list_id
+                and item.kind is ListWriteKind.DELETE
+                and not is_addressable(item)
+            ),
+            None,
+        )
+        if superseded is not None:
+            # 这一行建好之后用户已经删了它：那一条删除接替这一条记录。留两条同名记录的话，
+            # 认领那一步会以为「同名的有两条、分不清」而一直不动。
+            target.amend_list_change(superseded.id, payload={**record, **superseded.payload})
+            target.resolve_list(change.id)
+            return
+        target.amend_list_change(change.id, kind=ListWriteKind.AWAIT_ID, payload=record)
 
     def _adopt_created_list(
         self, target: ListWriteTarget, change: PendingListChange, created: Any
@@ -385,7 +663,15 @@ class ListMixin:
         """
         if not isinstance(created, Mapping) or not created.get("id"):
             return
-        local = target.list_payload(change.list_id) or {}
+        local = target.list_payload(change.list_id)
+        if local is None:
+            # 这一行在新建出去的过程中被删掉了（用户删了它，那一笔删除排在新建后面）：认领
+            # 只做「把队列挪到真 id 上」，**不把那一行写回来**——写回来就是「删掉的清单又出现
+            # 了」。删除随后自己去删服务端那一行。
+            target.identify_list(
+                local_id=change.list_id, real_id=str(created["id"]), remove=True
+            )
+            return
         target.adopt_created_list(
             change.list_id,
             {**local, **created, "id": str(created["id"])},
@@ -405,6 +691,59 @@ class ListMixin:
         if not isinstance(self._client, ProjectWriter):
             raise RuntimeError("清单的写路径需要 API 客户端：SyncEngine(client=DidaApiClient(...))")
         return self._client
+
+
+def _unclaimed_change(
+    target: ListWriteTarget, list_id: str, *, include_delete: bool = True
+) -> PendingListChange | None:
+    """这一行那条队列记录（#54）：临时 id 的行**只该有一条**。
+
+    ``include_delete=False`` 是给「改名」用的：一行上同时排着新建与删除时（见
+    :meth:`ListMixin._park_delete`），改名要并进那一条新建，不是并进删除。
+    """
+    return next(
+        (
+            item
+            for item in target.pending_lists()
+            if item.list_id == list_id
+            and (include_delete or item.kind is not ListWriteKind.DELETE)
+        ),
+        None,
+    )
+
+
+def _identify_record(
+    target: ListWriteTarget, pending: PendingListChange | None
+) -> dict[str, Any]:
+    """一份认领记录：这一行建出去时叫什么（``sentName``）、建之前本地认得哪些 id（``knownIds``）。
+
+    ``sentName`` 是对上服务端那一行的钥匙；``knownIds`` 是排除项——本来就有一张同名清单的
+    用户，不能因为名字一样就被认成刚建的那一条。一条记录都没有时只剩排除项（靠本地那一行的
+    名字兜底），那是给「队列是旧版本留下的」那类状态用的。
+    """
+    if pending is None:
+        return {"knownIds": _known_list_ids(target)}
+    if "sentName" in pending.payload:
+        # 新建已经发出去了（在等 id）：钥匙是**当时发出去**的那个名字，不是用户后来改成的名字
+        # ——服务端那一行现在叫的还是前者。
+        return {
+            "sentName": pending.payload.get("sentName"),
+            "knownIds": list(pending.payload.get("knownIds") or ()),
+        }
+    return {
+        "sentName": pending.payload.get("name"),
+        "knownIds": _known_list_ids(target),
+    }
+
+
+def _known_list_ids(target: ListWriteTarget) -> list[str]:
+    """本地已经认得的清单 id（不含本地临时那些）：建之前就有的，认领时要排除掉。"""
+    return sorted(row.id for row in target.lists() if not is_local_list_id(row.id))
+
+
+def _name_of(rows: Sequence[ListSnapshot], list_id: str) -> str:
+    """本地那一行现在叫什么（认领记录里没有名字时的兜底；那一行已经没了就是空串）。"""
+    return next((row.name for row in rows if row.id == list_id), "")
 
 
 def _request_body(*, name: str | None, color: str | None) -> dict[str, Any]:

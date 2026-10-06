@@ -332,8 +332,12 @@ class Engine(Protocol):
         """写：删除一条任务（服务端没有撤销，t16）。"""
         ...
 
-    def reschedule(self, task_id: str, *, due: datetime, all_day: bool) -> None:
-        """写：改期（``e``）——把截止时间换成 ``due``，只动 ``dueDate`` 与 ``isAllDay``。"""
+    def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> None:
+        """写：改期——把截止时间换成 ``due``，只动 ``dueDate`` 与 ``isAllDay``。
+
+        ``due=None`` 是**清除**（详细页 #44 的「把任务变回没有日期」）：写显式的
+        ``dueDate: null``，让服务端知道这一格空了，而不是「别动它」。
+        """
         ...
 
     def create(

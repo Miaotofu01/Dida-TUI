@@ -359,29 +359,29 @@ async def test_deleting_a_list_does_not_delete_its_tasks_from_the_local_cache(st
     assert "买牛奶" in [item.title for item in engine.tasks_in("all").items], "「所有」里仍然看得见它"
 
 
-async def test_a_list_created_offline_and_then_renamed_still_gets_both_changes_out(store):
-    """断网时「先建、再改名」：两笔都要推得出去，第二笔打的必须是**服务端给的 id**。
+async def test_a_list_created_offline_and_then_renamed_goes_out_as_one_change(store):
+    """断网时「先建、再改名」：改名**并进**那条还没出去的新建，最后发出去的是一笔。
 
-    本地新建用的是一个临时 id（服务端建好之后才给真 id）。第二笔改名如果一直打在临时 id
-    上，服务端上没有那个清单——它**永远**推不出去，状态栏那个数一直非零，用户读到的是
-    「等一下就好」。所以认领真 id 的时候，这条清单后面排着的改动跟着一起挪。
+    #42 时这里是两笔（新建 + 改名），而第二笔永远到不了服务端——新建还没成真，它没有 id
+    （#54 的洞）。并进去之后只有一笔，发出去的就是改名之后的那一份。
     """
     clock = ManualClock(T0)
-    transport = FakeTransport(json={"id": "p1", "name": "购物"})
+    transport = FakeTransport(json={"id": "p1", "name": "买买买"})
     engine = make_engine(store, transport, clock=clock)
 
     transport.enqueue(httpx.ConnectError("断网了"))
     local_id = engine.create_list("购物")
     await engine.wait_for_pushes()
-    transport.enqueue(httpx.ConnectError("还没好"))
+
     engine.update_list(local_id, name="买买买")
     await engine.wait_for_pushes()
-    assert engine.status().pending_count == 2, "两笔都还没出去"
+    assert engine.status().pending_count == 1, "一条改动，不是两条"
 
     clock.advance(timedelta(seconds=30))
     await engine.push_pending()
 
-    assert engine.status().pending_count == 0, "两笔都要出去"
-    assert str(transport.requests[-1].url).endswith("/open/v1/project/p1"), "改名打的是服务端的 id"
+    assert engine.status().pending_count == 0
+    assert transport.last_request.method == "POST"
+    assert str(transport.last_request.url).endswith("/open/v1/project"), "新建不带 id"
     assert transport.last_json == {"name": "买买买"}
-    assert names_of(engine) == ["收集箱", "买买买"], "本地那一行与刚发出去的一致（不是服务端那句旧名字）"
+    assert names_of(engine) == ["收集箱", "买买买"], "本地那一行与服务端刚收下的那份一致"

@@ -51,7 +51,12 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from dida.sync.lists import ListLocalEffect, ListWriteKind
+from dida.sync.lists import (
+    LOCAL_LIST_PREFIX,
+    ListLocalEffect,
+    ListWriteKind,
+    is_local_list_id,
+)
 from dida.sync.view import INBOX_ID, ListSnapshot, SyncState, TaskSnapshot
 from dida.sync.writes import LOCAL_LIST_PREFIX, LOCAL_TASK_PREFIX, LocalEffect, WriteKind
 
@@ -493,12 +498,18 @@ class Store:
 
         **两张表一起数**（#42）：清单的建 / 改 / 删与任务的改动一样是「本地比服务端新」，
         分开数的话删掉一个清单之后状态栏还是 0——用户读到的是「发出去了」。
+
+        **认领记录不算**（#54）：``AWAIT_ID`` 那一种不是一笔要发出去的改动，它只是「这一行
+        还欠一个真 id」。建完就回 ``201`` 空 body 的那条路若把它算进去，用户会看到状态栏挂着
+        一个永远不动的「待推送 1」——而那条清单其实早就建好了。等用户真改了名字，那一笔会
+        换成普通的 ``UPDATE``，照旧算数。
         """
         row = self._db.execute(
             """
             SELECT (SELECT COUNT(*) FROM pending_changes)
-                 + (SELECT COUNT(*) FROM pending_list_changes) AS n
-            """
+                 + (SELECT COUNT(*) FROM pending_list_changes WHERE kind <> ?) AS n
+            """,
+            (ListWriteKind.AWAIT_ID.value,),
         ).fetchone()
         return int(row["n"])
 
@@ -556,6 +567,9 @@ class Store:
 
     def new_local_list_id(self) -> str:
         """一个还没被占用的本地临时清单 id（新建清单时先占位）。
+
+        前缀本身的意思（「服务端没见过这个 id」）在 :mod:`dida.sync.lists`——写路径靠它决定
+        一笔改动发不发得出去，所以它是词汇，不是存储层的实现细节。
 
         服务端建好之后才给真 id，而「建完立刻出现在清单列表页」是 ADR-0002 的手感要求。
         取最小的空号而不是计数器：上一次没推成功的那一行还占着它的号，重开也不会撞上它
@@ -632,6 +646,71 @@ class Store:
                     "UPDATE pending_list_changes SET list_id = ? WHERE list_id = ?",
                     (target, local_id),
                 )
+
+    def amend_list_change(
+        self,
+        change_id: int,
+        *,
+        kind: ListWriteKind | None = None,
+        payload: Mapping[str, Any] | None = None,
+        list_id: str | None = None,
+        local: Mapping[str, Any] | None = None,
+    ) -> None:
+        """改写一条还没推成功的清单改动（#54）。
+
+        为什么需要它：一条**还没被服务端认领**的清单只许有**一条**队列记录。后来的改名并进
+        这一条（而不是在它后面再排一条——那条只会打到一个服务端没见过的 id 上）；认领的那一刻
+        也要改这一条（换成一次普通的改名，或者干脆认领记录出队）。
+
+        ``local`` 给出来就顺手把本地那一行写成它：与入队时「本地生效与入队同一个事务」同一条
+        规矩——并进去的改名，屏幕上那一行与队列里那一份必须是同一个意思。
+        """
+        with self._db:
+            if kind is not None:
+                self._db.execute(
+                    "UPDATE pending_list_changes SET kind = ? WHERE id = ?",
+                    (kind.value, change_id),
+                )
+            if payload is not None:
+                self._db.execute(
+                    "UPDATE pending_list_changes SET payload = ? WHERE id = ?",
+                    (_dumps(payload), change_id),
+                )
+            if list_id is not None:
+                self._db.execute(
+                    "UPDATE pending_list_changes SET list_id = ? WHERE id = ?",
+                    (list_id, change_id),
+                )
+            if local is not None:
+                self._write_list(dict(local))
+
+    def identify_list(
+        self,
+        *,
+        local_id: str,
+        real_id: str,
+        row: Mapping[str, Any] | None = None,
+        remove: bool = False,
+    ) -> None:
+        """认领一条「服务端已经建好、但没回 id」的清单（#54）：一个事务里做完三件事。
+
+        1. 队列里指向 ``local_id`` 的改动**全部挪到 ``real_id``** 上——认领之后它们才是可
+           寻址的（改 / 删要打一个服务端认得的 id）；
+        2. 本地那行临时 id 删掉（真 id 那一行刚刚由刷新写进来了）；
+        3. ``row`` 给出来就把它写成真 id 那一行（改名并进去过的那一份：用户要的名字 / 颜色）。
+           ``remove=True`` 是另一头——用户已经删了这一条清单，而刷新刚把服务端那行写进来，
+           这里要把它**摘掉**，否则屏幕上就是「删掉的清单又回来了」。
+        """
+        with self._db:
+            if remove:
+                self._db.execute("DELETE FROM lists WHERE id = ?", (real_id,))
+            elif row is not None:
+                self._write_list(dict(row))
+            self._db.execute("DELETE FROM lists WHERE id = ?", (local_id,))
+            self._db.execute(
+                "UPDATE pending_list_changes SET list_id = ? WHERE list_id = ?",
+                (real_id, local_id),
+            )
 
     def pending_lists(self) -> tuple[PendingListChange, ...]:
         """还没推成功的清单改动，按发生顺序（与 :meth:`pending` 同一条口径）。"""
@@ -788,7 +867,7 @@ class Store:
             for row in rows
             if str(row["id"]) not in remote_ids
             and not row["is_inbox"]
-            and not self._has_pending_list_change(str(row["id"]))
+            and not self._has_dirty_list_change(str(row["id"]))
         ]
         for list_id in gone:
             self._db.execute("DELETE FROM lists WHERE id = ?", (list_id,))
@@ -824,6 +903,19 @@ class Store:
         """这条任务上还有没有没推成功的改动（不关心是哪种）。"""
         row = self._db.execute(
             "SELECT 1 FROM pending_changes WHERE task_id = ? LIMIT 1", (task_id,)
+        ).fetchone()
+        return row is not None
+
+    def _has_dirty_list_change(self, list_id: str) -> bool:
+        """这条清单上有没有**一笔还没到服务端的改动**（认领记录不算，#54）。
+
+        剪枝读的是这一条：一条 ``AWAIT_ID``（建好了、在等真 id）的本地行如果在服务端的索引里
+        找不到，说明那条清单**本来就不存在了**（在别处被删了），本地这行是个影子——剪掉它才对。
+        而真正的改动（建 / 改 / 删还没出去）必须留着，否则剪掉的是用户刚做的那一下。
+        """
+        row = self._db.execute(
+            "SELECT 1 FROM pending_list_changes WHERE list_id = ? AND kind <> ? LIMIT 1",
+            (list_id, ListWriteKind.AWAIT_ID.value),
         ).fetchone()
         return row is not None
 
