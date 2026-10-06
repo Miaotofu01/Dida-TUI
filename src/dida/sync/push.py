@@ -25,10 +25,12 @@ from dida.sync.writes import (
     UnknownTaskError,
     WireCall,
     WriteKind,
+    is_a_move,
     is_addressable,
     is_addressable_task,
     is_local_list_id,
     is_local_task_id,
+    project_in,
 )
 
 if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能在这里 import
@@ -64,18 +66,6 @@ def _is_due(change: PendingChange, now: datetime) -> bool:
     「到点」是 ``<=``：注入的钟刚好走到 ``next_retry_at`` 时就算到期。
     """
     return change.next_retry_at is None or change.next_retry_at <= now
-
-
-def _project_in(payload: object) -> str | None:
-    """这一笔改动点名的**目标**清单（``{"projectId": …}``），没提就是 ``None``。
-
-    只有搬运会在 payload 里带 ``projectId``，而它要说清搬**到哪去**——那边同样可能是一条
-    还没推出去的清单。形状认不出来就当「没提」（与读路径对脏数据的口径一致，不猜）。
-    """
-    if not isinstance(payload, Mapping):
-        return None
-    named = payload.get("projectId")
-    return None if named is None else str(named)
 
 
 def _unaddressable(
@@ -217,7 +207,7 @@ class PushMixin:
         if snapshot is None or not snapshot.get("projectId"):
             raise UnknownTaskError(task_id)
         project = str(snapshot["projectId"])
-        target_project = _project_in(changes)
+        target_project = project_in(changes)
         if not is_addressable_task(
             task_id, kind, project_id=project, target_project_id=target_project
         ):
@@ -279,7 +269,10 @@ class PushMixin:
         推送排在事件循环上立刻跑，推不动就留在队列里退避重试——与其余几条写同一条口径。
 
         ``to_list_id`` 与当前清单相同时**什么都不写**：那不是一次改动，凭空入队只会让状态栏
-        多出一个永远没有意义的数。本地没有这条任务的底稿时与 :meth:`write` 一样当场抛
+        多出一个永远没有意义的数。这条判断的**本体在** :func:`~dida.sync.writes.is_a_move`
+        （「目标为空」与「就是它现在待的那个清单」两种都算没改）——界面那一侧问的是同一个
+        函数（工单 #58 的 T6：它以前在这里与 ``app._apply_pick`` 各写了一遍同一个比较）。
+        本地没有这条任务的底稿时与 :meth:`write` 一样当场抛
         :class:`~dida.sync.writes.UnknownTaskError`——``fromProjectId`` 只存在于那份底稿里，
         拼不出请求的改动永远推不出去（工单 #25）。
 
@@ -291,7 +284,7 @@ class PushMixin:
         current = "" if payload is None else str(payload.get("projectId") or "")
         if not current:
             raise UnknownTaskError(task_id)
-        if current == to_list_id or not to_list_id:
+        if not is_a_move(current, to_list_id):
             return
         self.write(task_id, changes={"projectId": to_list_id}, kind=WriteKind.MOVE)
 
@@ -388,7 +381,7 @@ class PushMixin:
             raise _unaddressable(
                 change.task_id,
                 project=change.list_id,
-                target_project=_project_in(change.payload),
+                target_project=project_in(change.payload),
             )
         if wire is WireCall.UPDATE_TASK:
             await writer.update_task(

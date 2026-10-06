@@ -49,6 +49,7 @@ from dida.sync.engine import (
     UnknownTaskError,
     ViewDefinition,
     ViewFormProblem,
+    is_a_move,
     parse_view_form,
 )
 from dida.tui import messages, theme
@@ -696,7 +697,8 @@ class DidaApp(App[None]):
         """``enter`` 落在挑选型字段上：把选项凑齐，开那张**共用的**表单浮层（工单 #45）。
 
         三格的选项各有各的来源，都在引擎那一侧：清单是 ``move_targets()``（真实清单、
-        进得去、服务端已经见过的那些），优先级是 ``messages.PRIORITY_NAMES`` 那张表，
+        进得去、服务端已经见过的那些），优先级是 ``PRIORITY_NAMES`` 那张表（它经引擎的
+        公开面转出：``messages.PRIORITY_NAMES``，本体的家在 ``dida.sync.view``，工单 #58），
         标签是 ``tags()``。标签那一份还要**拉一次**（``load_tags``，``GET /open/v1/tag``）
         ——那是这一格里唯一一次网络调用，所以拉不到时照旧开浮层（本地已知的那些照样挑得动），
         只把「没拉到」写在浮层的提示里（浮层是模态的，状态栏在它底下，看不见）。
@@ -764,13 +766,21 @@ class DidaApp(App[None]):
     def _apply_pick(self, task_id: str, field: str, values: dict[str, str]) -> bool:
         """挑完的那一份怎么变成一次写（三条路各自的形状只在这一个地方）。
 
-        **挑回原来那一档 = 没改**（与逐字段编辑那条规矩同一条）：一笔都不写。写一笔没发生的
-        改动会进待推送队列，离线时状态栏那个数就为一个空操作亮着。清单那一路的「同一个清单」
-        由引擎自己挡（``move_task``），这里挡的是优先级与标签。
+        **挑回原来那一档 = 没改**（与逐字段编辑那条规矩同一条）：一笔都不写，也**不排推送**。
+        写一笔没发生的改动会进待推送队列，离线时状态栏那个数就为一个空操作亮着。
+
+        清单那一路的「同一个清单」**由引擎自己挡**（``move_task`` 里问
+        :func:`dida.sync.writes.is_a_move`）——下面这一行问的是**同一个函数**，不是又写一遍
+        那个比较：判据只有一份，两个时刻各问一次（与 ``is_addressable_task`` 同一个形状）。
+        这里非问不可，是因为 ``move_task`` 回不了话（它的签名是 ``-> None``），不问就会为一次
+        根本没发生的改动推一轮（``tests/test_picker_fields.py`` 钉着那句 ``pushes == 0``）；
+        工单 #58 的 T6 之前，这里确实是自己又比了一遍，而注释还写着「由引擎自己挡」。
+        优先级与标签那两档是**界面自己的**判断：``write()`` 不做同值收敛，所以只有这里能挡。
 
         ``int(...)`` 那一下是**线上编码**：选项的值是 ``0/1/3/5``、标签是用户语言
-        （``messages.PRIORITY_NAMES``，唯一一张表）。表外的值不该出现（选项就是从那张表
-        生成的），认不出来就当没挑——不替服务端猜一个档位。
+        （``PRIORITY_NAMES``，唯一一张表——本体的家在 ``dida.sync.view``，经引擎的公开面
+        转出成 ``messages.PRIORITY_NAMES``，所以这句话现在是真的，工单 #58）。表外的值不该
+        出现（选项就是从那张表生成的），认不出来就当没挑——不替服务端猜一个档位。
 
         返回「真的写了一笔吗」：没改的那一条路连推送都不排（队列里不该多出一笔）。
         """
@@ -778,7 +788,7 @@ class DidaApp(App[None]):
         if detail is None:
             raise UnknownTaskError(task_id)
         if field == LIST_FIELD:
-            if values[LIST_FIELD] == detail.list_id:
+            if not is_a_move(detail.list_id, values[LIST_FIELD]):
                 return False
             self.engine.move_task(task_id, to_list_id=values[LIST_FIELD])
             return True

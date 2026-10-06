@@ -1,4 +1,4 @@
-"""架构不变量：七个模块的边界，TUI 的依赖方向，以及「只用终端 16 色」。
+"""架构不变量：模块的边界，TUI 的依赖方向，以及「只用终端 16 色」。
 
 TUI 的规矩写成**允许表**，不是黑名单：``src/dida/tui/**`` 只许 import ``dida.sync.engine``
 （它唯一的读写入出口）与 ``dida.tui.*`` 自己这一支，``dida`` 命名空间里别的任何东西都算越界。
@@ -14,12 +14,15 @@ import ast
 import importlib
 import re
 from pathlib import Path
-from typing import Iterator
+from typing import Any, Iterator
 
 import pytest
 from rich.color import ANSI_COLOR_NAMES
 from rich.style import Style
 from textual._color_constants import COLOR_NAME_TO_RGB
+
+from dida.sync import engine
+from dida.tui import messages
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -69,7 +72,7 @@ COLOUR_WORDS = frozenset(
 CSS 里 ``cyan`` 是 ``#00FFFF``（真彩色）。同一个词两个意思——所以名字只许在一个地方出现。
 """
 
-SEVEN_MODULES = [
+MODULE_WHITELIST = [
     "dida.config",  # 配置与凭据
     "dida.api.client",  # 滴答 API 客户端
     "dida.storage.store",  # 本地存储
@@ -77,6 +80,11 @@ SEVEN_MODULES = [
     "dida.logical_day",  # 逻辑日
     "dida.tui.app",  # TUI
 ]
+"""深模块的**白名单**：每一个都得能 import（``test_module_is_importable``）。
+
+名字里不写数目：v1 的日期解析器（``dida.date_parser``）已由 #34 删除，而它原来叫
+``SEVEN_MODULES``——从此这个名字就在说一句假话（名字说七、内容是六）。这张表本来就是一份
+**清单**，不是一次计数；加一个模块就往这里加一行，名字不用动。"""
 
 ALLOWED_IN_TUI = ("dida.sync.engine", "dida.tui")
 """TUI 的允许表：引擎的公开面，以及它自己这一支（``dida.tui.*``）。
@@ -172,7 +180,7 @@ def _scan_tui() -> tuple[set[str], list[str]]:
     return referenced, offenders
 
 
-@pytest.mark.parametrize("module", SEVEN_MODULES)
+@pytest.mark.parametrize("module", MODULE_WHITELIST)
 def test_module_is_importable(module):
     assert importlib.import_module(module) is not None
 
@@ -427,3 +435,196 @@ def _css_declarations(source: str) -> Iterator[tuple[int, str]]:
             continue  # 不像样式表，别拿它当 CSS 扫
         for match in declaration.finditer(text):
             yield lineno, match.group()
+
+
+# ---------------------------------------------------------------------------
+# 单一出处：一条判断只许有一份实现（工单 #58 的 T3 / T5 / T6）
+#
+# 三条守的是同一件事，只是说法不同：**一张表 / 一个函数 / 一次比较**。它们的形状都是
+# 「谁再抄一份就当场红」，而不是「现在这一份是对的」——抄一份正是这三条当初的病因。
+# ---------------------------------------------------------------------------
+
+PRIORITY_CODES = frozenset({0, 1, 3, 5})
+"""优先级四档的**线上编码**（服务端那一套，见 :data:`dida.sync.view.PRIORITY_CYCLE`）。"""
+
+PRIORITY_WORDS = frozenset({"无", "低", "中", "高"})
+"""四档的**用户语言**（spec 用户故事 73 那几个字）。"""
+
+PRIORITY_HOME = "src/dida/sync/view.py"
+"""优先级四档中文写法的**唯一一处**（工单 #58 的 T3）。
+
+它只能在 sync 那一侧：``tui/`` 只许 import ``dida.sync.engine``，而 ``sync/`` 永远不
+import ``tui/``，所以这张表不可能住在 :mod:`dida.tui.messages` 又被视图表单 import。
+"""
+
+
+def _constant_dicts(source: str) -> Iterator[tuple[int, dict[Any, Any]]]:
+    """源码里的字典字面量（键值都是字面量的那些）→ ``(行号, 内容)``。"""
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Dict) or not node.keys:
+            continue
+        pairs: dict[Any, Any] = {}
+        for key, value in zip(node.keys, node.values):
+            if not (isinstance(key, ast.Constant) and isinstance(value, ast.Constant)):
+                break
+            pairs[key.value] = value.value
+        else:
+            yield node.lineno, pairs
+
+
+def _priority_tables_in(source: str) -> list[int]:
+    """这份源码里那些「``0/1/3/5`` → 无 / 低 / 中 / 高」的字典字面量在第几行。"""
+    return [
+        lineno
+        for lineno, pairs in _constant_dicts(source)
+        if set(pairs) == PRIORITY_CODES and set(pairs.values()) == PRIORITY_WORDS
+    ]
+
+
+def _priority_tables() -> dict[str, list[int]]:
+    """``src/dida`` 里那些表的所在：模块（相对仓库根）→ 行号。"""
+    found: dict[str, list[int]] = {}
+    for path in sorted((ROOT / "src" / "dida").rglob("*.py")):
+        lineno = _priority_tables_in(path.read_text(encoding="utf-8"))
+        if lineno:
+            found[str(path.relative_to(ROOT))] = lineno
+    return found
+
+
+def test_the_priority_vocabulary_is_written_down_once():
+    """优先级四档的中文写法只有**一处**（工单 #58 的 T3）。
+
+    :data:`dida.tui.messages.PRIORITY_NAMES` 与 ``sync/views.py`` 的 ``_PRIORITY_LABELS``
+    曾经各写一份——而 ``app.py`` 那几行的注释还把前者称作「唯一一张表」。这一条扫的是源码里
+    的字典字面量：谁再抄一份同样的映射就当场红。修法是 import :data:`PRIORITY_HOME` 那一份
+    （界面经过引擎的公开面拿它）。
+    """
+    assert list(_priority_tables()) == [PRIORITY_HOME], (
+        f"优先级四档的中文写法只许在 {PRIORITY_HOME} 里写一次，别处 import 它"
+    )
+
+
+def test_the_priority_table_guard_catches_a_second_copy():
+    """上一条守卫自己也要有人守：它认得出抄来的第二份（工单 #58 的 T3）。"""
+    assert _priority_tables_in('MARKS = {0: "无", 1: "低", 3: "中", 5: "高"}\n') == [1]
+    assert _priority_tables_in('MARKS = {5: "高", 3: "中", 1: "低", 0: "无"}\n') == [1], (
+        "换个次序也是同一张表，守卫不许漏"
+    )
+    assert _priority_tables_in('MARK_GLYPHS = {5: "!", 3: "~"}\n') == [], "别的字典不是这张表"
+
+
+def test_the_tui_reads_the_priority_vocabulary_through_the_engine():
+    """界面拿到的是**引擎那一份表**，不是自己抄的一张（工单 #58 的 T3）。
+
+    这一条比上一条更严一点：上一条拦「又写了一个字面量」，这一条拦「换成一个长得一样的新
+    字典」（推导式、``dict(...)``、逐项抄）。断的是**同一个对象**，所以只有真的转出来才过。
+    """
+    assert messages.PRIORITY_NAMES is engine.PRIORITY_NAMES
+
+
+def _module_functions(source: str) -> Iterator[tuple[str, int, str]]:
+    """模块级函数 → ``(名字, 行号, 函数体的形状)``；文档字符串不算（那是说明，不是行为）。
+
+    只扫**模块级**：类体里那一堆 ``def …: ...`` 是 Protocol / mixin 的声明桩，同名同形是
+    故意的（``Engine.move_task`` 与 ``PushMixin.move_task`` 就是一对），拿它们报重复只会
+    教人关掉这条守卫。
+    """
+    for node in ast.parse(source).body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        body = list(node.body)
+        if (
+            body
+            and isinstance(body[0], ast.Expr)
+            and isinstance(body[0].value, ast.Constant)
+            and isinstance(body[0].value.value, str)
+        ):
+            body = body[1:]
+        yield node.name, node.lineno, ast.dump(ast.Module(body=body, type_ignores=[]))
+
+
+def _duplicate_function_bodies(sources: dict[str, str]) -> list[str]:
+    """这批源码里「同名的函数体出现在不止一个模块里」的那些，写成 ``名字: 甲 = 乙``。"""
+    seen: dict[tuple[str, str], list[str]] = {}
+    for name, source in sources.items():
+        for function, lineno, body in _module_functions(source):
+            seen.setdefault((function, body), []).append(f"{name}:{lineno}")
+    return [
+        f"{function}: {' = '.join(where)}"
+        for (function, _), where in sorted(seen.items())
+        if len({location.rsplit(":", 1)[0] for location in where}) > 1
+    ]
+
+
+def test_no_two_modules_define_the_same_function_body():
+    """同名的函数体不许在两个模块里各写一份（工单 #58 的 T5）。
+
+    ``_project_in`` 曾在 ``sync/push.py`` 与 ``sync/writes.py`` 里逐字相同（同名、同签名、
+    同函数体），而 ``push`` 本来就 import 了 ``writes``——那第二份是纯粹的重复。该往哪个方向
+    收，看的是既有的 import 图：叶模块留着它，依赖方 import 它（反过来就是一个环）。
+    """
+    sources = {
+        str(path.relative_to(ROOT)): path.read_text(encoding="utf-8")
+        for path in sorted((ROOT / "src" / "dida").rglob("*.py"))
+    }
+
+    assert _duplicate_function_bodies(sources) == [], (
+        "同名的函数体在两个模块里各有一份——让其中一个 import 另一个，别再抄一遍：\n"
+        + "\n".join(_duplicate_function_bodies(sources))
+    )
+
+
+def test_the_duplicate_body_guard_catches_a_second_copy():
+    """上一条守卫自己也要有人守（工单 #58 的 T5）：抄一份当场红，只是文档不同不算抄。"""
+    copy = "def read(payload):\n    if not payload:\n        return None\n    return payload\n"
+    assert _duplicate_function_bodies({"a.py": copy, "b.py": copy}) == ["read: a.py:1 = b.py:1"]
+    assert _duplicate_function_bodies({"a.py": copy, "b.py": '"""说明。"""\n\n' + copy}) == [
+        "read: a.py:1 = b.py:3"
+    ], "文档字符串不同不影响判定：那是说明，不是行为"
+    assert _duplicate_function_bodies({"a.py": copy, "b.py": "def read(payload):\n    return payload\n"}) == [], (
+        "同名但行为不同的两个函数不是重复"
+    )
+
+
+def _equality_with_attribute(source: str, attribute: str) -> list[int]:
+    """源码里 ``… .attribute == …`` 这种**相等比较**的行号。"""
+    found: list[int] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Compare):
+            continue
+        if not any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
+            continue
+        operands = [node.left, *node.comparators]
+        if any(isinstance(item, ast.Attribute) and item.attr == attribute for item in operands):
+            found.append(node.lineno)
+    return found
+
+
+def test_the_same_list_judgement_is_asked_of_the_engine_not_written_twice():
+    """「搬到它已经在的那个清单 = 没改」只实现一次，界面**问引擎**（工单 #58 的 T6）。
+
+    判据本体是 :func:`dida.sync.writes.is_a_move`，两个时刻各问一次（与
+    ``is_addressable_task`` 同一个形状）：引擎在 ``move_task`` 里问它决定**写不写**，
+    界面在 ``_apply_pick`` 里问它决定**推不推**。
+
+    界面那一问非有不可：``move_task`` 回不了话（它的签名是 ``-> None``），不问就会为一次
+    根本没发生的改动推一轮——``tests/test_picker_fields.py`` 钉着那句 ``pushes == 0``。
+    但**判据**只有一处，所以这里扫两件事：界面确实问了引擎，而且没有自己再比一遍。
+    """
+    source = (ROOT / "src" / "dida" / "tui" / "app.py").read_text(encoding="utf-8")
+
+    assert "is_a_move(" in source, "界面没有问引擎那条判据：它是不是又自己比了一遍？"
+    assert _equality_with_attribute(source, "list_id") == [], (
+        "界面自己判了「同一个清单」——这条判断归引擎（dida.sync.writes.is_a_move）"
+    )
+
+
+def test_the_same_list_guard_catches_an_inlined_comparison():
+    """上一条守卫自己也要有人守（工单 #58 的 T6）：再写一遍那个比较当场红。"""
+    inlined = "if field == LIST_FIELD:\n    if values[LIST_FIELD] == detail.list_id:\n        return False\n"
+
+    assert _equality_with_attribute(inlined, "list_id") == [2]
+    assert _equality_with_attribute("self.engine.move_task(task_id, to_list_id=x)\n", "list_id") == [], (
+        "把 id 当参数传出去不是「自己判」"
+    )
+    assert _equality_with_attribute("if other.list_id == mine.list_id:\n    pass\n", "list_id") == [1]
