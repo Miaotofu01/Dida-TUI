@@ -192,18 +192,22 @@ def reminder_text(trigger: str) -> str:
     都没说。三个已知的例子：``P0DT9H0M0S`` → 提前 9 小时、``PT0S`` → 准时、``P1DT2H`` →
     提前 1 天 2 小时（不压成 26 小时）。
 
-    ⚠ **正负号那一条是没有依据的，这里如实记下来。** 服务端的文档只给了两个**正**时长的例子
-    （``openapi-dida365.md:2280``：``["TRIGGER:P0DT9H0M0S", "TRIGGER:PT0S"]``），对负数一个字
-    都没有。而这个形状与 iCalendar 的 ``TRIGGER`` 属性一模一样，那边正负号的含义是**反过来**
-    的——RFC 5545 §3.8.6.3：「An alarm with a positive duration is triggered after the
-    associated start or end… A negative duration is triggered before」，例子是
-    ``TRIGGER:-PT15M`` ＝ 提前 15 分钟。TickTick 是不是照抄这一条，文档没说、也不许拿真账号
-    去试。所以：
+    ⚠ **正负号：正时长 = 提前，这个是核对过的；负时长的方向仍未验证。**
 
-    - **正时长读作「提前 N」是这张工单的前提**（它按用户实际看到的提醒习惯定的），不是这里
-      验证出来的事实；
-    - **负时长不猜方向**，只说「相对截止时间 N」——猜错就是把「提前 30 分钟」显示成「延后
-      30 分钟」，含糊一句比说反了强。
+    - 正时长读作「提前」**由用户在官方客户端上核对过**（同一条提醒，官方客户端读作「提前」）
+      ——不是从服务端文档推出来的：那份文档对符号一个字都没说，只有两个**正**时长的例子
+      （``openapi-dida365.md:2280``：``["TRIGGER:P0DT9H0M0S", "TRIGGER:PT0S"]``）。
+    - 零时长 = 准时。
+    - **负时长不猜方向**，只说「相对截止时间 N」。理由比「文档没写」更硬：TickTick 借了
+      iCalendar 的 ``TRIGGER`` 形状、却把符号**反过来**用（见下），那就更没有理由假设它的
+      负数落在那套语义里——猜错就是把「提前 30 分钟」显示成「延后 30 分钟」，含糊一句比说
+      反了强。
+
+    ⚠ **别照 RFC 5545 去「修正」这里的方向。** iCalendar 的 ``TRIGGER`` 属性（RFC 5545
+    §3.8.6.3）说的正相反：「An alarm with a positive duration is triggered after the
+    associated start or end… A negative duration is triggered before」，例子
+    ``TRIGGER:-PT15M`` ＝ 提前 15 分钟。TickTick 的格式与它同形、语义相反，所以那份 RFC 在
+    这里是个**反例**、不是依据——留着它是为了记住「不能拿 iCalendar 的直觉套这一格」。
 
     解析不了的一律**原样返回**：安静地少显示一个提醒，比显示得难看严重得多。
     """
