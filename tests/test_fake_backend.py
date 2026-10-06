@@ -9,7 +9,10 @@
 
 from datetime import datetime, timedelta, timezone
 
+import pytest
+
 from dida.sync.engine import INBOX_ID, Engine
+from dida.sync.writes import UnclaimedListError
 from dida.testing import FakeBackend, ManualClock
 
 T0 = datetime(2026, 3, 14, 12, 3, tzinfo=timezone(timedelta(hours=8)))
@@ -63,4 +66,20 @@ def test_a_create_through_the_fake_records_the_tags_on_the_task():
     assert payload is not None
     assert payload["tags"] == ["周报", "工作"], "标签要摆进这条任务的原文里"
     assert backend.created_tags == [("周报", "工作")], "记下来的那一份也照旧"
+
+
+def test_the_fake_refuses_a_create_into_an_unclaimed_list_like_the_engine_does():
+    """替身与引擎说同一句话：名字服务端没见过的清单收不了任务（#39 / #53）。
+
+    真引擎拒绝这一笔（请求体里的 ``projectId`` 服务端没见过 → 404 → 那笔新建永远出不了队，
+    而屏幕上那条任务看着像建好了）；替身要是照收不误，接缝一上「在还没推出去的清单里建」
+    就会看起来是通的——那正是 #39 一开始踩的那个坑（替身说了假话，测试全绿）。
+    """
+    backend = FakeBackend(clock=ManualClock(T0))
+    backend.add_list("还没推出去的清单", id="local-list-1")
+
+    with pytest.raises(UnclaimedListError):
+        backend.create("写周报", list_id="local-list-1")
+
+    assert backend.created == [] and backend.created_tasks == [], "拒绝就是拒绝，一条都不记"
 

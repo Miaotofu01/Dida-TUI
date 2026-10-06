@@ -122,13 +122,17 @@ from dida.sync.view import (
     summarize_lists,
 )
 from dida.sync.writes import (
+    LOCAL_LIST_PREFIX,
     LOCAL_TASK_PREFIX,
     LocalEffect,
+    UnclaimedListError,
     UnclaimedTaskError,
     UnknownTaskError,
     WireCall,
     WriteKind,
     WriteTarget,
+    is_local_id,
+    is_local_list_id,
 )
 from dida.sync.views import (
     BUILTIN_VIEW_DAYS,
@@ -147,6 +151,7 @@ if TYPE_CHECKING:  # 只为了标注：storage 反过来 import dida.sync.view�
 
 __all__ = [
     "INBOX_ID",
+    "LOCAL_LIST_PREFIX",
     "LOCAL_TASK_PREFIX",
     "NO_DUE_TEXT",
     "AuthError",
@@ -186,6 +191,7 @@ __all__ = [
     "ProjectWriter",
     "TaskSnapshot",
     "TodayView",
+    "UnclaimedListError",
     "UnclaimedTaskError",
     "UnknownListError",
     "UnknownTaskError",
@@ -209,6 +215,8 @@ __all__ = [
     "group_tasks",
     "implied_due_for",
     "is_inbox_id",
+    "is_local_id",
+    "is_local_list_id",
     "list_index",
     "next_priority",
     "order_key",

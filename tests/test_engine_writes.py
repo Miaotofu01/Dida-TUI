@@ -30,7 +30,12 @@ from dida.api.client import DidaApiClient
 from dida.api.errors import NetworkError
 from dida.storage.store import ChangeKind, Store
 from dida.sync.engine import INBOX_ID, NO_DUE_TEXT, SyncEngine
-from dida.sync.writes import LOCAL_TASK_PREFIX, UnclaimedTaskError
+from dida.sync.writes import (
+    LOCAL_TASK_PREFIX,
+    UnclaimedListError,
+    UnclaimedTaskError,
+    WriteKind,
+)
 from dida.testing import FakeTransport, ManualClock
 
 TZ = timezone(timedelta(hours=8))
@@ -534,6 +539,74 @@ async def test_a_completion_after_an_unclaimed_create_is_refused_too(store):
         "拒绝就是拒绝：本地一个字都不许写下去（新建那份原文里本来就没有 status——"
         "它只带用户写下、与守卫要求的那几个字段）"
     )
+
+
+# ---------------------------------------------------------------- 清单还没被认领时的写（#39/#53）
+
+
+@pytest.mark.parametrize("kind", [WriteKind.UPDATE, WriteKind.COMPLETE, WriteKind.DELETE])
+async def test_a_write_on_a_task_in_an_unclaimed_list_is_refused_not_queued(store, kind):
+    """任务的「可寻址」= **``projectId`` 与 ``taskId`` 都已被确认**（#53 的补充，实测过）。
+
+    一条任务落在**还没推出去的清单**里（那条清单的 id 还是 ``local-list-…``）时，对它的每一次
+    写都会打向一个服务端从没见过的 ``projectId``：``MOVE`` 的 ``fromProjectId`` 直接取改动行上
+    的 ``list_id``，完成与删除把它写在路径里，更新写在请求体里。实测的后果与 #53 那条一模一样
+    ——404、退避重试、**那笔改动永远出不了队**，队列永久增长，状态栏那个数永远不归零
+    （#45 的 merger 探针：``kind=move record list_id='local-list-1'`` 之后仍在队列里）。
+
+    这一条钉「**拒绝**，而不是排一条永远推不出去的改动」：一个请求都不发、队列不增长、
+    ``pending_count`` 如实。同一个库里那条在**真实清单**里的任务照旧写得动——守卫只拦
+    「这次请求要说的那个 id 服务端没见过」的那一种。
+    """
+    seed(
+        store,
+        task(id="t1", title="写周报", project_id="local-list-1"),
+        task(id="t2", title="交水费", project_id="work"),
+        lists=[inbox(), project(), {"id": "local-list-1", "name": "还没推出去的清单"}],
+    )
+    transport = FakeTransport(json=task(id="t2"))
+    engine = make_engine(store, transport)
+
+    with pytest.raises(UnclaimedListError):
+        engine.write("t1", kind=kind, changes={"title": "写周报（改）"})
+
+    assert store.pending() == (), "一个字都不许入队"
+    assert store.pending_count() == 0
+    assert engine.status().pending_count == 0, "状态栏那个数如实：0，不是 1"
+    assert store.task_payload("t1")["title"] == "写周报", "拒绝之后本地也不许改"
+
+    engine.write("t2", kind=kind, changes={"title": "交水费（改）"})  # 对照组：真实清单照旧
+    await engine.wait_for_pushes()
+
+    assert store.pending() == (), "对照组那一笔推成功了"
+    assert len(transport.requests) == 1, "只发了对照组那一笔"
+    assert "local-list-1" not in str(transport.last_request.url)
+
+
+async def test_a_create_into_an_unclaimed_list_is_refused_not_queued(store):
+    """在还没推出去的清单里建任务同样**拒绝**：请求体里的 ``projectId`` 服务端没见过（#39）。
+
+    ``POST /open/v1/task`` 的 URL 里没有 id，所以这一笔在**任务**那一半是可寻址的；不可寻址的
+    是它要落进去的那个**清单**。同一条规矩：不许发一个服务端没见过的 ``projectId``——否则
+    404 之后那笔新建永远出不了队，而屏幕上那条任务看着像建好了。
+
+    （另一种做法是照 #54 的清单那条路「排队 + 认领之后挪 id」，那要在 ``adopt_created_list``
+    里再发明一套跨对象的挪动，归清单的认领机制；这一票选的是同一条规矩：**拒绝**。）
+    """
+    seed(store, lists=[inbox(), project(), {"id": "local-list-1", "name": "还没推出去的清单"}])
+    transport = FakeTransport(json={"id": "srv-1", "projectId": "local-list-1"})
+    engine = make_engine(store, transport)
+
+    with pytest.raises(UnclaimedListError):
+        engine.create("写周报", "local-list-1")
+
+    await engine.wait_for_pushes()
+
+    assert store.pending() == ()
+    assert store.pending_count() == 0
+    assert engine.status().pending_count == 0
+    assert transport.requests == [], "拒绝就是拒绝：一个请求都不发"
+    assert [item.title for item in store.tasks()] == [], "本地也不许先造出一条推不出去的"
 
 
 # ---------------------------------------------------------------- 优先级（t17）

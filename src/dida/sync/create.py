@@ -16,7 +16,12 @@ from typing import Any, Sequence
 from uuid import uuid4
 
 from dida.api.guards import api_date
-from dida.sync.writes import LOCAL_TASK_PREFIX, WriteKind
+from dida.sync.writes import (
+    LOCAL_TASK_PREFIX,
+    UnclaimedListError,
+    WriteKind,
+    is_addressable_task,
+)
 
 
 class CreateMixin:
@@ -53,10 +58,20 @@ class CreateMixin:
         「标题是空的还硬建」——那种任务在服务端还会被顺手清掉重复规则，是双重错误；
         拦它的是调用方（#39 的新建输入框）：空标题不该走到这里。
 
+        落点那条清单**自己还没被认领**（id 还是 ``local-list-…``）时不入队，当场抛
+        :class:`~dida.sync.writes.UnclaimedListError`：请求体里的 ``projectId`` 服务端没见过，
+        推过去只会 404、退避重试、**永远出不了队**——而屏幕上那条任务看着像建好了。判据与
+        写入那一侧共用一处（:func:`~dida.sync.writes.is_addressable_task`），不是这里另写一个
+        前缀比较。这一条路径会自愈：那条清单被认领之后（#54 按名字认回来）再建就通了。
+
         返回本地那条任务的 id；推成功之后它会落到服务端给的 id 上。
         """
         target = self._write_target()
         local_id = _local_task_id()
+        if not is_addressable_task(local_id, WriteKind.CREATE, project_id=list_id):
+            # 只有一种可能：要落进去的那个清单还没被认领——任务那一半对新建不算数（它的 URL
+            # 里没有 id）。判据仍然只有 is_addressable_task 那一处。
+            raise UnclaimedListError(list_id)
         target.enqueue(
             task_id=local_id,
             kind=WriteKind.CREATE,

@@ -18,7 +18,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from dida.sync.engine import INBOX_ID
+from dida.sync.engine import INBOX_ID, UnclaimedListError
 from dida.testing import FakeBackend, ManualClock
 from dida.tui import messages
 from dida.tui.app import DidaApp
@@ -252,3 +252,45 @@ async def test_creating_in_a_view_without_a_date_leaves_the_date_empty():
         await pilot.pause()
 
     assert placed(fake, INBOX_ID) == [("以后要做", None, False)]
+
+
+# ------------------------------------------------------------------ 还没同步完的清单
+
+
+def test_the_message_for_a_list_that_has_not_synced_yet_says_so():
+    """在还没推出去的清单里写：用户看到的那句话（#39 / #53）。
+
+    引擎拒绝这一笔（请求体里的 ``projectId`` 服务端没见过），界面把原因原样报出来——**不许**
+    说成建好了，也不许只说一句笼统的「新建失败」（用户会去查网络，而问题在那条清单还没同步
+    完）。下一次刷新把那条清单认回来之后同一个按键就通了，所以这句话说的是「等同步完」，
+    不是「做不到」。
+    """
+    shown = messages.create_failed_message(UnclaimedListError("local-list-1"))
+
+    assert shown.startswith("没建成："), "说的是没建成，不是建好了"
+    assert "还没同步完" in shown and "等它同步完再来" in shown
+
+
+async def test_creating_in_a_list_that_has_not_synced_yet_is_refused_on_screen():
+    """这条路径在屏幕上长什么样：拒绝 + 如实说一句，一条任务都不许多出来（#39 / #53）。
+
+    还没推出去的清单（``local-list-…``）里建任务时，请求体里的 ``projectId`` 服务端没见过
+    ——真引擎当场拒绝，假后端照它的样子拒绝（替身说了假话，这条断言就会静默变绿）。用户看到
+    的是**原因**，不是一句「等一下就好」。
+    """
+    fake = backend()
+    fake.add_list("还没推出去的清单", id="local-list-1")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_container(pilot, app.index_page(), "local-list-1")
+        await pilot.press("n")
+        await pilot.pause()
+        await pilot.press(*"写周报")
+        await pilot.press("enter")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert fake.created == [] and fake.created_tasks == [], "一条都不许建"
+    assert "没建成" in after and "还没同步完" in after, "屏幕上要说出原因"

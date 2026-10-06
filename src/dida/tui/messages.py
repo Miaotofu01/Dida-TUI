@@ -20,6 +20,7 @@ from __future__ import annotations
 from dida.sync.engine import (
     AuthError,
     DidaError,
+    UnclaimedListError,
     UnclaimedTaskError,
     UnknownListError,
     UnknownTaskError,
@@ -249,11 +250,13 @@ def refresh_failed_message(error: DidaError) -> str:
 def create_failed_message(error: DidaError) -> str:
     """新建当场失败时的话（#39）。
 
-    被拒绝的两种情形分开说，因为用户该做的事不一样：``UnclaimedTaskError`` 是「**你自己**
-    刚建的那条还没同步完」——等一下再按一次就对（下一次刷新会带回真 id）；别的失败是网络
-    或服务端说不行。两句话都不许暗示「已经建好了」：那会让用户以为东西在服务端上。
+    被拒绝的三种情形分开说，因为用户该做的事不一样：``UnclaimedTaskError`` 是「**你自己**刚
+    建的那条还没同步完」、``UnclaimedListError`` 是「你要落进去的那个**清单**还没同步完」
+    （两种都是等一下再按一次就对——下一次刷新会把真 id 带回来，判据只有
+    ``dida.sync.writes.is_addressable_task`` 一处）；别的失败是网络或服务端说不行。
+    这一句不许暗示「已经建好了」：那会让用户以为东西在服务端上。
     """
-    if isinstance(error, UnclaimedTaskError):
+    if isinstance(error, (UnclaimedListError, UnclaimedTaskError)):
         return f"没建成：{error}"
     return f"新建失败：{error}"
 

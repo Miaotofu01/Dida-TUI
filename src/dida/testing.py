@@ -33,6 +33,7 @@ from dida.sync.engine import (
     ViewRow,
     WriteKind,
 )
+from dida.sync.writes import UnclaimedListError, is_local_id
 from dida.sync.view import (
     INBOX_ID,
     ListSnapshot,
@@ -552,7 +553,14 @@ class FakeBackend:
 
         ``priority or 0``：API 的「无」是 ``0``（快照那一侧的编码），而 ``None`` 是「调用方
         没写这个字段」——两者在快照里是同一个意思。
+
+        落点那条清单**还没被认领**（id 是 ``local-list-…``）时照引擎的样子抛
+        :class:`~dida.sync.writes.UnclaimedListError`（#39 / #53）：替身说了假话（收下一条
+        请求体里 ``projectId`` 服务端没见过的任务）就会让「在没推出去的清单里建」看起来
+        通了，而真引擎是拒绝的。判据读同一处（``is_local_id``）。
         """
+        if is_local_id(list_id):
+            raise UnclaimedListError(list_id)
         self.created.append(title)
         self.created_due.append(due)
         self.created_all_day.append(all_day)

@@ -20,12 +20,14 @@ from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_chec
 
 from dida.api.errors import DidaError
 from dida.sync.writes import (
+    UnclaimedListError,
     UnclaimedTaskError,
     UnknownTaskError,
     WireCall,
     WriteKind,
     is_addressable,
     is_addressable_task,
+    is_local_list_id,
 )
 
 if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能在这里 import
@@ -61,6 +63,34 @@ def _is_due(change: PendingChange, now: datetime) -> bool:
     「到点」是 ``<=``：注入的钟刚好走到 ``next_retry_at`` 时就算到期。
     """
     return change.next_retry_at is None or change.next_retry_at <= now
+
+
+def _project_in(payload: object) -> str | None:
+    """这一笔改动点名的**目标**清单（``{"projectId": …}``），没提就是 ``None``。
+
+    只有搬运会在 payload 里带 ``projectId``，而它要说清搬**到哪去**——那边同样可能是一条
+    还没推出去的清单。形状认不出来就当「没提」（与读路径对脏数据的口径一致，不猜）。
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    named = payload.get("projectId")
+    return None if named is None else str(named)
+
+
+def _unaddressable(
+    task_id: str, *, project: str | None, target_project: str | None
+) -> DidaError:
+    """这次写发不出去，**是哪一半**没过：返回说清原因的那个错误（#53）。
+
+    判据只有 :func:`~dida.sync.writes.is_addressable_task` 一处（它在两个时刻各被问一次：
+    入队之前、以及推送循环里）；这里只负责在**已经判定发不出去**之后，把它归到用户看得懂的
+    那一种原因上：点名的清单服务端没见过（:class:`UnclaimedListError`，包括搬运的目标清单），
+    还是这条任务自己还没被认领（:class:`UnclaimedTaskError`）。
+    """
+    for named in (project, target_project):
+        if named is not None and is_local_list_id(named):
+            return UnclaimedListError(named)
+    return UnclaimedTaskError(task_id)
 
 
 def _completed_status() -> int:
@@ -139,16 +169,23 @@ class PushMixin:
         本地缓存里没有这条任务（或者那份底稿没有 ``projectId``）时不入队，当场抛
         :class:`UnknownTaskError`：请求的清单 id 只存在于底稿里，凭空入队只会留下一条
         **永远推不出去**的改动，让状态栏那个数一直非零（工单 #25）。
+
+        这次请求要说的每个 id 都得是服务端见过的（判据在
+        :func:`~dida.sync.writes.is_addressable_task`，一处），否则当场抛**说清是哪一半**的那个
+        错误：任务自己还没被认领是 :class:`UnclaimedTaskError`，落点在一条还没推出去的清单里是
+        :class:`UnclaimedListError`（#53）。两种都**不入队**——排进去就是一条永远推不出去的
+        改动，而它们都会自愈（下一次全量刷新把真 id 带回来），所以诚实的回答是「等同步完」。
         """
         target = self._write_target()
         snapshot = target.task_payload(task_id)
         if snapshot is None or not snapshot.get("projectId"):
             raise UnknownTaskError(task_id)
-        if not is_addressable_task(task_id, kind):
-            # 新建还没被认领（#53）：本地这条的 id 服务端从没见过，排在它上面的改动会
-            # POST 到 /open/v1/task/local-…、404、退避重试、永远出不了队。这条路径会自愈
-            # （下一次全量刷新带回真 id 那一行），所以诚实的回答是「等这一步同步完」。
-            raise UnclaimedTaskError(task_id)
+        project = str(snapshot["projectId"])
+        target_project = _project_in(changes)
+        if not is_addressable_task(
+            task_id, kind, project_id=project, target_project_id=target_project
+        ):
+            raise _unaddressable(task_id, project=project, target_project=target_project)
         target.enqueue(
             task_id=task_id,
             kind=kind,
@@ -263,11 +300,16 @@ class PushMixin:
         """
         wire = change.kind.wire  # 打哪一个端点由词表说（dida.sync.writes），不在这里再列一遍成员
         if not is_addressable(change):
-            # 新建**自己**当然带着临时 id（它就是去换真 id 的那一笔，而它的 URL 里没有 id）；
-            # 这里挡的是排在它后面那些：本地这条的 id 服务端从没见过，改 / 完成 / 删都会打到
-            # 一个不存在的任务上（#53）。写入那一侧也挡了一道（``write``），这是第二道，防的是
-            # 别处再长出一条入队路径——两道都不许把这种改动**安静地**推到一个 404 上。
-            raise UnclaimedTaskError(change.task_id)
+            # 两种「名字服务端没见过」都在这里落地（#53）：排在一条还没被认领的新建后面的改动
+            # （任务 id 是临时的——新建**自己**不在此列，它的 URL 里没有 id），以及落在一条还没
+            # 推出去的清单里的改动（projectId 是 ``local-list-…``）。写入那一侧也挡了一道
+            # （``write``），这是第二道，防的是别处再长出一条入队路径——两道都不许把这种改动
+            # **安静地**推到一个 404 上、然后永远退避下去。
+            raise _unaddressable(
+                change.task_id,
+                project=change.list_id,
+                target_project=_project_in(change.payload),
+            )
         if wire is WireCall.UPDATE_TASK:
             await writer.update_task(
                 change.list_id,

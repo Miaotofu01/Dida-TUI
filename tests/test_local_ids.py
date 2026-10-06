@@ -18,15 +18,39 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta, timezone
+
 from dida.storage.store import LOCAL_LIST_PREFIX as STORE_LIST_PREFIX
+from dida.storage.store import PendingChange
 from dida.sync.writes import (
     LOCAL_ID_PREFIXES,
     LOCAL_LIST_PREFIX,
     LOCAL_TASK_PREFIX,
+    WriteKind,
+    is_addressable,
+    is_addressable_task,
     is_local_id,
     is_local_list_id,
     is_local_task_id,
 )
+
+TZ = timezone(timedelta(hours=8))
+
+
+def _change(*, task_id: str = "srv-1", list_id: str = "work", **payload: object) -> PendingChange:
+    """一条队列里的改动（形状照 :class:`~dida.storage.store.PendingChange`）。
+
+    直接摆一条改动，而不是起一个库：这里问的是**判据**，不是存储怎么入队（那一条在
+    ``tests/test_engine_writes.py`` 里走真库）。
+    """
+    return PendingChange(
+        id=1,
+        task_id=task_id,
+        list_id=list_id,
+        kind=WriteKind.UPDATE,
+        payload=dict(payload),
+        created_at=datetime(2026, 3, 14, 12, 0, tzinfo=TZ),
+    )
 
 
 def test_no_local_prefix_is_a_prefix_of_another():
@@ -82,3 +106,51 @@ def test_the_two_families_do_not_recognize_each_others_ids():
 def test_the_storage_layer_reexports_the_one_list_prefix():
     """存储层那个名字是**转发**，不是第二份定义（#54 把它移走之后也不许回来）。"""
     assert STORE_LIST_PREFIX is LOCAL_LIST_PREFIX
+
+
+# ---------------------------------------------------------------- 可寻址：要发的 id 都要确认
+
+
+def test_a_write_that_names_an_unclaimed_list_is_not_addressable():
+    """任务的「可寻址」= **``projectId`` 与 ``taskId`` 都已确认**（#53 的补充，实测过）。
+
+    落点在一条还没推出去的清单里时，任务自己的 id 可能已经是服务端给的真 id，但这次请求要
+    说的 ``projectId`` 还是 ``local-list-…``——服务端没有那个清单，于是 404、退避、
+    **永远出不了队**（#45 的 merger 探针量到 ``kind=move record list_id='local-list-1'``
+    之后那笔改动仍留在队列里）。搬运还要说清**搬到哪去**，那一边同样要确认，所以
+    ``target_project_id`` 一起查。
+    """
+    assert is_addressable_task("srv-1", project_id="work") is True, "两个 id 都是真的"
+    assert is_addressable_task("srv-1", project_id="local-list-1") is False, "落点还没被认领"
+    assert is_addressable_task("srv-1", project_id="work", target_project_id="life") is True
+    assert (
+        is_addressable_task("srv-1", project_id="work", target_project_id="local-list-2") is False
+    )
+    assert is_addressable_task(LOCAL_TASK_PREFIX + "0d0e", project_id="work") is False, (
+        "这条任务自己还没被认领"
+    )
+    assert is_addressable_task("srv-1", WriteKind.CREATE, project_id="work") is True, (
+        "新建的 URL 里没有任务 id（带着临时任务 id 的正是它自己），但它落进去的清单要确认"
+    )
+    assert (
+        is_addressable_task(
+            LOCAL_TASK_PREFIX + "0d0e", WriteKind.CREATE, project_id="local-list-1"
+        )
+        is False
+    )
+
+
+def test_a_queued_change_is_judged_on_every_id_it_would_send():
+    """推送循环问的是同一件事、判据也是同一处——它读的是**这条改动真要发的那几个 id**。
+
+    ``projectId`` 在改动行上（``list_id``：搬运用它当 ``fromProjectId``，完成与删除写在路径
+    里），也可能在 payload 里（搬运的目标清单）。两边都要看，否则一条「搬进还没推出去的清单」
+    的改动会安静地打到一个服务端不认识的名字上。
+    """
+    assert is_addressable(_change(list_id="work")) is True
+    assert is_addressable(_change(list_id="local-list-1")) is False, "改动行上那个"
+    assert is_addressable(_change(list_id="work", projectId="local-list-2")) is False, (
+        "payload 里那个（搬运的目标清单）"
+    )
+    assert is_addressable(_change(list_id="work", projectId="life")) is True
+    assert is_addressable(_change(task_id=LOCAL_TASK_PREFIX + "0d0e")) is False

@@ -48,6 +48,7 @@ __all__ = [
     "LOCAL_LIST_PREFIX",
     "LOCAL_TASK_PREFIX",
     "LocalEffect",
+    "UnclaimedListError",
     "UnclaimedTaskError",
     "UnknownTaskError",
     "WireCall",
@@ -278,41 +279,76 @@ def is_addressable(change: PendingChange) -> bool:
     """这一笔任务改动现在**发得出去**吗（#53）。
 
     与清单版的 :func:`dida.sync.lists.is_addressable` 是同一个判断、同一个名字，判据只差
-    一处，差的是**要确认哪一个 id**：
+    一处，差的是**这次请求要说哪几个 id**：
 
     - 清单那条路的 URL 里是**清单** id（``POST /open/v1/project/{projectId}``），所以它看
       ``change.list_id``；
-    - 任务这条路的 URL 里是**任务** id（``POST /open/v1/task/{taskId}``、
-      ``.../task/{taskId}/complete``、``DELETE .../task/{taskId}``），所以它看
-      ``change.task_id``。任务这一侧没有等价于「清单的 projectId」那样单独要确认的第二个
-      id：``projectId`` 只在更新请求**体**里，而它的缺席由 :class:`UnknownTaskError` 那条
-      底稿检查挡着（``write()`` 先要 ``task_payload`` 里有 ``projectId`` 才肯入队）。
+    - 任务那条路要说**两个**：``taskId``（``POST /open/v1/task/{taskId}``、
+      ``.../task/{taskId}/complete``、``DELETE .../task/{taskId}``）与 ``projectId``
+      （``MOVE`` 的 ``fromProjectId``、更新请求体里的那个、完成与删除路径里的那个）。两个
+      都得是服务端见过的——落点在一条**还没推出去的清单**里时，``projectId`` 也是本地的
+      （``local-list-…``），实测后果与「任务 id 是临时的」一模一样（#45 的 merger 探针）。
+      判据本体在 :func:`is_addressable_task`，这一处只是把改动上那两个 id 取出来交给它。
 
-    不发的两类（与清单版同形）：
-
-    - 改 / 完成 / 删一个**本地临时 id** —— 服务端没有那个任务，打过去只会 404、然后永远
-      重试、永远出不了队；
-    - （新建不在此列：``POST /open/v1/task`` 的 URL 里没有 id，带着临时 id 的**正是它自己**
-      ——它就是去换真 id 的那一笔，照发。）
-
-    发不出去不等于丢掉：它留在队列里，等认领拿到真 id 之后自然变得可寻址。
-
-    **这一处也是「入队之前先问一句」的那个判断**：写入那一侧要的无非是「这条任务现在可寻址
-    吗」，而它手里还没有那笔改动——所以它走下面那个 :func:`is_addressable_task`，判据由这里
-    分派，全仓库仍然只有一个出处。
+    发不出去不等于丢掉：它留在队列里，等认领拿到真 id 之后自然变得可寻址。**新建不在此列**：
+    ``POST /open/v1/task`` 的 URL 里没有 id，带着临时任务 id 的**正是它自己**——它就是去换真
+    id 的那一笔；但它请求体里的 ``projectId`` 仍然得是服务端见过的（在
+    :func:`is_addressable_task` 里判，写入那一侧也据此拒绝）。
     """
-    return is_addressable_task(change.task_id, change.kind)
+    return is_addressable_task(
+        change.task_id,
+        change.kind,
+        project_id=change.list_id,
+        target_project_id=_project_in(change.payload),
+    )
 
 
-def is_addressable_task(task_id: str, kind: WriteKind = WriteKind.UPDATE) -> bool:
-    """``is_addressable`` 的判据本体：这个任务 id + 这种写，现在发得出去吗。
+def is_addressable_task(
+    task_id: str,
+    kind: WriteKind = WriteKind.UPDATE,
+    *,
+    project_id: str | None = None,
+    target_project_id: str | None = None,
+) -> bool:
+    """``is_addressable`` 的判据本体：这一笔写要说的每个 id 服务端都见过吗——**判据只此一处**。
 
-    ``kind`` 默认按「已有任务的写」算（改 / 完成 / 删都是同一条判据）；只有新建例外，
-    因为它的 URL 里没有 id。写入那一侧在**入队之前**问的就是这个函数。
+    任务的「可寻址」= **``projectId`` 与 ``taskId`` 都已确认**（#53 的补充，有实测证据）：
+
+    - **``projectId``**（``project_id``）：任务落在一条还没推出去的清单里时，它的清单 id 还是
+      本地的（``local-list-…``）——服务端没有这个清单，任何点名它的请求（搬运用
+      ``fromProjectId``、更新放在请求体里、完成与删除写在路径里）都会 404、退避重试、
+      **永远出不了队**。
+    - **``taskId``**：还挂着本地临时前缀的，服务端没有这个任务，改 / 完成 / 删都会打到一个
+      不存在的任务上。**新建不在此列**：它的 URL 里没有 id，带着临时任务 id 的正是它自己。
+    - **``target_project_id``**：搬运还要说清**搬到哪去**，那一边同样可能是一条还没推出去的
+      清单。两个清单 id 都要确认，所以两个都查。
+
+    「服务端见过没有」这一问只有 :func:`is_local_id` 一处实现，这里不自己写前缀比较——
+    将来多一族本地 id 也不会漏。
+
+    写入那一侧在**入队之前**问的就是这个函数（它手里还没有那笔改动），``is_addressable``
+    在推送循环里问的也是它：同一个判据，两个时刻各问一次。
     """
+    if project_id is not None and is_local_id(project_id):
+        return False
+    if target_project_id is not None and is_local_id(target_project_id):
+        return False
     if kind.wire is WireCall.CREATE_TASK:
         return True
-    return not is_local_task_id(task_id)
+    return not is_local_id(task_id)
+
+
+def _project_in(payload: object) -> str | None:
+    """一笔改动里点名的**目标**清单（``{"projectId": …}``），没提就是 ``None``。
+
+    只有搬运（``MOVE``）会在 payload 里带 ``projectId``：改期 / 完成 / 删除的请求体里都没有
+    它（``status`` 不是写字段，``dueDate`` 那一类也不点清单）。认不出来的形状当「没提」——
+    与读路径对脏数据的口径一致，不猜。
+    """
+    if not isinstance(payload, Mapping):
+        return None
+    named = payload.get("projectId")
+    return None if named is None else str(named)
 
 
 class UnknownTaskError(DidaError):
@@ -335,6 +371,32 @@ class UnknownTaskError(DidaError):
         )
         self.task_id = task_id
         """请求写入的那条任务 id，UI 可以直接显示出来。"""
+
+
+class UnclaimedListError(DidaError):
+    """这次写要点的那个**清单**服务端还没见过，所以拒绝它（#39 / #53 的补充）。
+
+    一条任务落在**还没推出去的清单**里时（那条清单的 id 还是 ``local-list-…``），对这条任务
+    的每一次写都会点名一个服务端没有的 ``projectId``：``MOVE`` 的 ``fromProjectId`` 取的是
+    改动行上的 ``list_id``，完成与删除写在路径里，更新写在请求体里。实测的后果与
+    :class:`UnclaimedTaskError` 一模一样——404、退避重试、**那笔改动永远出不了队**，队列永久
+    增长，状态栏那个数永远不归零（#45 的 merger 探针量到过）。
+
+    与「这条任务自己还没被认领」分开说的理由：用户该做的事不一样——这一句说的是**那条清单**
+    还没同步完，等它同步完（#54 的认领机制会在下一次刷新按名字把它认回来）这一整类写就都能
+    干了，而不是这一条任务有问题。
+
+    与 :class:`~dida.sync.lists.UnknownListError` 不是一回事：那个是「本地没有这一行清单」，
+    这个是「本地有这一行，但服务端还没有它」。
+
+    「服务端见过没有」由 :func:`is_local_id` 一处判定；这一层只说**哪一半**没过（``list_id``
+    落在用户看得见的那句话里）。
+    """
+
+    def __init__(self, list_id: str) -> None:
+        super().__init__(f"这个清单还没同步完（服务端还不认识 {list_id}）：等它同步完再来")
+        self.list_id = list_id
+        """没被认领的那条清单 id，UI 可以直接显示出来。"""
 
 
 class UnclaimedTaskError(DidaError):
