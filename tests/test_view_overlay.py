@@ -235,7 +235,7 @@ async def test_the_view_form_takes_the_conditions_and_the_view_lands_on_the_page
 
 
 async def test_entering_the_new_view_shows_the_filtered_tasks():
-    """``enter`` 进去看到过滤后的任务（验收标准 5）：只有高优先级未完成的那两条。"""
+    """``→`` 进去看到过滤后的任务（验收标准 5）：只有高优先级未完成的那两条。"""
     fake = backend()
     app = DidaApp(fake)
 
@@ -330,7 +330,7 @@ async def test_escape_cancels_the_view_form_without_writing_anything():
 async def test_e_opens_the_conditions_prefilled_and_the_change_takes_effect_at_once():
     """``e`` 的表单填着**当前的**条件；改完清单列表页上立刻是新样子（验收标准 6）。
 
-    「立刻生效」断两处，都不必重进这一页：索引上的条数当场变了，再 ``enter`` 进去看到的
+    「立刻生效」断两处，都不必重进这一页：索引上的条数当场变了，再 ``→`` 进去看到的
     就是新的那一份成员。
     """
     fake = backend()
@@ -371,7 +371,7 @@ async def test_d_asks_once_and_y_deletes_the_view_without_touching_any_task():
     """``d`` 一次 ``y/n`` 确认后删除该视图；**删视图不删任务**（验收标准 7、8）。
 
     ``n`` 那一次什么都不做；``y`` 那一次只摘掉视图那一行——同一份缓存上，那些任务还在
-    各自的清单里（不是「也还在缓存里」：``enter`` 进清单看得见它们）。
+    各自的清单里（不是「也还在缓存里」：``→`` 进清单看得见它们）。
     """
     fake = backend()
     app = DidaApp(fake)

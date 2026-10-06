@@ -14,7 +14,7 @@ import re
 from datetime import datetime, timedelta, timezone
 
 from dida.testing import FakeBackend, ManualClock
-from dida.tui.app import DidaApp
+from dida.tui.app import DidaApp, Stage
 from dida.tui.keys import LAYER_DETAIL, LAYER_INDEX, LAYER_TASKS
 from dida.tui.messages import EMPTY_TASKS_MESSAGE, blocked_list_message
 from dida.tui.pages.index import BLOCKED_MARK, BUILTIN_MARK, CUSTOM_MARK, INBOX_MARK, LIST_MARK
@@ -212,18 +212,32 @@ async def test_the_cursor_moves_with_j_k_and_the_arrow_keys():
 
 
 async def test_left_on_the_index_page_does_nothing():
-    """清单列表页没有上一层，所以 ``←`` 在那里什么都不发生（验收标准 2）。"""
+    """清单列表页没有上一层，所以 ``←`` 在那里什么都不发生（验收标准 2、用户故事 124）。
+
+    ⚠ 这一条不是白断的：清单列表页**没有**绑 ``left``，于是它落到从
+    ``ScrollableContainer`` 继承来的 ``scroll_left`` 上（实测有效绑定就是它）。落下去之后
+    什么都不做，是因为这一页自己的 ``overflow-x`` 是 ``hidden``（``allow_horizontal_scroll``
+    为假，``action_scroll_left`` 开头就 ``SkipAction``）——所以这里把**三层证据**都钉住：
+    屏幕逐字节不变、平移轨道没动、这一页自己的滚动位置也没动。
+    """
     app = DidaApp(backend())
 
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
+        stage = app.query_one("#stage", Stage)
+        page = app.index_page()
         before = screen_text(app)
 
         await pilot.press("left")
         await pilot.pause()
         after = screen_text(app)
 
-    assert after == before, "清单列表页按 ← 不该动任何东西"
+        assert after == before, "清单列表页按 ← 不该动任何东西"
+        assert stage.scroll_offset.x == 0, f"平移轨道被推走了：{stage.scroll_offset.x}"
+        assert page.scroll_offset.x == 0, "清单列表页自己横向滚了一格"
+        assert app.layer == LAYER_INDEX, "没有溜进任务列表页"
+        assert page.selected_id == "inbox1", "光标没动"
+
     assert "最近七天" in after, "还在清单列表页上（内置视图那一行还在）"
     assert "写周报" not in after, "没有溜进任务列表页"
 
@@ -409,7 +423,7 @@ async def test_an_empty_cache_still_shows_the_inbox_and_the_builtin_views():
 
 
 async def test_the_restored_cursor_is_actually_visible_again():
-    """``esc`` 回来时，还原的那一行还得**看得见**——不只是「选中了」。
+    """``←`` 回来时，还原的那一行还得**看得见**——不只是「选中了」。
 
     清单长到超过一屏时这两件事会分家：光标记着，屏幕却停在顶上，用户面对一屏找不到自己在
     哪一行。这条与上一条各钉一半。

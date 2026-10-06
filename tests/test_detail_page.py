@@ -138,7 +138,7 @@ async def enter_detail(pilot, app: DidaApp) -> None:
 
 
 async def test_enter_opens_the_detail_page_with_the_cursor_on_the_field_list():
-    """任务列表页按 ``enter`` 进详细页，光标落在字段列表上（验收标准 1 + 2）。
+    """任务列表页按 ``→`` 进详细页，光标落在字段列表上（验收标准 1 + 2）。
 
     七个字段一个不少，而且光标**已经**停在第一个字段上（``j``/``k``/``enter`` 立刻能用）。
     """
@@ -540,7 +540,7 @@ async def test_the_bottom_line_is_still_there_when_the_page_is_long():
 async def test_every_field_is_pushed_the_moment_it_is_finished():
     """每改完一个字段**立刻推送**，不攒到离开这一页（验收标准 7）。
 
-    断法：改完还在详细页上，推送**已经**发生过了（不是等 ``esc`` 退回任务列表才发）。
+    断法：改完还在详细页上，推送**已经**发生过了（不是等 ``←`` 退回任务列表才发）。
     """
     fake = backend()
     app = DidaApp(fake)
@@ -856,6 +856,41 @@ async def test_left_and_right_move_the_caret_inside_a_text_field_instead_of_leav
         f"← / → 没有在文字里移动光标（写出去的是 {fake.writes}）"
     )
     assert "acXd" in field_row(text, "标题"), f"改动没有生效：\n{text}"
+
+
+async def test_left_and_right_also_move_the_caret_in_a_multiline_field():
+    """多行框（描述 / 备注）里同一条规矩：``←`` / ``→`` 移光标，不换层（验收标准 5）。
+
+    单行框与多行框是**两个**控件（``Input`` / ``TextArea``），绑定表各有一份，所以两半
+    都要真按一遍——只断单行那一半会把「多行框里按 ← 退回上一层」漏过去。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await pilot.press("j")  # 标题 → 描述
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press(*clear(len(CONTENT)))
+        await pilot.press(*"abcd")
+        await pilot.press("left", "left")
+        await pilot.press("backspace")  # 删掉 b
+        await pilot.press("right")
+        await pilot.press(*"X")
+        await pilot.pause()
+        still_editing = "编辑描述" in screen_text(app)
+        assert app.layer == LAYER_DETAIL, "多行框里的 ← / → 不该换层"
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert still_editing, "多行框里的 ← / → 不该把人弹出编辑态"
+    assert fake.writes == [("t1", {"content": "acXd"})], (
+        f"多行框里的 ← / → 没有在文字里移动光标（写出去的是 {fake.writes}）"
+    )
+    assert "acXd" in field_row(text, "描述"), f"改动没有生效：\n{text}"
 
 
 async def test_a_task_without_a_due_date_says_so_without_an_ambiguous_glyph():

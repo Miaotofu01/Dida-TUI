@@ -419,7 +419,7 @@ def delete_list_prompt(name: str) -> str:
 
 
 def blocked_list_message(row: object) -> str:
-    """``enter`` 一个进不去的清单时状态栏里的话（用户故事 23 / 24）。
+    """按 ``→`` 进一个进不去的清单时状态栏里的话（用户故事 23 / 24）。
 
     两种进不去的原因分开说：``kind`` 是 NOTE 的清单装不了任务，``permission`` 不是 write
     的改不动。行上那个记号只说「不可进入」，进不去的时候得说清是哪一种——否则用户会去
