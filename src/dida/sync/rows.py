@@ -8,7 +8,9 @@
 
 - :func:`row_sort_key` —— 整份列表的顺序。**客户端统一重排**，不看服务端的 ``sortOrder``
   （spec 的「一个已知的、故意的取舍」）：截止时间升序 → 优先级从高到低 → 没有截止时间的
-  排在有截止时间的后面 → 已完成的一律沉到最底。
+  排在有截止时间的后面 → 已完成的一律沉到最底。:func:`row_order_tail` 是这条链里「已完成」
+  那一位**之后**的那一段，两处只排已完成行的调用方（真实清单的已完成段、视图的已完成档）
+  直接用它——同一条链，一处实现。
 - :func:`completed_window_start` —— 已完成区/已完成流往回看多久（7 天）的那条左端。
 - :func:`task_is_completed` —— 本地判定「已完成」只看 ``status``，不看完成时间戳。
 
@@ -22,7 +24,13 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Protocol
 
-__all__ = ["RowFacts", "completed_window_start", "row_sort_key", "task_is_completed"]
+__all__ = [
+    "RowFacts",
+    "completed_window_start",
+    "row_order_tail",
+    "row_sort_key",
+    "task_is_completed",
+]
 
 
 class RowFacts(Protocol):
@@ -39,27 +47,48 @@ class RowFacts(Protocol):
     completed: bool
 
 
-def row_sort_key(item: RowFacts) -> tuple:
-    """一行在列表里的位置：``(已完成, 无日期, 截止时刻, 优先级降序, 标题, id)``。
+def row_order_tail(
+    *, due: datetime | None, priority: int, title: str, task_id: str
+) -> tuple:
+    """排序链里**「已完成」那一位之后**的那一段：``(无日期, 截止时刻, 优先级降序, 标题, id)``。
 
-    四段规矩各占一位，顺序就是 spec 的排序链：
+    两处「同一个已完成集合要排成同一个样子」共用它：真实清单的已完成段
+    （:func:`dida.sync.view.completed_section`）与视图求值的已完成档
+    （:func:`dida.sync.views.order_key`）。**这一段在 #64 落地时被手抄过一遍**，而抄出来的
+    那一条没有测试抓得住它漂——``tests/test_custom_views.py`` 的交叉验证只走过一对「有日期 /
+    没日期」，标题、id 与优先级正负号漂了照样是绿的。所以它现在是**一处**。
 
-    - ``completed`` 在最前：已完成的一律沉到最底（用户故事 90 的那条链的最后一段）。
+    分量与理由（:func:`row_sort_key` 那段解释就住在这里，不再抄第二遍）：
+
     - ``due is None`` 在 ``due`` 之前：没有截止时间的排在有截止时间的后面。**这一位是必需的**
-      ——直接拿 ``None`` 去和 ``datetime`` 比会抛 ``TypeError``；有了它，两个无日期的行在第
-      二位相等、走到第三位时两边都是 ``None``（比较相等，不比较大小），两个有日期的行则
-      在第三位比时刻。
+      ——直接拿 ``None`` 去和 ``datetime`` 比会抛 ``TypeError``；有了它，两个无日期的行在这一位
+      相等、走到下一位时两边都是 ``None``（比较相等，不比较大小），两个有日期的行则比时刻。
     - ``-priority``：优先级从高到低（线上编码 ``0/1/3/5``，取负正好反过来）。
     - ``title`` / ``task_id``：前面的都一样时给一个**确定**的顺序（标题相同也不会每次排成
       不一样的样子）。
     """
+    return (due is None, due, -int(priority), title, task_id)
+
+
+def row_sort_key(item: RowFacts) -> tuple:
+    """一行在列表里的位置：``(已完成, *row_order_tail(...))``。
+
+    两段：
+
+    - ``completed`` 单列一位、排在最前：已完成的一律沉到最底（用户故事 90 的那条链的最后
+      一段）。它只在「一个列表里同时有未完成与已完成」时才分得出高低，所以只排已完成行的
+      调用方省掉它——那一段的顺序由 :func:`row_order_tail` 一处提供。
+    - 其余分量（无日期位、截止时刻、优先级降序、标题、id）与理由全在
+      :func:`row_order_tail`：**同一个已完成集合在真实清单里与在视图里因此排成一个样子**。
+    """
     return (
         bool(item.completed),
-        item.due is None,
-        item.due,
-        -int(item.priority),
-        item.title,
-        item.task_id,
+        *row_order_tail(
+            due=item.due,
+            priority=item.priority,
+            title=item.title,
+            task_id=item.task_id,
+        ),
     )
 
 

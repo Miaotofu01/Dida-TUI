@@ -29,7 +29,7 @@ from datetime import date, datetime
 from typing import Any, Mapping, Protocol, Sequence
 
 from dida.logical_day import logical_day
-from dida.sync.rows import completed_window_start, row_sort_key
+from dida.sync.rows import completed_window_start, row_order_tail, row_sort_key
 
 NO_DUE_TEXT = "-"
 """没有截止时间的读法；与「今天」一眼可分。
@@ -359,32 +359,21 @@ def by_due(items: Sequence[TaskItem]) -> list[TaskItem]:
 # ------------------------------------------------------------------ 已完成流（t12）
 
 
-@dataclass(frozen=True)
-class _CompletedRowFacts:
-    """把 :class:`TaskSnapshot` 摆成 :class:`dida.sync.rows.RowFacts` 的形状，只为借一次排序键。
-
-    ``row_sort_key`` 认的是 ``task_id``，快照上那个字段叫 ``id``——只差一个名字。这层适配
-    只能放在读模型这一侧：:mod:`dida.sync.rows` 不 import 读模型（那边模块注释写了为什么），
-    而读形状不为排序长字段。**排序键本身不重写**，:func:`row_sort_key` 仍是唯一一处规矩。
-    """
-
-    task_id: str
-    title: str
-    due: datetime | None
-    priority: int
-    completed: bool
-
-
 def _completed_row_key(snapshot: TaskSnapshot) -> tuple:
-    """已完成段一行的位置：借 :func:`dida.sync.rows.row_sort_key`（不重写它）。"""
-    return row_sort_key(
-        _CompletedRowFacts(
-            task_id=snapshot.id,
-            title=snapshot.title,
-            due=snapshot.due,
-            priority=snapshot.priority,
-            completed=snapshot.completed,
-        )
+    """已完成段一行的位置：借 :func:`dida.sync.rows.row_order_tail`（不重写它）。
+
+    只取「已完成」那一位**之后**的那一段：进到这一段里的每一行都是已完成的（见
+    :func:`completed_section` 的过滤条件），那一位在这里恒定，省掉它不改变顺序。
+
+    这一层以前还包着一个 ``_CompletedRowFacts`` 适配器，只为把快照上的 ``id`` 摆成排序键认的
+    ``task_id``；#64 之后排序键那一段有了自己的名字（:func:`row_order_tail`），适配器整个
+    删掉了——按名字传参，不需要一个只差一个字段名的类型。
+    """
+    return row_order_tail(
+        due=snapshot.due,
+        priority=snapshot.priority,
+        title=snapshot.title,
+        task_id=snapshot.id,
     )
 
 

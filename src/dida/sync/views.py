@@ -57,6 +57,7 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import DidaError
 from dida.logical_day import logical_day
+from dida.sync.rows import row_order_tail
 from dida.sync.view import PRIORITY_CYCLE, PRIORITY_NAMES, TaskSnapshot, due_day, is_overdue
 
 __all__ = [
@@ -298,10 +299,11 @@ def order_key(snapshot: TaskSnapshot, *, today: date, day_end: str) -> tuple:
     末尾再按标题与 id 断开剩下的平局，所以结果是**确定的**（同一份输入不会两次不同）。
 
     **已完成那一档内部也走这条链**（工单 #64）：沉底之后仍按「有没有截止时间 → 截止时间
-    升序 → 优先级降序 → 标题 → id」排，与真实清单已完成段的
-    :func:`dida.sync.rows.row_sort_key` 逐位相同——同一个已完成集合在视图里与在清单里不会
-    排成两个样子（用户故事 155/156）。**这个 ``due is None`` 位是必需的**，与那边同一条
-    理由：直接拿 ``None`` 去比 ``datetime`` 会抛 ``TypeError``。
+    升序 → 优先级降序 → 标题 → id」排，而且与真实清单已完成段**共用同一段实现**
+    （:func:`dida.sync.rows.row_order_tail`，就是 ``row_sort_key`` 里「已完成」那一位之后的
+    那一段）——同一个已完成集合在视图里与在清单里不会排成两个样子（用户故事 155/156）。
+    **这个 ``due is None`` 位是必需的**，与那边同一条理由：直接拿 ``None`` 去比 ``datetime``
+    会抛 ``TypeError``。
 
     四档的第一位互不相同（逾期 ``0`` / 未逾期 ``1`` / 无日期 ``2`` / 已完成 ``3``），
     而已完成那一档多一位，所以元组长度并不齐——**不会**跨档比到长度差：第一位不等就在那里
@@ -314,11 +316,12 @@ def order_key(snapshot: TaskSnapshot, *, today: date, day_end: str) -> tuple:
     if snapshot.completed:
         return (
             3,
-            snapshot.due is None,
-            snapshot.due,
-            -snapshot.priority,
-            snapshot.title,
-            snapshot.id,
+            *row_order_tail(
+                due=snapshot.due,
+                priority=snapshot.priority,
+                title=snapshot.title,
+                task_id=snapshot.id,
+            ),
         )
     if snapshot.due is None:
         return (2, 0.0, -snapshot.priority, snapshot.title, snapshot.id)
