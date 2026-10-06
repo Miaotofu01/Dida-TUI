@@ -383,7 +383,10 @@ async def test_space_in_a_focused_input_is_a_space_and_completes_nothing():
 
     async with app.run_test(size=WIDE, notifications=True) as pilot:
         await pilot.pause()
-        await pilot.press("n")  # 层一：新建清单的表单，第一格（名字）自动拿到焦点
+        await pilot.press("n")  # 层一：新建（#36 起先问一句「清单还是视图」）
+        await pilot.pause()
+        await pilot.press("enter")  # 答「清单」（默认那一档），才进得了清单那张表单
+        await pilot.pause()
         await pilot.press(*"work report")  # 中间那一下是 space
         await pilot.press("enter")
         await pilot.pause()

@@ -61,7 +61,8 @@ def backend() -> FakeBackend:
     fake.add_list("笔记本", id="note", kind="NOTE")
     fake.add_list("别人的清单", id="shared", permission="read")
     fake.add_list("空清单", id="empty")
-    fake.add_view("我的一天", id="mine", task_ids=("t1",))
+    # 自建视图与内置视图走**同一条**求值路径（#36）：摆的是条件，成员由求值算。
+    fake.add_view("我的一天", id="mine")
     return fake
 
 

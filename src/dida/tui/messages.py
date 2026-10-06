@@ -17,7 +17,14 @@
 
 from __future__ import annotations
 
-from dida.sync.engine import AuthError, DidaError, UnknownListError, UnknownTaskError
+from dida.sync.engine import (
+    AuthError,
+    DidaError,
+    UnknownListError,
+    UnknownTaskError,
+    UnknownViewError,
+    ViewFormProblem,
+)
 
 UNKNOWN_TASK_MESSAGE = "没有改成：这条任务已经不在本地缓存里了，刷新之后再试一次"
 """引擎拒绝写入（本地没有这条任务的底稿，工单 #25）时的话：如实说没改成。"""
@@ -225,8 +232,116 @@ INBOX_LIST_MESSAGE = "收集箱不在这里改：它是客户端补出来的默�
 每次刷新都由服务端那一份说了算，所以在这里改它只会看起来成功、下一次刷新就变回去。
 """
 
-VIEW_ROW_MESSAGE = "这是视图，不是清单：视图的建 / 改 / 删还没接上"
-"""``e`` / ``d`` 落在视图行上时的话（#42 只管清单；视图那三条归 #36）。"""
+VIEW_ROW_MESSAGE = "这是视图，不是清单：视图走它自己那条建 / 改 / 删"
+"""视图行落到**清单**那条路上时的话（#42 的兜底；视图那三条从 #36 起归 :mod:`dida.sync.views`）。
+
+它现在是一条走不到的路：清单列表页先看行的类型再分派（``app._refusal_for``），视图行不会
+再进清单那三个口子。留着是因为 :func:`dida.tui.pages.index.list_write_refusal` 仍然只回答
+「能不能当清单改」——它要是对视图行说「能」，那才是真的坑。
+"""
+
+VIEW_LOCAL_ONLY = "自定义视图只存在这台机器上：手机端、网页版没有它，换台机器就没了"
+"""浮层里那句实话的**陈述**（验收标准 4，ADR-0005）。
+
+滴答清单的 Open API 里没有「保存一组过滤条件」这个接口——只有清单与任务，而
+``/task/filter`` 过滤的是开始时间、硬顶 200 条、没有分页。所以自定义视图**只存在本机**：
+手机端、网页版上没有它，换台机器也没了。这是能力上限，不是实现疏漏，所以照实说，
+也不许暗示「以后会同步上去」。
+
+它单独成一个常量、理由另起一个（:data:`VIEW_LOCAL_ONLY_WHY`）：这一句要在一行里排得下
+（浮层宽 74 格，CJK 一格算两格），拼上理由就会折行——而折行处夹着边框，屏幕上就再也
+读不出一整句了。
+"""
+
+VIEW_LOCAL_ONLY_WHY = "（API 没有保存一组过滤条件的接口）"
+"""上面那句话的**理由**：只说「只存在本机」用户会以为是客户端没做，说清是接口里没有这一条，
+他才知道这不是能补上的功能。
+"""
+
+VIEW_FORM_SYNTAX = "多个值用空格或逗号分开；留空 = 不限"
+"""视图表单底部那行提示的第一句：清单范围 / 优先级 / 标签都能写好几个。
+
+这三格是输入框而不是多选框（#45 的挑选型字段是另一张票），所以「怎么写多个」得说清楚——
+说不清楚用户只会填一个，而工单要的是多选。
+"""
+
+NEW_KIND_HINT = "清单装任务；视图只是一组过滤条件，只存在这台机器上"
+"""``n`` 那句「清单还是视图」下面的一行说明（#36 的验收标准 1）。
+
+问这一句是有理由的：两种东西后面完全是两回事（一个是服务端的容器，一个是本地的过滤
+条件），顺手说清哪一种是哪一种，用户才不会以为自己建了个「会同步的清单」。
+"""
+
+BUILTIN_VIEW_MESSAGE = "内置视图改不了也删不掉：它的条件是写死的（今天 / 最近七天 / 所有）"
+"""``e`` / ``d`` 落在**内置**视图行上时的话（#36）。
+
+内置视图不是本地库里的行，它是三个写死的定义（:func:`dida.sync.views.builtin_view_definitions`）
+——没有「改它」这回事，删掉它也没有落点。所以这里既不开表单也不问那一句：问一句就等于
+「有可能删」，而它不会。
+"""
+
+EMPTY_VIEW_NAME_MESSAGE = "没写名字：视图得有个名字"
+"""建视图时名字那一格是空的（#36）。与清单 / 任务那两句同一条口径：空态不许静默。"""
+
+
+def delete_view_prompt(name: str) -> str:
+    """**删视图**的确认文案（#36）。
+
+    与 :func:`delete_list_prompt` 的分别正是这一屏要说的那句话：视图只是一组过滤条件，
+    删掉它**不会动任何任务**——那些任务本来就在各自的清单里。所以这里没有「找不回来」那种
+    警告（那一句留给真会丢东西的删除），只说清删的是什么、以及不牵连什么。
+    """
+    return (
+        f"删除视图「{name}」？\n"
+        "视图只是一组过滤条件，删掉它不会动任何任务。\n\n"
+        "y 确认删除 · n / Esc 取消"
+    )
+
+
+def view_write_failed_message(error: DidaError) -> str:
+    """视图的建 / 改 / 删当场失败时的话（#36）。
+
+    与 :func:`list_write_failed_message` 同一条口径：引擎当场拒绝的（本地已经没有那一行）
+    与别的失败分开说。视图不推服务端，所以这里没有网络那几种失败。
+    """
+    if isinstance(error, UnknownViewError):
+        return UNKNOWN_VIEW_MESSAGE
+    return f"视图没改成：{error}"
+
+
+UNKNOWN_VIEW_MESSAGE = "没有改成：这个视图已经不在本地库里了"
+"""本地没有那一行视图时的话（#36）。
+
+它不说「刷新之后再试一次」：视图不是从服务端拉回来的，刷新不会把它变回来——再说那句
+就是给一条走不通的路指路。
+"""
+
+
+def view_form_problem(problem: ViewFormProblem) -> str:
+    """那张表单填不下去时状态栏里的话（#36）。
+
+    逐条说清**哪一处、哪几个词**：认不出的清单名 / 优先级词一律拒绝保存，因为沉默地存下
+    一个筛不出东西的视图，用户要过一阵子才发现，而且发现时不知道是自己填错了还是客户端
+    没做。句子在这里拼（产品文案住这一个模块），判据在 :func:`dida.sync.views.parse_view_form`。
+    """
+    sentences: list[str] = []
+    if problem.missing_name:
+        sentences.append(EMPTY_VIEW_NAME_MESSAGE)
+    if problem.unknown_lists:
+        sentences.append(
+            f"清单范围里认不出这些清单：{'、'.join(problem.unknown_lists)}"
+            "（写清单的名字或 id，空格分隔）"
+        )
+    if problem.unknown_priorities:
+        sentences.append(
+            f"优先级只认 高 / 中 / 低 / 无（也可以写 5 / 3 / 1 / 0）："
+            f"认不出 {'、'.join(problem.unknown_priorities)}"
+        )
+    if problem.never_matches:
+        sentences.append(
+            "这个条件永远筛不出任务：完成状态是「未完成」时没有完成时间可筛"
+        )
+    return "；".join(sentences) or "这张表单还没填完"
 
 
 def completed_message(title: str) -> str:

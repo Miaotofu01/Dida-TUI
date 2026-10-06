@@ -22,6 +22,7 @@ from dida.sync.completed import DEFAULT_COMPLETED_WINDOW_HOURS
 from dida.sync.engine import (
     NO_DUE_TEXT,
     CompletedItem,
+    Completion,
     SyncEngine,
     TaskItem,
     completed_section,
@@ -119,7 +120,7 @@ def test_a_completed_task_sinks_even_when_it_is_sorted_with_unfinished_ones():
     source = work_source()
     source.add_task("没做完的", list_name="work", due=at(16, 9, 0))
     source.add_task("做完的", list_name="work", due=at(13, 9, 0), completed=True, completed_at=T0)
-    source.add_view("混的", id="mix", task_ids=("t1", "t2"))
+    source.add_view("混的", id="mix", completion=Completion.ANY)
 
     items = engine_with(source).tasks_in("mix").items
 
@@ -422,7 +423,7 @@ def test_a_completed_task_is_never_overdue():
     """已经做完的不算逾期：它该有的样子是划掉沉底，不是标红（用户故事 25 只管未完成的）。"""
     source = work_source()
     source.add_task("昨天做完的", list_name="work", due=at(13, 9, 0), completed=True, completed_at=T0)
-    source.add_view("混的", id="mix", task_ids=("t1",))
+    source.add_view("混的", id="mix", completion=Completion.COMPLETED)
 
     items = engine_with(source).tasks_in("mix").items
 
@@ -451,7 +452,7 @@ def test_the_read_model_says_whether_the_container_is_a_list_or_a_view():
     """「这一行要不要写清单名」由读模型回答：清单是容器，视图不是（工单 #37 的验收标准）。"""
     source = work_source()
     source.add_task("写周报", list_name="work", due=at(14, 18, 0))
-    source.add_view("我的一天", id="mine", task_ids=("t1",))
+    source.add_view("我的一天", id="mine")
     engine = engine_with(source)
 
     assert engine.tasks_in("work").shows_list_name is False, "清单是容器，名字不必重复"

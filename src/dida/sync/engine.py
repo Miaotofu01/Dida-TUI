@@ -87,6 +87,7 @@ from dida.sync.read import (
     ViewRow,
     builtin_view_rows,
     container_tasks,
+    custom_view_rows,
     is_inbox_id,
     list_index,
     resolve_lists,
@@ -125,22 +126,56 @@ from dida.sync.view import (
 )
 from dida.sync.writes import LocalEffect, UnknownTaskError, WireCall, WriteKind, WriteTarget
 from dida.sync.views import (
+    ANY_VALUE,
     BUILTIN_VIEW_DAYS,
+    COMPLETED_DAYS_CHOICES,
+    COMPLETION_CHOICES,
+    DUE_CHOICES,
+    PRIORITY_CHOICES,
+    VIEW_COMPLETED_DAYS_FIELD,
+    VIEW_COMPLETION_FIELD,
+    VIEW_DUE_FIELD,
+    VIEW_LISTS_FIELD,
+    VIEW_NAME_FIELD,
+    VIEW_PRIORITY_FIELD,
+    VIEW_TAGS_FIELD,
     Completion,
     DueWindow,
+    UnknownViewError,
+    ViewChoice,
     ViewDefinition,
+    ViewFormProblem,
+    ViewMixin,
+    ViewStore,
     ViewTask,
     builtin_view_definitions,
+    due_window_of,
     evaluate_view,
     order_key,
+    parse_view_form,
+    view_form_values,
+    view_from_payload,
+    view_payload,
 )
 
 if TYPE_CHECKING:  # 只为了标注：storage 反过来 import dida.sync.view，运行时不能在这里 import
     from dida.storage.store import RefreshReport
 
 __all__ = [
+    "ANY_VALUE",
+    "COMPLETED_DAYS_CHOICES",
+    "COMPLETION_CHOICES",
+    "DUE_CHOICES",
     "INBOX_ID",
     "NO_DUE_TEXT",
+    "PRIORITY_CHOICES",
+    "VIEW_COMPLETED_DAYS_FIELD",
+    "VIEW_COMPLETION_FIELD",
+    "VIEW_DUE_FIELD",
+    "VIEW_LISTS_FIELD",
+    "VIEW_NAME_FIELD",
+    "VIEW_PRIORITY_FIELD",
+    "VIEW_TAGS_FIELD",
     "AuthError",
     "BUILTIN_VIEW_DAYS",
     "CompletedItem",
@@ -181,10 +216,14 @@ __all__ = [
     "TodayView",
     "UnknownListError",
     "UnknownTaskError",
+    "UnknownViewError",
+    "ViewChoice",
     "ViewDefinition",
+    "ViewFormProblem",
     "ViewReader",
     "ViewRow",
     "ViewSource",
+    "ViewStore",
     "ViewTask",
     "WireCall",
     "WriteKind",
@@ -194,6 +233,8 @@ __all__ = [
     "builtin_view_rows",
     "completed_section",
     "container_tasks",
+    "custom_view_rows",
+    "due_window_of",
     "evaluate_view",
     "filter_groups",
     "format_due",
@@ -203,12 +244,16 @@ __all__ = [
     "list_index",
     "next_priority",
     "order_key",
+    "parse_view_form",
     "pending_error",
     "priority_mark",
     "resolve_lists",
     "subtask_items",
     "summarize_lists",
     "task_detail",
+    "view_form_values",
+    "view_from_payload",
+    "view_payload",
 ]
 
 DEFAULT_DAY_END = "00:00"
@@ -383,6 +428,27 @@ class Engine(Protocol):
         """写：删一个清单（``d``，TUI 已经问过一句）。服务端没有撤销（#42）。"""
         ...
 
+    def create_view(self, definition: ViewDefinition) -> str:
+        """写：建一个自定义视图（``n`` → 「视图」），返回本地那一行的 id（#36）。
+
+        **只在本地落库**：视图不推服务端（API 没有「保存一组过滤条件」这个接口），
+        所以它不入队、待推送数量不动。
+        """
+        ...
+
+    def update_view(self, definition: ViewDefinition) -> None:
+        """写：改一个自定义视图的条件与名字（``e``）；本地没有这一行时抛
+        :class:`~dida.sync.views.UnknownViewError`（#36）。"""
+        ...
+
+    def delete_view(self, view_id: str) -> None:
+        """写：删一个自定义视图（``d``，TUI 已经问过一句）。**一条任务都不碰**（#36）。"""
+        ...
+
+    def view_definition(self, view_id: str) -> ViewDefinition | None:
+        """读：一个自定义视图的定义；本地没有就是 ``None``（``e`` 的表单要拿它填当前值）。"""
+        ...
+
     def cycle_priority(self, task_id: str) -> None:
         """写：优先级推进一档（``p``）——无 → 低 → 中 → 高 → 无。"""
         ...
@@ -401,6 +467,7 @@ class Engine(Protocol):
 
 class SyncEngine(
     ListMixin,
+    ViewMixin,
     RefreshMixin,
     PushMixin,
     CompletedStreamMixin,
@@ -414,7 +481,8 @@ class SyncEngine(
 
     :class:`~dida.sync.lists.ListMixin` 排在第一位，所以引擎的 ``push_pending()`` 是它那一份
     （先推清单改动，再把任务那一份交给 :class:`~dida.sync.push.PushMixin`）；其余方法照旧
-    按名字解析，各自的 ``self._…`` 都落在同一个实例上。
+    按名字解析，各自的 ``self._…`` 都落在同一个实例上。:class:`~dida.sync.views.ViewMixin`
+    在它们后面：自定义视图的建 / 改 / 删**只在本地落库**，与推送那几片没有交集。
     """
 
     def __init__(
@@ -482,12 +550,13 @@ class SyncEngine(
         """
         if self._source is None:
             return ()
+        tasks = tuple(self._source.tasks())
         return list_index(
             tuple(self._source.lists()),
-            tuple(self._source.tasks()),
+            tasks,
             now=self._clock.now(),
             day_end=self._day_end,
-            views=self._view_rows(),
+            views=self._view_rows(tasks),
         )
 
     def tasks_in(self, container_id: str) -> TaskList:
@@ -497,14 +566,15 @@ class SyncEngine(
         """
         if self._source is None:
             return TaskList(container_id=container_id)
+        tasks = tuple(self._source.tasks())
         return container_tasks(
             container_id,
             tuple(self._source.lists()),
-            tuple(self._source.tasks()),
+            tasks,
             now=self._clock.now(),
             day_end=self._day_end,
             window_hours=self._completed_window_hours,
-            views=self._view_rows(),
+            views=self._view_rows(tasks),
         )
 
     def task_detail(self, task_id: str) -> TaskDetail | None:
@@ -560,14 +630,23 @@ class SyncEngine(
             if change.kind is ListWriteKind.CREATE
         )
 
-    def _view_rows(self) -> tuple[ViewRow, ...]:
-        """本地库里的自定义视图行（#36 把视图定义落库、求值）。
+    def _view_rows(self, tasks: Sequence[TaskSnapshot]) -> tuple[ViewRow, ...]:
+        """本地库里那些自定义视图的行：**在这里求值**（#36）。
 
-        源上没有这个能力就是「没有自定义视图」，不是错误——与写路径上那几个
-        ``isinstance`` 门同一条口径。内置视图不走这里（:func:`builtin_view_rows` 自己算）。
+        本地副本只给**定义**（它手上没有逻辑日，不读时钟），求值走
+        :func:`~dida.sync.read.custom_view_rows`——与内置视图那三个是同一个
+        ``evaluate_view``。源上没有这个能力就是「没有自定义视图」，不是错误——与写路径上
+        那几个 ``isinstance`` 门同一条口径。
         """
         source = self._source
-        return tuple(source.views()) if isinstance(source, ViewReader) else ()
+        if not isinstance(source, ViewReader):
+            return ()
+        return custom_view_rows(
+            tuple(source.view_definitions()),
+            tasks,
+            now=self._clock.now(),
+            day_end=self._day_end,
+        )
 
     def _write_target(self) -> WriteTarget:
         """写路径要写的那个本地副本。没接上就大声报错——绝不假装写成功了。"""
