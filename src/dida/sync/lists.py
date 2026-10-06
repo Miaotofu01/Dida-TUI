@@ -11,6 +11,16 @@
 
 ## 四条不变量（#54 之后）
 
+第五条（#57）：**临时 id 的所有权跟着记录走**。剪枝可以只剪掉那一**行**（它没有「还没到
+服务端的改动」时），但那条记录还在原地等认领——所以分配器（
+:meth:`~dida.storage.store.Store.new_local_list_id`）**两处一起看**：行与记录。只看行就会把
+一个还挂着记录的号再发一次，于是一个号上出现两条清单的记录；那时按 id 找记录的任何一处都会
+挑错**一条**，最坏是拿另一条清单的名字去删服务端上的一行（#57 的探针就是这么删掉用户手机上
+一条清单的）。配套的两条硬规矩：**一个号上那几条记录说的不是同一条清单时，什么都不许做**
+（:class:`AmbiguousLocalListError`，大声拒绝），以及**加一种记录 / 一种端点时必须显式分类**
+（:attr:`~dida.sync.lists.ListWriteKind.counts_as_pending` / ``holds_its_row`` /
+:attr:`ListWire.addresses_an_id`——默认值取保守的那一侧）。
+
 **这四条不是清单专属的形状**：任务的写路径上是同一个洞（#53 的「认领了但没把队列里的改动带走」，
 #39 的「排在一条还没成真的新建后面」），同一套不变量对它一样成立——差别只在第 3 条：任务的
 标题不是身份，按标题对回来太弱，所以任务那条路自愈（下一次全量刷新把真 id 那行写回来、
@@ -74,6 +84,7 @@ if TYPE_CHECKING:  # storage 反过来 import 本模块（与 dida.sync.writes �
     from dida.storage.store import PendingListChange, RefreshReport
 
 __all__ = [
+    "AmbiguousLocalListError",
     "LIST_COLORS",
     "LOCAL_LIST_PREFIX",
     "ListColor",
@@ -121,13 +132,35 @@ class ListWire(Enum):
     NONE = "none"
     """不发任何请求：这一种改动不是「要发出去的东西」，而是一份**记录**（见 ``AWAIT_ID``）。"""
 
+    @property
+    def addresses_an_id(self) -> bool:
+        """这一种调用是不是把主语写在 URL 里（那就要求那个 id 服务端认得，#57）。
+
+        默认**是**：加一种新端点时忘了想这件事，得到的是「先不发」（改动留在队列里、状态栏
+        那个数照旧算它），而不是「打到一个服务端没见过的 id 上」。只有两种是例外，而且都是
+        URL 里根本没有 id 的：新建与「不发」。
+        """
+        return self not in (ListWire.CREATE_PROJECT, ListWire.NONE)
+
 
 @dataclass(frozen=True)
 class ListBehaviour:
-    """一种清单写的行为说明（见 :data:`_BEHAVIOUR`）。"""
+    """一种清单写的行为说明（见 :data:`_BEHAVIOUR`）。
+
+    ``counts_as_pending`` 与 ``holds_its_row`` 是**两处会读它的地方**（#57 的检查 8）：
+    状态栏那个「待推送 N」数不算它（:meth:`~dida.storage.store.Store.pending_count`），
+    剪枝要不要为它留住那一行（:meth:`~dida.storage.store.Store._has_dirty_list_change`）。
+    两个默认值都取**保守**的那一侧（算改动、留住行）：加一种记录时忘了想这两件事，得到的是
+    「多算一个数、多留一行」，不是「用户的东西不声不响地被剪掉」。
+    """
 
     local: ListLocalEffect
     wire: ListWire
+    counts_as_pending: bool = True
+    """算不算「还没到服务端的改动」（状态栏那个数）。"""
+
+    holds_its_row: bool = True
+    """剪枝要不要为它留住本地那一行（以及：那一行是不是「用户还没上去的东西」）。"""
 
 
 class ListWriteKind(Enum):
@@ -159,12 +192,27 @@ class ListWriteKind(Enum):
         """推送调客户端的哪一个方法（分派读这个）。"""
         return _BEHAVIOUR[self].wire
 
+    @property
+    def counts_as_pending(self) -> bool:
+        """这一种算不算「还没到服务端的改动」（状态栏那个数读它，不读成员名）。"""
+        return _BEHAVIOUR[self].counts_as_pending
+
+    @property
+    def holds_its_row(self) -> bool:
+        """剪枝要不要为这一种留住本地那一行（读它，不读成员名）。"""
+        return _BEHAVIOUR[self].holds_its_row
+
 
 _BEHAVIOUR: dict[ListWriteKind, ListBehaviour] = {
     ListWriteKind.CREATE: ListBehaviour(local=ListLocalEffect.SAVE, wire=ListWire.CREATE_PROJECT),
     ListWriteKind.UPDATE: ListBehaviour(local=ListLocalEffect.SAVE, wire=ListWire.UPDATE_PROJECT),
     ListWriteKind.DELETE: ListBehaviour(local=ListLocalEffect.DROP, wire=ListWire.DELETE_PROJECT),
-    ListWriteKind.AWAIT_ID: ListBehaviour(local=ListLocalEffect.SAVE, wire=ListWire.NONE),
+    ListWriteKind.AWAIT_ID: ListBehaviour(
+        local=ListLocalEffect.SAVE,
+        wire=ListWire.NONE,
+        counts_as_pending=False,  # 建都建好了：用户没有欠服务端什么
+        holds_its_row=False,  # 服务端索引里找不到它就是影子，剪掉才对（号仍然被这条记录占着）
+    ),
 }
 """**一处**记全每种清单写的行为（与 :mod:`dida.sync.writes` 的 ``_BEHAVIOUR`` 同一条规矩）。"""
 
@@ -199,20 +247,41 @@ LIST_COLORS: tuple[ListColor, ...] = (
 def is_addressable(change: PendingListChange) -> bool:
     """这一笔清单改动现在**发得出去**吗（#54）。
 
-    三类不发的：
+    判断只有这一处，而且读的是词表：**这一种调用要不要一个服务端认得的 id** 写在
+    :attr:`ListWire.addresses_an_id` 上（默认要），**这个 id 服务端见过没有**写在
+    :func:`is_local_list_id` 上（全树只此一处判断）。两件事都不是在这里按成员名数的。
 
-    - :attr:`ListWriteKind.AWAIT_ID` —— 它不是一笔要发的改动，是一份「还没认领」的记录；
-    - 改 / 删一个**本地临时 id** —— 服务端没有那个清单，打过去只会 404、然后永远重试；
-    - （新建不在此列：``POST /open/v1/project`` 的 URL 里没有 id，它照发。）
+    三类不发的：:attr:`ListWriteKind.AWAIT_ID`（它是一份「还没认领」的记录，不是要发的改动）、
+    改 / 删一个**本地临时 id**（服务端没有那个清单，打过去只会 404、然后永远重试）、
+    以及任何新加的、没说清要不要 id 的端点（默认要，于是没分类就不发）。
+    新建不在此列：``POST /open/v1/project`` 的 URL 里没有 id，它照发。
 
     发不出去不等于丢掉：它留在队列里（状态栏那个数照旧算它），等认领拿到真 id 之后自然
     变得可寻址。
     """
-    if change.kind.wire is ListWire.NONE:
+    wire = change.kind.wire
+    if wire is ListWire.NONE:
         return False
-    if change.kind is ListWriteKind.CREATE:
-        return True
-    return not is_local_list_id(change.list_id)
+    return not wire.addresses_an_id or not is_local_list_id(change.list_id)
+
+
+class AmbiguousLocalListError(DidaError):
+    """一个本地临时 id 上那几条记录说的**不是同一条清单**（#57）。
+
+    这是不变量被破坏的状态（一条还没认领的清单只该有一条记录）。**不许按顺序挑一条**：
+    挑错就是拿另一条清单的名字去改 / 删服务端上的一行——探针里那一次删掉了用户手机上的
+    一条清单，事后待推送回到 0、界面上一个字都没有。所以这一层大声拒绝：什么都不做，
+    让调用方把话说到屏幕上去。
+    """
+
+    def __init__(self, list_id: str, kinds: Sequence[str] = ()) -> None:
+        detail = f"（{'、'.join(kinds)}）" if kinds else ""
+        super().__init__(
+            f"本地临时清单 {list_id} 上挂着不止一条记录{detail}：状态不对，这一笔不做。"
+            "先同步一次，再看这个清单"
+        )
+        self.list_id = list_id
+        """那个状态不对的临时 id，UI 可以直接显示出来。"""
 
 
 class UnknownListError(DidaError):
@@ -372,7 +441,7 @@ class ListMixin:
         （发的就是改名之后的那一份）；已经建好、在等 id 时它换成一次普通的改名——那一笔
         **算进**待推送，因为它确实是用户刚做、还没到服务端的改动。
         """
-        pending = _unclaimed_change(target, list_id)
+        pending = _owning_change(target, list_id)
         if pending is None:
             raise UnknownListError(list_id)  # 不该发生：临时 id 的行一定有它那条记录
         target.amend_list_change(
@@ -420,7 +489,7 @@ class ListMixin:
         删除排在它后面——认领（不管是 200 的直接认领还是 201 的按名字认领）会把两笔一起挪到
         真 id 上。
         """
-        pending = _unclaimed_change(target, list_id, include_delete=False)
+        pending = _owning_change(target, list_id)
         record = _identify_record(target, pending)
         if record.get("sentName") is None:
             # 认不出这一行建出去时叫什么（队列记录不全，旧版本留下的状态）：用本地那一行现在
@@ -469,13 +538,24 @@ class ListMixin:
         target = self._source
         if not isinstance(target, ListWriteTarget):
             return 0
-        parked = [item for item in target.pending_lists() if not is_addressable(item)]
+        records = tuple(target.pending_lists())
+        parked = [item for item in records if not is_addressable(item)]
         if not parked:
             return 0
+        # 一个号上那几条记录说的不是同一条清单时，那个号整个**不许动**（#57）：陈旧的那一条
+        # 唯一对上一行时正是探针里删掉用户清单的那一步。
+        by_id: dict[str, list[PendingListChange]] = {}
+        for item in records:
+            by_id.setdefault(item.list_id, []).append(item)
+        reused = {
+            list_id for list_id, group in by_id.items() if not _records_are_one_list(group)
+        }
         rows = tuple(target.lists())
         identified = 0
         for change in sorted(parked, key=lambda item: item.id):
-            name = change.payload.get("sentName") or _name_of(rows, change.list_id)
+            if change.list_id in reused:
+                continue
+            name = _record_name(change) or _name_of(rows, change.list_id)
             if not name:
                 continue
             known = set(change.payload.get("knownIds") or ())
@@ -487,7 +567,7 @@ class ListMixin:
             waiting = [
                 item
                 for item in parked
-                if (item.payload.get("sentName") or _name_of(rows, item.list_id)) == name
+                if (_record_name(item) or _name_of(rows, item.list_id)) == name
             ]
             if len(candidates) != 1 or len(waiting) != 1:
                 continue
@@ -697,23 +777,49 @@ class ListMixin:
         return self._client
 
 
-def _unclaimed_change(
-    target: ListWriteTarget, list_id: str, *, include_delete: bool = True
-) -> PendingListChange | None:
-    """这一行那条队列记录（#54）：临时 id 的行**只该有一条**。
+def _records_are_one_list(records: Sequence[PendingListChange]) -> bool:
+    """这几条记录说的是**同一条**清单吗（#57 的第 2 条不变量）。
 
-    ``include_delete=False`` 是给「改名」用的：一行上同时排着新建与删除时（见
-    :meth:`ListMixin._park_delete`），改名要并进那一条新建，不是并进删除。
+    一个本地临时 id 上只该有这些形状：
+
+    - 一条「自己的」记录：新建 / 改名 / 还没认领（``CREATE`` / ``UPDATE`` / ``AWAIT_ID``）；
+    - 以及**最多一条**排在它后面的删除（新建还没发出去就被删掉的那一格，见
+      :meth:`ListMixin._park_delete`）——它与那条新建必须是**同一个名字**，否则说明这个号
+      被两条清单用过了。
+
+    别的组合都说明 id 被复用了（两条记录争一个号）。那时**什么都不许做**：挑一条就是拿
+    另一条清单的名字去改 / 删服务端上的一行。
     """
-    return next(
-        (
-            item
-            for item in target.pending_lists()
-            if item.list_id == list_id
-            and (include_delete or item.kind is not ListWriteKind.DELETE)
-        ),
-        None,
-    )
+    owning = [item for item in records if item.kind is not ListWriteKind.DELETE]
+    deletes = [item for item in records if item.kind is ListWriteKind.DELETE]
+    if len(owning) > 1 or len(deletes) > 1:
+        return False
+    if not owning or not deletes:
+        return True
+    if owning[0].kind is not ListWriteKind.CREATE:
+        return False  # 删除只与「还没发出去的新建」配对；别的组合都是复用的痕迹
+    return _record_name(owning[0]) == _record_name(deletes[0])
+
+
+def _record_name(change: PendingListChange) -> str | None:
+    """一条记录说的是哪条清单的名字：认领记录用 ``sentName``（发出去时的名字），
+    还没发出去的新建用它请求体里的 ``name``。"""
+    return change.payload.get("sentName") or change.payload.get("name")
+
+
+def _owning_change(target: ListWriteTarget, list_id: str) -> PendingListChange | None:
+    """这一行「自己的」那条记录；一条都没有就是 ``None``（#54 / #57）。
+
+    删除不算「自己的」：一行上同时排着新建与删除时（见 :meth:`ListMixin._park_delete`），
+    改名要并进那一条新建，不是并进删除。
+
+    **两条以上就是状态坏了**：不挑第一条，当场 :class:`AmbiguousLocalListError`
+    ——挑错就是删错清单，而这一层是唯一能拦住它的地方。
+    """
+    records = [item for item in target.pending_lists() if item.list_id == list_id]
+    if not _records_are_one_list(records):
+        raise AmbiguousLocalListError(list_id, [item.kind.value for item in records])
+    return next((item for item in records if item.kind is not ListWriteKind.DELETE), None)
 
 
 def _identify_record(

@@ -33,6 +33,7 @@ from dida.sync.engine import (
     ViewRow,
     WriteKind,
 )
+from dida.sync.lists import LOCAL_LIST_PREFIX
 from dida.sync.view import (
     INBOX_NAME,
     ListSnapshot,
@@ -573,12 +574,13 @@ class FakeBackend:
 
         与 :meth:`create` 同一条口径：清单列表页上「建完立刻多出一行」正是这张工单的验收
         标准，只记录的话接缝一根本测不到那句话。本地临时 id 也照真引擎的样子给
-        （服务端建好之后才给真 id），界面因此不必认识「哪条还没推上去」。
+        （服务端建好之后才给真 id），界面因此不必认识「哪条还没推上去」；前缀用
+        :data:`~dida.sync.lists.LOCAL_LIST_PREFIX`，不在这里另抄一份字面量（#57 的检查 10）。
         """
         self.created_lists.append((name, color))
         self._raise_list_error()
         return self.source.add_list(
-            name, id=f"local-list-{len(self.created_lists)}", color=color
+            name, id=f"{LOCAL_LIST_PREFIX}{len(self.created_lists)}", color=color
         ).id
 
     def update_list(
