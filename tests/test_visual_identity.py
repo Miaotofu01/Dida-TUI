@@ -388,12 +388,16 @@ async def go_to_layer(pilot, app: DidaApp, layer: int) -> None:
 
 @pytest.mark.parametrize("layer", [0, 1, 2])
 async def test_the_user_scroll_keys_never_push_the_pan_track(layer: int):
-    """``←`` ``→`` ``home`` ``end`` ``pageup`` ``pagedown`` 在三层上**什么都不做**（工单 #59）。
+    """``←`` ``→`` ``home`` ``end`` ``pageup`` ``pagedown``＋``ctrl+pageup`` / ``ctrl+pagedown``
+    在三层上**什么都不做**（工单 #59）。
 
     平移是**程序驱动**的（``show()`` 与 ``on_resize()`` 调 ``scroll_to``），不是用户滚的：
     轨道是个真能横向滚动的容器，于是继承了 Textual 的滚动键位——一按就挪一格，那条铺满整幅的
     规则线当场少一格；在第一层按 ``→`` 还会露出下一页的一条边。``home`` 更糟：在详细页按下去
     视图跳到第一页的位置，而 app 仍然认为你在第三层——屏幕和状态彻底对不上。
+
+    最后那两个键工单那张表没列：它们是同一个族剩下的两个横向键（``page_left`` / ``page_right``），
+    实测一次挪一整屏，比 ``←`` / ``→`` 还狠。
 
     ``←`` / ``→`` 本来就不在 spec 的键位表里（清单层 ``n`` / ``e`` / ``d`` / ``enter``，任务层
     ``space`` / ``n`` / ``d`` / ``g`` / ``G`` / ``enter``），所以「什么都不做」就是它们该有的样子。

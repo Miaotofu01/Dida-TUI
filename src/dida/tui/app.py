@@ -138,6 +138,11 @@ class Stage(HorizontalScroll):
 
     为什么不是「别用 :class:`HorizontalScroll`」：``show()`` / ``on_resize()`` 的 ``scroll_to``
     与三页并排的版式都建在它上面，换掉它不是修一个缺陷，是把 ADR-0007 的平移重做一遍。
+
+    **这条线只拦键盘。** 鼠标滚轮走的是 ``scroll_*`` **方法**（``Widget._on_mouse_scroll_down``
+    在 shift 时调 ``_scroll_right_for_pointer``），不经过上面这些 action——实测在轨道上
+    ``shift+滚轮`` 仍把它推得动（工单 #59 报的是键，这一条留给下一张票）。滚动条那条路是关着的：
+    ``#stage`` 的 ``scrollbar-size-*`` 都是 0。
     """
 
     def show(self, index: int, *, animate: bool = True) -> None:
