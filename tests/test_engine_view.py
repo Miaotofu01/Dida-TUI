@@ -1,4 +1,9 @@
-"""引擎的读路径：视图模型从注入的缓存来，「现在」从注入的时钟来。"""
+"""引擎的读路径：三种读形状从注入的缓存来，「现在」从注入的时钟来。
+
+v1 的整屏视图模型（``view() -> TodayView``、三个硬编码分区）在 #58 里删掉了，这里留在
+原位的是它旁边那些**不是** v1 的东西：状态栏快照、逻辑日、空缓存的降级、边界上「今天」
+怎么读、以及子任务那两半（只读）。
+"""
 
 from datetime import date, datetime, timedelta, timezone
 
@@ -6,7 +11,7 @@ import pytest
 
 from dida.storage.store import Store
 from dida.sync.engine import NO_DUE_TEXT, SyncEngine
-from dida.sync.view import GroupKind, SyncState, TodayView
+from dida.sync.view import SyncState
 from dida.testing import InMemorySource, ManualClock
 
 TZ = timezone(timedelta(hours=8))
@@ -28,25 +33,29 @@ def make_source() -> InMemorySource:
     return source
 
 
-def test_view_reads_the_cache_the_test_controls():
+def test_reads_come_from_the_cache_the_test_controls():
+    """三种读形状读的都是注入的那份缓存：索引里的条数、容器里的行、详情里的成品字段。"""
     engine = SyncEngine(clock=ManualClock(at(14, 12, 3)), day_end="24:00", source=make_source())
 
-    view = engine.view()
+    index = {
+        row.name: row.unfinished for row in engine.list_index() if row.name in {"工作", "生活"}
+    }
+    assert index == {"工作": 2, "生活": 1}, "清单行上的未完成条数从缓存里数"
+    assert [item.title for item in engine.tasks_in("工作").items] == ["交季度报告", "写周报"], (
+        "某个容器的任务列表：逾期的排前面（顺序由读模型给）"
+    )
+    detail = engine.task_detail("t1")
+    assert detail is not None and detail.title == "写周报"
 
-    assert [(item.name, item.unfinished) for item in view.lists] == [("工作", 2), ("生活", 1)]
-    assert [group.kind for group in view.groups] == [
-        GroupKind.OVERDUE,
-        GroupKind.TODAY,
-        GroupKind.INBOX_UNDATED,
-    ]
-    assert [group.count for group in view.groups] == [1, 1, 1]
-    assert view.groups[0].items[0].title == "交季度报告"
 
-
-def test_view_without_a_cache_is_empty_not_an_error():
+def test_reading_without_a_cache_is_empty_not_an_error():
+    """缓存不在（降级模式、还没接上本地副本）：读形状给空，不是错误（与空缓存同一条口径）。"""
     engine = SyncEngine(clock=ManualClock(at(14, 12, 3)))
 
-    assert engine.view() == TodayView(lists=(), groups=())
+    assert engine.list_index() == ()
+    assert engine.tasks_in("work").items == ()
+    assert engine.task_detail("t1") is None
+    assert engine.subtasks("t1") == ()
 
 
 def test_status_carries_the_logical_day_the_refresh_time_and_the_pending_count():
@@ -67,16 +76,21 @@ def test_status_logical_day_follows_the_injected_day_end():
     assert engine.status().logical_day == date(2026, 3, 14)
 
 
-def test_view_groups_a_last_night_due_date_into_today_at_two_in_the_morning():
+def test_a_last_night_due_date_reads_as_today_at_two_in_the_morning():
+    """边界 04:00、凌晨两点：昨夜 23:00 属于**当前逻辑日**，所以它读作「今天」、不算逾期。
+
+    这条原本断的是「它落在今日区」；#58 之后问的是同一个答案的 v2 形状——它在内置「今天」
+    这个视图里，而且行上的 ``overdue`` 位是 ``False``。
+    """
     source = InMemorySource()
     source.add_list("工作")
     source.add_task("写周报", list_name="工作", due=at(14, 23, 0))
     engine = SyncEngine(clock=ManualClock(at(15, 2, 0)), day_end="04:00", source=source)
 
-    (today,) = engine.view().groups
+    (item,) = engine.tasks_in("today").items
 
-    assert today.kind is GroupKind.TODAY
-    assert today.items[0].due_text == "今天 23:00"
+    assert item.due_text == "今天 23:00"
+    assert item.overdue is False
 
 
 # ------------------------------------------------------- 子任务：只读那两半（#43）

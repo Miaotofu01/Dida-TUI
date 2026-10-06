@@ -110,7 +110,9 @@ async def test_a_task_completed_on_the_phone_reaches_the_view(store):
         "endDate": "2026-03-14T12:03:00+0800",
     }
     assert report.written_tasks == 1
-    section = engine.view().completed
+    # 已完成区那一段（v1 的 ``view().completed`` 是同一个问法）：它挂在**清单**这个容器上，
+    # 因为已完成流是按清单落库的（#58 删掉了 v1 那条整屏读路径）。
+    section = engine.tasks_in("work").completed
     assert [(item.title, item.list_name) for item in section.items] == [("手机上做完的", "工作")]
     assert section.count == 1
 

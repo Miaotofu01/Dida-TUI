@@ -142,8 +142,10 @@ def test_the_completed_window_from_the_config_reaches_the_engine(tmp_path):
     narrow = make_app(db, Server(), completed_window_hours=24, refresh_on_start=False)
     wide = make_app(db, Server(), completed_window_hours=48, refresh_on_start=False)
 
-    assert [item.title for item in narrow.engine.view().completed.items] == []
-    assert [item.title for item in wide.engine.view().completed.items] == ["手机上做完的"]
+    assert [item.title for item in narrow.engine.tasks_in("inbox").completed.items] == []
+    assert [item.title for item in wide.engine.tasks_in("inbox").completed.items] == [
+        "手机上做完的"
+    ]
 
 
 def test_the_cache_lives_at_the_path_the_composition_root_was_given(tmp_path):
@@ -207,7 +209,7 @@ async def test_a_transport_that_cannot_be_built_still_reads_the_cache(tmp_path):
         db_path=db,
     )
 
-    assert [item.title for group in app.engine.view().groups for item in group.items] == ["写周报"], (
+    assert [item.title for item in app.engine.tasks_in("inbox").items] == ["写周报"], (
         "建不出客户端不影响读缓存"
     )
 

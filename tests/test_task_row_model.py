@@ -28,6 +28,7 @@ from dida.sync.engine import (
     TaskItem,
     completed_section,
     format_due,
+    next_priority,
     priority_mark,
 )
 from dida.sync.rows import completed_window_start, row_sort_key
@@ -231,6 +232,9 @@ async def test_a_task_that_was_uncompleted_does_not_come_back_in_the_completed_s
     服务端只按完成时间窗回话（那个端点没有 ``status`` 参数），「已完成」这一半只能由客户端
     拿**响应里的** ``status`` 筛掉：``2`` 是完成、``0`` 是正常、``-1`` 是已放弃。
     """
+    # 清单那一行由一次全量刷新写进来；这条测试只跑已完成流，所以自己先摆上它——
+    # 否则那条任务没有容器行可挂，v2 的读形状按 container_id 取成员（#58 之后只有这一条路）。
+    store.apply_refresh(lists=[{"id": "work", "name": "工作", "sortOrder": 1}], tasks=[])
     reader = StubCompletedReader(
         [
             completed_payload("t1", "手机上做完的", status=2),
@@ -244,7 +248,7 @@ async def test_a_task_that_was_uncompleted_does_not_come_back_in_the_completed_s
 
     assert report.written_tasks == 1
     assert [snapshot.id for snapshot in store.tasks()] == ["t1"], "取消完成的那条一条都不许落库"
-    assert [item.title for item in engine.view().completed.items] == ["手机上做完的"]
+    assert [item.title for item in engine.tasks_in("work").completed.items] == ["手机上做完的"]
 
 
 async def test_a_payload_without_a_status_is_not_treated_as_completed(store):
@@ -678,3 +682,79 @@ def test_an_all_day_task_due_today_stays_today_at_the_0400_boundary():
     """
     assert format_due(at(14, 0, 0), all_day=True, now=at(15, 2, 0), day_end="04:00") == "今天"
     assert format_due(at(14, 23, 0), all_day=False, now=at(15, 2, 0), day_end="04:00") == "今天 23:00"
+
+
+# ------------------------------------------------- 纯读法：截止时间与优先级标记（#58 搬过来的）
+#
+# 这一节原本住在 ``tests/test_view_models.py`` 里（v1 的「视图模型」：三个分区、左栏徽标、
+# ``/`` 的模糊过滤）。那张票的读路径在 #58 里删掉了，**留下的**是这几条与它无关的纯读法
+# ——截止时间怎么读、优先级标记是哪几个字、``p`` 的循环顺序——所以它们搬到这里（这一层正是
+# 「行读成什么」的家），那个文件跟着它钉的 v1 形状一起删掉。
+
+
+def test_timed_due_today_reads_as_today_plus_time():
+    assert format_due(at(14, 18, 0), all_day=False, now=at(14, 12, 3), day_end="24:00") == "今天 18:00"
+
+
+def test_all_day_due_today_never_shows_a_time():
+    assert format_due(at(14), all_day=True, now=at(14, 12, 3), day_end="24:00") == "今天"
+
+
+def test_timed_due_yesterday_reads_as_yesterday_plus_time():
+    assert format_due(at(13, 9, 0), all_day=False, now=at(14, 12, 3), day_end="24:00") == "昨天 09:00"
+
+
+def test_due_three_days_ago_reads_as_days_ago():
+    assert format_due(at(11, 9, 0), all_day=False, now=at(14, 12, 3), day_end="24:00") == "3 天前"
+
+
+def test_no_due_date_is_visually_distinct_from_due_today():
+    # 没有日期读作一道**宽度无歧义**的短横（工单 #37）：原来的 ``—``（U+2014）是东亚
+    # 歧义宽度，进了对齐列就会歪；``今天`` 是字，两者一眼可分。
+    assert format_due(None, all_day=False, now=at(14, 12, 3), day_end="24:00") == "-"
+    assert format_due(at(14), all_day=True, now=at(14, 12, 3), day_end="24:00") == "今天"
+
+
+def test_due_before_the_logical_day_end_reads_as_today():
+    """逻辑日边界 04:00：凌晨两点看到的昨天 23:00 截止仍是「今天」。"""
+    assert format_due(at(14, 23, 0), all_day=False, now=at(15, 2, 0), day_end="04:00") == "今天 23:00"
+
+
+def test_due_before_the_logical_day_start_reads_as_yesterday():
+    assert format_due(at(14, 3, 0), all_day=False, now=at(15, 2, 0), day_end="04:00") == "昨天 03:00"
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [
+        (0, 1),  # 无 → 低
+        (1, 3),  # 低 → 中
+        (3, 5),  # 中 → 高
+        (5, 0),  # 高 → 无（循环）
+    ],
+)
+def test_the_priority_cycle_walks_the_wire_values_0_1_3_5(current, expected):
+    """优先级循环走的是 ``0/1/3/5``，不是稠密的 1/2/3（api-contracts.md 第 3 条）。
+
+    原本钉在界面测试 ``test_priority_filter.py`` 里（工单 #32 搬出来的）：``p`` 那个**键**
+    在 v2 里归 #45 重做，但「线上编码是哪四个值、循环顺序是什么」是 API 的事实，与界面无关。
+    """
+    assert next_priority(current) == expected
+
+
+@pytest.mark.parametrize(
+    ("wire", "mark"),
+    [
+        (0, "."),  # 无
+        (1, "."),  # 低与无是同一个标记
+        (3, "~"),  # 中
+        (5, "!"),  # 高
+    ],
+)
+def test_each_priority_wire_value_has_its_one_mark(wire, mark):
+    """线上编码 → 标记是一张完整的表，不是只有「高」那一格（工单 #32 搬出来的）。
+
+    低/无的标记从 ``·``（U+00B7）换成 ``.``（U+002E）：前者是东亚**歧义**宽度，rich 量它
+    1 格而 zh_CN 的终端可能画 2 格——它站在任务行的第一列，歪的是整行（工单 #37）。
+    """
+    assert priority_mark(wire) == mark

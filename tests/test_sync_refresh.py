@@ -17,7 +17,7 @@ import pytest
 from dida.api.client import DidaApiClient
 from dida.api.errors import MalformedResponseError, NetworkError, ServerRejectionError
 from dida.storage.store import ChangeKind, RefreshReport, Store
-from dida.sync.engine import SyncEngine
+from dida.sync.engine import ListKind, ListRow, SyncEngine, TaskItem
 from dida.testing import FakeTransport, InMemorySource, ManualClock
 
 TZ = timezone(timedelta(hours=8))
@@ -88,6 +88,24 @@ def urls(transport: FakeTransport) -> list[str]:
     return [str(request.url) for request in transport.requests]
 
 
+def list_rows(engine: SyncEngine) -> list[ListRow]:
+    """库里那几行**真实清单**（收集箱置顶），顺序与未完成条数照清单索引给的那一份。
+
+    v1 的 ``view().lists`` 问的是同一句话（左栏那几行）；#58 把那条读路径删掉之后改问 v2 的
+    清单索引——索引里还夹着内置视图与自定义视图那几行，所以这里按 ``ListKind.LIST`` 滤一道。
+    """
+    return [row for row in engine.list_index() if row.kind is ListKind.LIST]
+
+
+def open_items(engine: SyncEngine) -> list[TaskItem]:
+    """屏幕上「未完成」那一段的行：每个真实清单的成员，按清单索引的顺序。
+
+    v1 的 ``view().groups`` 问的是同一句话（读路径上的成品行），只是它硬编码了三个分区。
+    这些测试摆的任务都没有未来截止的，两种问法在这些断言上逐字相同。
+    """
+    return [item for row in list_rows(engine) for item in engine.tasks_in(row.id).items]
+
+
 class PagedProjectServer:
     """**会真的分页**的假服务端（#41）。
 
@@ -151,7 +169,7 @@ async def test_the_project_index_is_paged_until_a_short_page(store):
     await engine.refresh()
 
     assert len(store.lists()) == 250, "第 201 个清单起不许被截断"
-    assert [item.name for item in engine.view().lists][-1] == "清单249"
+    assert [row.name for row in list_rows(engine)][-1] == "清单249"
     assert store.task_payload("deep") is not None, "翻页才看得见的那个清单里的任务也要在"
     assert server.index_pages == 2
     assert server.index_requests[0].url.params.get("limit") == "200"
@@ -174,7 +192,7 @@ async def test_refresh_fetches_every_list_and_writes_the_first_payload(store):
         "https://api.dida365.com/open/v1/project/work/data",
     ]
     assert (report.written_lists, report.written_tasks) == (2, 1)
-    assert [(item.name, item.unfinished) for item in engine.view().lists] == [
+    assert [(row.name, row.unfinished) for row in list_rows(engine)] == [
         ("收集箱", 0),
         ("工作", 1),
     ]
@@ -253,7 +271,7 @@ async def test_a_list_with_no_unfinished_tasks_is_not_an_error(store):
 
     assert (report.written_lists, report.written_tasks) == (2, 0)
     assert store.tasks() == ()
-    assert engine.view().groups == ()
+    assert open_items(engine) == [], "库里一条任务都没有，屏幕上也就没有行"
 
 
 async def test_an_empty_project_index_is_not_an_error(store):
@@ -352,7 +370,7 @@ async def test_the_inbox_is_never_pruned_even_when_the_index_never_mentions_it(s
     report = await engine.refresh()
 
     assert [item.name for item in store.lists()] == ["收集箱", "工作"]
-    assert [item.name for item in engine.view().lists] == ["收集箱", "工作"]
+    assert [row.name for row in list_rows(engine)] == ["收集箱", "工作"]
     assert report.pruned_lists == 0
 
 
@@ -443,7 +461,7 @@ async def test_a_task_deleted_remotely_disappears_from_the_local_library(store):
     assert [item.id for item in store.tasks()] == ["t2"]
     assert report.pruned_tasks == 1
     assert report.written_tasks == 0, "留下那条没变，一个字节都不写"
-    assert [item.title for group in engine.view().groups for item in group.items] == ["买牛奶"]
+    assert [item.title for item in engine.tasks_in("work").items] == ["买牛奶"]
 
 
 async def test_a_list_deleted_remotely_disappears_from_the_library(store):
@@ -464,7 +482,7 @@ async def test_a_list_deleted_remotely_disappears_from_the_library(store):
     report = await engine.refresh()
 
     assert [item.name for item in store.lists()] == ["收集箱"]
-    assert [item.name for item in engine.view().lists] == ["收集箱"]
+    assert [row.name for row in list_rows(engine)] == ["收集箱"]
     assert report.pruned_lists == 1
 
 
@@ -497,10 +515,8 @@ async def test_a_task_with_an_unpushed_change_is_never_pruned(store):
     assert store.pending_count() == 2, "两条改动都还在队列里"
     assert store.task_payload("t1")["title"] == "写周报（我改的）"
     assert store.task_payload("local-new")["title"] == "随手记"
-    assert [item.title for group in engine.view().groups for item in group.items] == [
-        "写周报（我改的）",
-        "随手记",
-    ]
+    assert [item.title for item in engine.tasks_in("work").items] == ["写周报（我改的）"]
+    assert [item.title for item in engine.tasks_in("inbox").items] == ["随手记"]
     assert report.pruned_tasks == 0
 
 
@@ -537,7 +553,10 @@ async def test_a_refresh_that_deletes_several_remote_records_keeps_unrelated_loc
     assert [item.id for item in store.tasks()] == ["t2"], "远端没有的剪掉，有本地改动的那条留住"
     assert store.pending() == queued, "队列里那一笔原封不动"
     assert store.task_payload("t2")["title"] == "买牛奶（我改的）"
-    assert [item.title for group in engine.view().groups for item in group.items] == ["买牛奶（我改的）"]
+    # 清单被剪掉之后，这条任务暂时刻画不出来：v2 的读形状按 container_id 取成员，而容器行
+    # 已经不在了（#41 已知的后果，notes/brief.md 记着，不是这里要顺手补的洞）。留住的是本地
+    # 那一份与待推送的改动——用户的操作没有被撤销；清单回来、或者那一笔推上去，它就回屏幕上。
+    assert engine.tasks_in("home").items == ()
     assert report.pruned_lists == 1
     assert report.pruned_tasks == 1
 
@@ -695,7 +714,7 @@ async def test_a_pending_change_survives_a_full_refresh(store):
     serve(transport, index=index, data=payload)
     report = await engine.refresh()
 
-    assert [item.title for group in engine.view().groups for item in group.items] == ["写周报（我改的）"]
+    assert [item.title for item in engine.tasks_in("work").items] == ["写周报（我改的）"]
     assert store.task_payload("t1")["title"] == "写周报（我改的）"
     assert [(item.task_id, item.field, item.local, item.server) for item in report.suppressed] == [
         ("t1", "title", "写周报（我改的）", "写周报")
@@ -729,7 +748,7 @@ async def test_a_failed_push_survives_a_full_refresh_and_then_succeeds(store):
     report = await engine.refresh()
 
     assert engine.status().pending_count == 1, "刷新不许把还没推成功的改动弄丢"
-    assert [item.title for group in engine.view().groups for item in group.items] == ["写周报（我改的）"]
+    assert [item.title for item in engine.tasks_in("work").items] == ["写周报（我改的）"]
     assert store.task_payload("t1")["title"] == "写周报（我改的）"
     assert [(item.task_id, item.field, item.local, item.server) for item in report.suppressed] == [
         ("t1", "title", "写周报（我改的）", "写周报")
@@ -769,7 +788,7 @@ async def test_the_inbox_is_fetched_even_when_the_project_index_omits_it(store):
         "https://api.dida365.com/open/v1/project/inbox/data",
     ]
     assert (report.written_lists, report.written_tasks) == (2, 1)
-    assert [(item.name, item.unfinished) for item in engine.view().lists] == [
+    assert [(row.name, row.unfinished) for row in list_rows(engine)] == [
         ("收集箱", 1),
         ("工作", 0),
     ]
@@ -915,7 +934,7 @@ async def test_a_task_without_a_project_id_is_attributed_to_its_list(store):
 
     await engine.refresh()
 
-    assert [item.list_name for group in engine.view().groups for item in group.items] == ["工作"]
+    assert [item.list_name for item in open_items(engine)] == ["工作"]
     assert store.task_payload("t1")["projectId"] == "work"
 
 
@@ -938,7 +957,7 @@ async def test_offline_still_reads_the_cache_and_queues_writes(store):
     with pytest.raises(NetworkError):
         await engine.refresh()
 
-    assert [item.title for group in engine.view().groups for item in group.items] == ["写周报"], (
+    assert [item.title for item in engine.tasks_in("work").items] == ["写周报"], (
         "缓存里的任务还在，断网不改变这一屏"
     )
 

@@ -21,7 +21,7 @@ import pytest
 from dida.api.client import DidaApiClient
 from dida.api.errors import DidaError
 from dida.storage.store import Store
-from dida.sync.engine import SyncEngine, UnknownTaskError, WriteKind
+from dida.sync.engine import ListKind, SyncEngine, UnknownTaskError, WriteKind
 from dida.testing import FakeTransport, ManualClock
 
 TZ = timezone(timedelta(hours=8))
@@ -81,8 +81,18 @@ def make_engine(
 
 
 def titles(engine: SyncEngine) -> list[str]:
-    """视图里看得见的任务标题（用户真正看到的那一份）。"""
-    return [item.title for group in engine.view().groups for item in group.items]
+    """屏幕上看得见的任务标题（用户真正看到的那一份）。
+
+    v1 的 ``view().groups`` 问的是同一句话；#58 把它换成 v2 的读形状——库里每个真实清单的
+    成员，按清单索引的顺序。这些测试摆的任务都在 ``work`` 里且没有未来截止的，两种问法
+    逐字相同。
+    """
+    return [
+        item.title
+        for row in engine.list_index()
+        if row.kind is ListKind.LIST
+        for item in engine.tasks_in(row.id).items
+    ]
 
 
 def test_writing_a_task_that_is_not_in_the_cache_is_refused(store):
