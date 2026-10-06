@@ -603,7 +603,7 @@ class DetailPage(CursorPage):
         """用户墙钟当前的时区（app 从注入的钟上取来，随 :meth:`show_detail` 递进来）。"""
 
     def compose(self) -> ComposeResult:
-        """正文 + 装饰光标条（页面的那两块），加上这一页自己的两块：底部那一行 + 编辑器。
+        """正文（页面的那一块），加上这一页自己的两块：底部那一行 + 编辑器。
 
         编辑器（单行 / 多行 / 截止时间那三套）**预先摆好、平时藏着**（``display: none``）：
         进编辑就是把正文藏起来、把它亮出来，退出反过来。挂载与卸载留到按键那一刻做的话，
@@ -682,7 +682,7 @@ class DetailPage(CursorPage):
         """每个字段占几屏行——**这张前缀和表就是详细页的光标与滚动**（#43 的实现后果 2）。
 
         一个长描述会占五六行，于是「第几个字段」与「第几屏行」分家：``CursorPage`` 里
-        ``_line_of_cursor`` / ``_total_lines`` / ``scroll_cursor_into_view`` 读的都是这一张表。
+        ``_line_of_cursor`` / ``_cursor_lines`` / ``scroll_cursor_into_view`` 读的都是这一张表。
         量的是 :meth:`_line_text` 那一份文字（含行首那两格光标空档），因为它才是画上去的
         东西。宽度还没量出来（第一帧、隐藏时）就先当一行，等 ``on_resize`` 重画再算。
         """
@@ -692,10 +692,9 @@ class DetailPage(CursorPage):
         return tuple(_screen_lines(self._line_text(row).plain, width) for row in self._rows)
 
     def on_resize(self) -> None:
-        """宽度变了：折行块的行数跟着变，光标条与滚动的位置都要按新表重算。"""
+        """宽度变了：折行块的行数跟着变，滚动的位置要按新表重算。"""
         super().on_resize()
         if self._rows and self._editing is None:
-            self._land_bar()
             self.scroll_cursor_into_view()
 
     # ---------------------------------------------------------------- 编辑
@@ -759,7 +758,6 @@ class DetailPage(CursorPage):
             single.cursor_position = len(field.value)
             single.focus()
         self._body().styles.display = "none"
-        self._bar().styles.visibility = "hidden"
         self.query_one("#detail-edit").styles.display = "block"
 
     # ---------------------------------------------------------------- 截止时间（#44）
@@ -785,7 +783,6 @@ class DetailPage(CursorPage):
         time_input.value = "" if detail.due is None else due.format_time_input(detail.due.time())
         time_input.display = not self._due_all_day
         self._body().styles.display = "none"
-        self._bar().styles.visibility = "hidden"
         self.query_one("#detail-edit").styles.display = "block"
         self._show_due_step()
         date_input.focus()
