@@ -1,8 +1,9 @@
 """层三：任务详细页——字段列表、逐字段编辑、只读的那几段（工单 #43）。
 
-spec 的三层状态机里，任务列表页 ``enter`` 进这一页、``esc`` 退回任务列表页。这一页上：
+spec 的三层状态机里，任务列表页 ``→`` 进这一页、``←`` 退回任务列表页。这一页上：
 ``j``/``k`` 在**字段之间**走（永远不停在折行块内部）、``enter`` 进当前字段的编辑、编辑中
-``esc`` **结束这次编辑并回到字段列表**（改动已经生效，没有「取消」）。
+``esc`` **结束这次编辑并回到字段列表**（改动已经生效，没有「取消」）。编辑中 ``←`` / ``→``
+归输入框——它们在文字里移动光标，不把人弹出这一层；退回只有一个键，就是 ``←``（ADR-0008 一）。
 
 **两个字段不许标反**（``GLOSSARY.md``：描述 = ``content``、备注 = ``desc``；v1 标反了，
 这份 spec 纠正它）：这一页按术语表写，``TaskDetail.content`` 画在「描述」那一行。
@@ -533,7 +534,7 @@ class DetailPage(CursorPage):
     """这一页**折行**：列表页那两页截断，详细页存在的意义就是「来这里读完整的」。"""
 
     class Back(Message):
-        """用户按了 ``esc``（字段列表上）：退回任务列表页（光标还原到进来的那条任务）。"""
+        """用户按了 ``←``（``left``）：退回任务列表页（光标还原到进来的那条任务）。"""
 
     class FieldEdited(Message):
         """用户按了 ``esc``（编辑中）：这个字段的文字改了，**已经生效、没有取消**。
@@ -988,7 +989,8 @@ class DetailPage(CursorPage):
         self.post_message(self.FieldEdited(self._task_id, field.wire or field.key, value))
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
-        """单行输入里按 ``enter`` ＝ 提交（键位表：``enter`` 是「进入下一层 / 提交输入」）。
+        """单行输入里按 ``enter`` ＝ 提交——那是 :class:`~textual.widgets.Input` 自己的绑定
+        （它在文本框里一直是这样），不是这一页的 ``enter``。
 
         截止时间那两格（#44）与自由文本框走同一条：日期那一格提交就轮到时刻，时刻那一格
         提交就把这一刻写出去（``#detail-input`` 那一路仍然是「结束这次编辑」）。
@@ -1000,17 +1002,26 @@ class DetailPage(CursorPage):
             self._finish_edit()
 
     def action_back(self) -> None:
-        """``esc``：编辑中结束这次编辑，字段列表上退回任务列表页（验收标准 4 + 5）。
+        """``←``（``left``）：退回任务列表页（验收标准 3）。
+
+        **无条件**：字段列表上按它是退回，编辑中按它也是退回——只不过编辑中这个键根本到不了
+        这里：焦点在输入框上，``←`` / ``→`` 归 :class:`~textual.widgets.Input` 的
+        ``cursor_left`` / ``cursor_right``，而焦点控件的绑定先于页面的（ADR-0008 一），
+        所以这一页绑的 ``left`` 抢不到它。
+        """
+        self.post_message(self.Back())
+
+    def action_end_edit(self) -> None:
+        """``esc``：结束这次编辑，**改动已经生效**（验收标准 4 + 5）。它不再是「退回」。
 
         三种编辑器**同一个含义**：自由文本框（#43）把文字交出去，截止时间（#44）把两格草稿
-        交出去（细节见 :meth:`_escape_due_edit`）——**没有「取消」**（用户故事 62）。只有
-        光标已经在字段列表上时，``esc`` 才是「退回上一层」。
+        交出去（细节见 :meth:`_escape_due_edit`）——**没有「取消」**（用户故事 62）。
+
+        光标已经在字段列表上时它什么都不做：**退回只有一个键**，就是 ``←``（ADR-0008 一）。
         """
         if self._due_editing:
             self._escape_due_edit()
             return
         if self._editing is not None:
             self._finish_edit()
-            return
-        self.post_message(self.Back())
 

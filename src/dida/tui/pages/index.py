@@ -4,13 +4,13 @@
 东西，所以各自一个前缀字符——**不靠颜色单独承担**（色弱、``NO_COLOR``、只有 8 色的终端上
 颜色全都不算数）。收集箱是客户端自己补的那一行（服务端的清单索引里没有它），置顶显示并
 有自己一眼能认出来的记号。真实清单按项目组归拢，项目组是**不可进入的小标题**：光标越过它，
-``enter`` 永远落不到它上面。
+``→`` 永远落不到它上面。
 
 ``kind`` 是 ``NOTE`` 的清单装不了任务、``permission`` 不是 ``write`` 的改不动（用户故事
 23/24）：两种都标记出来且**进不去**——进去只会看到一屏空白，或者改不动却不知道为什么。
 
 可不可进入是引擎给的判断（:attr:`dida.sync.read.ListRow.enterable`），这一页只画与转发：
-按 ``enter`` 时不可进入的行只报一句「进不去」，不进下一层。
+按 ``→`` 时不可进入的行只报一句「进不去」，不进下一层。
 """
 
 from __future__ import annotations
@@ -351,14 +351,14 @@ class IndexPage(CursorPage):
     EMPTY_TEXT = messages.EMPTY_INDEX_MESSAGE
 
     class Entered(Message):
-        """用户按了 ``enter``：进这个容器（清单或视图）。"""
+        """用户按了 ``→``（``right``）：进这个容器（清单或视图）。"""
 
         def __init__(self, container_id: str) -> None:
             self.container_id = container_id
             super().__init__()
 
     class Refused(Message):
-        """用户按了 ``enter``，但这一行进不去（NOTE 清单 / 没有写权限）。"""
+        """用户按了 ``→``，但这一行进不去（NOTE 清单 / 没有写权限）。"""
 
         def __init__(self, message: str) -> None:
             self.message = message
@@ -423,7 +423,7 @@ class IndexPage(CursorPage):
         return tuple(built)
 
     def action_enter(self) -> None:
-        """``enter``：进选中的那一行；进不去的行只报一句。"""
+        """``→``（``right``）：进选中的那一行；进不去的行只报一句。"""
         row = self._rows_by_id.get(self.selected_id or "")
         if row is None:
             return

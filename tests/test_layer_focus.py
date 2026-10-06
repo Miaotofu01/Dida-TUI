@@ -5,8 +5,9 @@
 在可见区（``Widget.visible`` 说的是 CSS 可见，不是「在这一屏里」），于是焦点被交给一个用户
 看不见的页面：屏幕纹丝不动，接下来按的键却全落在别处。
 
-``tab`` 不在 spec 的键位表里（清单层 ``n`` / ``e`` / ``d`` / ``enter``，任务层 ``space`` /
-``n`` / ``d`` / ``g`` / ``G`` / ``enter``，详细层 ``j`` / ``k`` / ``enter``）；它只在浮层里
+``tab`` 不在 spec 的键位表里（清单层 ``n`` / ``e`` / ``d`` / ``→``，任务层 ``space`` /
+``n`` / ``d`` / ``g`` / ``G`` / ``→`` / ``←``，详细层 ``j`` / ``k`` / ``enter`` / ``←`` /
+``esc``）；它只在浮层里
 有意义。**所以在页面上它本来就该什么都不做。**
 
 **接缝一**：真 ``DidaApp`` + ``FakeBackend`` + Pilot。断的是外部行为：「我按了 tab，焦点还在
@@ -51,10 +52,10 @@ async def go_to_layer(pilot, app: DidaApp, layer: int) -> None:
             break
         await pilot.press("j")
     if layer >= 1:
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
     if layer >= 2:
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
 
 
@@ -134,7 +135,7 @@ async def test_only_the_page_on_screen_can_be_focused(layer: int):
 
 
 async def test_focus_follows_the_layer_when_you_walk_in_and_out():
-    """换层（``enter`` / ``esc``）之后焦点**跟着层走**，而且原来那一页立刻不再可聚焦。
+    """换层（``→`` / ``←``）之后焦点**跟着层走**，而且原来那一页立刻不再可聚焦。
 
     这一条看着「本来就该这样」，但它是 #60 的验收核心：只有当前那一页可聚焦。所以这里连
     「旧页立刻不可聚焦」一起断——只断「焦点在正确的页上」会漏掉「旧页还能被 ``tab`` 走进去」。
@@ -155,16 +156,16 @@ async def test_focus_follows_the_layer_when_you_walk_in_and_out():
         assert app.focused is app.tasks_page(), f"进第二层之后焦点应当在那一页上：{app.focused!r}"
         assert not app.index_page().focusable, "离开之后，第一页不该还能被聚焦"
 
-        await pilot.press("enter")  # 1 → 2
+        await pilot.press("right")  # 1 → 2
         await pilot.pause()
         assert app.layer == LAYER_DETAIL
         assert app.focused is app.detail_page(), f"进第三层之后焦点应当在那一页上：{app.focused!r}"
         assert not app.tasks_page().focusable, "离开之后，第二页不该还能被聚焦"
 
-        await pilot.press("escape")  # 2 → 1
+        await pilot.press("left")  # 2 → 1
         await pilot.pause()
         assert app.focused is app.tasks_page()
-        await pilot.press("escape")  # 1 → 0
+        await pilot.press("left")  # 1 → 0
         await pilot.pause()
         assert app.focused is app.index_page()
         assert not app.detail_page().focusable, "离开之后，第三页不该还能被聚焦"

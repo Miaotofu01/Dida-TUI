@@ -32,6 +32,7 @@ from dida.tui.keys import (
     GLOBAL,
     LAYER_DETAIL,
     LAYER_INDEX,
+    LAYER_TASKS,
     LAYER_TITLES,
     LAYERS,
     bindings_for,
@@ -222,8 +223,8 @@ def backend() -> FakeBackend:
 
 
 async def open_help(pilot, app: DidaApp) -> str:
-    """按 ``?``、把那一屏读下来、再收起浮层。"""
-    await pilot.press("question_mark")
+    """按 ``h``、把那一屏读下来、再收起浮层。"""
+    await pilot.press("h")
     await pilot.pause()
     text = screen_text(app)
     await pilot.press("escape")
@@ -231,12 +232,12 @@ async def open_help(pilot, app: DidaApp) -> str:
     return text
 
 
-async def test_the_question_mark_help_shows_only_the_keys_of_the_layer_you_are_on():
-    """``?`` 只列**当前这一层**的键：别的层自己的键一个都不出现（用户故事 119）。
+async def test_the_h_help_shows_only_the_keys_of_the_layer_you_are_on():
+    """``h`` 只列**当前这一层**的键：别的层自己的键一个都不出现（用户故事 119）。
 
     走的是外部行为：真的按键、真的看下一屏。抬头先说清这是哪一层，然后拿同一张表里那三层
     的行对账——帮助跟着表走，「别的层自己的键」就是从表里减出来的那一份。第一层没有
-    ``esc`` 那一行（它无处可退，spec 的状态机里清单列表页只有 ``enter`` 向下）。
+    ``←`` 那一行（它无处可退，spec 的状态机里清单列表页只有 ``→`` 向下）。
     """
     app = DidaApp(backend())
 
@@ -248,7 +249,7 @@ async def test_the_question_mark_help_shows_only_the_keys_of_the_layer_you_are_o
 
             assert LAYER_TITLES[layer] in screen, f"帮助的抬头不是「{LAYER_TITLES[layer]}」"
             # 抬头那一行写的就是层名，而层名可能与某条说明同名（详细页的层名与任务列表页
-            # ``enter`` 的说明都是「任务详细页」）——对账只用**行**，所以先把抬头摘掉。
+            # ``→`` 的说明都是「任务详细页」）——对账只用**行**，所以先把抬头摘掉。
             rows_text = "\n".join(
                 line for line in screen.splitlines() if LAYER_TITLES[layer] not in line
             )
@@ -267,5 +268,65 @@ async def test_the_question_mark_help_shows_only_the_keys_of_the_layer_you_are_o
             else:
                 assert "退回" in rows_text, f"{layer} 得有一条退回上一层的键"
             if layer != LAYER_DETAIL:
-                await pilot.press("enter")  # 清单列表页 → 任务列表页 → 详细页
+                await pilot.press("right")  # 清单列表页 → 任务列表页 → 详细页
                 await pilot.pause()
+
+
+# ------------------------------------------------------------------ `h` 取代 `?`
+
+
+async def test_h_opens_the_help_and_question_mark_does_not():
+    """``h`` 打开键位表，``?`` 不再触发帮助（验收标准 8、用户故事 139 + 142）。"""
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        before = screen_text(app)
+
+        await pilot.press("question_mark")
+        await pilot.pause()
+        assert screen_text(app) == before, "``?`` 不该再弹出任何东西"
+
+        await pilot.press("h")
+        await pilot.pause()
+        opened = screen_text(app)
+
+    assert LAYER_TITLES[LAYER_INDEX] in opened, "``h`` 该弹出当前这一层的键位表"
+    assert "当前这一层的键位" in opened, "帮助的正文没出来"
+
+
+async def test_h_on_the_help_overlay_does_not_stack_a_second_one():
+    """帮助浮层上按 ``h`` 不叠出第二张（验收标准 10、用户故事 144）。
+
+    浮层是模态的：按键解析截断在浮层上，app 那条 ``h`` 够不着，所以第二张根本压不进去。
+    断法是「一次 ``esc`` 就够」——真叠了两张的话，第一次 ``esc`` 只关掉上面那张，
+    同一块帮助正文还在屏幕上。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("h")
+        await pilot.pause()
+        await pilot.press("h")  # 第二下不许叠出第二张
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert "当前这一层的键位" not in text, "一次 esc 之后帮助该收起来了——它叠了第二张"
+    assert "收集箱" in text, "收掉帮助之后回到清单列表页"
+
+
+def test_the_help_lists_the_arrow_keys_by_their_bare_ascii_names():
+    """帮助里的键名只用宽度无歧义的拼法（验收标准 9、ADR-0008 三）。
+
+    ``←`` / ``→`` 是东亚歧义宽度：rich 量 1 格、CJK 字体下终端可能画 2 格，那块
+    ``width: auto`` 的浮层就会被撑宽一格。所以它们在帮助里写成 ASCII 的 ``left`` /
+    ``right``——``KEY_NAMES`` 里**没有**它们，``key_text`` 查不到就原样显示键名。
+    """
+    for layer in LAYERS:
+        body = help_body(layer)
+        assert "←" not in body and "→" not in body, f"{layer} 的帮助里出现了歧义宽度的箭头"
+    assert "left" in help_body(LAYER_TASKS), "任务列表页的「退回」该写成 left"
+    assert "right" in help_body(LAYER_TASKS), "任务列表页的「进入」该写成 right"

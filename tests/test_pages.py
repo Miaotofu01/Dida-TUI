@@ -15,6 +15,7 @@ from datetime import datetime, timedelta, timezone
 
 from dida.testing import FakeBackend, ManualClock
 from dida.tui.app import DidaApp
+from dida.tui.keys import LAYER_DETAIL, LAYER_INDEX, LAYER_TASKS
 from dida.tui.messages import EMPTY_TASKS_MESSAGE, blocked_list_message
 from dida.tui.pages.index import BLOCKED_MARK, BUILTIN_MARK, CUSTOM_MARK, INBOX_MARK, LIST_MARK
 from support import screen_text
@@ -169,14 +170,14 @@ async def test_a_note_list_and_a_read_only_list_are_marked_and_cannot_be_entered
         assert BLOCKED_MARK in row_of(text, "别人的清单")
         assert BLOCKED_MARK not in row_of(text, "工作"), "能进的清单不该被标记"
 
-        # 走过去按 enter：进不去，而且说清是哪一种原因。
+        # 走过去按 →：进不去，而且说清是哪一种原因。
         for _ in range(20):
             if app.index_page().selected_id == "note":
                 break
             await pilot.press("j")
         assert app.index_page().selected_id == "note", "光标没能走到那条 NOTE 清单上"
 
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         text = screen_text(app)
 
@@ -187,7 +188,7 @@ async def test_a_note_list_and_a_read_only_list_are_marked_and_cannot_be_entered
 async def test_the_cursor_moves_with_j_k_and_the_arrow_keys():
     """``j``/``k`` 与方向键移动光标（验收标准 6、用户故事 9）。
 
-    断法完全走外部行为：光标移到哪一行，``enter`` 进去看到的就是哪一个容器。
+    断法完全走外部行为：光标移到哪一行，``→`` 进去看到的就是哪一个容器。
     """
     app = DidaApp(backend())
 
@@ -195,19 +196,74 @@ async def test_the_cursor_moves_with_j_k_and_the_arrow_keys():
         await pilot.pause()
 
         await pilot.press("j")  # 收集箱 → 今天
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         text = screen_text(app)
         assert "写周报" in text, "进的是「今天」这个视图：今天到期的任务在里面"
         assert "交水费" not in text, "没有截止时间的不算「今天」"
 
-        await pilot.press("escape")
+        await pilot.press("left")
         await pilot.press("down")  # 最近七天
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         text = screen_text(app)
 
     assert "写周报" in text and "季度报告" in text, "方向键也能移动光标"
+
+
+async def test_left_on_the_index_page_does_nothing():
+    """清单列表页没有上一层，所以 ``←`` 在那里什么都不发生（验收标准 2）。"""
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        before = screen_text(app)
+
+        await pilot.press("left")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert after == before, "清单列表页按 ← 不该动任何东西"
+    assert "最近七天" in after, "还在清单列表页上（内置视图那一行还在）"
+    assert "写周报" not in after, "没有溜进任务列表页"
+
+
+async def test_enter_and_esc_no_longer_navigate_on_the_three_pages():
+    """三个导航页上 ``enter`` 与 ``esc`` 不再触发导航（验收标准 2 + 3）。
+
+    「不再触发导航」断的是**层没变**：每个键各按一次、各断一次，不靠「两个键抵消」通过。
+    详细页那两格单说——``enter`` 在那里是「编辑这个字段」（不是导航），而 ``esc`` 在字段
+    列表上什么都不做，而不是退回任务列表页。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        on_index = screen_text(app)
+        for key in ("enter", "escape"):
+            await pilot.press(key)
+            await pilot.pause()
+            assert app.layer == LAYER_INDEX, f"清单列表页上 {key} 把人带走了"
+            assert screen_text(app) == on_index, f"清单列表页上 {key} 不该动屏幕"
+
+        await move_cursor_to(pilot, app.index_page(), "study")
+        await pilot.press("right")
+        await pilot.pause()
+        on_tasks = screen_text(app)
+        for key in ("enter", "escape"):
+            await pilot.press(key)
+            await pilot.pause()
+            assert app.layer == LAYER_TASKS, f"任务列表页上 {key} 把人带走了"
+            assert screen_text(app) == on_tasks, f"任务列表页上 {key} 不该动屏幕"
+
+        await pilot.press("right")  # 进详细页
+        await pilot.pause()
+        on_detail = screen_text(app)
+        await pilot.press("escape")
+        await pilot.pause()
+        assert app.layer == LAYER_DETAIL, "详细页字段列表上 esc 不该退回任务列表页"
+        assert screen_text(app) == on_detail, "详细页字段列表上 esc 不该动屏幕"
+
 
 
 async def test_a_long_index_scrolls_instead_of_hiding_the_rest():
@@ -230,8 +286,8 @@ async def test_a_long_index_scrolls_instead_of_hiding_the_rest():
 # ------------------------------------------------------------------ 层二：进出与光标
 
 
-async def test_enter_opens_the_container_and_esc_comes_back_to_the_row_you_came_from():
-    """``enter`` 进任务列表页；``esc`` 退回，光标**还原到进来的那一行**（验收标准 7 + 8）。"""
+async def test_right_opens_the_container_and_left_comes_back_to_the_row_you_came_from():
+    """``→`` 进任务列表页；``←`` 退回，光标**还原到进来的那一行**（验收标准 7 + 8）。"""
     app = DidaApp(backend())
 
     async with app.run_test(size=WIDE) as pilot:
@@ -241,17 +297,17 @@ async def test_enter_opens_the_container_and_esc_comes_back_to_the_row_you_came_
             if app.index_page().selected_id == "study":
                 break
             await pilot.press("j")
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         inside = screen_text(app)
         assert "复习 Rust 所有权" in inside, "进的是「学习」"
 
-        await pilot.press("escape")
+        await pilot.press("left")
         await pilot.pause()
         back = screen_text(app)
         assert "收集箱" in back, "回到了清单列表页"
 
-        await pilot.press("enter")  # 再进去一次
+        await pilot.press("right")  # 再进去一次
         await pilot.pause()
         again = screen_text(app)
 
@@ -268,15 +324,15 @@ async def test_an_empty_list_says_so_instead_of_showing_a_blank_screen():
             if app.index_page().selected_id == "empty":
                 break
             await pilot.press("j")
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         text = screen_text(app)
 
     assert EMPTY_TASKS_MESSAGE in text
 
 
-async def test_enter_on_a_task_opens_the_detail_page_and_esc_comes_back():
-    """``enter`` 进任务详细页，``esc`` 退回任务列表页（spec 的三层状态机）。"""
+async def test_right_on_a_task_opens_the_detail_page_and_left_comes_back():
+    """``→`` 进任务详细页，``←`` 退回任务列表页（spec 的三层状态机）。"""
     app = DidaApp(backend())
 
     async with app.run_test(size=WIDE) as pilot:
@@ -285,16 +341,16 @@ async def test_enter_on_a_task_opens_the_detail_page_and_esc_comes_back():
             if app.index_page().selected_id == "study":
                 break
             await pilot.press("j")
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
 
-        await pilot.press("enter")  # 光标下那条任务 → 详细页
+        await pilot.press("right")  # 光标下那条任务 → 详细页
         await pilot.pause()
         detail = screen_text(app)
         assert "复习 Rust 所有权" in detail, "详细页说的是光标那条任务"
         assert "学习" in detail, "详细页里有它属于哪个清单"
 
-        await pilot.press("escape")
+        await pilot.press("left")
         await pilot.pause()
         back = screen_text(app)
 
@@ -317,7 +373,7 @@ async def test_a_background_refresh_keeps_the_cursor_on_both_layers():
         app.refresh_view()  # 后台刷新落地（缓存变了，行的条数也跟着变）
         assert app.index_page().selected_id == "next7", "层一的光标不许跳"
 
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         await pilot.press("j")  # 光标移到第二条任务上
         before = app.tasks_page().selected_id
@@ -329,7 +385,7 @@ async def test_a_background_refresh_keeps_the_cursor_on_both_layers():
         assert app.tasks_page().selected_id == before, "层二的光标不许跳到别的任务上"
         assert before != "t10", "新来的那条不许把光标抢走"
 
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         detail = screen_text(app)
 
@@ -370,9 +426,9 @@ async def test_the_restored_cursor_is_actually_visible_again():
         await pilot.pause()
         assert "清单29" in screen_text(app)
 
-        await pilot.press("enter")  # 进这个空清单
+        await pilot.press("right")  # 进这个空清单
         await pilot.pause()
-        await pilot.press("escape")  # 回来
+        await pilot.press("left")  # 回来
         await pilot.pause()
         text = screen_text(app)
 
@@ -391,15 +447,15 @@ async def test_a_different_container_starts_the_cursor_at_its_first_task():
         await pilot.pause()
 
         await move_cursor_to(pilot, app.index_page(), "today")
-        await pilot.press("enter")  # 今天：写周报、季度报告
+        await pilot.press("right")  # 今天：写周报、季度报告
         await pilot.pause()
         await pilot.press("j")  # 光标移到第 2 条（季度报告）
         assert app.tasks_page().selected_id == "t3"
-        await pilot.press("escape")
+        await pilot.press("left")
         await pilot.pause()
 
         await move_cursor_to(pilot, app.index_page(), "inbox1")  # 收集箱：写周报、交水费
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         first = app.tasks_page().selected_id
 

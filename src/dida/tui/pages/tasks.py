@@ -207,14 +207,14 @@ class TasksPage(CursorPage):
     EMPTY_TEXT = messages.EMPTY_TASKS_MESSAGE
 
     class Entered(Message):
-        """用户按了 ``enter``：进这条任务的详细页。"""
+        """用户按了 ``→``（``right``）：进这条任务的详细页。"""
 
         def __init__(self, task_id: str) -> None:
             self.task_id = task_id
             super().__init__()
 
     class Back(Message):
-        """用户按了 ``esc``：退回清单列表页（光标还原到进来的那一行）。"""
+        """用户按了 ``←``（``left``）：退回清单列表页（光标还原到进来的那一行）。"""
 
     class NewTask(Message):
         """用户按了 ``n``：新建一条任务（#39，浮层与写路径都在外层）。"""
@@ -278,7 +278,7 @@ class TasksPage(CursorPage):
     def show_tasks(self, task_list: TaskList, *, name: str) -> None:
         """铺开一个容器的任务：标题 + 未完成任务 + 已完成的那几条。
 
-        换了一个容器就把光标放回第一条；**同一个**容器再进来（``esc`` 回去又进来）则按行 id
+        换了一个容器就把光标放回第一条；**同一个**容器再进来（``←`` 回去又进来）则按行 id
         认回原来那条任务——那是「回到我刚才看的地方」，是好事。
         """
         same_container = task_list.container_id == self._container_id
@@ -346,7 +346,7 @@ class TasksPage(CursorPage):
         super().on_resize()
 
     def action_enter(self) -> None:
-        """``enter``：进光标下那条任务的详细页。"""
+        """``→``（``right``）：进光标下那条任务的详细页。"""
         if self.selected_id is not None:
             self.post_message(self.Entered(self.selected_id))
 
@@ -392,7 +392,7 @@ class TasksPage(CursorPage):
         return None
 
     def action_back(self) -> None:
-        """``esc``：退回清单列表页。"""
+        """``←``（``left``）：退回清单列表页。"""
         self.post_message(self.Back())
 
     def action_delete(self) -> None:
