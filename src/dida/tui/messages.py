@@ -472,7 +472,8 @@ def create_failed_message(error: DidaError) -> str:
 def completed_failed_message(error: DidaError) -> str:
     """已完成流没拉到，但全量刷新与推送已经落地时的话（工单 #21）。
 
-    这里**不能**说成整次同步都失败了：未完成任务那一份是新的，只有「已完成 N 项」还是旧的。
+    这里**不能**说成整次同步都失败了：未完成任务那一份是新的，只有列表底部那一段已完成行
+    还是旧的（屏幕上没有「已完成 N 项」这种汇总行，spec 不要它）。
     """
     return f"已完成流没拉到：{error}"
 

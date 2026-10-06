@@ -205,7 +205,11 @@ class CompletedSection:
 
     @property
     def count(self) -> int:
-        """窗口内完成的条数，显示在「已完成 N 项」上。"""
+        """窗口内完成的条数（列表底部那一段有几行）。
+
+        **屏幕上没有一处显示它**：那一段直接画行，而「已完成 N 项」那条分隔行是 spec 明确
+        不要的（#64）。这个数只被测试用来断「这一段里应当有几条」。
+        """
         return len(self.items)
 
 
