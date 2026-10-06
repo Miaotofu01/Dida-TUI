@@ -53,7 +53,7 @@ from typing import Any, Mapping, Sequence
 
 from dida.sync.lists import ListLocalEffect, ListWriteKind
 from dida.sync.view import INBOX_ID, ListSnapshot, SyncState, TaskSnapshot
-from dida.sync.writes import LOCAL_TASK_PREFIX, LocalEffect, WriteKind
+from dida.sync.writes import LOCAL_LIST_PREFIX, LOCAL_TASK_PREFIX, LocalEffect, WriteKind
 
 ChangeKind = WriteKind
 """改动种类：对应 API 的四个写操作（新建 / 更新 / 完成 / 删除）。
@@ -66,13 +66,6 @@ ChangeKind = WriteKind
 
 COMPLETED_STATUS = 2
 """任务「已完成」的 ``status`` 值（api-contracts.md：Completed 是 2，不是 1）。"""
-
-LOCAL_LIST_PREFIX = "local-list-"
-"""本地临时清单 id 的前缀（#42）：新建的清单在服务端给出真 id 之前先用它占位。
-
-它**不是**收集箱那种「形如 ``inbox`` 加数字」的 id（``sync.read.is_inbox_id`` 认的是那个），
-所以本地新建的清单不会被误认成收集箱。
-"""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS lists (

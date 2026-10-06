@@ -44,6 +44,8 @@ if TYPE_CHECKING:  # 只为了标注：storage 反过来 import dida.sync.view�
     from dida.storage.store import PendingChange
 
 __all__ = [
+    "LOCAL_ID_PREFIXES",
+    "LOCAL_LIST_PREFIX",
     "LOCAL_TASK_PREFIX",
     "LocalEffect",
     "UnclaimedTaskError",
@@ -53,25 +55,68 @@ __all__ = [
     "WriteTarget",
     "is_addressable",
     "is_addressable_task",
+    "is_local_id",
+    "is_local_list_id",
     "is_local_task_id",
 ]
 
-LOCAL_TASK_PREFIX = "local-"
+LOCAL_LIST_PREFIX = "local-list-"
+"""本地临时**清单** id 的前缀（#42 / #54）：新建的清单在服务端给出真 id 之前先用它占位。
+
+它同时是**一条语义**（#54）：带这个前缀的 id 服务端**没见过**，所以任何「打到一个 id 上」
+的请求都不许发出去。存储层用它生成 id（:meth:`~dida.storage.store.Store.new_local_list_id`），
+写路径用它判断能不能发。
+
+**它住在这一层**（:mod:`dida.sync.writes`）：这是叶模块，谁先 import 都行；而
+:mod:`dida.sync.lists` 一 import 就跑 ``from dida.sync.push import backoff_delay``，
+``push`` 又 import ``writes``——反过来把判断放在 ``lists`` 里会成环（实测：四个入口
+全部 ``ImportError: cannot import name ... from partially initialized module``）。
+``lists`` 从这一层把它与判断一起取回去用，所以它们的**定义处**仍然只有这一处。
+"""
+
+LOCAL_TASK_PREFIX = "local-task-"
 """本地临时**任务** id 的前缀（t15 / #39）：新建的任务在服务端给出真 id 之前先用它占位。
 
 它同时是一个**状态**：id 还挂着这个前缀，就说明那条任务的新建**还没有被认领**
-（:meth:`~dida.storage.store.Store.adopt_created` 才是认领那一步）。服务端从没见过这个
-id，所以任何带着它的改动都推不出去——:meth:`~dida.sync.create.CreateMixin.create` 造 id
-与 :func:`is_addressable` 判「发不发得出去」读的是**同一个**常量，两处不会漂。
+（:meth:`~dida.storage.store.Store.adopt_created` 才是认领那一步）；服务端从没见过这个
+id，所以任何带着它的改动都推不出去。
+
+**刻意不与清单前缀重叠**（#39）：原来这里是 ``local-``，而 ``local-`` 恰好是
+``local-list-`` 的**前缀**——一个 OR 起来判断两族的 :func:`is_local_id` 就必须先比长的，
+那是「今天对、加一个前缀就错」的顺序依赖（这个仓库已经为「一条判断两处实现」付过一次
+代价）。改成不重叠之后，判断与顺序无关，:func:`is_local_id` 也就没有歧义了。
+"""
+
+LOCAL_ID_PREFIXES: tuple[str, ...] = (LOCAL_LIST_PREFIX, LOCAL_TASK_PREFIX)
+"""本地临时 id 的**全部**前缀——「本地临时 id」这件事的登记处。
+
+存储层生成 id、写路径判断能不能发，读的都是这里。将来加一族本地 id（比如标签）只加一条；
+``tests/test_local_ids.py`` 有一道对象级守卫：**任何一条不许是另一条的前缀**（这正是
+``local-`` 那条老前缀踩过的坑），加错了它先红。
 """
 
 
-def is_local_task_id(value: str) -> bool:
-    """这个 id 是不是本地临时占位的（服务端没见过它）。
+def is_local_id(value: str) -> bool:
+    """这个 id 是本地临时占位的吗（服务端没见过它）——**形状判断只有这一处**。
 
-    与 :func:`dida.sync.lists.is_local_list_id` 同形同名：清单与任务各有一个本地占位前缀，
-    两个判断各留一处，所以别处不许再写 ``startswith("local-")``。
+    两族前缀都不允许是彼此的前缀（见 :data:`LOCAL_TASK_PREFIX` 与
+    ``tests/test_local_ids.py`` 那道守卫），所以这里 ``any(...)`` 的顺序**没有语义**：
+    任何顺序给同一个答案。
     """
+    return any(value.startswith(prefix) for prefix in LOCAL_ID_PREFIXES)
+
+
+def is_local_list_id(value: str) -> bool:
+    """这个 id 是不是本地临时**清单**占位的（服务端没见过它）。
+
+    它只是 :func:`is_local_id` 的**窄化读法**（「是不是我这一族的」）——窄化是有意义的：
+    清单与任务各有自己的 id 空间，而写路径要问的正是「我这一族的这个 id 服务端见过没有」。
+    """
+    return value.startswith(LOCAL_LIST_PREFIX)
+
+
+def is_local_task_id(value: str) -> bool:
+    """这个 id 是不是本地临时**任务**占位的（服务端没见过它）。同 :func:`is_local_list_id`。"""
     return value.startswith(LOCAL_TASK_PREFIX)
 
 
