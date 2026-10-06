@@ -76,9 +76,9 @@ async def enter_detail(pilot, app: DidaApp) -> None:
         if app.index_page().selected_id == "work":
             break
         await pilot.press("j")
-    await pilot.press("enter")
+    await pilot.press("right")
     await pilot.pause()
-    await pilot.press("enter")
+    await pilot.press("right")
     await pilot.pause()
 
 

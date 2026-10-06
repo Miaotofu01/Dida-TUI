@@ -1,4 +1,4 @@
-"""app 这一层的那几个键与状态栏：``?`` / ``o`` / ``r`` / ``q`` 与状态栏那一行。
+"""app 这一层的那几个键与状态栏：``h`` / ``o`` / ``r`` / ``q`` 与状态栏那一行。
 
 **接缝一**：真 ``DidaApp`` + ``FakeBackend`` + Pilot。断的是「按了这个键，屏幕上/假后端
 那里看得见什么」，不读控件树、不读内部状态。
@@ -145,21 +145,21 @@ def style_of(line: str, text: str) -> str:
 
 
 async def test_the_help_lists_the_keys_of_the_layer_you_are_on():
-    """``?`` 列的是**当前这一层**的键（验收标准、用户故事 119）。"""
+    """``h`` 列的是**当前这一层**的键（验收标准、用户故事 119）。"""
     app = DidaApp(backend())
 
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
-        await pilot.press("question_mark")
+        await pilot.press("h")
         await pilot.pause()
         on_index = screen_text(app)
 
         await pilot.press("escape")
         await pilot.pause()
         await pilot.press("j")  # 收集箱 → 工作
-        await pilot.press("enter")  # 进任务列表页
+        await pilot.press("right")  # 进任务列表页
         await pilot.pause()
-        await pilot.press("question_mark")
+        await pilot.press("h")
         await pilot.pause()
         on_tasks = screen_text(app)
 
@@ -167,10 +167,10 @@ async def test_the_help_lists_the_keys_of_the_layer_you_are_on():
         await pilot.pause()
         back = screen_text(app)
 
-    assert "进入这一行" in on_index, "清单列表页的 enter 说的是「进入这一行」"
+    assert "进入这一行" in on_index, "清单列表页的 → 说的是「进入这一行」"
     assert "退回清单列表页" not in on_index, "清单列表页上没有「退回清单」这件事"
 
-    assert "任务详细页" in on_tasks, "任务列表页的 enter 说的是「任务详细页」"
+    assert "任务详细页" in on_tasks, "任务列表页的 → 说的是「任务详细页」"
     assert "退回清单列表页" in on_tasks
     assert "进入这一行" not in on_tasks, "任务列表页不该列清单列表页的键"
 
@@ -188,7 +188,7 @@ async def test_o_hands_the_url_of_the_task_under_the_cursor_to_the_browser():
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
         await pilot.press("j")  # 收集箱 → 工作
-        await pilot.press("enter")  # 进「工作」
+        await pilot.press("right")  # 进「工作」
         await pilot.pause()
         await pilot.press("o")
         await pilot.pause()
@@ -305,7 +305,7 @@ async def test_a_browser_that_says_no_reports_the_url_instead_of_failing_silentl
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
         await pilot.press("j")
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         await pilot.press("o")
         await pilot.pause()
@@ -325,7 +325,7 @@ async def test_a_browser_that_raises_is_reported_instead_of_taking_the_app_down(
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
         await pilot.press("j")
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         await pilot.press("o")
         await pilot.pause()

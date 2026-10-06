@@ -4,14 +4,16 @@
 
 - 真实绑定：三张页面各自的 ``BINDINGS`` 与 app 的 ``BINDINGS`` 都从 :func:`bindings_for`
   长出来，没有人在别处手写第二条绑定；
-- ``?`` 那张帮助：:func:`help_rows` 从同一张表里取当前这一层该看到的行。
+- ``h`` 那张帮助：:func:`help_rows` 从同一张表里取当前这一层该看到的行。
 
 手抄第二份的下场是加了键忘了写帮助——用户找不到那个功能，而测试只能看见两份表不一致，
 说不出哪一份是对的。
 
 **按层**是 v2 的要求（用户故事 119：帮助里是「当前这一层可用的键」，不是一张混杂所有层
-的大表）。``enter`` 在清单列表页是「进入这个清单」、在任务列表页是「进入详细页」，
-``esc`` 在任务列表页是「退回清单列表页」——同一个键在不同层做不同的事，所以它必须跟着层走。
+的大表）。``right`` 在清单列表页是「进入这个清单」、在任务列表页是「进入详细页」，
+``left`` 在任务列表页与详细页是「退回上一层」——同一个键在不同层做不同的事，所以它必须
+跟着层走。**往里走 / 往回走各只有一个键**（ADR-0008 一）：``enter`` / ``esc`` 在这三个
+导航页上不再触发导航。
 
 **这是 #48 的接缝**（「键位守卫 + 分层帮助」）：那一张要在这张表上加一道守卫（键位只能用
 终端一定会传上来的那些），并把帮助做成分层的样子。:func:`help_rows` 就是它要读的口子。
@@ -102,7 +104,7 @@ class Key:
 
 BINDINGS: dict[str, tuple[Key, ...]] = {
     GLOBAL: (
-        Key(("question_mark",), "help", "当前这一层的键位"),
+        Key(("h",), "help", "当前这一层的键位"),
         Key(("r",), "refresh", "手动同步"),
         Key(("o",), "open", "在浏览器里打开当前任务"),
         Key(QUIT_KEYS, QUIT_ACTION, "退出"),
@@ -110,7 +112,7 @@ BINDINGS: dict[str, tuple[Key, ...]] = {
     LAYER_INDEX: (
         Key(("j", "down"), "cursor_down", "下一行"),
         Key(("k", "up"), "cursor_up", "上一行"),
-        Key(("enter",), "enter", "进入这一行"),
+        Key(("right",), "enter", "进入这一行"),
         Key(("n",), "new_list", "新建清单或视图"),
         Key(("e",), "edit_list", "改这一行（清单或视图）"),
         Key(("d",), "delete_list", "删除这一行（清单或视图）"),
@@ -119,9 +121,9 @@ BINDINGS: dict[str, tuple[Key, ...]] = {
         Key(("j", "down"), "cursor_down", "下一条"),
         Key(("k", "up"), "cursor_up", "上一条"),
         Key(("space",), "toggle_complete", "完成 / 取消完成"),
-        Key(("enter",), "enter", "任务详细页"),
+        Key(("right",), "enter", "任务详细页"),
         Key(("n",), "new_task", "新建任务"),
-        Key(("escape",), "back", "退回清单列表页"),
+        Key(("left",), "back", "退回清单列表页"),
         Key(("d",), "delete", "删除这条任务"),
         Key(("g",), "defer", "顺延到下一个逻辑日"),
         Key(("G",), "defer_week", "顺延一周"),
@@ -130,22 +132,25 @@ BINDINGS: dict[str, tuple[Key, ...]] = {
         Key(("j", "down"), "cursor_down", "下一个字段"),
         Key(("k", "up"), "cursor_up", "上一个字段"),
         Key(("enter",), "enter", "编辑这个字段"),
-        Key(("escape",), "back", "结束编辑 / 退回任务列表页"),
+        Key(("left",), "back", "退回任务列表页"),
+        Key(("escape",), "end_edit", "结束编辑（保存）"),
     ),
 }
 
 KEY_NAMES: dict[str, str] = {
-    "question_mark": "?",
     "escape": "esc",
     "enter": "enter",
 }
-"""帮助里怎么写这些键名：Textual 的名字（``question_mark``）不是给人看的。
+"""帮助里怎么写这些键名：Textual 的名字（``escape``）不是用户嘴里的那个（``esc``）。
 
-**这里只许放宽度不含糊的拼法。** 这张表的输出进的是 ``?`` 那块 ``width: auto`` 的浮层，宽度由
+**这里只许放宽度不含糊的拼法。** 这张表的输出进的是 ``h`` 那块 ``width: auto`` 的浮层，宽度由
 rich 量出来的最宽那行决定；而 ``↓``（U+2193）与 ``↑``（U+2191）是东亚**歧义**宽度——rich 量 1
 格、CJK 字体下终端画 2 格，于是 ``j / ↓`` 那一行比它自称的宽一格，说明列右移一格（ADR-0007）。
-方向键在 Textual 里的键名本来就是 ASCII 的 ``down`` / ``up``，所以它们**没有**条目：查不到就
-原样显示键名，那正好是两边都算 1 格的拼法。
+``←`` / ``→`` 同一条理由（ADR-0008 三），所以这里也**没有**它们。
+
+方向键在 Textual 里的键名本来就是 ASCII 的 ``down`` / ``up`` / ``left`` / ``right``，所以它们
+**没有**条目：查不到就原样显示键名，那正好是两边都算 1 格的拼法。``?`` 解绑之后
+``question_mark`` 的条目一并摘掉（``h`` 也不需要条目：它本身就是 ASCII）。
 """
 
 
@@ -213,7 +218,7 @@ def bindings_for(layer: str) -> list[Binding]:
 
 @dataclass(frozen=True)
 class HelpRow:
-    """``?`` 那张表里的一行：左边是怎么按，右边是做什么。"""
+    """``h`` 那张表里的一行：左边是怎么按，右边是做什么。"""
 
     key: str
     """帮助里的键位写法，如 ``j / down``。"""
@@ -245,11 +250,11 @@ LAYER_TITLES: dict[str, str] = {
     LAYER_TASKS: "任务列表页",
     LAYER_DETAIL: "任务详细页",
 }
-"""``?`` 那张帮助的抬头：先说清「这是哪一层的键」。"""
+"""``h`` 那张帮助的抬头：先说清「这是哪一层的键」。"""
 
 
 def help_body(layer: str) -> str:
-    """``?`` 那一屏的正文：当前这一层的键 + 说明，跟着绑定表走。
+    """``h`` 那一屏的正文：当前这一层的键 + 说明，跟着绑定表走。
 
     抬头就是层名（用户故事 119：帮助里是**当前这一层**可用的键，而不是一张混杂了所有层的
     大表）。#48 接手时改的是这一段的排版与那道守卫，键与说明仍然只有 :data:`BINDINGS`

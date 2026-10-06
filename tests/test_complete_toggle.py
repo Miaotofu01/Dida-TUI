@@ -309,7 +309,7 @@ async def enter_the_list(pilot, app: DidaApp) -> None:
             break
         await pilot.press("j")
     assert app.index_page().selected_id == PROJECT_ID, "没能把光标挪到「工作」那一行上"
-    await pilot.press("enter")
+    await pilot.press("right")
     await pilot.pause()
 
 
@@ -339,13 +339,13 @@ def recently_completed_view() -> FakeBackend:
 
 
 async def enter_view(pilot, app: DidaApp, view_id: str) -> None:
-    """从清单列表页走进一个视图（光标从收集箱往下走到那一行，再 ``enter``）。"""
+    """从清单列表页走进一个视图（光标从收集箱往下走到那一行，再 ``→``）。"""
     for _ in range(20):
         if app.index_page().selected_id == view_id:
             break
         await pilot.press("j")
     assert app.index_page().selected_id == view_id, f"没能把光标挪到视图 {view_id} 那一行上"
-    await pilot.press("enter")
+    await pilot.press("right")
     await pilot.pause()
 
 

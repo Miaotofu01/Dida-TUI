@@ -1,6 +1,6 @@
 """外壳：组装、三层页面的进出、状态栏、同步泵、退出流——**这是一个薄 app**。
 
-一栏、三层页面（ADR-0004）：启动落在清单列表页，``enter`` 向下、``esc`` 向上。三层各是
+一栏、三层页面（ADR-0004）：启动落在清单列表页，``→`` 向下、``←`` 向上。三层各是
 一个控件（:mod:`dida.tui.pages`），这里管的是**它们之间的进出**：谁在屏上、焦点在哪、
 光标从哪来、``o`` 说的是哪条任务。
 
@@ -119,7 +119,7 @@ class StatusBar(Static):
 class Stage(HorizontalScroll):
     """三层页面并排停在这里；换层就是把它横向滚过一整屏。
 
-    换层 = 平移不是装饰：``enter`` 压栈、``esc`` 出栈本来就是**导航栈**（GLOSSARY 的
+    换层 = 平移不是装饰：``→`` 压栈、``←`` 出栈本来就是**导航栈**（GLOSSARY 的
     「导航路径」），左右平移正是这个语义的标准表达。页面底色必须不透明（:data:`CSS_PAGE`），
     否则滑走的那块会漏出后面的东西。
 
@@ -154,7 +154,7 @@ class Stage(HorizontalScroll):
 
     ## 它自己也**不是个焦点目标**（工单 #60）
 
-    轨道上没有键位（``j`` / ``enter`` / … 全在页面上），可它继承了 ``ScrollableContainer``
+    轨道上没有键位（``j`` / ``→`` / … 全在页面上），可它继承了 ``ScrollableContainer``
     的 ``can_focus = True``，于是 ``tab`` 会在它身上停一站。聚焦它什么也不会发生，却让焦点
     离开了页面——而页面才是按键该去的地方：``_show`` 每次都把焦点交给当前那一页，用户按下
     去的键就该落在那一页上。所以这里把 ``can_focus`` 关掉。
@@ -245,10 +245,10 @@ def save_line(status: SyncStatus) -> str:
 class DidaApp(App[None]):
     """一栏 + 三层页面 + 状态栏。"""
 
-    ENABLE_COMMAND_PALETTE = False  # 命令面板会抢键；键位帮助是 ?
+    ENABLE_COMMAND_PALETTE = False  # 命令面板会抢键；键位帮助是 h
     BINDINGS = bindings_for(GLOBAL)
     """全局那几条（退出 / 同步 / 浏览器 / 帮助）。各层自己的键在各自的页面上——
-    所以 ``?`` 列出来的、以及 footer 上显示的，都是**当前这一层真正能按的**那些。"""
+    所以 ``h`` 列出来的、以及 footer 上显示的，都是**当前这一层真正能按的**那些。"""
 
     CSS = theme.app_css()
     """外观**一个来源**（:mod:`dida.tui.theme`）：页面底色、顶栏/状态栏、浮层、toast、
@@ -306,7 +306,7 @@ class DidaApp(App[None]):
         ``set_interval`` 回一个 ``Timer``，丢掉它就没有第二个人能停这一跳——关窗之后
         它还挂在事件循环上。``None`` 表示泵没开（策略没给间隔）或者已经停了。"""
         self._layer = LAYER_INDEX
-        """当前在屏上的是哪一层（``?`` 与 ``o`` 都按它说话）。"""
+        """当前在屏上的是哪一层（``h`` 与 ``o`` 都按它说话）。"""
         self._container_id: str | None = None
         """当前打开的是哪个容器（清单或视图的 id）；``None`` = 还没进过任何一层。"""
         self._detail_task_id: str | None = None
@@ -401,11 +401,11 @@ class DidaApp(App[None]):
         }
 
     def _show(self, layer: str) -> None:
-        """把这一层滑到眼前，并把焦点交给它（``j``/``k``/``enter`` 立刻能用）。
+        """把这一层滑到眼前，并把焦点交给它（``j``/``k``/``→`` 立刻能用）。
 
         三层**都在 DOM 里**、并排停在 :class:`Stage` 上：它们的行与光标因此原样留着，
-        ``esc`` 回去时用户看到的就是他离开时那一行（用户故事 20/62）。换层是横向平移——
-        ``enter`` 压栈、``esc`` 出栈本来就是导航栈（ADR-0007 三）。
+        ``←`` 回去时用户看到的就是他离开时那一行（用户故事 20/62）。换层是横向平移——
+        ``→`` 压栈、``←`` 出栈本来就是导航栈（ADR-0007 三）。
         """
         previous = self._layer
         self._layer = layer
@@ -430,25 +430,25 @@ class DidaApp(App[None]):
         return (LAYER_INDEX, LAYER_TASKS, LAYER_DETAIL).index(layer)
 
     def open_container(self, container_id: str) -> None:
-        """进层二：某个清单或视图里的任务（``enter``）。"""
+        """进层二：某个清单或视图里的任务（``→``）。"""
         self._container_id = container_id
         self._detail_task_id = None
         self.refresh_view()
         self._show(LAYER_TASKS)
 
     def open_detail(self, task_id: str) -> None:
-        """进层三：一条任务的详细页（任务列表页上按 ``enter``）。"""
+        """进层三：一条任务的详细页（任务列表页上按 ``→``）。"""
         self._detail_task_id = task_id
         self.refresh_view()
         self._show(LAYER_DETAIL)
 
     def back_to_index(self) -> None:
-        """回层一（任务列表页上按 ``esc``）——光标照旧停在他进来的那一行。"""
+        """回层一（任务列表页上按 ``←``）——光标照旧停在他进来的那一行。"""
         self._detail_task_id = None
         self._show(LAYER_INDEX)
 
     def back_to_tasks(self) -> None:
-        """回层二（详细页上按 ``esc``）——光标照旧停在他进来的那条任务上。"""
+        """回层二（详细页上按 ``←``）——光标照旧停在他进来的那条任务上。"""
         self._show(LAYER_TASKS)
 
     # ---------------------------------------------------------------- 重画
@@ -588,19 +588,19 @@ class DidaApp(App[None]):
     # ---------------------------------------------------------------- 页面消息
 
     def on_index_page_entered(self, event: IndexPage.Entered) -> None:
-        """清单列表页上按了 ``enter``：进这个容器。"""
+        """清单列表页上按了 ``→``：进这个容器。"""
         self.open_container(event.container_id)
 
     def on_index_page_refused(self, event: IndexPage.Refused) -> None:
-        """``enter`` 了一个进不去的清单：如实说一句，不进下一层。"""
+        """按 ``→`` 进一个进不去的清单：如实说一句，不进下一层。"""
         self._write_status(event.message)
 
     def on_tasks_page_entered(self, event: TasksPage.Entered) -> None:
-        """任务列表页上按了 ``enter``：进这条任务的详细页。"""
+        """任务列表页上按了 ``→``：进这条任务的详细页。"""
         self.open_detail(event.task_id)
 
     def on_tasks_page_back(self, event: TasksPage.Back) -> None:
-        """任务列表页上按了 ``esc``：回清单列表页。"""
+        """任务列表页上按了 ``←``：回清单列表页。"""
         self.back_to_index()
 
     def on_tasks_page_toggle_complete(self, event: TasksPage.ToggleComplete) -> None:
@@ -631,7 +631,7 @@ class DidaApp(App[None]):
         )
 
     def on_detail_page_back(self, event: DetailPage.Back) -> None:
-        """详细页上按了 ``esc``：回任务列表页。"""
+        """详细页上按了 ``←``：回任务列表页。"""
         self.back_to_tasks()
 
     # ---------------------------------------------------------------- 新建任务（#39）
@@ -1156,7 +1156,7 @@ class DidaApp(App[None]):
     # ---------------------------------------------------------------- 帮助（工单 #18 / #48）
 
     def action_help(self) -> None:
-        """``?``：当前这一层的键位帮助（跟着绑定表走，不是手抄一份）。"""
+        """``h``：当前这一层的键位帮助（跟着绑定表走，不是手抄一份）。"""
         self.push_screen(MessageOverlay(help_body(self._layer)))
 
     # ---------------------------------------------------------------- 同步泵（t21）
@@ -1352,7 +1352,7 @@ class DidaApp(App[None]):
     def _confirming_quit(self) -> bool:
         """退出浮层已经开着了吗。
 
-        看**整摞** screen，不是只看顶上那一块：确认框上面还能再盖一层（``?`` 的帮助浮层
+        看**整摞** screen，不是只看顶上那一块：确认框上面还能再盖一层（``h`` 的帮助浮层
         就盖得住它），而那时 ``self.screen`` 是**最上面**那一块——只比它一块就会再叠一个
         确认框出来。这个口子是真的：浮层是模态的，键位解析在它那儿就截断了，
         :meth:`action_quit` 照样会跑到。

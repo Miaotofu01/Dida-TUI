@@ -99,7 +99,7 @@ async def enter_work(pilot, app: DidaApp) -> None:
         if app.index_page().selected_id == "work":
             break
         await pilot.press("j")
-    await pilot.press("enter")
+    await pilot.press("right")
     await pilot.pause()
 
 
@@ -234,13 +234,13 @@ def two_lists() -> FakeBackend:
 
 
 async def enter_container(pilot, app: DidaApp, container_id: str) -> None:
-    """走到清单列表页的某一行上，按 ``enter`` 进去。"""
+    """走到清单列表页的某一行上，按 ``→`` 进去。"""
     for _ in range(20):
         if app.index_page().selected_id == container_id:
             break
         await pilot.press("j")
     assert app.index_page().selected_id == container_id
-    await pilot.press("enter")
+    await pilot.press("right")
     await pilot.pause()
 
 

@@ -30,6 +30,7 @@ import pytest
 from dida.testing import FakeBackend, ManualClock
 from dida.tui import messages, theme
 from dida.tui.app import DidaApp
+from dida.tui.keys import LAYER_DETAIL
 from support import screen_sgr, screen_styled_text, screen_text
 
 SGR = re.compile(r"\x1b\[[0-9;]*m")
@@ -126,9 +127,9 @@ async def enter_detail(pilot, app: DidaApp) -> None:
         if app.index_page().selected_id == "work":
             break
         await pilot.press("j")
-    await pilot.press("enter")
+    await pilot.press("right")
     await pilot.pause()
-    await pilot.press("enter")
+    await pilot.press("right")
     await pilot.pause()
 
 
@@ -136,7 +137,7 @@ async def enter_detail(pilot, app: DidaApp) -> None:
 
 
 async def test_enter_opens_the_detail_page_with_the_cursor_on_the_field_list():
-    """任务列表页按 ``enter`` 进详细页，光标落在字段列表上（验收标准 1 + 2）。
+    """任务列表页按 ``→`` 进详细页，光标落在字段列表上（验收标准 1 + 2）。
 
     七个字段一个不少，而且光标**已经**停在第一个字段上（``j``/``k``/``enter`` 立刻能用）。
     """
@@ -476,7 +477,7 @@ async def test_the_bottom_line_is_still_there_when_the_page_is_long():
 async def test_every_field_is_pushed_the_moment_it_is_finished():
     """每改完一个字段**立刻推送**，不攒到离开这一页（验收标准 7）。
 
-    断法：改完还在详细页上，推送**已经**发生过了（不是等 ``esc`` 退回任务列表才发）。
+    断法：改完还在详细页上，推送**已经**发生过了（不是等 ``←`` 退回任务列表才发）。
     """
     fake = backend()
     app = DidaApp(fake)
@@ -702,11 +703,11 @@ async def test_an_empty_field_keeps_its_place_so_it_can_be_written():
 # ------------------------------------------------------------------ 进出与剩下几条
 
 
-async def test_esc_on_the_field_list_goes_back_to_the_task_you_came_from():
-    """字段列表上 ``esc`` 退回任务列表页，光标还原到进来时那条任务（验收标准 5）。
+async def test_left_on_the_field_list_goes_back_to_the_task_you_came_from():
+    """字段列表上 ``←`` 退回任务列表页，光标还原到进来时那条任务（验收标准 3 + 4）。
 
     从**第二条**任务进去（不是第一条），回来时任务列表页的光标还得在它上面——这是 #34 那条
-    规矩在详细页这一侧的延续：``esc`` 出栈，不是把用户踢回列表第一行。
+    规矩在详细页这一侧的延续：``←`` 出栈，不是把用户踢回列表第一行。
     """
     fake = backend()
     fake.add_task("另一条任务", list_name="work", id="t2")
@@ -718,18 +719,18 @@ async def test_esc_on_the_field_list_goes_back_to_the_task_you_came_from():
             if app.index_page().selected_id == "work":
                 break
             await pilot.press("j")
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         await pilot.press("j")  # 光标移到第二条任务上
-        await pilot.press("enter")  # 进它的详细页
+        await pilot.press("right")  # 进它的详细页
         await pilot.pause()
         in_detail = screen_text(app)
         await pilot.press("j", "j")  # 字段列表上走两格
-        await pilot.press("escape")  # 回任务列表页
+        await pilot.press("left")  # 回任务列表页
         await pilot.pause()
         listed = screen_text(app)
         back_on = app.tasks_page().selected_id
-        await pilot.press("enter")  # 再进来一次
+        await pilot.press("right")  # 再进来一次
         await pilot.pause()
         again = screen_text(app)
 
@@ -737,6 +738,96 @@ async def test_esc_on_the_field_list_goes_back_to_the_task_you_came_from():
     assert "另一条任务" in listed, f"没有回到任务列表页：\n{listed}"
     assert back_on == "t2", "回来时光标不在进来时那条任务上"
     assert "另一条任务" in field_row(again, "标题"), f"再进来时进的是另一条任务：\n{again}"
+
+
+async def test_esc_on_the_field_list_stays_on_the_field_list():
+    """字段列表上 ``esc`` **不是**「退回」：它只结束编辑，没有编辑可结束时什么都不做。
+
+    退回只有一个键（``←``，验收标准 3 + 4）——误按 ``esc`` 不该把人带走。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        before = screen_text(app)
+
+        await pilot.press("escape")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert after == before, "字段列表上按 esc 不该退回任务列表页"
+    assert has_field(after, "标题"), "还该停在字段列表上"
+
+
+async def test_left_and_right_move_the_caret_inside_a_text_field_instead_of_leaving_the_layer():
+    """编辑自由文本时 ``←`` / ``→`` 归输入框（在文字里移光标），不把人弹出这一层（验收标准 5）。
+
+    两条证据一起断：按完之后**还在编辑态**（层没动），而且接着那一下退格删掉的正是光标左边
+    那一格——光标真的动了，不是被页面吃掉。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await pilot.press("enter")  # 光标在标题上：进编辑
+        await pilot.pause()
+        await pilot.press(*clear(len(TITLE)))
+        await pilot.press(*"abcd")
+        await pilot.press("left", "left")  # 光标退到 b 与 c 之间
+        await pilot.press("backspace")  # 删掉 b
+        await pilot.press("right")  # 光标回到末尾
+        await pilot.press(*"X")
+        await pilot.pause()
+        still_editing = "编辑标题" in screen_text(app)
+        on_the_detail_layer = app.layer == LAYER_DETAIL
+        await pilot.press("escape")  # 结束这次编辑 → 交出去
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert still_editing, "文本框里的 ← / → 不该把人弹出编辑态"
+    assert on_the_detail_layer, "文本框里的 ← / → 不该换层"
+    assert fake.writes == [("t1", {"title": "acXd"})], (
+        f"← / → 没有在文字里移动光标（写出去的是 {fake.writes}）"
+    )
+    assert "acXd" in field_row(text, "标题"), f"改动没有生效：\n{text}"
+
+
+async def test_left_and_right_also_move_the_caret_in_a_multiline_field():
+    """多行框（描述 / 备注）里同一条规矩：``←`` / ``→`` 移光标，不换层（验收标准 5）。
+
+    单行框与多行框是**两个**控件（``Input`` / ``TextArea``），绑定表各有一份，所以两半
+    都要真按一遍——只断单行那一半会把「多行框里按 ← 退回上一层」漏过去。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await pilot.press("j")  # 标题 → 描述
+        await pilot.press("enter")
+        await pilot.pause()
+        await pilot.press(*clear(len(CONTENT)))
+        await pilot.press(*"abcd")
+        await pilot.press("left", "left")
+        await pilot.press("backspace")  # 删掉 b
+        await pilot.press("right")
+        await pilot.press(*"X")
+        await pilot.pause()
+        still_editing = "编辑描述" in screen_text(app)
+        assert app.layer == LAYER_DETAIL, "多行框里的 ← / → 不该换层"
+        await pilot.press("escape")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert still_editing, "多行框里的 ← / → 不该把人弹出编辑态"
+    assert fake.writes == [("t1", {"content": "acXd"})], (
+        f"多行框里的 ← / → 没有在文字里移动光标（写出去的是 {fake.writes}）"
+    )
+    assert "acXd" in field_row(text, "描述"), f"改动没有生效：\n{text}"
 
 
 async def test_a_task_without_a_due_date_says_so_without_an_ambiguous_glyph():
@@ -1079,10 +1170,10 @@ async def test_an_empty_date_field_is_refused_instead_of_clearing_silently():
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
         await enter_detail(pilot, app)
-        await pilot.press("escape")  # 回任务列表页
+        await pilot.press("left")  # 回任务列表页
         await pilot.pause()
         await pilot.press("j")  # 光标到第二条（没有日期的那一条）
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         await walk_to_the_due_field(pilot, app)
         await pilot.press("enter")
@@ -1231,10 +1322,10 @@ async def test_esc_on_an_empty_untouched_date_ends_the_edit_and_says_why():
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
         await enter_detail(pilot, app)
-        await pilot.press("escape")  # 回任务列表页
+        await pilot.press("left")  # 回任务列表页
         await pilot.pause()
         await pilot.press("j")  # 光标到第二条（没有日期的那一条）
-        await pilot.press("enter")
+        await pilot.press("right")
         await pilot.pause()
         await walk_to_the_due_field(pilot, app)
         await pilot.press("enter")
