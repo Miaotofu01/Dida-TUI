@@ -24,6 +24,7 @@ import httpx
 
 from dida.api.errors import (
     AuthError,
+    BatchRejectedError,
     DidaError,
     MalformedResponseError,
     NetworkError,
@@ -32,6 +33,7 @@ from dida.api.errors import (
 from dida.api.guards import (
     guard_writable,
     merge_snapshot,
+    prepare_batch_body,
     prepare_completed_window_body,
     prepare_project_body,
     prepare_write_body,
@@ -107,6 +109,47 @@ class DidaApiClient:
             self._request("POST", f"/open/v1/project/{project_id}", body=body)
         )
         return self._payload_object_or_none(response, endpoint=f"更新清单 {project_id} 的响应")
+
+    async def batch_update(self, updates: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+        """POST /open/v1/task/batch —— 批量更新（工单 #38：**取消完成的唯一路径**）。
+
+        这条用法官方文档**一字未提**（：551–590 通篇没有 ``status``、也没有 ``delete`` 数组）：
+        实测是批量更新带 ``status: 2`` 能把任务完成、带 ``status: 0`` 能把已完成的任务改回
+        未完成（spec 的实测事实第 1 条）。所以它按「实测确认的用法」写，不写成文档化特性。
+
+        批量更新是**合并语义**：每一条只发 :data:`~dida.api.guards.BATCH_UPDATE_FIELDS`
+        那几个字段，标题 / 描述 / 备注 / 优先级一个都不发——多带一个字段就是拿本地那一份
+        去覆盖服务端，那正是「更新时没带回去的字段会把手机端设置的东西抹掉」的另一半。
+
+        响应里的 ``id2error`` 必须读（见 :meth:`_batch_errors`）：每个任务的失败藏在
+        ``200 OK`` 里。
+        """
+        body = prepare_batch_body({"update": [dict(item) for item in updates]})
+        response = await self._send(self._request("POST", "/open/v1/task/batch", body=body))
+        payload = self._payload_object(response, endpoint="批量更新的响应")
+        self._reject_batch_errors(payload, response)
+        return payload
+
+    @staticmethod
+    def _reject_batch_errors(payload: Mapping[str, Any], response: httpx.Response) -> None:
+        """``id2error`` 非空就是失败，哪怕 HTTP 是 200（openapi :567 的那张码表）。
+
+        ``id2etag`` 不读：它不是结果，只是服务端顺手给的 etag，而且这一层不认识它。
+        """
+        errors = payload.get("id2error")
+        if errors is None or errors == {}:
+            return
+        if not isinstance(errors, Mapping):
+            raise MalformedResponseError(
+                f"批量更新的响应里 id2error 期望一个对象，收到 {type(errors).__name__}",
+                status_code=response.status_code,
+            )
+        listed = "、".join(f"{task_id}: {code}" for task_id, code in errors.items())
+        raise BatchRejectedError(
+            f"批量更新失败了 {len(errors)} 条（服务端返回 HTTP {response.status_code}）：{listed}",
+            errors={str(task_id): str(code) for task_id, code in errors.items()},
+            status_code=response.status_code,
+        )
 
     async def delete_project(self, project_id: str) -> None:
         """DELETE /open/v1/project/{projectId} —— 删清单（工单 #42）。
@@ -248,6 +291,35 @@ class DidaApiClient:
         """DELETE .../task/{taskId} —— 响应体不可信，不解析。"""
         await self._send(self._request("DELETE", f"/open/v1/project/{project_id}/task/{task_id}"))
 
+    async def move_task(
+        self, from_project_id: str, to_project_id: str, task_id: str
+    ) -> list[dict[str, Any]]:
+        """POST /open/v1/task/move —— 把一条任务搬去另一个清单（工单 #45）。
+
+        **请求体是 JSON 数组**，不是对象（``openapi-dida365.md:504`` 的 "A JSON array
+        containing task move operations"，例子 ``:530–536``）：一项一次搬运，
+        ``fromProjectId`` / ``toProjectId`` / ``taskId`` 三个都必填（``:508–510``）。
+        一次搬一条，所以数组里就一项——这是本客户端**唯一**一个数组请求体的端点。
+
+        **响应也是数组**，每项 ``{id, etag}``（``:516``、例子 ``:542–547``）——**不是**
+        被搬的那条 Task。所以返回类型是那个数组（调用方要的是「搬成功了」，那条任务的
+        新样子由全量刷新带回来）。``201 → No Content``（``:517``）也是成功形状：空响应体
+        给空数组，不按坏数据报错。
+
+        ``inbox`` 这个别名在这份文档的这一节里**一次都没出现**（``:497–548``）：
+        收集箱与真实清单之间能不能双向搬，文档沉默。这里不猜——调用方给什么 id 就发什么
+        id（收集箱那一行带的是服务端返回的那个 id，见 ``sync.read.resolve_lists``）。
+        """
+        body = [
+            {
+                "fromProjectId": from_project_id,
+                "toProjectId": to_project_id,
+                "taskId": task_id,
+            }
+        ]
+        response = await self._send(self._request("POST", "/open/v1/task/move", body=body))
+        return self._payload_array_or_none(response, endpoint="搬运的响应")
+
     def _payload(self, response: httpx.Response) -> Any:
         """解析 2xx 的响应体：不是 JSON 也要是结构化错误，不是裸 JSONDecodeError。"""
         try:
@@ -303,6 +375,19 @@ class DidaApiClient:
         self._require_items(response, payload, endpoint=endpoint, item_keys=item_keys)
         return payload
 
+    def _payload_array_or_none(
+        self, response: httpx.Response, *, endpoint: str, item_keys: Sequence[str] = ()
+    ) -> list[Any]:
+        """同 :meth:`_payload_array`，但**空响应体是合法的**：那种成功形状表示「没有内容」。
+
+        搬运（``POST /open/v1/task/move``）写着两种成功：``200 → {id, etag} 数组`` 与
+        ``201 → No Content``（``openapi-dida365.md:516–517``）。判据与
+        :meth:`_payload_object_or_none` 同一条：看**响应体空不空**，不看状态码。
+        """
+        if not response.content:
+            return []
+        return self._payload_array(response, endpoint=endpoint, item_keys=item_keys)
+
     def _require_items(
         self,
         response: httpx.Response,
@@ -353,9 +438,14 @@ class DidaApiClient:
         method: str,
         path: str,
         *,
-        body: Mapping[str, Any] | None = None,
+        body: Mapping[str, Any] | Sequence[Any] | None = None,
         params: Mapping[str, Any] | None = None,
     ) -> httpx.Request:
+        """拼一个请求。
+
+        ``body`` 收 ``Mapping`` **也收 ``Sequence``**：``POST /open/v1/task/move`` 的请求体
+        是 JSON 数组（``openapi-dida365.md:504``），它是唯一一个这样的端点。
+        """
         kwargs: dict[str, Any] = {} if body is None else {"json": body}
         return httpx.Request(
             method,

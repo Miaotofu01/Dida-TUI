@@ -21,7 +21,12 @@ from typing import Any, Mapping, Sequence
 import httpx
 
 from dida.clock import Clock
-from dida.storage.store import COMPLETED_STATUS, RefreshReport
+from dida.storage.store import (
+    COMPLETED_STATUS,
+    UNCOMPLETED_STATUS,
+    VIEW_ID_PREFIX,
+    RefreshReport,
+)
 from dida.sync.engine import (
     CompletedReport,
     ListRow,
@@ -30,9 +35,10 @@ from dida.sync.engine import (
     SyncStatus,
     TaskDetail,
     TaskList,
-    ViewRow,
+    ViewDefinition,
     WriteKind,
 )
+from dida.sync.lists import LOCAL_LIST_PREFIX
 from dida.sync.writes import UnclaimedListError, is_local_id
 from dida.sync.view import (
     INBOX_ID,
@@ -44,12 +50,18 @@ from dida.sync.view import (
 )
 
 
-_SNAPSHOT_FIELDS = frozenset({"title", "content", "desc", "priority", "completed", "due", "all_day"})
+_SNAPSHOT_FIELDS = frozenset(
+    {"title", "content", "desc", "priority", "completed", "due", "all_day", "tags"}
+)
 """一次写里能直接盖进 :class:`TaskSnapshot` 的那些字段名。
 
 引擎给的是**服务端字段名**（``content`` / ``desc`` / ``title``……），快照上那几位恰好同名；
 其余（``dueDate``、``items``、未知字段）只并进服务端原文。替身不自己翻译字段——那一层
 是 ``Store`` 的事，替身照它的口径做最小的那一份。
+
+``tags`` 在里面（#45）：``Store`` 读快照时是从原文里取 ``tags`` 的（``_snapshot``），所以
+一次改标签在真库里当场就反映到读路径上；替身少了这一条就会「写进去了但屏幕上没变」——
+那正是接缝一要断的那句话。
 """
 
 
@@ -131,7 +143,7 @@ class InMemorySource:
 
         self._lists: dict[str, ListSnapshot] = {}
         self._tasks: dict[str, TaskSnapshot] = {}
-        self._views: dict[str, ViewRow] = {}
+        self._views: dict[str, ViewDefinition] = {}
         self._raw: dict[str, Mapping[str, Any]] = {}
         self._seq = 0
 
@@ -185,15 +197,34 @@ class InMemorySource:
         """本地摘掉一行清单（#42 删除的本地效果）。"""
         self._lists.pop(list_id, None)
 
-    def add_view(self, name: str, *, id: str | None = None, task_ids: Sequence[str] = ()) -> ViewRow:
-        """加一条自定义视图行（#36）：``task_ids`` 是这一层算好的求值结果。
+    def set_completed(self, task_id: str, *, completed: bool) -> None:
+        """把一条任务标成完成 / 未完成（工单 #38 的乐观写在内存里的那一半）。
 
-        替身不自己求值——过滤条件怎么算成一份任务列表是视图求值那一层的判断（#35/#36），
-        替身照收不误（与 ``set_subtasks`` 收成品行同一条口径）。
+        与真 ``Store`` 同一条口径：**只动 ``status``**，``completedTime`` 一个字不动。
+        取消完成之后完成时间戳还留着正是实测行为（spec 的实测事实第 1 条），而「还算不算
+        已完成」只看 ``status``——替身要是顺手把时间戳也清了，接缝一就再也测不到那句话。
         """
-        row = ViewRow(id=id if id is not None else name, name=name, task_ids=tuple(task_ids))
-        self._views[row.id] = row
-        return row
+        snapshot = self._tasks.get(task_id)
+        if snapshot is None:
+            return
+        status = COMPLETED_STATUS if completed else UNCOMPLETED_STATUS
+        self._tasks[task_id] = replace(snapshot, completed=completed)
+        raw = self._raw.get(task_id)
+        if raw is not None:
+            self._raw[task_id] = {**raw, "status": status}
+
+    def add_view(self, name: str, *, id: str | None = None, **conditions: Any) -> ViewDefinition:
+        """加一个自定义视图（#36）：``conditions`` 就是 :class:`ViewDefinition` 的那几维。
+
+        替身**不自己求值**——成员怎么算出来是视图求值那一层的判断（``evaluate_view``），
+        真引擎的读路径从这里读定义、当场求值。所以「这个视图选中了谁」在接缝一上与生产
+        走的是同一份实现（#39 的教训：替身自己编一份，测试就会静默断言成别的东西）。
+        """
+        definition = ViewDefinition(
+            id=id if id is not None else name, name=name, **conditions
+        )
+        self._views[definition.id] = definition
+        return definition
 
     def add_task(
         self,
@@ -282,6 +313,34 @@ class InMemorySource:
             payload["reminders"] = list(snapshot.reminders)
         return payload
 
+    def view_definitions(self) -> tuple[ViewDefinition, ...]:
+        """自定义视图的**定义**（#36），按加进来的顺序。
+
+        与 ``Store.views()`` 同一口径：给定义不给成员——成员要「全量缓存 + 当前逻辑日」
+        才算得出来，替身与存储层一样不读时钟。
+        """
+        return tuple(self._views.values())
+
+    def view_definition(self, view_id: str) -> ViewDefinition | None:
+        """一个视图的定义；没加过就是 ``None``。"""
+        return self._views.get(view_id)
+
+    def save_view(self, definition: ViewDefinition) -> None:
+        """写下一行视图（新建与改都是覆盖式地写）；**位置照旧不动**（字典改已有的键
+        不会把它挪到末尾，与 ``Store.save_view`` 保住 ``position`` 是同一件事）。"""
+        self._views[definition.id] = definition
+
+    def drop_view(self, view_id: str) -> None:
+        """本地摘掉一行视图（只动这一行，一条任务都不碰）。"""
+        self._views.pop(view_id, None)
+
+    def new_view_id(self) -> str:
+        """一个还没被占用的本地视图 id（与 ``Store.new_view_id`` 同一个前缀与算法）。"""
+        index = 1
+        while f"{VIEW_ID_PREFIX}{index}" in self._views:
+            index += 1
+        return f"{VIEW_ID_PREFIX}{index}"
+
     def lists(self) -> tuple[ListSnapshot, ...]:
         return tuple(self._lists.values())
 
@@ -297,6 +356,10 @@ class InMemorySource:
         翻译的。替身不翻译的话，「改完截止时间屏幕上就变了」这句话在接缝一根本测不到
         （#44：详细页那一格读的是快照上的 ``due``）。**显式的 ``None`` 是清除**——与 ``Store``
         把 ``dueDate: null`` 读成「没有日期」同一个口径（``_parse_time`` 只认字符串）。
+
+        **``projectId`` 那一条是搬运**（#45）：快照上「在哪个清单」那一位叫 ``list_id``，
+        与 ``Store._write_task`` 同一条口径（它也是从 ``projectId`` 算出 ``list_id`` 那一列）。
+        不翻这一下的话，「搬完在读路径上人在新清单里」这句话在接缝一根本测不到。
         """
         snapshot = self._tasks.get(task_id)
         if snapshot is None:
@@ -310,13 +373,13 @@ class InMemorySource:
                 all_day=bool(raw.get("isAllDay")),
             )
         known = {key: value for key, value in changes.items() if key in _SNAPSHOT_FIELDS}
+        if changes.get("projectId"):
+            known["list_id"] = str(changes["projectId"])
+        if "tags" in known:
+            known["tags"] = tuple(known["tags"])
         snapshot = replace(snapshot, **known) if known else snapshot
         self._tasks[task_id] = snapshot
         self._raw[task_id] = raw
-
-    def views(self) -> tuple[ViewRow, ...]:
-        """自定义视图行（#36 的本地库那一样；替身里是 :meth:`add_view` 摆的）。"""
-        return tuple(self._views.values())
 
     def tasks(self) -> tuple[TaskSnapshot, ...]:
         return tuple(self._tasks.values())
@@ -353,6 +416,9 @@ class FakeBackend:
 
         self.completed: list[str] = []
         """``complete(task_id)`` 收到的任务 id，按调用顺序。"""
+
+        self.uncompleted: list[str] = []
+        """``uncomplete(task_id)`` 收到的任务 id，按调用顺序（工单 #38）。"""
 
         self.deferred: list[str] = []
         """``defer(task_id, days=...)`` 收到的任务 id，按调用顺序。"""
@@ -393,6 +459,20 @@ class FakeBackend:
         self.deleted: list[str] = []
         """``delete(task_id)`` 收到的任务 id，按调用顺序（t16 的删除）。"""
 
+        self.moved: list[tuple[str, str]] = []
+        """``move_task(task_id, to_list_id=)`` 收到的每一笔（任务 id + 目标清单 id），按顺序
+        （#45 的搬运）。与 ``writes`` 分开记：搬运**不是**一次普通字段更新，混在一起就看不出
+        它到底走了哪条路。"""
+
+        self.tag_loads = 0
+        """``load_tags()`` 被调用的次数（#45：打开挑标签那一格才拉一次）。"""
+
+        self.tag_error: Exception | None = None
+        """摆一个异常进去，``load_tags`` 就抛它（试界面拉不到标签列表时的反应）。"""
+
+        self._tags: tuple[str, ...] = ()
+        """摆进来的那一份「服务端有的标签」（:meth:`set_tags`）。"""
+
         self.writes: list[tuple[str, dict[str, Any]]] = []
         """``write(task_id, changes=)`` 收到的每一笔（任务 id + 改动的字段），按调用顺序。
 
@@ -423,6 +503,18 @@ class FakeBackend:
 
         self.list_error: Exception | None = None
         """摆一个异常进去，清单的三种写就抛它（试 TUI 拿到结构化错误时的反应）。"""
+
+        self.created_views: list[ViewDefinition] = []
+        """``create_view(definition)`` 收到的每一笔，按顺序（#36）。"""
+
+        self.updated_views: list[ViewDefinition] = []
+        """``update_view(definition)`` 收到的每一笔，按顺序（#36）。"""
+
+        self.deleted_views: list[str] = []
+        """``delete_view(view_id)`` 收到的视图 id，按顺序（#36）。"""
+
+        self.view_error: Exception | None = None
+        """摆一个异常进去，视图的三种写就抛它（与 ``list_error`` 同一条口径）。"""
 
         self._subtasks: dict[str, tuple[SubtaskItem, ...]] = {}
         """摆进来的子任务，按任务 id 索引（t20）；:meth:`set_subtasks` 摆，读路径照给。"""
@@ -471,9 +563,9 @@ class FakeBackend:
     def add_list(self, name: str, **kwargs: Any) -> ListSnapshot:
         return self.source.add_list(name, **kwargs)
 
-    def add_view(self, name: str, *, id: str | None = None, task_ids: Sequence[str] = ()) -> ViewRow:
-        """摆一条自定义视图行（#36 的求值结果）：这个视图当前选中的那些任务 id。"""
-        return self.source.add_view(name, id=id, task_ids=task_ids)
+    def add_view(self, name: str, **conditions: Any) -> ViewDefinition:
+        """摆一个自定义视图（#36）：``conditions`` 就是 :class:`ViewDefinition` 的那几维。"""
+        return self.source.add_view(name, **conditions)
 
     def add_task(self, title: str, **kwargs: Any) -> TaskSnapshot:
         return self.source.add_task(title, **kwargs)
@@ -492,6 +584,38 @@ class FakeBackend:
         """读：委托给真引擎（某个容器的全部未完成任务 + 该显示的那部分已完成）。"""
         return self._engine.tasks_in(container_id)
 
+    def move_targets(self) -> tuple[ListRow, ...]:
+        """读：委托给真引擎（真实清单、进得去、服务端已经见过的那些，#45）。
+
+        「服务端见过没有」的判据在真引擎里读的是**队列**（``pending_lists``），而内存替身
+        没有队列，所以它这一路不过滤——接缝一测的是「挑选器给的正好是引擎说的那一份」，
+        过滤本身归接缝二（真库那一条）。
+        """
+        return self._engine.move_targets()
+
+    def set_tags(self, *names: str) -> None:
+        """摆一份「服务端有的标签」（#45）：下一次 :meth:`load_tags` 就交回这一份。
+
+        替身不自己编标签——编出来的东西会让「挑得到哪些标签」这句话变成空话（与
+        ``set_subtasks`` 收成品行同一条口径）。
+        """
+        self._tags = tuple(names)
+
+    async def load_tags(self) -> tuple[str, ...]:
+        """读：把摆进来的那一份交回去（#45），并记下拉过几次。
+
+        摆了 ``tag_error`` 就抛它：模拟拉不到标签列表（断网、服务端拒绝），好试界面
+        「说出来 + 照旧让用户挑本地已知的」那两半。
+        """
+        self.tag_loads += 1
+        if self.tag_error is not None:
+            raise self.tag_error
+        return self._tags
+
+    def tags(self) -> tuple[str, ...]:
+        """读：摆进来的那一份 ∪ 本地任务上出现过的那些（与真引擎同一条口径）。"""
+        return tuple(dict.fromkeys((*self._tags, *self._engine.tags())))
+
     def task_detail(self, task_id: str) -> TaskDetail | None:
         """读：委托给真引擎（详情页的字段，含原文里我们不认识的那些）。"""
         return self._engine.task_detail(task_id)
@@ -500,7 +624,25 @@ class FakeBackend:
         return self._engine.status()
 
     def complete(self, task_id: str) -> None:
+        """写：记下这一笔，**并且真的把它标成完成**（工单 #38）。
+
+        与 :meth:`create` 同一条口径（清单那三种写也是）：本地效果是真引擎当场做的事
+        （``Store`` 的乐观写把 ``status`` 写成 2），只记录的话接缝一看不到「按下去这一行
+        就变了」——而完成 / 取消完成正是要按键才看得见的那一类。
+
+        ``completedTime`` 照真引擎的样子**不动**：服务端还没认过这一笔，屏幕上的完成时刻
+        要等已完成流把它带回来（#37 的 ``completed_section`` 只认服务端那个时间戳）。
+        """
         self.completed.append(task_id)
+        self.source.set_completed(task_id, completed=True)
+
+    def uncomplete(self, task_id: str) -> None:
+        """写：记下这一笔，并把它改回未完成（工单 #38 的第二个方向）。
+
+        与 :meth:`complete` 同一条口径，只是 ``status`` 写回 0；完成时间戳同样不动。
+        """
+        self.uncompleted.append(task_id)
+        self.source.set_completed(task_id, completed=False)
 
     def defer(self, task_id: str, *, days: int = 1) -> None:
         self.deferred.append(task_id)
@@ -596,6 +738,24 @@ class FakeBackend:
         if self.delete_error is not None:
             raise self.delete_error
 
+    def move_task(self, task_id: str, *, to_list_id: str) -> None:
+        """写：记下这一笔，**并且真的把任务挪进目标清单**（#45 的搬运）。
+
+        与 ``write`` / ``create`` 同一条口径（那两处也是「真的摆进缓存」）：只记录的话，
+        「搬完那条任务出现在新清单里、原清单里没有了」这句话在接缝一根本测不到——而它正是
+        这一票的验收标准。摆了 ``write_error`` 就记完这一笔再抛（与 ``write`` 同一个口子：
+        引擎当场拒绝时界面要说得出具体原因）。
+        """
+        current = next((task.list_id for task in self.source.tasks() if task.id == task_id), None)
+        if current == to_list_id:
+            # 与真引擎同一条口径（``PushMixin.move_task``）：已经在那个清单里 = 什么都不写。
+            # 不照做的话，替身会记下一笔「搬了」而生产那一条根本没写——接缝一断的就是这句话。
+            return
+        self.moved.append((task_id, to_list_id))
+        if self.write_error is not None:
+            raise self.write_error
+        self.source.apply_changes(task_id, {"projectId": to_list_id})
+
     def write(
         self,
         task_id: str,
@@ -626,12 +786,13 @@ class FakeBackend:
 
         与 :meth:`create` 同一条口径：清单列表页上「建完立刻多出一行」正是这张工单的验收
         标准，只记录的话接缝一根本测不到那句话。本地临时 id 也照真引擎的样子给
-        （服务端建好之后才给真 id），界面因此不必认识「哪条还没推上去」。
+        （服务端建好之后才给真 id），界面因此不必认识「哪条还没推上去」；前缀用
+        :data:`~dida.sync.lists.LOCAL_LIST_PREFIX`，不在这里另抄一份字面量（#57 的检查 10）。
         """
         self.created_lists.append((name, color))
         self._raise_list_error()
         return self.source.add_list(
-            name, id=f"local-list-{len(self.created_lists)}", color=color
+            name, id=f"{LOCAL_LIST_PREFIX}{len(self.created_lists)}", color=color
         ).id
 
     def update_list(
@@ -665,6 +826,40 @@ class FakeBackend:
         """摆了 ``list_error`` 就在记完这一笔之后抛它（引擎当场拒绝的那条路）。"""
         if self.list_error is not None:
             raise self.list_error
+
+    def create_view(self, definition: ViewDefinition) -> str:
+        """写：记下这一笔，**并且真的把它摆进内存缓存**（#36）。
+
+        与 :meth:`create_list` 同一条口径：清单列表页上「建完立刻多出一行」正是这张工单的
+        验收标准，只记录的话接缝一根本测不到那句话。
+
+        实际落库**委托给真引擎**（``self._engine``）：视图那条写路径不需要网络也不需要
+        客户端，替身没有理由再抄一遍「分配 id + 覆盖式写一行」——抄一遍就会与生产漂移。
+        """
+        self.created_views.append(definition)
+        self._raise_view_error()
+        return self._engine.create_view(definition)
+
+    def update_view(self, definition: ViewDefinition) -> None:
+        """写：记下这一笔，并改内存缓存里那一行（位置照旧不动）。"""
+        self.updated_views.append(definition)
+        self._raise_view_error()
+        self._engine.update_view(definition)
+
+    def delete_view(self, view_id: str) -> None:
+        """写：记下这一笔，并从内存缓存里摘掉那一行（**一条任务都不碰**）。"""
+        self.deleted_views.append(view_id)
+        self._raise_view_error()
+        self._engine.delete_view(view_id)
+
+    def view_definition(self, view_id: str) -> ViewDefinition | None:
+        """读：委托给真引擎（本地库里那一行定义；没建过就是 ``None``）。"""
+        return self._engine.view_definition(view_id)
+
+    def _raise_view_error(self) -> None:
+        """摆了 ``view_error`` 就在记完这一笔之后抛它（引擎当场拒绝的那条路）。"""
+        if self.view_error is not None:
+            raise self.view_error
 
     def set_subtasks(self, task_id: str, *items: SubtaskItem) -> None:
         """摆一条任务的子任务（t20）：右栏渲染与勾选测试的输入。

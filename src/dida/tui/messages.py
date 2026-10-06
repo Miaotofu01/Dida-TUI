@@ -24,6 +24,8 @@ from dida.sync.engine import (
     UnclaimedTaskError,
     UnknownListError,
     UnknownTaskError,
+    UnknownViewError,
+    ViewFormProblem,
 )
 
 UNKNOWN_TASK_MESSAGE = "没有改成：这条任务已经不在本地缓存里了，刷新之后再试一次"
@@ -152,6 +154,68 @@ def field_save_failed_message(reason: object) -> str:
     return f"{FIELD_SAVE_FAILED_PREFIX}{reason}"
 
 
+NO_CHOICES_TEXT = "（没有可选项）"
+"""多选那一格一个可挑的都没有时画的那一句（工单 #45）。
+
+它不是「空状态」，而是**事实**：这个客户端不做新建标签（见
+:data:`TAGS_PICKER_HINT`），所以一个标签都没有时这一格确实是空的——用户要看到的是
+「一个都没有」加上「去哪儿能建」，而不是一片什么都没有的黑。
+"""
+
+TAGS_PICKER_HINT = (
+    "空格 打上或取消 / 上下方向键 换一个 / Enter 确认 / Esc 取消 / Ctrl+C 退出\n"
+    "这个客户端不做新建标签：要打一个还没有的标签，请回官方客户端建。\n"
+    "删除标签的接口官方文档里没有，所以这里也删不掉。"
+)
+"""挑标签那一格的底部提示（工单 #45，验收标准 6）——**这一票最要紧的一行字**。
+
+措辞里那两件事，一件是范围决定、一件是接口事实，**不许混**：
+
+- **新建标签**：``POST /open/v1/tag`` 是文档里**有**的端点（``openapi-dida365.md:1612–1654``，
+  ``name`` 与 ``label`` 都必填、小写、且 ``label`` 必须等于小写后的 ``name``，``:1620–1621``）。
+  所以「不能新建」是**这个客户端**的范围决定（spec 的 Out of Scope :306），不是接口做不到。
+  写成「API 没有这个能力」就是对用户说假话——那句话会被一个真去查文档的人当场戳穿。
+- **删除标签**：``:1576–1654`` 整节只有 ``GET`` 与 ``POST``，没有 update、没有 delete。
+  这一半是接口真的没有（用户故事 113 要的就是这句如实告知）。
+
+``空格``/``上下方向键`` 而不是 ``⎵``/``↑↓``：后两个是东亚**歧义**宽度（rich 量 1 格、CJK
+字体下终端可能画 2 格），而这块浮层是 ``width: auto``——宽度正由最宽那行算出来（#48 在
+帮助正文上立的同一条规矩）。
+"""
+
+
+def hidden_choices_message(hidden: int) -> str:
+    """多选那一格没画出来的那几个（工单 #45）：说个数，**不静默地藏**。
+
+    选项多于 :data:`~dida.tui.theme.PICKER_VISIBLE_ROWS` 时只画光标周围那一段；被藏起来的
+    那几个照样走得过去（光标会把它带进窗口），但用户得知道「下面还有」。
+    """
+    return f"还有 {hidden} 个未显示"
+
+
+def tags_load_failed_message(error: object) -> str:
+    """标签列表没拉到（工单 #45）时的那一句：挑标签那一格照旧开出来，这一句写在它的提示里。
+
+    与 :func:`field_save_failed_message` 同一条口径：后面跟的是**具体**那一句（断网、凭据
+    失效、服务端拒绝），不是一个笼统的「失败」。
+
+    **为什么写在浮层里而不是状态栏上**：浮层是模态的，用户的眼睛在它身上——状态栏那一行
+    在浮层底下（实测：模态开着时 ``screen_text`` 只画得出浮层自己）。而且这一句说的正是
+    「你现在看到的这一份是什么」，写在被说的那份名单旁边才对得上。
+
+    后半句是**必须**的：不说清「这一份是本地的」，用户会以为自己一个标签都没有。
+    """
+    return f"标签列表没拉到：{error}（下面这一份是本地已经见过的）"
+
+
+def tags_picker_hint(notice: str = "") -> str:
+    """挑标签那一格的底部提示；``notice`` 是这一次没拉到名单时那一句，放在最前面。
+
+    默认那一份是 :data:`TAGS_PICKER_HINT`（键位 + 那两条如实告知）。
+    """
+    return f"{notice}\n{TAGS_PICKER_HINT}" if notice else TAGS_PICKER_HINT
+
+
 def priority_name(priority: int) -> str:
     """优先级那一格的读法（``0/1/3/5`` → 无 / 低 / 中 / 高）。"""
     return PRIORITY_NAMES.get(priority, PRIORITY_NAMES[0])
@@ -170,8 +234,146 @@ INBOX_LIST_MESSAGE = "收集箱不在这里改：它是客户端补出来的默�
 每次刷新都由服务端那一份说了算，所以在这里改它只会看起来成功、下一次刷新就变回去。
 """
 
-VIEW_ROW_MESSAGE = "这是视图，不是清单：视图的建 / 改 / 删还没接上"
-"""``e`` / ``d`` 落在视图行上时的话（#42 只管清单；视图那三条归 #36）。"""
+VIEW_ROW_MESSAGE = "这是视图，不是清单：视图走它自己那条建 / 改 / 删"
+"""视图行落到**清单**那条路上时的话（#42 的兜底；视图那三条从 #36 起归 :mod:`dida.sync.views`）。
+
+它现在是一条走不到的路：清单列表页先看行的类型再分派（``app._refusal_for``），视图行不会
+再进清单那三个口子。留着是因为 :func:`dida.tui.pages.index.list_write_refusal` 仍然只回答
+「能不能当清单改」——它要是对视图行说「能」，那才是真的坑。
+"""
+
+VIEW_LOCAL_ONLY = "自定义视图只存在这台机器上：手机端、网页版没有它，换台机器就没了"
+"""浮层里那句实话的**陈述**（验收标准 4，ADR-0005）。
+
+滴答清单的 Open API 里没有「保存一组过滤条件」这个接口——只有清单与任务，而
+``/task/filter`` 过滤的是开始时间、硬顶 200 条、没有分页。所以自定义视图**只存在本机**：
+手机端、网页版上没有它，换台机器也没了。这是能力上限，不是实现疏漏，所以照实说，
+也不许暗示「以后会同步上去」。
+
+它单独成一个常量、理由另起一个（:data:`VIEW_LOCAL_ONLY_WHY`）：这一句要在一行里排得下
+（浮层宽 74 格，CJK 一格算两格），拼上理由就会折行——而折行处夹着边框，屏幕上就再也
+读不出一整句了。
+"""
+
+VIEW_LOCAL_ONLY_WHY = "（API 没有保存一组过滤条件的接口）"
+"""上面那句话的**理由**：只说「只存在本机」用户会以为是客户端没做，说清是接口里没有这一条，
+他才知道这不是能补上的功能。
+"""
+
+VIEW_FORM_SYNTAX = "多个值用空格或逗号分开；留空 = 不限"
+"""视图表单底部那行提示的第一句：清单范围 / 优先级 / 标签都能写好几个。
+
+这三格是输入框而不是多选框（#45 的挑选型字段是另一张票），所以「怎么写多个」得说清楚——
+说不清楚用户只会填一个，而工单要的是多选。
+"""
+
+NEW_KIND_HINT = "清单装任务；视图只是一组过滤条件，只存在这台机器上"
+"""``n`` 那句「清单还是视图」下面的一行说明（#36 的验收标准 1）。
+
+问这一句是有理由的：两种东西后面完全是两回事（一个是服务端的容器，一个是本地的过滤
+条件），顺手说清哪一种是哪一种，用户才不会以为自己建了个「会同步的清单」。
+"""
+
+BUILTIN_VIEW_MESSAGE = "内置视图改不了也删不掉：它的条件是写死的（今天 / 最近七天 / 所有）"
+"""``e`` / ``d`` 落在**内置**视图行上时的话（#36）。
+
+内置视图不是本地库里的行，它是三个写死的定义（:func:`dida.sync.views.builtin_view_definitions`）
+——没有「改它」这回事，删掉它也没有落点。所以这里既不开表单也不问那一句：问一句就等于
+「有可能删」，而它不会。
+"""
+
+EMPTY_VIEW_NAME_MESSAGE = "没写名字：视图得有个名字"
+"""建视图时名字那一格是空的（#36）。与清单 / 任务那两句同一条口径：空态不许静默。"""
+
+
+def delete_view_prompt(name: str) -> str:
+    """**删视图**的确认文案（#36）。
+
+    与 :func:`delete_list_prompt` 的分别正是这一屏要说的那句话：视图只是一组过滤条件，
+    删掉它**不会动任何任务**——那些任务本来就在各自的清单里。所以这里没有「找不回来」那种
+    警告（那一句留给真会丢东西的删除），只说清删的是什么、以及不牵连什么。
+    """
+    return (
+        f"删除视图「{name}」？\n"
+        "视图只是一组过滤条件，删掉它不会动任何任务。\n\n"
+        "y 确认删除 · n / Esc 取消"
+    )
+
+
+def view_write_failed_message(error: DidaError) -> str:
+    """视图的建 / 改 / 删当场失败时的话（#36）。
+
+    与 :func:`list_write_failed_message` 同一条口径：引擎当场拒绝的（本地已经没有那一行）
+    与别的失败分开说。视图不推服务端，所以这里没有网络那几种失败。
+    """
+    if isinstance(error, UnknownViewError):
+        return UNKNOWN_VIEW_MESSAGE
+    return f"视图没改成：{error}"
+
+
+UNKNOWN_VIEW_MESSAGE = "没有改成：这个视图已经不在本地库里了"
+"""本地没有那一行视图时的话（#36）。
+
+它不说「刷新之后再试一次」：视图不是从服务端拉回来的，刷新不会把它变回来——再说那句
+就是给一条走不通的路指路。
+"""
+
+
+def view_form_problem(problem: ViewFormProblem) -> str:
+    """那张表单填不下去时状态栏里的话（#36）。
+
+    逐条说清**哪一处、哪几个词**：认不出的清单名 / 优先级词一律拒绝保存，因为沉默地存下
+    一个筛不出东西的视图，用户要过一阵子才发现，而且发现时不知道是自己填错了还是客户端
+    没做。句子在这里拼（产品文案住这一个模块），判据在 :func:`dida.sync.views.parse_view_form`。
+    """
+    sentences: list[str] = []
+    if problem.missing_name:
+        sentences.append(EMPTY_VIEW_NAME_MESSAGE)
+    if problem.unknown_lists:
+        sentences.append(
+            f"清单范围里认不出这些清单：{'、'.join(problem.unknown_lists)}"
+            "（写清单的名字或 id，空格分隔）"
+        )
+    if problem.unknown_priorities:
+        sentences.append(
+            f"优先级只认 高 / 中 / 低 / 无（也可以写 5 / 3 / 1 / 0）："
+            f"认不出 {'、'.join(problem.unknown_priorities)}"
+        )
+    if problem.never_matches:
+        sentences.append(
+            "这个条件永远筛不出任务：完成状态是「未完成」时没有完成时间可筛"
+        )
+    return "；".join(sentences) or "这张表单还没填完"
+
+
+def completed_message(title: str) -> str:
+    """按下 ``space`` 把一条任务标成完成时的回声（工单 #38，用户故事 41、43）。
+
+    说的是**本地已经生效**（乐观写，ADR-0002），不是「服务端已经收到了」：推不上去时那条
+    改动还在队列里，状态栏那个「待推送 N」一直说着这件事——两句话各说各的那一半。
+    """
+    return f"已完成「{title}」"
+
+
+def uncompleted_message(title: str) -> str:
+    """按下 ``space`` 把一条已完成的任务改回未完成时的回声（工单 #38，用户故事 42、43）。
+
+    与 :func:`completed_message` 同一条口径。措辞里认下的是「本地不再是已完成」：
+    完成时间戳可能还在（实测取消完成不会清掉它），而「还算不算已完成」只看 ``status``。
+    """
+    return f"已取消完成「{title}」"
+
+
+def toggle_complete_failed_message(error: DidaError) -> str:
+    """完成 / 取消完成**当场**失败时状态栏里的话（工单 #38）。
+
+    与别的写路径同一条口径：引擎当场拒绝的（本地已经没有这条任务的底稿）与别的失败分开说，
+    因为用户该做的事不一样——前者刷新一下再看，后者是网络或权限。按下去什么都不说，
+    用户会以为它成了（ADR-0002 要消灭的正是这个）。
+    """
+    if isinstance(error, UnknownTaskError):
+        return UNKNOWN_TASK_MESSAGE
+    return f"没改成：{error}"
 
 
 def readonly_list_message(row: object) -> str:

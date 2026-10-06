@@ -112,6 +112,16 @@ def _completed_status() -> int:
     return COMPLETED_STATUS
 
 
+def _uncompleted_status() -> int:
+    """任务「未完成」的 ``status`` 值（``0``，取消完成写回的那一档，工单 #38）。
+
+    与 :func:`_completed_status` 并排：这两个值是**同一张码表**的两档，分开写两处就会漂。
+    """
+    from dida.storage.store import UNCOMPLETED_STATUS
+
+    return UNCOMPLETED_STATUS
+
+
 @runtime_checkable
 class TaskWriter(Protocol):
     """推送要的那几个写操作；t07 的 ``DidaApiClient`` 满足它。
@@ -138,8 +148,25 @@ class TaskWriter(Protocol):
         """``POST /open/v1/project/{projectId}/task/{taskId}/complete``：无请求体。"""
         ...
 
+    async def batch_update(self, updates: Sequence[Mapping[str, Any]]) -> Any:
+        """``POST /open/v1/task/batch``：批量更新（取消完成的唯一路径，工单 #38）。
+
+        每一条只带 id / projectId / status；逐条失败藏在 ``200 OK`` 的 ``id2error`` 里，
+        由客户端读出来抛结构化错误。
+        """
+        ...
+
     async def delete_task(self, project_id: str, task_id: str) -> None:
         """``DELETE /open/v1/project/{projectId}/task/{taskId}``。"""
+        ...
+
+    async def move_task(
+        self, from_project_id: str, to_project_id: str, task_id: str
+    ) -> Sequence[Mapping[str, Any]]:
+        """``POST /open/v1/task/move``：把一条任务搬去另一个清单（工单 #45）。
+
+        请求体是**数组**、响应是 ``{id, etag}`` 的**数组**——本仓库唯一一个这样的端点。
+        """
         ...
 
 
@@ -204,13 +231,30 @@ class PushMixin:
         self._push_now()
 
     def complete(self, task_id: str) -> None:
-        """写：完成任务并立即推送（ADR 0002，服务端不可逆）。
+        """写：完成任务并立即推送（ADR 0002 的乐观写：本地先动，服务端随后到）。
 
         就是 :meth:`write` 的一个预置：本地当场标记完成（``status`` 由引擎补 ``2``），
-        推送走没有请求体的 ``complete`` 端点。没有「取消完成」这条路径——服务端没有
-        这个接口，本地自己造一个只会在下一次刷新时被服务端权威抹掉（ADR-0002）。
+        推送走没有请求体的 ``complete`` 端点。
+
+        **反方向是 :meth:`uncomplete`，不是「没有这条路」**：ADR-0002 记的「完成不可逆」
+        已被实测推翻（spec 的实测事实第 1 条），服务端那条路是 ``task/batch`` 的
+        ``update`` 带 ``status: 0``。完成这条路本身仍然是不可逆的（它没有撤销参数），
+        所以「按键的手感比可撤销性值钱」这条口径没变——变的是它**真的**可逆了。
         """
         self.write(task_id, kind=WriteKind.COMPLETE)
+
+    def uncomplete(self, task_id: str) -> None:
+        """写：取消完成并立即推送（工单 #38，``space`` 的第二个方向）。
+
+        与 :meth:`complete` 同一条口径的预置：本地当场把 ``status`` 写回 ``0``（完成时间戳
+        不动——实测取消完成不会清掉它），推送走 ``task/batch`` 的 ``update`` 数组。
+
+        **为什么不是普通更新端点**：``status`` 在 ``POST /open/v1/task/{taskId}`` 上会被
+        服务端静默忽略（所以本地守卫一直拒绝它），实测能生效的只有批量更新这一条路
+        （spec 的实测事实第 1 条）。所以这一种写打的是一个**新形状**的端点，而它每一条
+        只发 id / projectId / status——批量更新是合并语义，其余字段服务端自己保留。
+        """
+        self.write(task_id, kind=WriteKind.UNCOMPLETE)
 
     def delete(self, task_id: str) -> None:
         """写：删除一条任务（``d``），本地当场摘掉快照、推送走 ``DELETE``（t16）。
@@ -223,6 +267,33 @@ class PushMixin:
         所以这次确认是唯一的防线，而它归 TUI：引擎这一层只保证「调用它就删」，不负责问。
         """
         self.write(task_id, kind=WriteKind.DELETE)
+
+    def move_task(self, task_id: str, *, to_list_id: str) -> None:
+        """写：把这条任务搬到另一个清单（``POST /open/v1/task/move``，工单 #45）。
+
+        **不是一次普通字段更新**：搬运有自己的端点、自己的数组请求体，所以它是
+        :class:`~dida.sync.writes.WriteKind` 里的一个成员，而不是 ``write(changes={"projectId": …})``
+        的另一种叫法（spec :230 明确要求走搬运端点）。
+
+        本地那一份**当场就换清单**（``projectId`` 盖进快照，读路径立刻把它画在新清单里），
+        推送排在事件循环上立刻跑，推不动就留在队列里退避重试——与其余几条写同一条口径。
+
+        ``to_list_id`` 与当前清单相同时**什么都不写**：那不是一次改动，凭空入队只会让状态栏
+        多出一个永远没有意义的数。本地没有这条任务的底稿时与 :meth:`write` 一样当场抛
+        :class:`~dida.sync.writes.UnknownTaskError`——``fromProjectId`` 只存在于那份底稿里，
+        拼不出请求的改动永远推不出去（工单 #25）。
+
+        **目标清单必须服务端已经见过**（本地刚建、还没推上去的清单 id 是本地临时的）：
+        搬过去会 404，而那条改动会永远留在队列里。挑选器因此只给
+        :meth:`~dida.sync.engine.SyncEngine.move_targets` 那一份（#45）。
+        """
+        payload = self._write_target().task_payload(task_id)
+        current = "" if payload is None else str(payload.get("projectId") or "")
+        if not current:
+            raise UnknownTaskError(task_id)
+        if current == to_list_id or not to_list_id:
+            return
+        self.write(task_id, changes={"projectId": to_list_id}, kind=WriteKind.MOVE)
 
     async def push_pending(self) -> int:
         """推一轮：把**到期**的待推送改动依次推给服务端，返回推成功的条数。
@@ -329,8 +400,31 @@ class PushMixin:
             )
         elif wire is WireCall.COMPLETE_TASK:
             await writer.complete_task(change.list_id, change.task_id)
+        elif wire is WireCall.BATCH_UPDATE_TASK:
+            # 批量更新：请求体是 {update: [...]}，每一条只带 id / projectId / status。
+            # 取消完成是唯一走这条路的一种写（`_BEHAVIOUR` 说的一种写一种端点形状）；
+            # 那条改动在本地要写下的 ``status`` 就是这条请求要发的值——两者同一个来源，
+            # 不会出现「本地改成未完成、服务端收到的是别的」。
+            await writer.batch_update(
+                [
+                    {
+                        "id": change.task_id,
+                        "projectId": change.list_id,
+                        **change.payload,
+                    }
+                ]
+            )
         elif wire is WireCall.DELETE_TASK:
             await writer.delete_task(change.list_id, change.task_id)
+        elif wire is WireCall.MOVE_TASK:
+            # 搬运：``fromProjectId`` 是**入队那一刻**那条任务所在的清单（改动行上记着），
+            # ``toProjectId`` 是这次改动盖上去的 ``projectId``。请求体那一层再翻成文档的
+            # 数组形状——这里给的是「从哪到哪」，端点形状是客户端的事。
+            await writer.move_task(
+                change.list_id,
+                str(change.payload.get("projectId") or ""),
+                change.task_id,
+            )
         elif wire is WireCall.CREATE_TASK:
             # 新建才知道服务端给的 id，所以这一条推成功之后要顺手认领它（t15）。
             self._adopt_created(target, change, await writer.create_task(change.payload))
@@ -378,8 +472,15 @@ class PushMixin:
         而这个值只有 API 知道（Completed 是 ``2``，api-contracts.md 第 2 条）——由引擎补，
         不让 t11 自己记一个魔法数。它不会进请求体：完成走的是没有请求体的 ``complete``
         端点，而且 ``status`` 本来也不是新建/更新接受的字段（同文件第 5 条）。
+
+        取消完成是同一个例外**反过来的那一半**（工单 #38）：本地要把 ``status`` 写回
+        ``0``（完成时间戳不动），而那个值同样只有 API 知道。它进请求体——那一档正是
+        ``task/batch`` 的 ``update`` 要发的东西（实测确认，spec 的实测事实第 1 条）。
         """
         merged = dict(changes or {})
-        if kind.marks_completed:  # 「本地立刻完成」这件事由词表说（dida.sync.writes）
+        # 「本地立刻完成 / 立刻不再完成」这两件事都由词表说（dida.sync.writes 的 _BEHAVIOUR）
+        if kind.marks_completed:
             merged.setdefault("status", _completed_status())
+        elif kind.clears_completed:
+            merged.setdefault("status", _uncompleted_status())
         return merged

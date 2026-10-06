@@ -46,7 +46,15 @@ COMPLETED_WINDOW_DATE_FIELDS = ("startDate", "endDate")
 
 #: 文档说 create / update **都不接受**的字段（api-contracts.md 第 5 条）。
 #: 写它们等于什么都没写：服务端静默忽略，用户以为完成了，其实没有（ADR 0002）。
+#: **例外只有一处**：批量更新的 ``update`` 数组（:func:`prepare_batch_body`，实测确认）。
 NON_WRITABLE_FIELDS = ("status",)
+
+#: 批量更新（``POST /open/v1/task/batch``）的 ``update`` 里每一条**只发**这三个字段。
+#:
+#: 端点与数组的形状是文档给的（openapi §A3 :559–562），``status`` 则是**实测确认**的
+#: （spec 的实测事实第 1 条）：文档在这一节里一次都没提它。所以这张表不是照文档抄的，
+#: 它记的是「我们确实这么用过、且回读确认生效」的那一份。
+BATCH_UPDATE_FIELDS: tuple[str, ...] = ("id", "projectId", "status")
 
 #: 清单（``Project``）的写请求体接受的字段（openapi-dida365.md:1184–1188 建、:1235–1239 改）。
 #:
@@ -131,6 +139,29 @@ def prepare_completed_window_body(body: Mapping[str, Any]) -> dict[str, Any]:
     return normalize_dates(body, fields=COMPLETED_WINDOW_DATE_FIELDS)
 
 
+def prepare_batch_body(body: Mapping[str, Any]) -> dict[str, Any]:
+    """批量更新（``POST /open/v1/task/batch``）的守卫：``update`` 里每一条**只留三个字段**。
+
+    这是 :data:`NON_WRITABLE_FIELDS` 唯一的例外，而且范围就到这里为止：``status`` 在普通
+    更新端点上会被服务端静默忽略（所以 :func:`guard_writable` 继续拒绝它），但在批量更新
+    的 ``update`` 数组里它是**实测确认**能生效的（spec 的实测事实第 1 条：带 ``status: 0``
+    能把已完成的任务改回未完成）。放宽的是一个端点加一个数组，不是那条规矩本身。
+
+    收窄成 :data:`BATCH_UPDATE_FIELDS` 是同一件事的另一半：批量更新是**合并语义**
+    （只发改动的字段，其余服务端保留），所以就算请求体里多带了别的字段，这里也不发出去
+    ——「其余字段不因这次取消完成而改变」这句话靠的就是这一行。
+
+    与别的守卫不同，这里**不抛** ``FieldIgnoredError``：形状是这一层自己的调用方拼的
+    （引擎按词表给的 payload），拼错了是程序错误、当场就炸在本地，不会发出一个安静的请求。
+    """
+    return {
+        "update": [
+            {field: entry[field] for field in BATCH_UPDATE_FIELDS if entry.get(field) is not None}
+            for entry in body["update"]
+        ]
+    }
+
+
 def _normalize_item(index: int, item: Any) -> Any:
     if not isinstance(item, Mapping):
         return item
@@ -165,16 +196,19 @@ def prepare_write_body(body: Mapping[str, Any]) -> dict[str, Any]:
 
 
 def guard_writable(changes: Mapping[str, Any]) -> None:
-    """拦下文档说服务端**不接受**的字段。
+    """拦下文档说服务端**不接受**的字段——**普通**写路径（新建 / 更新）上的那一道。
 
     ``status`` 就是那一个（api-contracts.md 第 5 条）：写它请求会成功，服务端静默忽略，
-    用户以为任务完成了。完成只有一条路：``complete_task``（ADR 0002，不可逆）。
+    用户以为任务完成了。两个方向都不走它：完成走没有请求体的 ``complete_task``，取消完成
+    走 ``task/batch`` 的 ``update``（那是 :func:`prepare_batch_body` 的事，实测确认能生效
+    ——spec 的实测事实第 1 条）。所以这条守卫的例外**只有那一个端点那一个数组**，
+    规矩本身没有变：文档说服务端不接受的字段，本地一律不发。
     """
     for field in NON_WRITABLE_FIELDS:
         if field in changes:
             raise FieldIgnoredError(
                 f"{field} 不能通过新建/更新写入（服务端会静默忽略）；"
-                "完成任务请走 complete_task",
+                "完成请走 complete_task，取消完成请走 batch_update",
                 field=field,
             )
 

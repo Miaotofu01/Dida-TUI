@@ -46,7 +46,12 @@ from dida.sync.view import (
     subtask_items,
     task_item,
 )
-from dida.sync.views import builtin_view_definitions, evaluate_view, implied_due_for
+from dida.sync.views import (
+    ViewDefinition,
+    builtin_view_definitions,
+    evaluate_view,
+    implied_due_for,
+)
 
 __all__ = [
     "BUILTIN_VIEW_IDS",
@@ -60,6 +65,7 @@ __all__ = [
     "ViewRow",
     "builtin_view_rows",
     "container_tasks",
+    "custom_view_rows",
     "is_inbox_id",
     "list_index",
     "resolve_lists",
@@ -159,11 +165,11 @@ class ListRow:
 class ViewRow:
     """清单索引里的一行视图（内置或自定义）：身份、名字，以及它选中的那些任务。
 
-    ``task_ids`` 是**视图求值的结果**：内置视图由 :func:`builtin_view_rows` 算（#35 会把
-    求值长全），自定义视图由本地库那一层算（#36 把视图定义落库并求值）。行上的未完成条数
-    由 :func:`list_index` 从缓存里数**成员里未完成的那些**——索引里的数字与进去看到的列表
-    因此来自同一次求值，不可能对不上（「最近完成」那种视图里也有已完成的成员，所以条数
-    不是 ``len(task_ids)``）。
+    ``task_ids`` 是**视图求值的结果**：内置视图由 :func:`builtin_view_rows` 算，自定义视图由
+    :func:`custom_view_rows` 算（#36：定义来自本地库，求值走同一个 ``evaluate_view``）。
+    行上的未完成条数由 :func:`list_index` 从缓存里数**成员里未完成的那些**——索引里的数字与
+    进去看到的列表因此来自同一次求值，不可能对不上（「最近完成」那种视图里也有已完成的成员，
+    所以条数不是 ``len(task_ids)``）。
     """
 
     id: str
@@ -278,14 +284,19 @@ KNOWN_TASK_FIELDS: frozenset[str] = frozenset(
 
 @runtime_checkable
 class ViewReader(Protocol):
-    """本地库里那些自定义视图行（#36 把视图定义落库）。
+    """本地库里那些自定义视图的**定义**（#36 把视图定义落库）。
 
     比 :class:`~dida.sync.view.ViewSource` 宽的一件可选能力：只读的替身没有它就是
     「没有自定义视图」，不是错误（与写路径上那几个 ``isinstance`` 门同一条口径）。
+
+    给的是**定义**而不是算好的成员：成员要「全量缓存 + 当前逻辑日」才算得出来
+    （``evaluate_view``），而本地副本手上没有逻辑日——它与 :mod:`dida.sync.view` 那一层
+    同一条规矩，不读时钟。求值因此发生在引擎里（:func:`custom_view_rows`），与内置视图
+    走的是同一个函数。
     """
 
-    def views(self) -> Sequence[ViewRow]:
-        """自定义视图的行，按用户自己的顺序。"""
+    def view_definitions(self) -> Sequence[ViewDefinition]:
+        """自定义视图的定义，按用户自己的顺序。"""
         ...
 
 
@@ -457,6 +468,13 @@ def _implied_due(container_id: str, *, now: datetime, day_end: str) -> datetime 
     只有**内置视图的定义**才隐含日期，所以这里查 :func:`builtin_view_definitions`——自定义
     视图（#36）没有这个语义，``None`` 就是「不隐含」。哪一个是哪一天写在
     :func:`dida.sync.views.implied_due_for` 一处，这里只负责按 id 找到那个定义。
+
+    **自定义视图不在这一条里是故意的**（#39 的边界，报告里写过）：用户自建的视图可能带一个
+    「截止于今天」的窗口，但它的**定义**（``ViewDefinition``）没有随 ``TaskList`` 上来——
+    ``container_tasks`` 手里只有 :class:`~dida.sync.read.ViewRow`（id / 名字 / 成员
+    id），要按它的条件推日期就得再从本地库那份定义接一条线（#36 的接缝）。今天的选择是
+    只认「今天」这个内置视图，换句话说：**在内置「今天」里建会自动带上今天，在自建视图里建
+    不带日期**。要改这条边界，先决定「自建视图的条件算不算隐含」，再把定义接过来。
     """
     definition = next(
         (item for item in builtin_view_definitions() if item.id == container_id), None
@@ -520,6 +538,34 @@ def builtin_view_rows(
             builtin=True,
         )
         for definition in builtin_view_definitions()
+    )
+
+
+def custom_view_rows(
+    definitions: Sequence[ViewDefinition],
+    tasks: Sequence[TaskSnapshot],
+    *,
+    now: datetime,
+    day_end: str,
+) -> tuple[ViewRow, ...]:
+    """用户建的那些视图的行（#36）：**同一条**求值路径，只是定义来自本地库。
+
+    与 :func:`builtin_view_rows` 是同一个形状、同一个 :func:`~dida.sync.views.evaluate_view`
+    ——区别只有「定义从哪来」：那里是三个写死的，这里是本地库读出来的。所以「内置视图与
+    自定义视图共用同一条求值路径」这句话在这一层就是字面意思，而视图的成员、顺序、条数
+    不可能与内置视图有任何算法上的分别（验收标准的最后一条）。
+    """
+    return tuple(
+        ViewRow(
+            id=definition.id,
+            name=definition.name,
+            task_ids=tuple(
+                item.snapshot.id
+                for item in evaluate_view(definition, tasks, now=now, day_end=day_end)
+            ),
+            builtin=False,
+        )
+        for definition in definitions
     )
 
 

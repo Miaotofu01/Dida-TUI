@@ -22,6 +22,8 @@ from dida.sync.completed import DEFAULT_COMPLETED_WINDOW_HOURS
 from dida.sync.engine import (
     NO_DUE_TEXT,
     CompletedItem,
+    DueWindow,
+    Completion,
     SyncEngine,
     TaskItem,
     completed_section,
@@ -119,7 +121,7 @@ def test_a_completed_task_sinks_even_when_it_is_sorted_with_unfinished_ones():
     source = work_source()
     source.add_task("没做完的", list_name="work", due=at(16, 9, 0))
     source.add_task("做完的", list_name="work", due=at(13, 9, 0), completed=True, completed_at=T0)
-    source.add_view("混的", id="mix", task_ids=("t1", "t2"))
+    source.add_view("混的", id="mix", completion=Completion.ANY)
 
     items = engine_with(source).tasks_in("mix").items
 
@@ -422,7 +424,7 @@ def test_a_completed_task_is_never_overdue():
     """已经做完的不算逾期：它该有的样子是划掉沉底，不是标红（用户故事 25 只管未完成的）。"""
     source = work_source()
     source.add_task("昨天做完的", list_name="work", due=at(13, 9, 0), completed=True, completed_at=T0)
-    source.add_view("混的", id="mix", task_ids=("t1",))
+    source.add_view("混的", id="mix", completion=Completion.COMPLETED)
 
     items = engine_with(source).tasks_in("mix").items
 
@@ -451,7 +453,7 @@ def test_the_read_model_says_whether_the_container_is_a_list_or_a_view():
     """「这一行要不要写清单名」由读模型回答：清单是容器，视图不是（工单 #37 的验收标准）。"""
     source = work_source()
     source.add_task("写周报", list_name="work", due=at(14, 18, 0))
-    source.add_view("我的一天", id="mine", task_ids=("t1",))
+    source.add_view("我的一天", id="mine")
     engine = engine_with(source)
 
     assert engine.tasks_in("work").shows_list_name is False, "清单是容器，名字不必重复"
@@ -479,6 +481,25 @@ def test_the_read_model_says_which_date_a_view_implies_for_a_new_task():
     assert engine.tasks_in("next7").implied_due is None, "七天是一段窗口，藏不进一个日期"
     assert engine.tasks_in("all").implied_due is None
     assert engine.tasks_in("work").implied_due is None, "清单不隐含日期"
+
+
+def test_a_custom_view_does_not_imply_a_date_yet():
+    """**自建**视图（#36）不隐含日期——这是 #39 故意定的边界，不是漏掉的一条。
+
+    这里摆的还是一条**最像「今天」**的自建视图（截止窗口就是「今天到期」，与内置「今天」
+    的 ``last=0`` 一样）：它仍然不隐含日期。理由不是「自建的不算」，而是它的定义
+    （``ViewDefinition``）**没有随** ``TaskList`` 上来——``container_tasks`` 手里只有
+    ``ViewRow``（id / 名字 / 成员），要按它的条件推日期得再从本地库那份定义接一条线
+    （#36 的接缝）。所以今天的行为是：在内置「今天」里建会自动带上今天，在自建视图里建
+    **不带日期**（落点仍然是收集箱）。要改这条边界，先决定「自建视图的条件算不算隐含」
+    ——那时这条测试跟着改，而不是被静默改掉。
+    """
+    source = work_source()
+    source.add_view("今天到期", id="mine", due=DueWindow(first=0, last=0))
+    engine = engine_with(source)
+
+    assert engine.tasks_in("mine").shows_list_name is True, "自建视图仍然不是容器"
+    assert engine.tasks_in("mine").implied_due is None, "但不隐含日期（#39 的边界）"
 
 
 def test_the_implied_date_follows_the_logical_day_not_the_natural_one():

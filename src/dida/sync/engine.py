@@ -8,7 +8,8 @@ TUI 读写一切只能走本模块；分组、排序、逾期判定、冲突裁�
 - ``refresh() -> RefreshReport`` —— 写：全量刷新，**async**（:mod:`dida.sync.refresh`；清单索引
   翻页翻到底、远端已经没有的清单与任务顺手剪掉，#41）。
 - ``write(task_id, changes=, kind=)`` —— 写：乐观写，本地当场生效、立即推送（:mod:`dida.sync.push`）。
-- ``complete(task_id)`` / ``delete(task_id)`` —— 写：完成与删除的两个预置（:mod:`dida.sync.push`）。
+- ``complete(task_id)`` / ``uncomplete(task_id)`` / ``delete(task_id)`` —— 写：完成、取消完成
+  与删除的三个预置（:mod:`dida.sync.push`；取消完成走 ``task/batch``，工单 #38）。
 - ``refresh_completed() -> CompletedReport`` —— 写：已完成流，**async**（:mod:`dida.sync.completed`）。
 - ``defer(task_id)`` / ``reschedule(...)`` —— 写：顺延与改期（:mod:`dida.sync.schedule`）。
 - ``create(title, ...)`` —— 写：新建，落在收集箱（:mod:`dida.sync.create`）。
@@ -86,6 +87,7 @@ from dida.sync.read import (
     ViewRow,
     builtin_view_rows,
     container_tasks,
+    custom_view_rows,
     is_inbox_id,
     list_index,
     resolve_lists,
@@ -94,6 +96,7 @@ from dida.sync.read import (
 from dida.sync.refresh import ProjectReader, RefreshMixin, RefreshTarget
 from dida.sync.schedule import ScheduleMixin
 from dida.sync.subtasks import SubtaskMixin, SubtaskWrite, TaskReader
+from dida.sync.tags import TagMixin, TagReader
 from dida.sync.view import (
     INBOX_ID,
     NO_DUE_TEXT,
@@ -135,25 +138,59 @@ from dida.sync.writes import (
     is_local_list_id,
 )
 from dida.sync.views import (
+    ANY_VALUE,
     BUILTIN_VIEW_DAYS,
+    COMPLETED_DAYS_CHOICES,
+    COMPLETION_CHOICES,
+    DUE_CHOICES,
+    PRIORITY_CHOICES,
+    VIEW_COMPLETED_DAYS_FIELD,
+    VIEW_COMPLETION_FIELD,
+    VIEW_DUE_FIELD,
+    VIEW_LISTS_FIELD,
+    VIEW_NAME_FIELD,
+    VIEW_PRIORITY_FIELD,
+    VIEW_TAGS_FIELD,
     Completion,
     DueWindow,
+    UnknownViewError,
+    ViewChoice,
     ViewDefinition,
+    ViewFormProblem,
+    ViewMixin,
+    ViewStore,
     ViewTask,
     builtin_view_definitions,
+    due_window_of,
     evaluate_view,
     implied_due_for,
     order_key,
+    parse_view_form,
+    view_form_values,
+    view_from_payload,
+    view_payload,
 )
 
 if TYPE_CHECKING:  # 只为了标注：storage 反过来 import dida.sync.view，运行时不能在这里 import
     from dida.storage.store import RefreshReport
 
 __all__ = [
+    "ANY_VALUE",
+    "COMPLETED_DAYS_CHOICES",
+    "COMPLETION_CHOICES",
+    "DUE_CHOICES",
     "INBOX_ID",
     "LOCAL_LIST_PREFIX",
     "LOCAL_TASK_PREFIX",
     "NO_DUE_TEXT",
+    "PRIORITY_CHOICES",
+    "VIEW_COMPLETED_DAYS_FIELD",
+    "VIEW_COMPLETION_FIELD",
+    "VIEW_DUE_FIELD",
+    "VIEW_LISTS_FIELD",
+    "VIEW_NAME_FIELD",
+    "VIEW_PRIORITY_FIELD",
+    "VIEW_TAGS_FIELD",
     "AuthError",
     "BUILTIN_VIEW_DAYS",
     "CompletedItem",
@@ -189,16 +226,21 @@ __all__ = [
     "TaskList",
     "TaskReader",
     "ProjectWriter",
+    "TagReader",
     "TaskSnapshot",
     "TodayView",
     "UnclaimedListError",
     "UnclaimedTaskError",
     "UnknownListError",
     "UnknownTaskError",
+    "UnknownViewError",
+    "ViewChoice",
     "ViewDefinition",
+    "ViewFormProblem",
     "ViewReader",
     "ViewRow",
     "ViewSource",
+    "ViewStore",
     "ViewTask",
     "WireCall",
     "WriteKind",
@@ -208,6 +250,8 @@ __all__ = [
     "builtin_view_rows",
     "completed_section",
     "container_tasks",
+    "custom_view_rows",
+    "due_window_of",
     "evaluate_view",
     "filter_groups",
     "format_due",
@@ -220,12 +264,16 @@ __all__ = [
     "list_index",
     "next_priority",
     "order_key",
+    "parse_view_form",
     "pending_error",
     "priority_mark",
     "resolve_lists",
     "subtask_items",
     "summarize_lists",
     "task_detail",
+    "view_form_values",
+    "view_from_payload",
+    "view_payload",
 ]
 
 DEFAULT_DAY_END = "00:00"
@@ -293,8 +341,24 @@ class Engine(Protocol):
         """读：某个容器的任务列表（一个清单，或一个视图）。"""
         ...
 
+    def move_targets(self) -> tuple[ListRow, ...]:
+        """读：能把任务搬进去的那些清单（工单 #45 的挑选器只给这一份）。
+
+        真实清单、进得去、**而且服务端已经见过它**——三条判据写在
+        :meth:`SyncEngine.move_targets` 上。
+        """
+        ...
+
     def task_detail(self, task_id: str) -> TaskDetail | None:
         """读：单条任务的详情；本地没有这条任务时 ``None``。"""
+        ...
+
+    def tags(self) -> tuple[str, ...]:
+        """读：现在能挑的那些标签名（服务端给过的那一份 ∪ 本地任务上出现过的，#45）。"""
+        ...
+
+    async def load_tags(self) -> tuple[str, ...]:
+        """读：拉一次标签列表（``GET /open/v1/tag``）——**要 await**（#45）。"""
         ...
 
     async def refresh(self) -> RefreshReport:
@@ -332,12 +396,24 @@ class Engine(Protocol):
         """写：完成并立即推送。"""
         ...
 
+    def uncomplete(self, task_id: str) -> None:
+        """写：取消完成并立即推送（``space`` 的第二个方向，工单 #38）。
+
+        本地当场把 ``status`` 写回「未完成」那一档（完成时间戳不动），推送走
+        ``task/batch`` 的 ``update``——那是实测确认能生效的唯一一条路。
+        """
+        ...
+
     def defer(self, task_id: str, *, days: int = 1) -> None:
         """写：顺延 ``days`` 个逻辑日（``g`` 是 1 天、``G`` 是 7 天）。"""
         ...
 
     def delete(self, task_id: str) -> None:
         """写：删除一条任务（服务端没有撤销，t16）。"""
+        ...
+
+    def move_task(self, task_id: str, *, to_list_id: str) -> None:
+        """写：把这条任务搬到另一个清单——走**搬运端点**，不是普通字段更新（#45）。"""
         ...
 
     def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> None:
@@ -378,6 +454,27 @@ class Engine(Protocol):
         """写：删一个清单（``d``，TUI 已经问过一句）。服务端没有撤销（#42）。"""
         ...
 
+    def create_view(self, definition: ViewDefinition) -> str:
+        """写：建一个自定义视图（``n`` → 「视图」），返回本地那一行的 id（#36）。
+
+        **只在本地落库**：视图不推服务端（API 没有「保存一组过滤条件」这个接口），
+        所以它不入队、待推送数量不动。
+        """
+        ...
+
+    def update_view(self, definition: ViewDefinition) -> None:
+        """写：改一个自定义视图的条件与名字（``e``）；本地没有这一行时抛
+        :class:`~dida.sync.views.UnknownViewError`（#36）。"""
+        ...
+
+    def delete_view(self, view_id: str) -> None:
+        """写：删一个自定义视图（``d``，TUI 已经问过一句）。**一条任务都不碰**（#36）。"""
+        ...
+
+    def view_definition(self, view_id: str) -> ViewDefinition | None:
+        """读：一个自定义视图的定义；本地没有就是 ``None``（``e`` 的表单要拿它填当前值）。"""
+        ...
+
     def cycle_priority(self, task_id: str) -> None:
         """写：优先级推进一档（``p``）——无 → 低 → 中 → 高 → 无。"""
         ...
@@ -396,6 +493,7 @@ class Engine(Protocol):
 
 class SyncEngine(
     ListMixin,
+    ViewMixin,
     RefreshMixin,
     PushMixin,
     CompletedStreamMixin,
@@ -403,12 +501,14 @@ class SyncEngine(
     CreateMixin,
     PriorityMixin,
     SubtaskMixin,
+    TagMixin,
 ):
     """通用客户端的数据与写入入口（组装各片；读路径在本模块）。
 
     :class:`~dida.sync.lists.ListMixin` 排在第一位，所以引擎的 ``push_pending()`` 是它那一份
     （先推清单改动，再把任务那一份交给 :class:`~dida.sync.push.PushMixin`）；其余方法照旧
-    按名字解析，各自的 ``self._…`` 都落在同一个实例上。
+    按名字解析，各自的 ``self._…`` 都落在同一个实例上。:class:`~dida.sync.views.ViewMixin`
+    在它们后面：自定义视图的建 / 改 / 删**只在本地落库**，与推送那几片没有交集。
     """
 
     def __init__(
@@ -417,7 +517,7 @@ class SyncEngine(
         clock: Clock,
         day_end: str = DEFAULT_DAY_END,
         source: ViewSource | None = None,
-        client: ProjectReader | TaskWriter | CompletedReader | None = None,
+        client: ProjectReader | TaskWriter | CompletedReader | TagReader | None = None,
         completed_window_hours: int = DEFAULT_COMPLETED_WINDOW_HOURS,
         push_on_change: bool = True,
     ) -> None:
@@ -426,6 +526,8 @@ class SyncEngine(
         self._source = source
         self._client = client
         self._completed_window_hours = completed_window_hours
+        # 标签列表：用户打开挑标签那一格时拉一次，只活在内存里（见 dida.sync.tags 的模块文档）。
+        self._tags: tuple[str, ...] = ()
         # 「界面上的改动立即推送」（配置键 push_on_change，spec 的配置 schema）。关掉它只是
         # 不排那一轮**立刻**的推送：改动照样入队、照样在本地生效，等下一次 push_pending
         # （手动同步 r，或 t21 的周期泵）再出去。默认开着，ADR-0002 要的就是立刻推。
@@ -474,12 +576,13 @@ class SyncEngine(
         """
         if self._source is None:
             return ()
+        tasks = tuple(self._source.tasks())
         return list_index(
             tuple(self._source.lists()),
-            tuple(self._source.tasks()),
+            tasks,
             now=self._clock.now(),
             day_end=self._day_end,
-            views=self._view_rows(),
+            views=self._view_rows(tasks),
         )
 
     def tasks_in(self, container_id: str) -> TaskList:
@@ -489,14 +592,15 @@ class SyncEngine(
         """
         if self._source is None:
             return TaskList(container_id=container_id)
+        tasks = tuple(self._source.tasks())
         return container_tasks(
             container_id,
             tuple(self._source.lists()),
-            tuple(self._source.tasks()),
+            tasks,
             now=self._clock.now(),
             day_end=self._day_end,
             window_hours=self._completed_window_hours,
-            views=self._view_rows(),
+            views=self._view_rows(tasks),
         )
 
     def task_detail(self, task_id: str) -> TaskDetail | None:
@@ -516,14 +620,59 @@ class SyncEngine(
             day_end=self._day_end,
         )
 
-    def _view_rows(self) -> tuple[ViewRow, ...]:
-        """本地库里的自定义视图行（#36 把视图定义落库、求值）。
+    def move_targets(self) -> tuple[ListRow, ...]:
+        """读：能把任务搬进去的那些清单（工单 #45 的挑选器只给这一份）。
 
-        源上没有这个能力就是「没有自定义视图」，不是错误——与写路径上那几个
-        ``isinstance`` 门同一条口径。内置视图不走这里（:func:`builtin_view_rows` 自己算）。
+        三条判据缺一不可：
+
+        - **是真实清单**（``ListKind.LIST``）：内置视图与自定义视图不是清单，搬不进去。
+        - **进得去**（:attr:`~dida.sync.read.ListRow.enterable`）：``kind`` 是 ``NOTE`` 的
+          装不了任务、没有写权限的改不动（用户故事 23 / 24）——搬进去只会被服务端拒掉。
+        - **服务端已经见过它**：本地刚建、还没推上去的那一行 id 是**本地临时的**
+          （``local-list-N``），拿它当 ``toProjectId`` 会 404，而那条改动**永远推不出去**
+          ——状态栏那个数从此一直非零（#53/#54 是同一类）。判据是队列里还有没有这一行的
+          ``CREATE``，不是 id 长什么样。
+        """
+        unseen = self._unseen_list_ids()
+        return tuple(
+            row
+            for row in self.list_index()
+            if row.kind is ListKind.LIST and row.enterable and row.id not in unseen
+        )
+
+    def _unseen_list_ids(self) -> frozenset[str]:
+        """服务端还没见过的清单 id（本地还有一笔没推成功的 ``CREATE``）。
+
+        读的是一条**已经记下来的事实**（``Store.pending_lists`` 那张队列表），不是 id 的
+        形状。只读替身没有队列，于是没有这个信息——与写路径上那几个 ``isinstance`` 门
+        同一条口径：不知道就说不知道，不猜一个。
         """
         source = self._source
-        return tuple(source.views()) if isinstance(source, ViewReader) else ()
+        if not isinstance(source, ListWriteTarget):
+            return frozenset()
+        return frozenset(
+            change.list_id
+            for change in source.pending_lists()
+            if change.kind is ListWriteKind.CREATE
+        )
+
+    def _view_rows(self, tasks: Sequence[TaskSnapshot]) -> tuple[ViewRow, ...]:
+        """本地库里那些自定义视图的行：**在这里求值**（#36）。
+
+        本地副本只给**定义**（它手上没有逻辑日，不读时钟），求值走
+        :func:`~dida.sync.read.custom_view_rows`——与内置视图那三个是同一个
+        ``evaluate_view``。源上没有这个能力就是「没有自定义视图」，不是错误——与写路径上
+        那几个 ``isinstance`` 门同一条口径。
+        """
+        source = self._source
+        if not isinstance(source, ViewReader):
+            return ()
+        return custom_view_rows(
+            tuple(source.view_definitions()),
+            tasks,
+            now=self._clock.now(),
+            day_end=self._day_end,
+        )
 
     def _write_target(self) -> WriteTarget:
         """写路径要写的那个本地副本。没接上就大声报错——绝不假装写成功了。"""

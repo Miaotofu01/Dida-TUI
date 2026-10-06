@@ -16,13 +16,16 @@
 
 from __future__ import annotations
 
+import re
 from datetime import datetime, timedelta, timezone
+
+import pytest
 
 from dida.sync.engine import INBOX_ID, UnclaimedListError
 from dida.testing import FakeBackend, ManualClock
 from dida.tui import messages
 from dida.tui.app import DidaApp
-from support import screen_text
+from support import screen_sgr, screen_text
 
 TZ = timezone(timedelta(hours=8))
 WIDE = (100, 30)
@@ -72,7 +75,12 @@ async def open_container(pilot, page, row_id: str) -> None:
 
 
 async def test_n_asks_for_a_title_and_nothing_else():
-    """``n`` 弹出的是**只填标题**的输入框：不问截止时间，也不问优先级（用户故事 44）。"""
+    """``n`` 弹出的是**只填标题**的输入框：不问截止时间，也不问优先级（用户故事 44）。
+
+    顺带钉住「这块浮层排得下」：字段只有一格，所以底部那行提示（``Esc`` 是出口）不会被裁掉
+    ——#36 实测过七格的视图表单在 30 行终端上要 30 行、而浮层只给 24 行，底部那几个字段与
+    提示会被整个裁掉。这一票的表单永远只有一格，这条断言就是它的下限。
+    """
     app = DidaApp(backend())
 
     async with app.run_test(size=WIDE) as pilot:
@@ -84,6 +92,7 @@ async def test_n_asks_for_a_title_and_nothing_else():
 
     assert "标题" in form, "表单里要有一格写标题"
     assert "截止" not in form and "优先级" not in form, "这一步不问日期与优先级"
+    assert "Esc 取消" in form, "底部那行提示不许被裁掉：它是「怎么退出这张表单」的唯一说明"
     assert messages.NO_TITLE_MESSAGE not in form, "刚打开时还没提交，不该报错"
 
 
@@ -294,3 +303,80 @@ async def test_creating_in_a_list_that_has_not_synced_yet_is_refused_on_screen()
 
     assert fake.created == [] and fake.created_tasks == [], "一条都不许建"
     assert "没建成" in after and "还没同步完" in after, "屏幕上要说出原因"
+
+
+# ------------------------------------------------------------------ 表单的聚焦信号
+
+
+SGR = re.compile(r"\x1b\[[0-9;]*m")
+"""屏幕字节里的样式序列；剥掉它剩下的才是**文本**（``test_task_rows_page.py`` 同形）。"""
+
+ACCENT_BACKGROUND = 46
+"""强调色的**底色**（ANSI 槽 6 的背景；前景是 36，见 ``theme.ACCENT``）。
+
+与 ``tests/test_visual_identity.py`` 那条「条子是一块强调色实心」用的是同一个参数。
+"""
+
+
+def sgr_parameters(emitted: str) -> set[int]:
+    """屏幕字节里出现过的每一个 SGR 参数（``\\x1b[46;49m`` → ``{46, 49}``）。
+
+    本文件自带一份，与 ``tests/test_visual_identity.py`` / ``test_task_rows_page.py`` 那几份
+    同形：这几行是「读渲染字节」的取数工具，五六个测试文件各带一份是现状（``support.py``
+    只放触碰合成器的那几个函数）。
+    """
+    out: set[int] = set()
+    for group in re.findall(r"\x1b\[([0-9;]*)m", emitted):
+        out.update(int(part) for part in group.split(";") if part)
+    return out
+
+
+def line_with(emitted: str, needle: str) -> str:
+    """带样式的屏幕字节里，剥掉 SGR 之后含 ``needle`` 的那一行。"""
+    for line in emitted.splitlines():
+        if needle in SGR.sub("", line):
+            return line
+    raise AssertionError(f"屏幕上没有「{needle}」这一行：\n{emitted}")
+
+
+async def test_the_focused_title_field_carries_the_accent(monkeypatch: pytest.MonkeyPatch):
+    """焦点在标题那一格上时，那一行带**强调底色**（SGR ``46``）——表单的聚焦信号（#39）。
+
+    断的是 ``46``（ANSI 槽 6 的**背景**，见 ``theme.form_css`` 的「聚焦的记号从边框换成强调色
+    的底色」），**不是** ``38;2;`` / ``48;2;`` 那类真彩色。理由实测过（编排者量过两种浮层
+    状态，我在这一张表单上复核过）：浮层自己那层 ANSI 面已经把真彩色挡在外面，这张表单渲染
+    出来的字节里**一个真彩色序列都没有**——断言 ``38;2;`` 是空的，去掉 ``Input:focus`` 那条
+    覆盖它照样是 0，永远不会红。跟着那条覆盖一起消失的是 ``46``。页面里的输入框（不在浮层里）
+    是另一个场合，那里才该断真彩色（#44 在详细页上量到过 24 处）。
+
+    ⚠ ``NO_COLOR`` 必须在**构造 App 之前**摘掉（#51 实测的次序）：这个 shell 有 ``NO_COLOR=1``，
+    留着它整个 App 会挂一层 Monochrome，上面这条断言就成了「测 shell 的样子」——我第一次量
+    就是这么量出「一个 46 都没有」的。
+    """
+    monkeypatch.delenv("NO_COLOR", raising=False)  # 先摘，再构造 App
+
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_container(pilot, app.index_page(), "work")
+        await pilot.press("n")
+        await pilot.pause()
+        focused = app.focused
+        await pilot.press(*"写周报")  # 打点东西进去，那一行才有一块受样式管的文本
+        await pilot.pause()
+        emitted = screen_sgr(app)
+
+    assert focused is not None and focused.id == "field-title", (
+        "打开就能打字：焦点在标题那一格上"
+    )
+    field = line_with(emitted, "写周报")
+    label = line_with(emitted, "标题")
+    assert ACCENT_BACKGROUND in sgr_parameters(field), (
+        "聚焦的那一格要带强调底色（表单唯一的聚焦信号）；"
+        f"这一行的 SGR 参数是 {sorted(sgr_parameters(field))}"
+    )
+    assert ACCENT_BACKGROUND not in sgr_parameters(label), (
+        "底色标的是**那一格**，不是「标题」那行字段名——否则整张表单看着都像聚焦的"
+    )

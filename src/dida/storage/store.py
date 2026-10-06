@@ -1,11 +1,16 @@
 """本地存储（第 3 个深模块）：SQLite（stdlib），无 ORM、无迁移框架。
 
-四类数据：
+五类数据：
 
 - 清单（API 叫 project，界面叫清单）：名称、颜色、排序、项目组、是否收集箱，
 - 任务快照：服务端原始字段 **含未知字段** + 本地已生效的改动，
 - 待推送改动（Pending Change）：创建时间、尝试次数、下次重试时间、最后一次错误，
-- 同步状态：已完成流游标、上次刷新完成时间、上次算出的逻辑日。
+- 同步状态：已完成流游标、上次刷新完成时间、上次算出的逻辑日，
+- **自定义视图**（#36）：过滤条件的原文 + 它在清单列表页上的位置。
+
+自定义视图**只存在这里**（ADR-0005）：``config.toml`` 是放 token 的文件，为了改一个过滤
+条件去手写凭据是不对的；而 API 里没有「保存一组过滤条件」这个接口，所以它也不进待推送
+队列——那条队列的每一行都是「要推给服务端」的改动，视图没有服务端那一半。
 
 待推送改动有**两张表**：``pending_changes`` 是任务改动（一行一条任务），
 ``pending_list_changes`` 是清单改动（建 / 改 / 删一个清单，#42）。分成两张是因为它们改的
@@ -36,7 +41,10 @@
   ``record_attempt(...)`` / ``resolve(change_id)`` / ``set_sync_state(...)``；
 - 写（清单，#42）：``save_list(...)`` / ``drop_list(list_id)`` / ``list_payload(list_id)`` /
   ``new_local_list_id()`` / ``enqueue_list(...)`` / ``pending_lists()`` /
-  ``record_list_attempt(...)`` / ``resolve_list(change_id)`` / ``adopt_created_list(...)``。
+  ``record_list_attempt(...)`` / ``resolve_list(change_id)`` / ``adopt_created_list(...)``；
+- 读 / 写（自定义视图，#36）：``view_definitions()`` / ``view_definition(view_id)`` /
+  ``save_view(definition)`` / ``drop_view(view_id)`` / ``new_view_id()``——**没有队列**，
+  视图只在本地（:class:`~dida.sync.views.ViewStore` 就是这五个方法）。
 
 ``task_payload()`` 是给 t07 的 ``update_task(snapshot=)`` 用的那一份：**字典形状**，
 不是领域 dataclass，客户端不认识的字段一个都不丢。
@@ -58,7 +66,8 @@ from dida.sync.lists import (
     is_local_list_id,
 )
 from dida.sync.view import INBOX_ID, ListSnapshot, SyncState, TaskSnapshot
-from dida.sync.writes import LOCAL_LIST_PREFIX, LOCAL_TASK_PREFIX, LocalEffect, WriteKind
+from dida.sync.views import ViewDefinition, view_from_payload, view_payload
+from dida.sync.writes import LOCAL_TASK_PREFIX, LocalEffect, WriteKind
 
 ChangeKind = WriteKind
 """改动种类：对应 API 的四个写操作（新建 / 更新 / 完成 / 删除）。
@@ -71,6 +80,16 @@ ChangeKind = WriteKind
 
 COMPLETED_STATUS = 2
 """任务「已完成」的 ``status`` 值（api-contracts.md：Completed 是 2，不是 1）。"""
+
+UNCOMPLETED_STATUS = 0
+"""任务「未完成」的 ``status`` 值（``0`` 是正常、``-1`` 是已放弃；spec 的「本地判定已完成
+一律看 ``status``」）。
+
+取消完成写回的就是这一档（工单 #38）。**它旁边的完成时间戳不会被清掉**——实测
+（spec 的实测事实第 1 条）取消完成只改 ``status``，所以「还算不算已完成」只认这一个值，
+不认有没有 ``completedTime``。与 :data:`COMPLETED_STATUS` 并排放在这里：同一个 API 事实
+（状态码表）只写一处，调用点一个字面量都不写。
+"""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS lists (
@@ -119,6 +138,26 @@ CREATE TABLE IF NOT EXISTS sync_state (
     last_refresh_at  TEXT,
     logical_day      TEXT
 );
+
+CREATE TABLE IF NOT EXISTS views (
+    id          TEXT PRIMARY KEY,
+    definition  TEXT NOT NULL,
+    position    INTEGER NOT NULL
+);
+"""
+
+# 自定义视图那一行只存两样东西：它的定义（一份 JSON 原文）与它在列表页上的位置。
+# **一维一列**是另一条路，但那条路每加一维都要改表（#36 的六个维度就是这么长出来的）；
+# 而这份原文的形状是 `sync/views.py` 的判断（`view_payload` / `view_from_payload`），
+# 不是存储层的——这一层只负责把一份 JSON 原样放下、原样拿回来。
+# `position` 显式存着，是因为 `INSERT OR REPLACE` 会换掉 rowid：不记位置的话，改一次条件
+# 就会让那个视图在列表页上跳到末尾。
+VIEW_ID_PREFIX = "view-"
+"""本地视图 id 的前缀（#36）。
+
+视图**只在本地**（API 没有「保存一组过滤条件」这个接口），所以它没有「服务端给了真 id
+之后认领」那一套——这个前缀是它从头到尾的身份，不是临时占位（与 ``local-list-`` 的分别
+正在这里：那个前缀的意思是「还没推上去」）。
 """
 
 
@@ -240,6 +279,19 @@ class RefreshReport:
     pruned_tasks: int = 0
     overwritten: tuple[FieldOverride, ...] = ()
     suppressed: tuple[FieldOverride, ...] = ()
+
+
+def _decode_payload(text: str) -> Mapping[str, Any]:
+    """一行视图的定义原文 → 字典；读不成样子时给空字典（那一行退回默认值）。
+
+    读路径上没有「坏一行就整屏空掉」的道理。**写**那一侧不吞：写的是我们自己刚编好的
+    一份原文，编不出来是 bug，不该静默变成一行空视图。
+    """
+    try:
+        decoded = json.loads(text)
+    except (TypeError, ValueError):
+        return {}
+    return decoded if isinstance(decoded, Mapping) else {}
 
 
 class Store:
@@ -503,15 +555,18 @@ class Store:
         还欠一个真 id」。建完就回 ``201`` 空 body 的那条路若把它算进去，用户会看到状态栏挂着
         一个永远不动的「待推送 1」——而那条清单其实早就建好了。等用户真改了名字，那一笔会
         换成普通的 ``UPDATE``，照旧算数。
+
+        **算不算由词表说了算**（#57 的检查 8）：:attr:`~dida.sync.lists.ListWriteKind.counts_as_pending`
+        一处分类，加一种记录时不会在这里被默默归错类（默认是「算」，保守的那一侧）。
         """
-        row = self._db.execute(
-            """
-            SELECT (SELECT COUNT(*) FROM pending_changes)
-                 + (SELECT COUNT(*) FROM pending_list_changes WHERE kind <> ?) AS n
-            """,
-            (ListWriteKind.AWAIT_ID.value,),
-        ).fetchone()
-        return int(row["n"])
+        counted = self._db.execute("SELECT COUNT(*) AS n FROM pending_changes").fetchone()
+        task_changes = int(counted["n"])
+        list_changes = sum(
+            1
+            for row in self._db.execute("SELECT kind FROM pending_list_changes")
+            if ListWriteKind(row["kind"]).counts_as_pending
+        )
+        return task_changes + list_changes
 
     def record_attempt(
         self,
@@ -572,21 +627,39 @@ class Store:
         一笔改动发不发得出去，所以它是词汇，不是存储层的实现细节。
 
         服务端建好之后才给真 id，而「建完立刻出现在清单列表页」是 ADR-0002 的手感要求。
-        取最小的空号而不是计数器：上一次没推成功的那一行还占着它的号，重开也不会撞上它
-        （撞上就是两条清单合成一条，用户刚建的那条不见了）。
+        取最小的空号而不是计数器：上一次没推成功的那一行还占着它的号，重开也不会撞上它。
+
+        **占着号的有两处**（#57）：``lists`` 里那一行，以及队列里还挂着它记录的那些 id
+        （:meth:`_held_local_list_ids`）。只看行是不够的——一行可以**在记录还在的时候**被剪掉
+        （服务端索引里找不到它、而它又没有「还没到服务端的改动」，见 :meth:`_prune_lists`），
+        那个号就从行那一侧空了出来；再发一次就是两条清单用同一个临时 id，而按 id 找记录的
+        地方会挑错**一条**，最坏是拿另一条清单的名字去删服务端上的一行（#57 的探针）。
+
+        所以规矩一句话：**临时 id 的所有权跟着记录走**——记录还在，这个号就不许再发。
+        行的寿命与记录的寿命因此可以不一样长（剪枝只剪行），而号永远是安全的。
         """
-        rows = self._db.execute(
-            "SELECT id FROM lists WHERE id LIKE ?", (f"{LOCAL_LIST_PREFIX}%",)
-        ).fetchall()
         used = {
-            int(str(row["id"])[len(LOCAL_LIST_PREFIX) :])
-            for row in rows
-            if str(row["id"])[len(LOCAL_LIST_PREFIX) :].isdigit()
+            int(value[len(LOCAL_LIST_PREFIX) :])
+            for value in self._held_local_list_ids()
+            if value[len(LOCAL_LIST_PREFIX) :].isdigit()
         }
         number = 1
         while number in used:
             number += 1
         return f"{LOCAL_LIST_PREFIX}{number}"
+
+    def _held_local_list_ids(self) -> set[str]:
+        """本地临时 id 的**全部**占用者：``lists`` 里的行 + 队列里的记录（#57）。
+
+        「这是不是本地临时 id」只在 :func:`~dida.sync.lists.is_local_list_id` 一处判断
+        （这里不写 ``LIKE`` 之类第二条判据），所以两张表先各取一列、在 Python 这边筛。
+        """
+        values = {str(row["id"]) for row in self._db.execute("SELECT id FROM lists")}
+        values |= {
+            str(row["list_id"])
+            for row in self._db.execute("SELECT list_id FROM pending_list_changes")
+        }
+        return {value for value in values if is_local_list_id(value)}
 
     def enqueue_list(
         self,
@@ -739,6 +812,82 @@ class Store:
         """这条清单改动已经推到服务端了，出队。"""
         with self._db:
             self._db.execute("DELETE FROM pending_list_changes WHERE id = ?", (change_id,))
+
+    # ---------------------------------------------------------------- 读 / 写：自定义视图（#36）
+
+    def view_definitions(self) -> tuple[ViewDefinition, ...]:
+        """本地库里那些自定义视图的定义，按用户自己的顺序（#36）。
+
+        给的是**定义**不是算好的成员：成员要「全量缓存 + 当前逻辑日」才算得出来，而这一层
+        与 ``sync.view`` 一样不读时钟（「现在」一律由调用方给）。求值在引擎里发生，与内置
+        视图走同一个 ``evaluate_view``。
+
+        读不成样子的那一行**退回默认值**（:func:`~dida.sync.views.view_from_payload`），
+        不把整个清单列表页带走——与空缓存给空视图同一条口径。
+        """
+        return tuple(
+            view_from_payload(_decode_payload(row["definition"]), view_id=row["id"])
+            for row in self._db.execute(
+                "SELECT id, definition FROM views ORDER BY position, rowid"
+            )
+        )
+
+    def view_definition(self, view_id: str) -> ViewDefinition | None:
+        """一个视图的定义；本地没有就是 ``None``（``e`` 的表单要拿它填当前值）。"""
+        row = self._db.execute(
+            "SELECT id, definition FROM views WHERE id = ?", (view_id,)
+        ).fetchone()
+        if row is None:
+            return None
+        return view_from_payload(_decode_payload(row["definition"]), view_id=row["id"])
+
+    def save_view(self, definition: ViewDefinition) -> None:
+        """写下一行视图（新建与改都是覆盖式地写）。
+
+        **位置照旧不动**：改名 / 改条件不该让它在清单列表页上跳到末尾。新的一行排在最后
+        （``position`` 取当前最大值 +1），所以列表页上的顺序就是用户建它们的顺序。
+        """
+        with self._db:
+            row = self._db.execute(
+                "SELECT position FROM views WHERE id = ?", (definition.id,)
+            ).fetchone()
+            position = int(row["position"]) if row is not None else self._next_view_position()
+            self._db.execute(
+                "INSERT OR REPLACE INTO views (id, definition, position) VALUES (?, ?, ?)",
+                (
+                    definition.id,
+                    json.dumps(view_payload(definition), ensure_ascii=False),
+                    position,
+                ),
+            )
+
+    def drop_view(self, view_id: str) -> None:
+        """本地摘掉一行视图：**只动这一行**。
+
+        它只是一组过滤条件，不是容器——它「里面」的任务本来就在各自的清单里，所以这里
+        一条任务都不删（验收标准「删视图不删任务」）。
+        """
+        with self._db:
+            self._db.execute("DELETE FROM views WHERE id = ?", (view_id,))
+
+    def new_view_id(self) -> str:
+        """一个还没被占用的本地视图 id（``view-1``、``view-2``……）。
+
+        视图没有服务端那一半，所以这个 id 是**最终的**身份，不存在「推送成功之后认领真 id」
+        那一步（与 :meth:`new_local_list_id` 的分别正在这里）。
+        """
+        used = {row["id"] for row in self._db.execute("SELECT id FROM views")}
+        index = 1
+        while f"{VIEW_ID_PREFIX}{index}" in used:
+            index += 1
+        return f"{VIEW_ID_PREFIX}{index}"
+
+    def _next_view_position(self) -> int:
+        """新的一行排在哪：当前最大位置 +1（一行都没有时从 1 开始）。"""
+        row = self._db.execute(
+            "SELECT COALESCE(MAX(position), 0) + 1 AS next FROM views"
+        ).fetchone()
+        return int(row["next"])
 
     # ---------------------------------------------------------------- 同步状态
 
@@ -912,12 +1061,19 @@ class Store:
         剪枝读的是这一条：一条 ``AWAIT_ID``（建好了、在等真 id）的本地行如果在服务端的索引里
         找不到，说明那条清单**本来就不存在了**（在别处被删了），本地这行是个影子——剪掉它才对。
         而真正的改动（建 / 改 / 删还没出去）必须留着，否则剪掉的是用户刚做的那一下。
+
+        **哪一种算「真正的改动」由词表说了算**（#57 的检查 8）：
+        :attr:`~dida.sync.lists.ListWriteKind.holds_its_row` 一处分类，加一种记录时不会在这里
+        被默默归错类（默认是「留住行」，保守的那一侧）。
+
+        ⚠ 剪掉那一行**不代表**那条记录也没了：记录还在原地等认领，并且**仍然占着那个临时
+        id**（:meth:`new_local_list_id` 两处一起看，#57）——行的寿命与记录的寿命可以不一样长，
+        但号永远有主。
         """
-        row = self._db.execute(
-            "SELECT 1 FROM pending_list_changes WHERE list_id = ? AND kind <> ? LIMIT 1",
-            (list_id, ListWriteKind.AWAIT_ID.value),
-        ).fetchone()
-        return row is not None
+        rows = self._db.execute(
+            "SELECT kind FROM pending_list_changes WHERE list_id = ?", (list_id,)
+        ).fetchall()
+        return any(ListWriteKind(row["kind"]).holds_its_row for row in rows)
 
     def _has_pending_list_change(self, list_id: str) -> bool:
         """这条清单上还有没有没推成功的改动（#42）。
