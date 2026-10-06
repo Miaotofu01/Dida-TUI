@@ -46,7 +46,12 @@ from dida.sync.view import (
     subtask_items,
     task_item,
 )
-from dida.sync.views import ViewDefinition, builtin_view_definitions, evaluate_view
+from dida.sync.views import (
+    ViewDefinition,
+    builtin_view_definitions,
+    evaluate_view,
+    implied_due_for,
+)
 
 __all__ = [
     "BUILTIN_VIEW_IDS",
@@ -194,6 +199,17 @@ class TaskList:
     **视图不是容器**，同一个清单名在这里重复出现是必要信息（用户故事 34 / 58）；真实清单
     里那个名字一整屏都写着，重复一百遍只是噪音。判断归读模型——页面自己去猜「这个容器
     是不是视图」就又多了一份会漂移的判断。
+    """
+
+    implied_due: datetime | None = None
+    """在这个容器里新建一条任务时，它自动该带上的截止时间（``None`` = 不带，#39）。
+
+    用户故事 35：「如果视图隐含了日期（比如在「今天」里建），新任务自动带上那个日期」。
+    只有「今天」隐含（就是当前逻辑日那个日期，写法是全天任务的日期标记）；真实清单与
+    另外两个内置视图都不隐含——理由写在 :func:`dida.sync.views.implied_due_for` 一处。
+
+    它与 :attr:`shows_list_name` 是同一个判断的两面（两者都由「这个容器是不是视图」决定），
+    所以一起在这里给：调用方读这一个字段就够，不必自己认识视图。
     """
 
 
@@ -426,6 +442,7 @@ def container_tasks(
             window_hours=window_hours,
         )
         shows_list_name = False
+        implied_due = None
         items = tuple(
             by_due([task_item(snapshot, names, now=now, day_end=day_end) for snapshot in members])
         )
@@ -434,13 +451,37 @@ def container_tasks(
         members = _view_members(container_id, tasks, now=now, day_end=day_end, views=views)
         completed = CompletedSection()
         shows_list_name = True
+        implied_due = _implied_due(container_id, now=now, day_end=day_end)
         items = tuple(task_item(snapshot, names, now=now, day_end=day_end) for snapshot in members)
     return TaskList(
         container_id=container_id,
         items=items,
         completed=completed,
         shows_list_name=shows_list_name,
+        implied_due=implied_due,
     )
+
+
+def _implied_due(container_id: str, *, now: datetime, day_end: str) -> datetime | None:
+    """这个视图隐含的日期（#39）：在它里面新建的任务自动带上的那个截止时间。
+
+    只有**内置视图的定义**才隐含日期，所以这里查 :func:`builtin_view_definitions`——自定义
+    视图（#36）没有这个语义，``None`` 就是「不隐含」。哪一个是哪一天写在
+    :func:`dida.sync.views.implied_due_for` 一处，这里只负责按 id 找到那个定义。
+
+    **自定义视图不在这一条里是故意的**（#39 的边界，报告里写过）：用户自建的视图可能带一个
+    「截止于今天」的窗口，但它的**定义**（``ViewDefinition``）没有随 ``TaskList`` 上来——
+    ``container_tasks`` 手里只有 :class:`~dida.sync.read.ViewRow`（id / 名字 / 成员
+    id），要按它的条件推日期就得再从本地库那份定义接一条线（#36 的接缝）。今天的选择是
+    只认「今天」这个内置视图，换句话说：**在内置「今天」里建会自动带上今天，在自建视图里建
+    不带日期**。要改这条边界，先决定「自建视图的条件算不算隐含」，再把定义接过来。
+    """
+    definition = next(
+        (item for item in builtin_view_definitions() if item.id == container_id), None
+    )
+    if definition is None:
+        return None
+    return implied_due_for(definition, now=now, day_end=day_end)
 
 
 def task_detail(

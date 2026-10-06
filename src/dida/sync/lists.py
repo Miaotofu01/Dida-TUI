@@ -79,6 +79,7 @@ from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_chec
 from dida.api.errors import DidaError
 from dida.sync.push import backoff_delay
 from dida.sync.view import ListSnapshot, ViewSource
+from dida.sync.writes import LOCAL_LIST_PREFIX, is_local_list_id
 
 if TYPE_CHECKING:  # storage 反过来 import 本模块（与 dida.sync.writes 同一条规矩）
     from dida.storage.store import PendingListChange, RefreshReport
@@ -98,18 +99,13 @@ __all__ = [
     "is_local_list_id",
 ]
 
-LOCAL_LIST_PREFIX = "local-list-"
-"""本地临时清单 id 的前缀（#42）：新建的清单在服务端给出真 id 之前先用它占位。
-
-它同时是**一条语义**（#54）：带这个前缀的 id 服务端**没见过**，所以任何「打到一个 id 上」
-的请求都不许发出去。存储层用它生成 id（:meth:`~dida.storage.store.Store.new_local_list_id`），
-写路径用它判断能不能发——所以它住在词汇这一层，不在存储层。
-"""
-
-
-def is_local_list_id(value: str) -> bool:
-    """这个 id 是不是本地临时占位的（服务端没见过它）。"""
-    return value.startswith(LOCAL_LIST_PREFIX)
+# ``LOCAL_LIST_PREFIX`` 与 ``is_local_list_id`` 是**转发**，不是定义（#39 / #54 的裁定：
+# 「这个 id 服务端见过没有」这条形状判断全仓库只许有一处）。定义处是 :mod:`dida.sync.writes`
+# ——那是叶模块，谁先 import 都行；反过来把定义留在**这一层**会成环：本模块一 import 就跑
+# ``from dida.sync.push import backoff_delay``，而 ``push`` 要
+# ``from dida.sync.writes import ...``（实测：四个入口全部
+# ``ImportError: cannot import name ... from partially initialized module``）。
+# 名字在这里转出来，是为了让 ``from dida.sync.lists import LOCAL_LIST_PREFIX`` 这一族读法照旧。
 
 
 class ListLocalEffect(Enum):

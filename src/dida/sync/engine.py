@@ -124,7 +124,19 @@ from dida.sync.view import (
     subtask_items,
     summarize_lists,
 )
-from dida.sync.writes import LocalEffect, UnknownTaskError, WireCall, WriteKind, WriteTarget
+from dida.sync.writes import (
+    LOCAL_LIST_PREFIX,
+    LOCAL_TASK_PREFIX,
+    LocalEffect,
+    UnclaimedListError,
+    UnclaimedTaskError,
+    UnknownTaskError,
+    WireCall,
+    WriteKind,
+    WriteTarget,
+    is_local_id,
+    is_local_list_id,
+)
 from dida.sync.views import (
     ANY_VALUE,
     BUILTIN_VIEW_DAYS,
@@ -151,6 +163,7 @@ from dida.sync.views import (
     builtin_view_definitions,
     due_window_of,
     evaluate_view,
+    implied_due_for,
     order_key,
     parse_view_form,
     view_form_values,
@@ -167,6 +180,8 @@ __all__ = [
     "COMPLETION_CHOICES",
     "DUE_CHOICES",
     "INBOX_ID",
+    "LOCAL_LIST_PREFIX",
+    "LOCAL_TASK_PREFIX",
     "NO_DUE_TEXT",
     "PRIORITY_CHOICES",
     "VIEW_COMPLETED_DAYS_FIELD",
@@ -214,6 +229,8 @@ __all__ = [
     "TagReader",
     "TaskSnapshot",
     "TodayView",
+    "UnclaimedListError",
+    "UnclaimedTaskError",
     "UnknownListError",
     "UnknownTaskError",
     "UnknownViewError",
@@ -240,7 +257,10 @@ __all__ = [
     "format_due",
     "fuzzy_match",
     "group_tasks",
+    "implied_due_for",
     "is_inbox_id",
+    "is_local_id",
+    "is_local_list_id",
     "list_index",
     "next_priority",
     "order_key",
@@ -407,13 +427,19 @@ class Engine(Protocol):
     def create(
         self,
         title: str,
+        list_id: str,
         *,
         due: datetime | None = None,
         all_day: bool = False,
         priority: int | None = None,
         tags: Sequence[str] = (),
     ) -> str:
-        """写：新建一条任务到收集箱（``a``），返回本地那条的 id（t15）。"""
+        """写：新建一条任务到 ``list_id``（``n``），返回本地那条的 id（#39）。
+
+        ``list_id`` **必填**：在清单里建就传那个清单的 id，在视图里建传收集箱
+        （``INBOX_ID``——视图不是容器），视图隐含的日期由调用方从
+        ``tasks_in(视图).implied_due`` 读出来交给 ``due=``。
+        """
     def create_list(self, name: str, *, color: str | None = None) -> str:
         """写：新建一个清单（``n``），返回本地那一行的 id（#42）。"""
         ...

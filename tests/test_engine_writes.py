@@ -29,7 +29,13 @@ import pytest
 from dida.api.client import DidaApiClient
 from dida.api.errors import NetworkError
 from dida.storage.store import ChangeKind, Store
-from dida.sync.engine import NO_DUE_TEXT, SyncEngine
+from dida.sync.engine import INBOX_ID, NO_DUE_TEXT, SyncEngine
+from dida.sync.writes import (
+    LOCAL_TASK_PREFIX,
+    UnclaimedListError,
+    UnclaimedTaskError,
+    WriteKind,
+)
 from dida.testing import FakeTransport, ManualClock
 
 TZ = timezone(timedelta(hours=8))
@@ -210,6 +216,7 @@ async def test_a_create_lands_locally_first_and_pushes_the_whole_line(store):
 
     local_id = engine.create(
         "交季度报告",
+        list_id=INBOX_ID,
         due=at(15, 15, 0),
         all_day=False,
         priority=5,
@@ -219,7 +226,7 @@ async def test_a_create_lands_locally_first_and_pushes_the_whole_line(store):
     local = store.task_payload(local_id)
     assert local is not None, "本地当场就要看得见（网络不是这一屏的前置条件）"
     assert local["title"] == "交季度报告"
-    assert local["projectId"] == "inbox", "v1 的新建落在收集箱"
+    assert local["projectId"] == "inbox", "落点就是交进来的那个清单"
 
     await engine.wait_for_pushes()
 
@@ -261,7 +268,7 @@ async def test_an_all_day_create_writes_the_date_marker_verbatim(store):
     )
     engine = make_engine(store, transport, clock=ManualClock(at(15, 2, 0)), day_end="04:00")
 
-    engine.create("还信用卡", due=at(14, 0, 0), all_day=True)
+    engine.create("还信用卡", list_id=INBOX_ID, due=at(14, 0, 0), all_day=True)
     await engine.wait_for_pushes()
 
     assert transport.last_json["dueDate"] == "2026-03-14T00:00:00+0800"
@@ -283,7 +290,7 @@ async def test_a_thin_create_response_does_not_drop_what_the_user_wrote(store):
     transport = FakeTransport(json={"id": "srv-3"})
     engine = make_engine(store, transport)
 
-    engine.create("交季度报告", due=at(15, 15, 0), all_day=False)
+    engine.create("交季度报告", list_id=INBOX_ID, due=at(15, 15, 0), all_day=False)
     await engine.wait_for_pushes()
 
     payload = store.task_payload("srv-3")
@@ -306,7 +313,7 @@ async def test_a_failed_create_push_stays_in_the_retry_queue(store):
     clock = ManualClock(T0)
     engine = make_engine(store, transport, clock=clock)
 
-    local_id = engine.create("买牛奶", due=at(15, 0, 0), all_day=True)
+    local_id = engine.create("买牛奶", list_id=INBOX_ID, due=at(15, 0, 0), all_day=True)
     await engine.wait_for_pushes()
 
     assert len(transport.requests) == 1, "写就是立即推：不等用户再按一次"
@@ -324,6 +331,282 @@ async def test_a_failed_create_push_stays_in_the_retry_queue(store):
     assert await engine.push_pending() == 1, "钟走到点，这一次推成功"
     assert store.pending() == ()
     assert [item.id for item in store.tasks()] == ["srv-9"], "推成功之后才认领服务端的 id"
+
+
+# ---------------------------------------------------------------- 新建的落点（#39）
+
+
+async def test_a_create_can_land_in_a_named_list_not_the_inbox(store):
+    """落点是参数：在「工作」里建就落在「工作」（工单 #39，用户故事 45）。
+
+    ``projectId`` 在新建上是**必填**（``openapi-dida365.md:222``），示例发的就是一个真实
+    清单 id（``:263``）；客户端本来就是透传（``api/client.py`` 的 ``create_task``）。写死
+    收集箱是**仓库这一侧**的选择——就是 ``sync/create.py`` 里那一行，这一票改的正是它。
+    """
+    seed(store)
+    transport = FakeTransport(json={"id": "srv-7", "projectId": "work", "title": "写周报"})
+    engine = make_engine(store, transport)
+
+    local_id = engine.create("写周报", list_id="work")
+
+    assert store.task_payload(local_id)["projectId"] == "work", "本地那条也落在「工作」里"
+
+    await engine.wait_for_pushes()
+
+    assert transport.last_request.method == "POST"
+    assert str(transport.last_request.url).endswith("/open/v1/task")
+    assert transport.last_json == {"title": "写周报", "projectId": "work"}, (
+        "没写日期就不许出现 dueDate / isAllDay（只写用户真的写了的字段）"
+    )
+    assert store.pending() == ()
+    assert store.task_payload("srv-7")["projectId"] == "work"
+    assert [item.id for item in store.tasks()] == ["srv-7"]
+
+
+async def test_a_create_from_a_view_that_implies_a_date_carries_that_date(store):
+    """视图隐含的日期（「今天」）：在视图里建就是「收集箱 + 今天」这一条（#39、用户故事 35）。
+
+    ``tasks_in()`` 的读模型给的就是这一条：视图不是容器（``shows_list_name=True``），而
+    「今天」隐含**当前逻辑日**那个日期（``implied_due``），写法是全天任务的日期标记。
+    这一层因此不必自己认识哪个视图叫什么——它照读模型给的那一份拼请求。
+    """
+    seed(
+        store,
+        task(id="t1", title="今天要做的", dueDate="2026-03-14T18:00:00+0800", project_id="inbox"),
+        lists=[inbox()],
+    )
+    transport = FakeTransport(
+        json={
+            "id": "srv-8",
+            "projectId": "inbox",
+            "title": "随手记一笔",
+            "dueDate": "2026-03-14T00:00:00+0800",
+            "isAllDay": True,
+        }
+    )
+    engine = make_engine(store, transport)
+
+    today = engine.tasks_in("today")
+    assert today.shows_list_name is True, "视图不是容器（哪一份判断在这一处）"
+    assert today.implied_due == T0.replace(hour=0, minute=0, second=0, microsecond=0)
+
+    engine.create("随手记一笔", list_id=INBOX_ID, due=today.implied_due, all_day=True)
+    await engine.wait_for_pushes()
+
+    assert transport.last_json == {
+        "title": "随手记一笔",
+        "projectId": "inbox",
+        "dueDate": "2026-03-14T00:00:00+0800",
+        "isAllDay": True,
+    }
+
+
+async def test_a_create_from_a_view_without_a_date_carries_no_date(store):
+    """「最近七天」是**一段**窗口，藏不进一个日期里：那里建的新任务不带日期。"""
+    seed(store, lists=[inbox()])
+
+    engine = make_engine(store, FakeTransport())
+
+    assert engine.tasks_in("today").implied_due is not None
+    assert engine.tasks_in("next7").implied_due is None, (
+        "挑窗口里任何一天当「隐含日期」都是替用户做一个他没做的决定"
+    )
+    assert engine.tasks_in("all").implied_due is None
+    assert engine.tasks_in("work").implied_due is None, "真实清单不隐含日期"
+
+
+# ---------------------------------------------------------------- 新建之后接着改（#53）
+
+
+async def test_a_change_queued_behind_a_create_follows_it_to_the_real_id(store):
+    """推成功认领服务端 id 时，**排在它后面的那笔改动也跟着挪过去**（#53，与 #42 的清单版同形）。
+
+    不挪的实测后果（#42 在清单那条路上量过）：那笔改动的 ``task_id`` 仍然指向 ``local-…``
+    ——服务端从没见过这个 id，于是它 POST 到 ``/open/v1/task/local-…``、404、退避重试、
+    **永远出不了队**：状态栏那个数一直非零，用户的编辑永远到不了服务端。
+    ``UnknownTaskError`` 那条注释说的「永远推不出去的改动」就是这一类。
+    """
+    transport = FakeTransport(json={"id": "srv-1", "projectId": "work", "title": "写周报"})
+    seed(store)
+    clock = ManualClock(T0)
+    engine = make_engine(store, transport, clock=clock)
+    transport.enqueue(NetworkError("断网"))  # 建的那一笔先失败，停在队列里
+
+    local_id = engine.create("写周报", list_id="work")
+    await engine.wait_for_pushes()
+
+    # 排在它后面的那笔改动。走存储层的公开入口入队，而不是 ``engine.write``：写入那一侧
+    # 自己就挡着这条路（#53 的第一道，下一条测试钉它），这里要复现的是**队列里已经有一笔**
+    # 指向临时 id 的改动（#42 在清单那条路上量到的形状），好让认领那一步去处理它。
+    store.enqueue(
+        task_id=local_id,
+        kind=ChangeKind.UPDATE,
+        payload={"title": "写周报（改）"},
+        now=clock.now(),
+        list_id="work",
+    )
+
+    assert [change.task_id for change in store.pending()] == [local_id, local_id], (
+        "两笔都指向临时 id"
+    )
+    assert local_id.startswith(LOCAL_TASK_PREFIX), "认领之前它是本地临时 id"
+
+    clock.advance(timedelta(seconds=2))  # 退避到点，轮到这一笔了
+    await engine.push_pending()
+
+    assert store.pending() == (), "认领之后队列该清空（那笔改动跟着挪到真 id 上了）"
+    assert store.pending_count() == 0
+    assert engine.status().pending_count == 0
+    assert [item.id for item in store.tasks()] == ["srv-1"], "本地那一条落到服务端给的 id 上"
+
+    # 只挪队列里的 id 还不够（#53 的第 2 件）：那一笔得**真的**打到真 id 上。请求 URL 是最
+    # 外面那份证据——``local-…`` 还出现在里面，走的就是 404 那条路；而只重读队列、不挪 id
+    # 的话，这里发出去的仍然是临时 id。
+    urls = [str(request.url) for request in transport.requests]
+    assert urls == [
+        # 第一次新建：断网，失败退避（这一笔也是 POST 到集合端点——它的 URL 里没有 id）
+        "https://api.dida365.com/open/v1/task",
+        # 退避到点，新建推成功
+        "https://api.dida365.com/open/v1/task",
+        # 排在后面那笔改动：真 id，不是 local-…
+        "https://api.dida365.com/open/v1/task/srv-1",
+    ], "新建 POST 到集合端点；那笔改动 POST 到服务端给的真 id，不是临时 id"
+    assert transport.last_json["title"] == "写周报（改）", "用户改的那一份真的发出去了"
+
+    # 已知边界（不是本票修的那一件事，报给编排者）：本地那份的标题仍是服务端建它时回的
+    # 那一个。认领是「把本地那条挪到真 id 上」，而挪过去的那一份取自**新建当时的**原文
+    # 与服务端响应的合并——排在后面那笔改动的本地效果在临时 id 那一行上，没跟着走。
+    # 下一次全量刷新会由服务端权威把它拉正（服务端那份**是**改过的）。修法属于 #54 说的
+    # 「把改动并进那条还没成真的新建」那一类，本票不自己发明第二套。
+
+
+async def test_an_edit_after_an_unclaimed_create_is_refused_not_queued(store):
+    """新建还没被认领（``201`` 空 body ⇒ 认领根本没发生）时，后来的改**不许排队**（#53）。
+
+    这是 #53 的第二半，有出处：``POST /open/v1/task`` 的响应表里 200 带 body、**201 无
+    content 两条都写着**（``openapi-dida365.md`` 的 Create Task 一节），而
+    ``_adopt_created`` 在没有 id 时直接提前返回——于是那一笔排在临时 id 上的改动永远停在
+    ``local-…``，POST 到服务端没见过的 id 上、404、退避重试、**永远出不了队**，而用户的
+    编辑永远到不了服务端。
+
+    这条路径**会自愈**（下一次全量刷新带回真 id 那一行、剪掉临时那一行），所以诚实的回答
+    是「等这一步同步完」，而不是安静地排一条永远失败的改动。完整机制归 #54；这里钉的是
+    最小的那一版：拒绝 + 一个字都不入队。
+    """
+    transport = FakeTransport(json={"id": "srv-1", "projectId": "work", "title": "写周报"})
+    seed(store)
+    clock = ManualClock(T0)
+    engine = make_engine(store, transport, clock=clock)
+    transport.enqueue(NetworkError("断网"))
+
+    local_id = engine.create("写周报", list_id="work")
+    await engine.wait_for_pushes()
+
+    clock.advance(timedelta(seconds=2))  # 那一笔退避到点了
+    transport.enqueue(httpx.Response(201))  # 服务端只回一个空 body
+    assert await engine.push_pending() == 1, "新建那一笔算推成功了"
+
+    assert store.task_payload(local_id) is not None, "本地那条还挂着临时 id（认领没发生）"
+
+    with pytest.raises(UnclaimedTaskError):
+        engine.write(local_id, changes={"title": "写周报（改）"})
+
+    assert [change.kind for change in store.pending()] == [], (
+        "被拒绝的改动一个字都不许入队——排进去就是一条永远推不出去的改动"
+    )
+    assert engine.status().pending_count == 0, "待推送数回到 0"
+
+
+async def test_a_completion_after_an_unclaimed_create_is_refused_too(store):
+    """完成 / 删除 / 顺延走的是同一个入口，所以同一句话对它们一起成立。"""
+    transport = FakeTransport(json={"id": "srv-1", "projectId": "work", "title": "写周报"})
+    seed(store)
+    clock = ManualClock(T0)
+    engine = make_engine(store, transport, clock=clock)
+    transport.enqueue(NetworkError("断网"))
+
+    local_id = engine.create("写周报", list_id="work")
+    await engine.wait_for_pushes()
+    clock.advance(timedelta(seconds=2))
+    transport.enqueue(httpx.Response(201))
+    await engine.push_pending()
+
+    with pytest.raises(UnclaimedTaskError):
+        engine.complete(local_id)
+
+    assert store.pending() == ()
+    assert "status" not in store.task_payload(local_id), (
+        "拒绝就是拒绝：本地一个字都不许写下去（新建那份原文里本来就没有 status——"
+        "它只带用户写下、与守卫要求的那几个字段）"
+    )
+
+
+# ---------------------------------------------------------------- 清单还没被认领时的写（#39/#53）
+
+
+@pytest.mark.parametrize("kind", [WriteKind.UPDATE, WriteKind.COMPLETE, WriteKind.DELETE])
+async def test_a_write_on_a_task_in_an_unclaimed_list_is_refused_not_queued(store, kind):
+    """任务的「可寻址」= **``projectId`` 与 ``taskId`` 都已被确认**（#53 的补充，实测过）。
+
+    一条任务落在**还没推出去的清单**里（那条清单的 id 还是 ``local-list-…``）时，对它的每一次
+    写都会打向一个服务端从没见过的 ``projectId``：``MOVE`` 的 ``fromProjectId`` 直接取改动行上
+    的 ``list_id``，完成与删除把它写在路径里，更新写在请求体里。实测的后果与 #53 那条一模一样
+    ——404、退避重试、**那笔改动永远出不了队**，队列永久增长，状态栏那个数永远不归零
+    （#45 的 merger 探针：``kind=move record list_id='local-list-1'`` 之后仍在队列里）。
+
+    这一条钉「**拒绝**，而不是排一条永远推不出去的改动」：一个请求都不发、队列不增长、
+    ``pending_count`` 如实。同一个库里那条在**真实清单**里的任务照旧写得动——守卫只拦
+    「这次请求要说的那个 id 服务端没见过」的那一种。
+    """
+    seed(
+        store,
+        task(id="t1", title="写周报", project_id="local-list-1"),
+        task(id="t2", title="交水费", project_id="work"),
+        lists=[inbox(), project(), {"id": "local-list-1", "name": "还没推出去的清单"}],
+    )
+    transport = FakeTransport(json=task(id="t2"))
+    engine = make_engine(store, transport)
+
+    with pytest.raises(UnclaimedListError):
+        engine.write("t1", kind=kind, changes={"title": "写周报（改）"})
+
+    assert store.pending() == (), "一个字都不许入队"
+    assert store.pending_count() == 0
+    assert engine.status().pending_count == 0, "状态栏那个数如实：0，不是 1"
+    assert store.task_payload("t1")["title"] == "写周报", "拒绝之后本地也不许改"
+
+    engine.write("t2", kind=kind, changes={"title": "交水费（改）"})  # 对照组：真实清单照旧
+    await engine.wait_for_pushes()
+
+    assert store.pending() == (), "对照组那一笔推成功了"
+    assert len(transport.requests) == 1, "只发了对照组那一笔"
+    assert "local-list-1" not in str(transport.last_request.url)
+
+
+async def test_a_create_into_an_unclaimed_list_is_refused_not_queued(store):
+    """在还没推出去的清单里建任务同样**拒绝**：请求体里的 ``projectId`` 服务端没见过（#39）。
+
+    ``POST /open/v1/task`` 的 URL 里没有 id，所以这一笔在**任务**那一半是可寻址的；不可寻址的
+    是它要落进去的那个**清单**。同一条规矩：不许发一个服务端没见过的 ``projectId``——否则
+    404 之后那笔新建永远出不了队，而屏幕上那条任务看着像建好了。
+
+    （另一种做法是照 #54 的清单那条路「排队 + 认领之后挪 id」，那要在 ``adopt_created_list``
+    里再发明一套跨对象的挪动，归清单的认领机制；这一票选的是同一条规矩：**拒绝**。）
+    """
+    seed(store, lists=[inbox(), project(), {"id": "local-list-1", "name": "还没推出去的清单"}])
+    transport = FakeTransport(json={"id": "srv-1", "projectId": "local-list-1"})
+    engine = make_engine(store, transport)
+
+    with pytest.raises(UnclaimedListError):
+        engine.create("写周报", "local-list-1")
+
+    await engine.wait_for_pushes()
+
+    assert store.pending() == ()
+    assert store.pending_count() == 0
+    assert engine.status().pending_count == 0
+    assert transport.requests == [], "拒绝就是拒绝：一个请求都不发"
+    assert [item.title for item in store.tasks()] == [], "本地也不许先造出一条推不出去的"
 
 
 # ---------------------------------------------------------------- 优先级（t17）

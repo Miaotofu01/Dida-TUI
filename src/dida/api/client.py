@@ -232,12 +232,25 @@ class DidaApiClient:
         )
 
     async def create_task(self, body: Mapping[str, Any]) -> dict[str, Any]:
-        """POST /open/v1/task —— 请求体透传，但先过本地守卫（日期、重复规则、不可写字段）。"""
+        """POST /open/v1/task —— 请求体透传，但先过本地守卫（日期、重复规则、不可写字段）。
+
+        成功形状有**两种**，文档两条都写着：``200 → Task`` 与 ``201 → No Content``。走
+        ``_payload_object`` 的实现在第二种上会把一次**成功**报成
+        ``MalformedResponseError``（「响应体不是 JSON」），于是推送按失败退避重试——而新建
+        **不是幂等的**，重试就是让服务端多一条。所以空体照
+        :meth:`_payload_object_or_none` 的口径读作「服务端没给那条任务」，返回 ``{}``。
+
+        ``{}`` 这一份是**诚实**的：认领（``Store.adopt_created``）需要服务端给的 id，
+        没有 id 就没有认领——本地那条临时任务活到下一次全量刷新，那时服务端的索引里已经有
+        它了（真 id 那一行写进来、临时那一行被剪掉），屏幕上始终只有一条。排在那条临时 id
+        后面的改动因此推不出去，写入那一侧当场拒绝它们（#53），不排一条永远失败的改动。
+        """
         guard_writable(body)
         response = await self._send(
             self._request("POST", "/open/v1/task", body=prepare_write_body(body))
         )
-        return self._remember(self._payload_object(response, endpoint="新建任务的响应"))
+        created = self._payload_object_or_none(response, endpoint="新建任务的响应")
+        return self._remember(created) if created is not None else {}
 
     async def update_task(
         self,
