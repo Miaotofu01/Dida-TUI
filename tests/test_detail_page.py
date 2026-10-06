@@ -660,7 +660,8 @@ async def test_subtasks_reminders_and_repeat_are_read_only_but_visible():
 
     assert theme.SUBTASK_DONE_MARK in subtasks and "收集数据" in subtasks, subtasks
     assert theme.SUBTASK_TODO_MARK in subtasks and "写结论" in subtasks, subtasks
-    assert "TRIGGER:P0DT9H0M0S" in reminders, reminders
+    # 提醒读成人话、不摊服务端原文（#55；读法本身在 ``tests/test_reminders.py``）。
+    assert "提前 9 小时" in reminders, reminders
     assert "RRULE:FREQ=DAILY;INTERVAL=1" in repeat, repeat
 
 
