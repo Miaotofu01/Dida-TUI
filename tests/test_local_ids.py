@@ -154,3 +154,27 @@ def test_a_queued_change_is_judged_on_every_id_it_would_send():
     )
     assert is_addressable(_change(list_id="work", projectId="life")) is True
     assert is_addressable(_change(task_id=LOCAL_TASK_PREFIX + "0d0e")) is False
+
+
+def test_not_addressable_always_means_one_of_the_ids_is_local():
+    """不变量：判据说「发不出去」，永远是**这次要说的 id 里有一个是本地占位的**。
+
+    它把判据与那份前缀登记表钉在一起，也让「拒绝的时候说不出是哪一半」这一支不可达——
+    ``dida.sync.push._unaddressable`` 靠的就是这条（它只在那三个 id 上认族）。判据哪天自己
+    长出一条与 id 无关的理由（比如「这条改动太老」），这条测试先红，那时得先决定用户看到
+    哪一种原因。
+    """
+    ids = ("srv-1", "work", LOCAL_LIST_PREFIX + "1", LOCAL_TASK_PREFIX + "0d0e")
+    checked = 0
+    for task_id in ids:
+        for project in ids:
+            for target in ids:
+                addressable = is_addressable_task(
+                    task_id, WriteKind.UPDATE, project_id=project, target_project_id=target
+                )
+                local_named = any(is_local_id(value) for value in (task_id, project, target))
+                assert addressable is not local_named, (
+                    f"判据与登记表不一致：task={task_id} project={project} target={target}"
+                )
+                checked += 1
+    assert checked == len(ids) ** 3, "四个 id 的三重组合都查过"

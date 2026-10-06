@@ -28,6 +28,7 @@ from dida.sync.writes import (
     is_addressable,
     is_addressable_task,
     is_local_list_id,
+    is_local_task_id,
 )
 
 if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能在这里 import
@@ -86,10 +87,18 @@ def _unaddressable(
     入队之前、以及推送循环里）；这里只负责在**已经判定发不出去**之后，把它归到用户看得懂的
     那一种原因上：点名的清单服务端没见过（:class:`UnclaimedListError`，包括搬运的目标清单），
     还是这条任务自己还没被认领（:class:`UnclaimedTaskError`）。
+
+    两个窄化判断（「是哪一族」）与判据读的是同一张前缀登记表，所以「判据说不行、这里一个都
+    对不上」这一支走不到——``tests/test_local_ids.py`` 把那条不变量钉住了（判据说 False 的
+    每一组输入，三个 id 里至少有一个是本地占位的）。
     """
     for named in (project, target_project):
         if named is not None and is_local_list_id(named):
             return UnclaimedListError(named)
+    if is_local_task_id(task_id):
+        return UnclaimedTaskError(task_id)
+    # 到不了这里（不变量由上面那条测试守着）。真到了也仍然按「任务这一半」报：那是这句诊断里
+    # 最保守的一种说法，绝不假装这一次发得出去。
     return UnclaimedTaskError(task_id)
 
 
