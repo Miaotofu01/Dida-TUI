@@ -256,7 +256,7 @@ async def test_the_form_shell_has_no_cancel_escape_hands_the_values_back():
 async def test_the_form_hint_describes_the_new_keys():
     """底部那行提示写的是新语义：``Esc`` 是保存，屏幕上没有「Esc 取消」这半句（ADR-0008 二）。
 
-    提示是这一层唯一的说明书（浮层模态，``?`` 的键位表不看编辑态），所以它必须与真按下去的
+    提示是这一层唯一的说明书（浮层模态，``h`` 的键位表不看编辑态），所以它必须与真按下去的
     键一致——写着「取消」而按下去是保存，比没有提示更坏。
     """
     app = DidaApp(backend())

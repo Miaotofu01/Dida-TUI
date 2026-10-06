@@ -4,7 +4,7 @@
 所以清单的建/改表单与视图的过滤条件表单由它在**这个文件**里搭出来，#36 复用）。
 #34 先在这里放下所有人都要用的那两件：
 
-- :class:`MessageOverlay` —— 一块只读的正文（``?`` 的键位帮助就挂在它上面）；
+- :class:`MessageOverlay` —— 一块只读的正文（``h`` 的键位帮助就挂在它上面）；
 - :class:`ConfirmOverlay` —— 一句提示 + ``y`` / ``n``（删除、退出那两处「先问一句」）。
 
 #42 在这里补上第三件：**表单浮层** :class:`FormOverlay`。它与上面两件的分别只有一处：
@@ -419,7 +419,7 @@ QUIT_BINDINGS = [Binding(key, f"app.{QUIT_ACTION}", "退出", show=False) for ke
 ``_modal_binding_chain``，而那条链在**最后一个模态控件**处截断——``app._bindings`` 因此
 进不来。``q`` 在浮层上按不出来（它只绑在页面与 ``Screen`` 上），``Ctrl+C`` 更绕：Textual
 把 ``ctrl+c`` 绑在 ``Screen.BINDINGS`` 的 ``screen.copy_text`` 上，而 ``Screen`` 恰好不在
-模态链里——于是同一个键在清单列表页上能退出、在 ``?`` 帮助浮层上只是「复制一段文字」。
+模态链里——于是同一个键在清单列表页上能退出、在 ``h`` 帮助浮层上只是「复制一段文字」。
 **那正是本票要关掉的第二条退出路径**：按了退出键，什么都没发生。
 
 ``app.`` 前缀是 Textual 的动作命名空间（``App._action_targets`` 里的 ``app`` 指向 app
@@ -436,7 +436,7 @@ QUIT_BINDINGS = [Binding(key, f"app.{QUIT_ACTION}", "退出", show=False) for ke
 class MessageOverlay(ModalScreen[None]):
     """一块只读正文的浮层：``Esc`` / ``Enter`` 关掉，退出键照旧交回 app。
 
-    正文由调用方拼好原样交给它（``?`` 那一屏是 :func:`dida.tui.keys.help_body`），所以
+    正文由调用方拼好原样交给它（``h`` 那一屏是 :func:`dida.tui.keys.help_body`），所以
     控件不认识键位表、也不认识任务——换一块正文不必动它。
     """
 
