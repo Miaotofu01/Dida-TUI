@@ -1,10 +1,13 @@
 """同步引擎（第 4 个深模块）——公开面与读路径。
 
-TUI 读写一切只能走本模块；分组、排序、逾期判定、冲突裁决都发生在这一层，不在 TUI 里。
+TUI 读写一切只能走本模块；排序、逾期判定、视图求值、冲突裁决都发生在这一层，不在 TUI 里。
 公开接口：
 
 - ``status() -> SyncStatus`` —— 读：状态栏所需的全部信息。
-- ``view() -> TodayView`` —— 读：分组视图模型（类型见 :mod:`dida.sync.view`）。
+- ``logical_day() -> date`` —— 读：现在是哪个逻辑日（工单 #46 的心跳）。
+- **三种读形状**（#33）：``list_index() -> tuple[ListRow, ...]``（清单索引）、
+  ``tasks_in(container_id) -> TaskList``（某个容器的任务列表）、
+  ``task_detail(task_id) -> TaskDetail | None``（单条任务的详情）。
 - ``refresh() -> RefreshReport`` —— 写：全量刷新，**async**（:mod:`dida.sync.refresh`；清单索引
   翻页翻到底、远端已经没有的清单与任务顺手剪掉，#41）。
 - ``write(task_id, changes=, kind=)`` —— 写：乐观写，本地当场生效、立即推送（:mod:`dida.sync.push`）。
@@ -16,7 +19,13 @@ TUI 读写一切只能走本模块；分组、排序、逾期判定、冲突裁�
 - ``create_list(name, color=)`` / ``update_list(id, name=, color=)`` / ``delete_list(id)`` ——
   写：清单的建 / 改 / 删，乐观写 + 立即推送 + 失败进重试队列（:mod:`dida.sync.lists`，#42）。
 - ``cycle_priority(task_id)`` —— 写：优先级推进一档（:mod:`dida.sync.priority`）。
-- ``subtasks(task_id)`` / ``toggle_subtask(...)`` —— 读 / 写：子任务（:mod:`dida.sync.subtasks`）。
+- ``subtasks(task_id)`` —— 读：子任务那几行（只读，:mod:`dida.sync.subtasks`；spec 的
+  「子任务只看不勾」）。
+
+**v1 那条读路径在 #58 里删掉了**：``view() -> TodayView`` 与它硬编码的三个分区、左栏的
+``ListSummary`` 徽标、``/`` 的模糊过滤、以及子任务的勾选写路径（``toggle_subtask``）都只
+为「今日执行台」服务，spec 要求读模型重写、模糊过滤不迁移、子任务只看不勾。三种读形状是
+v2 的全部读面。
 
 **这个文件只做两件事：组装，以及读路径。** ``SyncEngine`` 由几片职责各自独立的 mixin 拼成，
 每片一个模块、一个变化原因（t32 拆的）：
@@ -44,7 +53,7 @@ TUI 读写一切只能走本模块；分组、排序、逾期判定、冲突裁�
 「现在」永远取自注入的 ``Clock``，「一天结束的时刻」是注入的 ``day_end``——
 这一层里没有 ``datetime.now()``，也没有自己算的日界（交给 :mod:`dida.logical_day`）。
 
-视图模型与分组纯函数都在 :mod:`dida.sync.view`，这里再导出一份，好让 TUI 只 import
+行的字段与纯读法都在 :mod:`dida.sync.view`，这里再导出一份，好让 TUI 只 import
 ``dida.sync.engine`` 一个东西（``tests/test_architecture.py`` 守着这条）——**TUI 的允许表
 只有这一个模块**，所以新增的公开类型都要在这里转出去。
 """
@@ -95,7 +104,7 @@ from dida.sync.read import (
 )
 from dida.sync.refresh import ProjectReader, RefreshMixin, RefreshTarget
 from dida.sync.schedule import ScheduleMixin
-from dida.sync.subtasks import SubtaskMixin, SubtaskWrite, TaskReader
+from dida.sync.subtasks import SubtaskMixin
 from dida.sync.tags import TagMixin, TagReader
 from dida.sync.view import (
     INBOX_ID,
@@ -104,26 +113,18 @@ from dida.sync.view import (
     SUBTASK_COMPLETED_STATUS,
     CompletedItem,
     CompletedSection,
-    GroupKind,
     ListSnapshot,
-    ListSummary,
     SubtaskItem,
     SyncState,
-    TaskGroup,
     TaskItem,
     TaskSnapshot,
-    TodayView,
     ViewSource,
     completed_section,
-    filter_groups,
     format_due,
-    fuzzy_match,
-    group_tasks,
     list_names,
     next_priority,
     priority_mark,
     subtask_items,
-    summarize_lists,
 )
 from dida.sync.writes import (
     LOCAL_LIST_PREFIX,
@@ -204,13 +205,11 @@ __all__ = [
     "DidaError",
     "DueWindow",
     "Engine",
-    "GroupKind",
     "LIST_COLORS",
     "ListColor",
     "ListKind",
     "ListRow",
     "ListSnapshot",
-    "ListSummary",
     "ListWriteKind",
     "ListWriteTarget",
     "LocalEffect",
@@ -219,19 +218,15 @@ __all__ = [
     "RefreshTarget",
     "SUBTASK_COMPLETED_STATUS",
     "SubtaskItem",
-    "SubtaskWrite",
     "SyncEngine",
     "SyncState",
     "SyncStatus",
     "TaskDetail",
-    "TaskGroup",
     "TaskItem",
     "TaskList",
-    "TaskReader",
     "ProjectWriter",
     "TagReader",
     "TaskSnapshot",
-    "TodayView",
     "UnclaimedListError",
     "UnclaimedTaskError",
     "UnknownListError",
@@ -256,10 +251,7 @@ __all__ = [
     "custom_view_rows",
     "due_window_of",
     "evaluate_view",
-    "filter_groups",
     "format_due",
-    "fuzzy_match",
-    "group_tasks",
     "implied_due_for",
     "is_a_move",
     "is_inbox_id",
@@ -274,7 +266,6 @@ __all__ = [
     "priority_mark",
     "resolve_lists",
     "subtask_items",
-    "summarize_lists",
     "task_detail",
     "view_form_values",
     "view_from_payload",
@@ -350,10 +341,6 @@ class Engine(Protocol):
         （同步状态 + 待推送条数，实测 13.7 µs、两条 SQL），而「今天是哪天」是纯算术
         （注入的钟 + 当前日界，实测 5.5 µs、零 I/O）。一秒问一次的那一跳走这一口。
         """
-        ...
-
-    def view(self) -> TodayView:
-        """读：分组后的视图模型。"""
         ...
 
     def list_index(self) -> tuple[ListRow, ...]:
@@ -503,13 +490,10 @@ class Engine(Protocol):
         ...
 
     def subtasks(self, task_id: str) -> tuple[SubtaskItem, ...]:
-        """读：这条任务的子任务行（右栏），标题与完成状态都已经是可以直接画的成品。"""
-        ...
+        """读：这条任务的子任务行（详情页的只读那一段），标题与完成状态都已经是可以直接画的成品。
 
-    async def toggle_subtask(self, task_id: str, subtask_id: str) -> SubtaskWrite:
-        """写：勾选/取消勾选一个子任务——**写回之前先重读该任务**（工单 #20）。
-
-        **要 await**：重读是一次网络调用，而这次写回必须建立在它带回来的底稿上。
+        **只读**：spec 的「子任务只看不勾（也不能增删改）」，所以没有对应的写入口（#58 把
+        v1 的 ``toggle_subtask`` 删掉了）。
         """
         ...
 
@@ -596,29 +580,10 @@ class SyncEngine(
         """
         return logical_day(self._clock.now(), self._day_end).label
 
-    def view(self) -> TodayView:
-        """读：从本地缓存分组出的视图模型。缓存不在就是空视图，不是错误。"""
-        if self._source is None:
-            return TodayView(lists=(), groups=())
-        lists = tuple(self._source.lists())
-        tasks = tuple(self._source.tasks())
-        now = self._clock.now()
-        return TodayView(
-            lists=summarize_lists(lists, tasks),
-            groups=group_tasks(tasks, lists, now=now, day_end=self._day_end),
-            completed=completed_section(
-                tasks,
-                lists,
-                now=now,
-                day_end=self._day_end,
-                window_hours=self._completed_window_hours,
-            ),
-        )
-
     def list_index(self) -> tuple[ListRow, ...]:
         """读：清单索引——收集箱置顶，然后内置视图、自定义视图、真实清单（#33）。
 
-        缓存不在就是空索引，不是错误（与 :meth:`view` 空缓存给空视图同一条口径）。
+        缓存不在就是空索引，不是错误（空缓存给空行，而不是抛）。
         """
         if self._source is None:
             return ()

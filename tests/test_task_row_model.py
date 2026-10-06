@@ -28,10 +28,12 @@ from dida.sync.engine import (
     TaskItem,
     completed_section,
     format_due,
+    next_priority,
     priority_mark,
 )
 from dida.sync.rows import completed_window_start, row_sort_key
 from dida.sync.view import ListSnapshot, TaskSnapshot
+from dida.sync.views import ViewDefinition, due_window_of, implied_due_for
 from dida.testing import InMemorySource, ManualClock
 from dida.tui import theme
 from dida.tui.pages.tasks import completed_line, task_line
@@ -230,6 +232,9 @@ async def test_a_task_that_was_uncompleted_does_not_come_back_in_the_completed_s
     服务端只按完成时间窗回话（那个端点没有 ``status`` 参数），「已完成」这一半只能由客户端
     拿**响应里的** ``status`` 筛掉：``2`` 是完成、``0`` 是正常、``-1`` 是已放弃。
     """
+    # 清单那一行由一次全量刷新写进来；这条测试只跑已完成流，所以自己先摆上它——
+    # 否则那条任务没有容器行可挂，v2 的读形状按 container_id 取成员（#58 之后只有这一条路）。
+    store.apply_refresh(lists=[{"id": "work", "name": "工作", "sortOrder": 1}], tasks=[])
     reader = StubCompletedReader(
         [
             completed_payload("t1", "手机上做完的", status=2),
@@ -243,7 +248,7 @@ async def test_a_task_that_was_uncompleted_does_not_come_back_in_the_completed_s
 
     assert report.written_tasks == 1
     assert [snapshot.id for snapshot in store.tasks()] == ["t1"], "取消完成的那条一条都不许落库"
-    assert [item.title for item in engine.view().completed.items] == ["手机上做完的"]
+    assert [item.title for item in engine.tasks_in("work").completed.items] == ["手机上做完的"]
 
 
 async def test_a_payload_without_a_status_is_not_treated_as_completed(store):
@@ -483,23 +488,56 @@ def test_the_read_model_says_which_date_a_view_implies_for_a_new_task():
     assert engine.tasks_in("work").implied_due is None, "清单不隐含日期"
 
 
-def test_a_custom_view_does_not_imply_a_date_yet():
-    """**自建**视图（#36）不隐含日期——这是 #39 故意定的边界，不是漏掉的一条。
+def test_a_custom_view_with_the_same_due_window_implies_the_same_date():
+    """隐含日期跟着视图的**定义**走，不跟着它的身份走（#58 的 S1、用户故事 35）。
 
-    这里摆的还是一条**最像「今天」**的自建视图（截止窗口就是「今天到期」，与内置「今天」
-    的 ``last=0`` 一样）：它仍然不隐含日期。理由不是「自建的不算」，而是它的定义
-    （``ViewDefinition``）**没有随** ``TaskList`` 上来——``container_tasks`` 手里只有
-    ``ViewRow``（id / 名字 / 成员），要按它的条件推日期得再从本地库那份定义接一条线
-    （#36 的接缝）。所以今天的行为是：在内置「今天」里建会自动带上今天，在自建视图里建
-    **不带日期**（落点仍然是收集箱）。要改这条边界，先决定「自建视图的条件算不算隐含」
-    ——那时这条测试跟着改，而不是被静默改掉。
+    内置「今天」与一个用户自建的、截止窗口**一模一样**的视图（表单里就是「今天到期（含
+    逾期）」那一档，``DueWindow(first=None, last=0)``）必须给同一个答案：内置与自定义视图
+    走的是同一条求值路径，而「这个视图隐不隐含日期」是**定义**的语义、不是「它是不是内置」
+    的语义。按 id 在三个内置定义里查的那一版会让自建的拿到 ``None``——同一屏里两种行为，
+    用户看不出为什么。
+
+    期望值是测试直接给出的 ``at(14)``，不是照 ``logical_day`` 再算一遍。
     """
     source = work_source()
-    source.add_view("今天到期", id="mine", due=DueWindow(first=0, last=0))
+    source.add_view("今天到期", id="mine", due=DueWindow(first=None, last=0))
     engine = engine_with(source)
 
-    assert engine.tasks_in("mine").shows_list_name is True, "自建视图仍然不是容器"
-    assert engine.tasks_in("mine").implied_due is None, "但不隐含日期（#39 的边界）"
+    assert engine.tasks_in("today").implied_due == at(14), "内置「今天」隐含那个逻辑日"
+    assert engine.tasks_in("mine").implied_due == at(14), (
+        "自建视图只要窗口一样，答案就得一样（判断跟着定义走）"
+    )
+    assert engine.tasks_in("mine").implied_due == engine.tasks_in("today").implied_due, (
+        "两种视图的答案必须逐字相同"
+    )
+
+
+@pytest.mark.parametrize(
+    ("preset", "implies_today"),
+    [
+        ("any", False),  # 不限：连截止时间都不看
+        ("today", True),  # 今天到期（含逾期）：今天就是它最新的那一天
+        ("next7", False),  # 最近七天：今天只是七分之一，挑哪一天都是替用户做决定
+        ("overdue", False),  # 已逾期：今天不在窗口里，带上去的新任务当场不在这一屏
+        ("undated", False),  # 无日期：这一屏要的正是**没有**日期的任务
+    ],
+)
+def test_every_due_preset_says_what_it_implies_for_a_new_task(preset, implies_today):
+    """表单那五档截止条件**逐档**说清隐含什么（#58 的 S1 把这条规则写下来）。
+
+    规则只有一句：**今天在这个窗口里，而且今天就是它最新的那一天**（``last == 0``）才隐含
+    一个日期——隐含的是当前逻辑日那一个日期标记（当天 00:00，全天任务那个写法）。所以
+    「今天到期（含逾期）」隐含今天，其余四档都不隐含，各自的理由写在上面那张表里。
+
+    这是**纯函数**那一半：定义直接给，不经过引擎、不经过界面。
+    """
+    definition = ViewDefinition(
+        id=f"custom-{preset}", name=f"自定义 {preset}", due=due_window_of(preset)
+    )
+
+    implied = implied_due_for(definition, now=T0, day_end="24:00")
+
+    assert implied == (at(14) if implies_today else None)
 
 
 def test_the_implied_date_follows_the_logical_day_not_the_natural_one():
@@ -512,6 +550,20 @@ def test_the_implied_date_follows_the_logical_day_not_the_natural_one():
     engine = SyncEngine(clock=ManualClock(at(15, 2, 0)), day_end="04:00", source=source)
 
     assert engine.tasks_in("today").implied_due == at(14), "凌晨两点仍是逻辑日 03-14"
+
+
+def test_the_implied_date_of_a_custom_view_follows_the_logical_day_too():
+    """自建的那一份也一样按逻辑日算（#58 的 S1）：同一句话不许在两种视图上分岔。
+
+    窗口一样只是第一半——「哪一天」也得是同一个逻辑日，所以日界换到 04:00、凌晨两点进来，
+    自建视图与内置「今天」仍要给同一天。
+    """
+    source = work_source()
+    source.add_view("今天到期", id="mine", due=DueWindow(first=None, last=0))
+    engine = SyncEngine(clock=ManualClock(at(15, 2, 0)), day_end="04:00", source=source)
+
+    assert engine.tasks_in("mine").implied_due == at(14), "凌晨两点仍是逻辑日 03-14"
+    assert engine.tasks_in("mine").implied_due == engine.tasks_in("today").implied_due
 
 
 # ------------------------------------------------------------------ 窄终端：丢弃顺序
@@ -630,3 +682,79 @@ def test_an_all_day_task_due_today_stays_today_at_the_0400_boundary():
     """
     assert format_due(at(14, 0, 0), all_day=True, now=at(15, 2, 0), day_end="04:00") == "今天"
     assert format_due(at(14, 23, 0), all_day=False, now=at(15, 2, 0), day_end="04:00") == "今天 23:00"
+
+
+# ------------------------------------------------- 纯读法：截止时间与优先级标记（#58 搬过来的）
+#
+# 这一节原本住在 ``tests/test_view_models.py`` 里（v1 的「视图模型」：三个分区、左栏徽标、
+# ``/`` 的模糊过滤）。那张票的读路径在 #58 里删掉了，**留下的**是这几条与它无关的纯读法
+# ——截止时间怎么读、优先级标记是哪几个字、``p`` 的循环顺序——所以它们搬到这里（这一层正是
+# 「行读成什么」的家），那个文件跟着它钉的 v1 形状一起删掉。
+
+
+def test_timed_due_today_reads_as_today_plus_time():
+    assert format_due(at(14, 18, 0), all_day=False, now=at(14, 12, 3), day_end="24:00") == "今天 18:00"
+
+
+def test_all_day_due_today_never_shows_a_time():
+    assert format_due(at(14), all_day=True, now=at(14, 12, 3), day_end="24:00") == "今天"
+
+
+def test_timed_due_yesterday_reads_as_yesterday_plus_time():
+    assert format_due(at(13, 9, 0), all_day=False, now=at(14, 12, 3), day_end="24:00") == "昨天 09:00"
+
+
+def test_due_three_days_ago_reads_as_days_ago():
+    assert format_due(at(11, 9, 0), all_day=False, now=at(14, 12, 3), day_end="24:00") == "3 天前"
+
+
+def test_no_due_date_is_visually_distinct_from_due_today():
+    # 没有日期读作一道**宽度无歧义**的短横（工单 #37）：原来的 ``—``（U+2014）是东亚
+    # 歧义宽度，进了对齐列就会歪；``今天`` 是字，两者一眼可分。
+    assert format_due(None, all_day=False, now=at(14, 12, 3), day_end="24:00") == "-"
+    assert format_due(at(14), all_day=True, now=at(14, 12, 3), day_end="24:00") == "今天"
+
+
+def test_due_before_the_logical_day_end_reads_as_today():
+    """逻辑日边界 04:00：凌晨两点看到的昨天 23:00 截止仍是「今天」。"""
+    assert format_due(at(14, 23, 0), all_day=False, now=at(15, 2, 0), day_end="04:00") == "今天 23:00"
+
+
+def test_due_before_the_logical_day_start_reads_as_yesterday():
+    assert format_due(at(14, 3, 0), all_day=False, now=at(15, 2, 0), day_end="04:00") == "昨天 03:00"
+
+
+@pytest.mark.parametrize(
+    ("current", "expected"),
+    [
+        (0, 1),  # 无 → 低
+        (1, 3),  # 低 → 中
+        (3, 5),  # 中 → 高
+        (5, 0),  # 高 → 无（循环）
+    ],
+)
+def test_the_priority_cycle_walks_the_wire_values_0_1_3_5(current, expected):
+    """优先级循环走的是 ``0/1/3/5``，不是稠密的 1/2/3（api-contracts.md 第 3 条）。
+
+    原本钉在界面测试 ``test_priority_filter.py`` 里（工单 #32 搬出来的）：``p`` 那个**键**
+    在 v2 里归 #45 重做，但「线上编码是哪四个值、循环顺序是什么」是 API 的事实，与界面无关。
+    """
+    assert next_priority(current) == expected
+
+
+@pytest.mark.parametrize(
+    ("wire", "mark"),
+    [
+        (0, "."),  # 无
+        (1, "."),  # 低与无是同一个标记
+        (3, "~"),  # 中
+        (5, "!"),  # 高
+    ],
+)
+def test_each_priority_wire_value_has_its_one_mark(wire, mark):
+    """线上编码 → 标记是一张完整的表，不是只有「高」那一格（工单 #32 搬出来的）。
+
+    低/无的标记从 ``·``（U+00B7）换成 ``.``（U+002E）：前者是东亚**歧义**宽度，rich 量它
+    1 格而 zh_CN 的终端可能画 2 格——它站在任务行的第一列，歪的是整行（工单 #37）。
+    """
+    assert priority_mark(wire) == mark

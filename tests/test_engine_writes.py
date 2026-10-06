@@ -29,7 +29,7 @@ import pytest
 from dida.api.client import DidaApiClient
 from dida.api.errors import NetworkError
 from dida.storage.store import ChangeKind, Store
-from dida.sync.engine import INBOX_ID, NO_DUE_TEXT, SyncEngine
+from dida.sync.engine import INBOX_ID, NO_DUE_TEXT, ListKind, SyncEngine
 from dida.sync.writes import (
     LOCAL_TASK_PREFIX,
     UnclaimedListError,
@@ -98,8 +98,17 @@ def make_engine(
 
 
 def titles(engine: SyncEngine) -> list[str]:
-    """视图里看得见的任务标题（用户真正看到的那一份）。"""
-    return [item.title for group in engine.view().groups for item in group.items]
+    """屏幕上看得见的任务标题（用户真正看到的那一份）。
+
+    v1 的 ``view().groups`` 问的是同一句话；#58 把它换成 v2 的读形状——库里每个真实清单的
+    成员，按清单索引的顺序。这些测试摆的任务都没有未来截止的，两种问法逐字相同。
+    """
+    return [
+        item.title
+        for row in engine.list_index()
+        if row.kind is ListKind.LIST
+        for item in engine.tasks_in(row.id).items
+    ]
 
 
 # ---------------------------------------------------------------- 完成（t11）
@@ -274,10 +283,10 @@ async def test_an_all_day_create_writes_the_date_marker_verbatim(store):
     assert transport.last_json["dueDate"] == "2026-03-14T00:00:00+0800"
     assert transport.last_json["isAllDay"] is True
     assert "priority" not in transport.last_json, "没写优先级就不写这个字段，服务端默认就是「无」"
-    items = [item for group in engine.view().groups for item in group.items]
+    items = engine.tasks_in(INBOX_ID).items
     assert [(item.title, item.due_text, item.all_day) for item in items] == [
         ("还信用卡", "今天", True)
-    ], "全天任务的「今天」要落在今日区，且不许读成「今天 00:00」"
+    ], "全天任务的「今天」要读成日期标记，且不许读成「今天 00:00」"
 
 
 async def test_a_thin_create_response_does_not_drop_what_the_user_wrote(store):
@@ -707,10 +716,10 @@ async def test_an_all_day_reschedule_is_written_verbatim_as_a_date_marker(store)
 
     assert transport.last_json["dueDate"] == "2026-03-14T00:00:00+0800"
     assert transport.last_json["isAllDay"] is True
-    items = [item for group in engine.view().groups for item in group.items]
+    items = engine.tasks_in("work").items
     assert [(item.title, item.due_text, item.all_day) for item in items] == [
         ("还信用卡", "今天", True)
-    ], "全天任务的「今天」要落在今日区，且不许读成「今天 00:00」"
+    ], "全天任务的「今天」要读成日期标记，且不许读成「今天 00:00」"
 
 
 async def test_rescheduling_an_all_day_task_to_a_time_clears_the_all_day_flag(store):

@@ -21,7 +21,7 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from dida.sync.engine import INBOX_ID, UnclaimedListError
+from dida.sync.engine import INBOX_ID, UnclaimedListError, due_window_of
 from dida.testing import FakeBackend, ManualClock
 from dida.tui import messages
 from dida.tui.app import DidaApp
@@ -240,6 +240,32 @@ async def test_creating_in_today_gives_the_task_todays_date():
         await pilot.pause()
 
     assert placed(fake, INBOX_ID) == [("今天要做", at(14, 0, 0), True)]
+
+
+async def test_creating_in_a_custom_view_with_todays_window_gives_todays_date():
+    """自建视图只要**条件一样**，落点与隐含日期就一样（#58 的 S1、用户故事 35）。
+
+    这里摆的是一个用户自建的、截止窗口与内置「今天」**逐字相同**的视图（表单里的
+    「今天到期（含逾期）」那一档）。内置与自定义视图走同一条求值路径，所以「在这一屏里
+    写下的东西意思就是今天」这句话不该因为它是自建的而变——按 id 认内置视图的那一版会
+    给 ``None``，同一屏在两种视图上两种行为，用户看不出为什么。
+    """
+    fake = backend()
+    fake.add_view("今天到期", id="mine", due=due_window_of("today"))
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_container(pilot, app.index_page(), "mine")
+        await pilot.press("n")
+        await pilot.pause()
+        await pilot.press(*"自建的今天")
+        await pilot.press("enter")
+        await pilot.pause()
+
+    assert placed(fake, INBOX_ID) == [("自建的今天", at(14, 0, 0), True)], (
+        "自建视图里的新建：落收集箱，而且带上今天那个日期标记"
+    )
 
 
 async def test_creating_in_a_view_without_a_date_leaves_the_date_empty():

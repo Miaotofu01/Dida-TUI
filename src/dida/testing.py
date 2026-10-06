@@ -3,11 +3,12 @@
 - :class:`ManualClock` —— 时钟接缝（``dida.clock.Clock``）。
 - :class:`FakeTransport` —— HTTP 传输接缝（``dida.api.transport.Transport``）。
 - :class:`InMemorySource` —— 本地缓存的内存替身（``dida.sync.view.ViewSource``）。
-- :class:`FakeBackend` —— **接缝一的假后端**：给它内存数据，它用真引擎的纯函数分组，
+- :class:`FakeBackend` —— **接缝一的假后端**：给它内存数据，它用真引擎的读路径，
   写操作只记录。TUI 测试一律 ``DidaApp(FakeBackend(clock=...))`` 这样搭。
 
-这里只放「记录 + 回放」的哑替身，不含任何业务判断：分组、排序、逾期判定都调用
-``dida.sync.view`` 的纯函数，和真引擎同一份实现，替身不会跟真货说不一样的话。
+这里只放「记录 + 回放」的哑替身，不含任何业务判断：三种读形状委托给真引擎，
+行的读法（排序、逾期判定、截止时间读法）调用 ``dida.sync.view`` 的纯函数——
+和真引擎同一份实现，替身不会跟真货说不一样的话。
 """
 
 from __future__ import annotations
@@ -30,7 +31,6 @@ from dida.storage.store import (
 from dida.sync.engine import (
     CompletedReport,
     ListRow,
-    SubtaskWrite,
     SyncEngine,
     SyncStatus,
     TaskDetail,
@@ -46,7 +46,6 @@ from dida.sync.view import (
     SubtaskItem,
     SyncState,
     TaskSnapshot,
-    TodayView,
 )
 
 
@@ -392,7 +391,7 @@ class FakeBackend:
     """接缝一的假后端：内存缓存 + 真引擎的读路径，写操作只记录。
 
     读（``view()`` / ``status()``）委托给真 :class:`~dida.sync.engine.SyncEngine`，
-    所以渲染测试跑的是真的分组、排序与逻辑日判定；写（``refresh`` / ``complete`` /
+    所以渲染测试跑的是真的读路径、排序与逻辑日判定；写（``refresh`` / ``complete`` /
     ``defer``）只把调用记下来，等对应工单落地后由它们决定要不要真的走一遍。
 
     用法::
@@ -519,18 +518,6 @@ class FakeBackend:
         self._subtasks: dict[str, tuple[SubtaskItem, ...]] = {}
         """摆进来的子任务，按任务 id 索引（t20）；:meth:`set_subtasks` 摆，读路径照给。"""
 
-        self.toggled_subtasks: list[tuple[str, str]] = []
-        """``toggle_subtask(task_id, subtask_id)`` 收到的调用，按顺序（t20）。"""
-
-        self.subtask_changed_elsewhere: bool = False
-        """摆 ``True``，下一次勾选就报「重读发现任务在别处被改过」。"""
-
-        self.subtask_written: bool = True
-        """摆 ``False``，下一次勾选就报「服务端已经没有这个子任务了」。"""
-
-        self.subtask_error: Exception | None = None
-        """摆一个异常进去，``toggle_subtask`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。"""
-
         self._engine = SyncEngine(clock=clock, day_end=day_end, source=self.source)
 
     async def refresh(self) -> RefreshReport:
@@ -572,9 +559,6 @@ class FakeBackend:
 
     def set_sync_state(self, *, last_refresh_at: datetime | None = None, pending_count: int = 0) -> None:
         self.source.state = SyncState(last_refresh_at=last_refresh_at, pending_count=pending_count)
-
-    def view(self) -> TodayView:
-        return self._engine.view()
 
     def list_index(self) -> tuple[ListRow, ...]:
         """读：委托给真引擎——三种行怎么组装、收集箱那一行是谁、条数怎么数，都是生产那一份。"""
@@ -874,7 +858,7 @@ class FakeBackend:
             raise self.view_error
 
     def set_subtasks(self, task_id: str, *items: SubtaskItem) -> None:
-        """摆一条任务的子任务（t20）：右栏渲染与勾选测试的输入。
+        """摆一条任务的子任务（t20）：详情页那一段只读行的输入。
 
         ``SubtaskItem`` 是引擎给的成品行（标题、完成状态、截止读法），替身照收不误——
         「怎么从 ``items`` 数组读出这一行」是引擎的判断（``dida.sync.view.subtask_items``），
@@ -885,26 +869,3 @@ class FakeBackend:
     def subtasks(self, task_id: str) -> tuple[SubtaskItem, ...]:
         """读：摆进去的那一份（t20）；没摆过就是没有子任务。"""
         return self._subtasks.get(task_id, ())
-
-    async def toggle_subtask(self, task_id: str, subtask_id: str) -> SubtaskWrite:
-        """写：记下这一笔，并把摆进去的那一份翻过来（t20）。
-
-        「写前重读、只合并这一次改动」是引擎的判断（``SyncEngine.toggle_subtask``），替身
-        不自己再抄一份；它只把结果摆成调用方看得见的样子：右栏要重画，状态栏要说清服务端
-        有没有说出别的事。真要断言「重读保护了别处的修改」，走接缝二那份测试。
-        """
-        self.toggled_subtasks.append((task_id, subtask_id))
-        if self.subtask_error is not None:
-            raise self.subtask_error
-        rows = tuple(
-            replace(row, completed=not row.completed) if row.subtask_id == subtask_id else row
-            for row in self._subtasks.get(task_id, ())
-        )
-        self._subtasks[task_id] = rows
-        return SubtaskWrite(
-            task_id=task_id,
-            subtask_id=subtask_id,
-            items=rows,
-            written=self.subtask_written and any(row.subtask_id == subtask_id for row in rows),
-            changed_elsewhere=self.subtask_changed_elsewhere,
-        )

@@ -206,32 +206,47 @@ def builtin_view_definitions() -> tuple[ViewDefinition, ...]:
 
 
 def implied_due_for(definition: ViewDefinition, *, now: datetime, day_end: str) -> datetime | None:
-    """在**这个视图里**新建一条任务，它自动该带上的截止时间；没有就是 ``None``（#39）。
+    """在**这个视图里**新建一条任务，它自动该带上的截止时间；没有就是 ``None``（#39 / #58）。
 
     用户故事 35：「如果视图隐含了日期（比如在「今天」里建），新任务自动带上那个日期」。
-    **只有「今天」隐含日期**，而且隐含的是当前**逻辑日**那一个日期——这一屏里的每一条都
-    逾期或截止于今天，用户在这里写下的东西，意思就是「今天」。
 
-    另外两个内置视图不隐含：
+    **规则只有一句，而且是定义的一句话**：今天在这个视图的截止窗口里（``covers(today)``），
+    而且**今天就是它最新的那一天**（``last == 0``）——这时隐含当前**逻辑日**那一个日期。
+    换句话说，用户在这一屏里写下的东西，意思就是「今天」：带上去的新任务当场就在这一屏里，
+    而窗口里也没有比今天更晚的日子可选（有的话，挑哪一天都是替用户做一个他没做的决定）。
 
-    - 「最近七天」是**一段**窗口（``DueWindow(first=0, last=6)``），挑其中任何一天都是替
-      用户做一个他没做的决定；
-    - 「所有」连截止时间都不看。
+    判据是 ``ViewDefinition.due``（定义），**不是这个视图的 id**：内置的那三个也是定义，
+    用户自建的也是定义，两者走同一条求值路径——同一个窗口必须给同一个答案，否则同一屏
+    在两种视图上会有两种行为（#58 的 S1：按 id 在三个内置定义里查的那一版就让自建的
+    拿到 ``None``）。所以它是个**纯函数**：只看定义、注入的 ``now`` 与 ``day_end``，
+    不读时钟、不碰存储、不认识「内置」这两个字。
+
+    表单那五档截止条件（:data:`_DUE_CHOICE_TABLE`）逐档的结果：
+
+    - 「今天到期（含逾期）」``DueWindow(first=None, last=0)`` → **今天的日期标记**。下界是
+      ``None`` 承重地表示「逾期也在里面」（写成 ``first=0`` 会静默丢掉每一条逾期任务），
+      而今天正是它最新的那一天。
+    - 「不限」``None`` → 不隐含：这个视图连截止时间都不看。
+    - 「最近七天」``DueWindow(first=0, last=6)`` → 不隐含：今天只是七分之一，**一段**窗口
+      藏不进一个日期。
+    - 「已逾期」``DueWindow(first=None, last=-1)`` → 不隐含：今天不在窗口里，带上去的新任务
+      当场不在这一屏——那是给用户一个假的「落点」。
+    - 「无日期」``DueWindow(dated=False, undated=True)`` → 不隐含：这一屏要的正是**没有**
+      日期的任务，替它带上日期就是跟这个视图对着干。
 
     返回的是**全天任务的日期标记**（那个逻辑日的 00:00，承重：``due_day`` 认这个形状），
-    不是「现在」——「今天要做、没说几点」正是这样一条任务。``now``/``day_end`` 从参数进来，
-    这一层不看表。
+    不是「现在」——「今天要做、没说几点」正是这样一条任务。
 
     判断写在这里而不是 TUI 里的理由：哪一个视图隐含哪一天，是**视图定义**的语义，而定义
     只住在这一处；同时它也让「这条任务该不该带上日期」与视图求值用的是同一个逻辑日。
     """
-    if definition.due is None or definition.due.undated:
+    window = definition.due
+    if window is None:
         return None
-    if definition.due.first is None and definition.due.last == 0:
-        # 「今天」= 上界今天、下界不设（逾期也在里面）。**下界是 None 不能读**——见 TODAY_VIEW：
-        # 它承重地表示「逾期也在」，不是「从今天开始」。
-        return datetime.combine(logical_day(now, day_end).label, time(), tzinfo=now.tzinfo)
-    return None
+    today = logical_day(now, day_end).label
+    if window.last != 0 or not window.covers(today, today=today):
+        return None
+    return datetime.combine(today, time(), tzinfo=now.tzinfo)
 
 
 @dataclass(frozen=True)

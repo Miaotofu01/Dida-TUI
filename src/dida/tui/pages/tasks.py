@@ -70,6 +70,9 @@ COMPLETED_STYLE = theme.DONE
 
 删除线是「这条已经做完了」的读法，而它**还在列表里**——用户才有机会对它的取消完成
 （那是 #38 的 ``space``；已完成的行**可以**停光标，不然那个键永远送不到它身上）。
+
+两段数据都用它：真实清单的已完成那几条由 :func:`completed_line` 画，而**视图**里已完成的是
+求值选中的成员、混在 :attr:`TaskList.items` 里，由 :func:`task_line` 按行上那一位画。
 """
 
 TITLE_GAP = 2
@@ -164,13 +167,23 @@ def task_line(item: TaskItem, *, width: int, show_list_name: bool = False) -> Te
 
     注解块贴着右边缘：截止时间因此在每一行都落在同一个位置上（一列），而不是跟着标题的
     长短漂。放不下时按 :data:`_DROP_ORDER` 丢，最后才截标题。
+
+    **这一行算不算已完成由行自己说**（``TaskItem.completed``）：真实清单里完成的那几条从
+    读模型的已完成区来（:func:`completed_line` 画），而**视图里**它们是求值选中的成员、
+    与未完成的混在同一段里。同一条任务因此在两种容器里从不同的数据来，划掉显示（用户
+    故事 54）只有跟着**行上那一位**才可能两处一致——按「它从哪一段出来」判，视图那一边
+    就会把做完的画成没做完，``space`` 也就跟着朝反方向写（工单 #38 / #58）。
     """
-    prefix = f"{item.priority_mark} "
+    prefix = f"{DONE_MARK if item.completed else item.priority_mark} "
     annotations = _annotations(item, show_list_name=show_list_name)
     kept = _keep_what_fits(prefix, item.title, annotations, width)
     # 逾期整行标红：颜色只有一个出处（theme.OVERDUE = 槽 1），而且它进的是 **span**
     # （``Text("x", style="red")`` 会被 Textual 当成 CSS 具名色解析成真彩色）。
-    style = theme.OVERDUE if item.overdue else ""
+    # 已完成的优先：做完的任务既不逾期也不再需要它的优先级（与 :func:`completed_line` 同一条口径）。
+    if item.completed:
+        style = COMPLETED_STYLE
+    else:
+        style = theme.OVERDUE if item.overdue else ""
     return _assemble(prefix, item.title, kept, width=width, style=style)
 
 
@@ -277,7 +290,12 @@ class TasksPage(CursorPage):
         self.set_rows(self._build(), keep_cursor=same_container)
 
     def _build(self) -> tuple[Row, ...]:
-        """按当前宽度铺一页的行（抬头两条暗线夹着 + 未完成 + 已完成 + 空态）。"""
+        """按当前宽度铺一页的行（抬头两条暗线夹着 + 成员 + 已完成区 + 空态）。
+
+        ``items`` 里**可能**有已完成的（视图的成员是混的）：那几行由 :func:`task_line`
+        按行上那一位画成划掉的样子，落点与顺序都是求值给的。真实清单的 ``items`` 只有
+        未完成的，已完成的那几条在下面那一段（:attr:`TaskList.completed`）。
+        """
         task_list = self._task_list
         # 抬头是「哪一屏 + 两条暗线夹着」：顶上一条（顶栏下面的分隔）、抬头本身、
         # 抬头下面一条（分区标题的细线）。分隔与留白承担层级，不靠框线。
@@ -355,18 +373,22 @@ class TasksPage(CursorPage):
     def _row(self, task_id: str) -> tuple[str, bool] | None:
         """这一行的标题，以及它**现在**算不算已完成；读模型里没有这一条就是 ``None``。
 
-        已完成那一段是**唯一**能说明「这条已完成」的地方：本地判定只看 ``status``
-        （spec：2 是完成、0 是正常、-1 是已放弃），而这一段就是按它分出来的。
+        「算不算已完成」读的是**行上那一位**（``TaskItem.completed``，本地判定只看服务端的
+        ``status``），不是「它从哪一段取出来」：视图的成员是混的（#36 的「最近完成」这类
+        自定义视图按完成状态筛），已完成的那几条与未完成的同在 :attr:`TaskList.items` 里，
+        而真实清单的已完成那几条在 :attr:`TaskList.completed` 里——两段都读，判据只有一个。
+        按段判会让 ``space`` 在视图里朝反方向写（工单 #58 的 S2）。
         """
         task_list = self._task_list
         if task_list is None:
             return None
-        for item in task_list.completed.items:
-            if item.task_id == task_id:
-                return item.title, True
         for item in task_list.items:
             if item.task_id == task_id:
-                return item.title, False
+                return item.title, item.completed
+        for item in task_list.completed.items:
+            # 已完成区按定义只装已完成的（:func:`dida.sync.view.completed_section`）。
+            if item.task_id == task_id:
+                return item.title, True
         return None
 
     def action_back(self) -> None:

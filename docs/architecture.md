@@ -12,7 +12,7 @@
 | 1 | 配置与凭据 | `dida/config.py` | `Config`（`token` / `day_end` / `refresh_on_start` / `push_on_change` / `completed_window_hours`）、`config_path()`、`load_config()`、`save_config()`、`needs_token()`、`Credentials(transport=, path=).verify_and_store(token)`、`DayEndReader(path=).current()`（日界跟着配置文件走，#46）；失败是 `ConfigError` / `CredentialsError` | t03 已实现 |
 | 2 | 滴答 API 客户端 | `dida/api/` | `DidaApiClient(token=, transport=, base_url=)`：`list_projects(offset=, limit=)`、`get_project_data(project_id)`、`get_task(project_id, task_id)`、`list_tags()`、`list_completed(project_ids=, start_date=, end_date=)`、`create_task(body)`、`update_task(project_id, task_id, changes, snapshot=)`、`complete_task(project_id, task_id)`、`delete_task(project_id, task_id)`、**清单的建 / 改 / 删**（#42）：`create_project(body)`、`update_project(project_id, changes, snapshot=)`、`delete_project(project_id)`——三条都有 `200 → Project` 与 `201 No Content` 两种成功形状，所以后两者返回「那一份清单，或者 `None`」；失败一律是 `dida.api.errors.DidaError` 的子类（`NetworkError` / `AuthError` / `ServerRejectionError` / `FieldIgnoredError`，守卫另有 `InvalidDateError` / `DatelessRepeatError` / `MalformedResponseError`） | t07 已实现 |
 | 3 | 本地存储 | `dida/storage/store.py` | `Store`：清单、任务快照、待推送改动、同步状态 | t08 已实现 |
-| 4 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` + `dida/sync/read.py` + `dida/sync/views.py` + `dida/sync/lists.py` | `SyncEngine(clock=, day_end=, source=, client=)`、`status() -> SyncStatus`、`logical_day() -> date`、`view() -> TodayView`、**三种读形状**（#33）：`list_index() -> tuple[ListRow, ...]`、`tasks_in(container_id) -> TaskList`、`task_detail(task_id) -> TaskDetail \| None`、`refresh() -> RefreshReport`（**async**）、`complete(task_id)`、`defer(task_id)`、`push_pending()`、`set_day_end(day_end) -> bool`（换日界，#46）、**清单的建 / 改 / 删**（#42）：`create_list(name, color=)`、`update_list(list_id, name=, color=)`、`delete_list(list_id)`；视图模型与分组纯函数在 `dida/sync/view.py`，读模型在 `dida/sync/read.py`，视图求值在 `dida/sync/views.py`（#35），清单的写路径与颜色档在 `dida/sync/lists.py`（#42；#54 加了「建好但服务端没回 id」时的认领：认领记录、按名字唯一对上、认领前不改 / 删那个临时 id）；**判据只有一个家、出口只有一道门**（#58）：优先级四档的用户语言 `PRIORITY_NAMES`（家在 `dida/sync/view.py`，与 `PRIORITY_CYCLE` 同一片词汇）与「搬到它已经在的那个清单不算一次改动」`is_a_move`（家在 `dida/sync/writes.py`）都经这里转出——界面只许 import 引擎，所以判据本体住在 sync 那一侧，两个时刻各问一次（与 `is_addressable_task` 同一个形状） | t05 / t09 / t10 已实现；读形状 #33；视图求值 #35；清单写 #42；日界重读 #46；单一出处 #58 |
+| 4 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` + `dida/sync/read.py` + `dida/sync/views.py` + `dida/sync/lists.py` | `SyncEngine(clock=, day_end=, source=, client=)`、`status() -> SyncStatus`、`logical_day() -> date`、**三种读形状**（#33）：`list_index() -> tuple[ListRow, ...]`、`tasks_in(container_id) -> TaskList`、`task_detail(task_id) -> TaskDetail \| None`、`refresh() -> RefreshReport`（**async**）、`complete(task_id)`、`defer(task_id)`、`push_pending()`、`set_day_end(day_end) -> bool`（换日界，#46）、**清单的建 / 改 / 删**（#42）：`create_list(name, color=)`、`update_list(list_id, name=, color=)`、`delete_list(list_id)`；行的字段与纯读法（截止时间读法、优先级标记、排序、逾期判定）在 `dida/sync/view.py`，读模型在 `dida/sync/read.py`，视图求值在 `dida/sync/views.py`（#35），清单的写路径与颜色档在 `dida/sync/lists.py`（#42；#54 加了「建好但服务端没回 id」时的认领：认领记录、按名字唯一对上、认领前不改 / 删那个临时 id）；**判据只有一个家、出口只有一道门**（#58）：优先级四档的用户语言 `PRIORITY_NAMES`（家在 `dida/sync/view.py`，与 `PRIORITY_CYCLE` 同一片词汇）与「搬到它已经在的那个清单不算一次改动」`is_a_move`（家在 `dida/sync/writes.py`）都经这里转出——界面只许 import 引擎，所以判据本体住在 sync 那一侧，两个时刻各问一次（与 `is_addressable_task` 同一个形状）；**v1 的 `view() -> TodayView` 已由 #58 删除**，三种读形状是唯一的读面 | t05 / t09 / t10 已实现；读形状 #33；视图求值 #35；清单写 #42；日界重读 #46；单一出处 #58 |
 | 5 | 逻辑日 | `dida/logical_day.py` | `parse_day_end(text) -> timedelta`、`logical_day(now, day_end) -> LogicalDay`（`label` / `start` / `end`，半开区间） | t04 已实现 |
 | 6 | TUI | `dida/tui/` | `DidaApp(engine)`；三层页面 `dida/tui/pages/`（`index` / `tasks` / `detail`）、按层的键位表 `dida/tui/keys.py`、浮层 `dida/tui/overlays.py`、**视觉常量唯一出处 `dida/tui/theme.py`**（颜色 / 字形 / 间距 / 动效）、顶栏 `#top-bar`（`top_line()`，词标 + 导航路径）、状态栏 `#status-bar`（`status_line()` / `format_status()`） | v1 t05 / t18；一栏三层 #34；视觉地基 #51 |
 
@@ -33,7 +33,7 @@ bootstrap ─► config ─► api.client（「列清单」验证凭据；失败
 ```
 
 - TUI 只许 import `dida.sync.engine` 和自己的 `dida.tui.*`；不许碰存储与 API 客户端，
-  `tests/test_architecture.py` 用 AST 守着这条。分组、排序、逾期判定全在引擎里。
+  `tests/test_architecture.py` 用 AST 守着这条。排序、逾期判定、视图求值全在引擎里。
 - 组合根是 `dida/bootstrap.py`（`dida` 命令 = `dida.bootstrap:main`），由它注入协作者。
 - 颜色**跟随终端主题**，而不是 app 自带的一套调色板（ADR-0007 一）。2026-10 的实测推翻了原先写在
   这一行的说法：Textual 8.2.8 默认把每个 `ansi_*` 改写成它内建 Monokai 调色板里的**真彩色**
@@ -81,8 +81,10 @@ assert transport.last_json == {"title": "写周报"}      # 请求体字段
 
 ## v2 的三种读形状（#33）
 
-v1 的读入口只有一个为「今日」硬编码的 `view()`（v1 的三栏界面 #34 已删；`view()` 本身留给
-还在用它的非界面测试）。v2 的三层页面要三种形状，类型与组装纯函数在 `dida/sync/read.py`，
+v1 的读入口只有一个为「今日」硬编码的 `view() -> TodayView`；#58 把它连同 `TodayView`、
+三个分区（逾期 / 今日 / 收集箱无日期）、左栏的 `ListSummary`、`/` 的模糊过滤与子任务的勾选
+写路径一起**删掉了**——那些只为「今日执行台」服务，spec 要求读模型重写、模糊过滤不迁移、
+子任务只看不勾。三种读形状因此是**唯一**的读面，类型与组装纯函数在 `dida/sync/read.py`，
 引擎把它们再导出（TUI 只 import `dida.sync.engine` 这一条不变）：
 
 - `list_index() -> tuple[ListRow, ...]` —— 清单索引：收集箱置顶 → 内置视图（今天 / 最近七天 /
@@ -133,40 +135,40 @@ v1 的读入口只有一个为「今日」硬编码的 `view()`（v1 的三栏�
 日期判断只有一份：`due_day()`（全天任务的截止是日期标记）与 `is_overdue()` 在
 `dida/sync/view.py`，视图求值复用它们。
 
-## 读路径：视图模型与内存假后端（t05 定稿）
+## 读路径：三种读形状与内存假后端（t05 定稿；读面在 #58 收成一条）
 
-一启动就读本地缓存渲染，网络不是这一屏的前置条件。`view()` 的数据来源是注入的
+一启动就读本地缓存渲染，网络不是这一屏的前置条件。三种读形状的数据来源是注入的
 `dida.sync.view.ViewSource`（t08 的 `Store` 是生产实现，测试用 `dida.testing.InMemorySource`），
 类型分两组：
 
 ```python
 # 输入（缓存 → 引擎），只有事实，没有判断
-ListSnapshot(id, name)                       # 一条清单
+ListSnapshot(id, name)
 TaskSnapshot(id, title, list_id, due, all_day, priority, completed)
 SyncState(last_refresh_at, pending_count)
 
 # 输出（引擎 → TUI），字段都是可以直接画的成品
-TodayView(lists, groups, completed: CompletedSection)   # 已完成区在中栏底部，自己不在 groups 里
-ListSummary(id, name, unfinished)            # 左栏的未完成条数徽标
-TaskGroup(kind: GroupKind, items)            # kind 是 OVERDUE / TODAY / INBOX_UNDATED；title 与 count 由 kind 推出
+ListRow(id, name, kind: ListKind, unfinished, is_inbox, color, group_id, project_kind, permission)
+TaskList(container_id, items: tuple[TaskItem, ...], completed: CompletedSection,
+         shows_list_name, implied_due)       # 索引 / 容器列表 / 详情这三种形状见上一节
 TaskItem(task_id, title, list_id, list_name, priority, priority_mark, due, all_day, due_text,
          overdue, desc, content, tags_text, repeat_flag, reminders, completed)
-# desc/content/tags_text 是右栏常驻的「描述 / 备注 / 标签」；overdue 是求值给的逾期判定
-# （TUI 不许自己判日期）；repeat_flag/reminders 是行上的重复与提醒标记；completed 决定沉底
+# desc/content/tags_text 是详细页常驻的「描述 / 备注 / 标签」；overdue 是求值给的逾期判定
+# （TUI 不许自己判日期）；repeat_flag/reminders 是行上的重复与提醒标记；completed 决定
+# 「划掉 + 沉底」——它跟着**行**走，视图里那一行也照样算（#58 的 S2）
 CompletedSection(items: tuple[CompletedItem, ...])
+TaskDetail(...)                              # 单条任务的详情（#33）
 ```
 
-分组、排序、逾期判定、截止时间读法（「今天 18:00」「昨天 09:00」「3 天前」「-」）全在
+排序、逾期判定、截止时间读法（「今天 18:00」「昨天 09:00」「3 天前」「-」）全在
 `dida.sync.view` 的纯函数里（**排序键**在 `dida/sync/rows.py`，`by_due` 只是转发，#37），
 TUI 只画字符串。截止时间读法的字形必须是**宽度无歧义**的：没有截止时间读作 ASCII 的 `-`，
-不是 `—`（U+2014，东亚歧义宽度，进了对齐列整列会歪，#37）。两个已经踩过的坑：
+不是 `—`（U+2014，东亚歧义宽度，进了对齐列整列会歪，#37）。一个已经踩过的坑：
 
 - 全天任务的 `due` 是**日期标记**（当天 00:00），不是时刻：`due_day()` 对它按日期算，
   否则 `day_end = "04:00"` 时一个「今天」的全天任务会被算成昨天。
-- 没有截止时间的任务单独成区「收集箱无日期」（读作「-」）：它按「有没有日期」分，不看这条
-  任务在哪个清单（`GroupKind.INBOX_UNDATED`）。
 
-接缝一的假后端在 `dida.testing.FakeBackend`：读委托给真引擎（分组行为跟生产同一份实现），
+接缝一的假后端在 `dida.testing.FakeBackend`：读委托给真引擎（三种读形状跟生产同一份实现），
 写操作只记录（`refreshes` / `completed` / `deferred`）。TUI 测试一律这样搭：
 
 ```python

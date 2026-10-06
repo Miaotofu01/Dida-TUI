@@ -17,6 +17,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 from rich.cells import cell_len
 
+from dida.sync.engine import Completion
 from dida.testing import FakeBackend, ManualClock
 from dida.tui import theme
 from dida.tui.app import DidaApp
@@ -280,6 +281,63 @@ async def test_completed_rows_are_struck_through_and_sunk_below_the_unfinished_o
     assert next(i for i, line in enumerate(rows) if "没做完的" in line) < next(
         i for i, line in enumerate(rows) if "做完了的" in line
     ), "已完成的要沉在未完成下面"
+
+
+def recently_completed_view() -> FakeBackend:
+    """一份缓存 + 一个自建视图：视图里**含已完成成员**（#36 的「最近完成」那个例子）。
+
+    视图不是容器，它的成员由求值给：已完成的那条与未完成的落在**同一份成员**里，而真实清单
+    的已完成那几条来自读模型的已完成区（窗口 + ``CompletedItem``）。两种容器于是走的是两段
+    不同的数据，这一条摆的正是前一种。
+    """
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_task("没做完的", list_name="work", id="t1", due=at(14, 18, 0))
+    fake.add_task("做完了的", list_name="work", id="t2", completed=True, completed_at=at(14, 11, 0))
+    fake.add_view("最近完成", id="recent", completion=Completion.COMPLETED, completed_days=7)
+    return fake
+
+
+async def test_a_completed_row_in_a_view_is_struck_through_like_one_in_a_list():
+    """视图里的已完成行照样划掉显示（用户故事 54）：算不算已完成跟着**行**走，不跟着它从哪一段出来走。
+
+    同一句话在真实清单里是对的（那一条测试在上面），在视图里必须一样对——「已完成」是这一
+    **行**的事实，不是「它恰好从哪一段取出来」的推论。
+    """
+    app = DidaApp(recently_completed_view())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_container(pilot, app, "recent")
+        styled = screen_styled_text(app)
+
+    done = line_with(styled, "做完了的")
+    assert theme.DONE_MARK in done, f"已完成的行有自己的前缀记号：{done!r}"
+    assert STRIKE in sgr_parameters(style_before(done, "做完了的")), f"视图里没划掉：{done!r}"
+
+
+async def test_a_completed_row_in_a_view_sinks_below_the_unfinished_ones():
+    """已完成沉底在视图里也成立（用户故事 55）：顺序归读模型的求值，页面只照画。
+
+    清单里那一条（上面）沉底靠的是「未完成一段 + 已完成区」这个拼接；视图里两段是**同一
+    份成员**，沉底只能靠求值那份顺序（``order_key`` 的已完成那一档）。同一句话，两处来源，
+    所以两处各断一次。
+    """
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_task("没做完的", list_name="work", id="t1", due=at(14, 18, 0))
+    fake.add_task("做完了的", list_name="work", id="t2", completed=True, completed_at=at(14, 11, 0))
+    fake.add_view("全部任务", id="everything", completion=Completion.ANY)
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_container(pilot, app, "everything")
+        rows = lines(screen_text(app))
+
+    assert next(i for i, line in enumerate(rows) if "没做完的" in line) < next(
+        i for i, line in enumerate(rows) if "做完了的" in line
+    ), "视图里已完成的也要沉在未完成下面"
 
 
 async def test_a_task_completed_more_than_seven_days_ago_does_not_take_the_screen():

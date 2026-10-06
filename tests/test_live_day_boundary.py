@@ -24,7 +24,7 @@ import pytest
 from dida.config import Config, DayEndReader, load_config, save_config
 from dida.api.errors import NetworkError
 from dida.storage.store import RefreshReport, Store
-from dida.sync.engine import GroupKind, SyncEngine
+from dida.sync.engine import SyncEngine
 from dida.testing import FakeBackend, FakeTransport, InMemorySource, ManualClock
 from dida.tui.app import DidaApp
 from dida.tui.pages.base import CURSOR_MARK
@@ -127,8 +127,9 @@ def test_the_engine_re_derives_the_logical_day_when_the_boundary_changes():
     """换掉日界之后，「今天」与逾期判定按**新的**逻辑日重算（工单 #46 验收标准 2）。
 
     算例就是工单里那句话：凌晨两点的「昨天 23:00 截止」在 ``24:00`` 下是逾期（读到「昨天
-    23:00」），在 ``04:00`` 下属于今天（读到「今天 23:00」）。逾期与今日是同一份分组里的
-    两个桶（GLOSSARY：逾期不属于今日），所以那一个字段的变化就是判定跟着变的证据。
+    23:00」），在 ``04:00`` 下属于今天（读到「今天 23:00」）。逾期与今日的判定都落在同一条
+    读路径上（``tasks_in()`` 给的这一行：``overdue`` 位与 ``due_text``），所以那一个字段的
+    变化就是判定跟着变的证据。
     """
     engine = SyncEngine(
         clock=ManualClock(at(14, 2, 0)),
@@ -136,17 +137,19 @@ def test_the_engine_re_derives_the_logical_day_when_the_boundary_changes():
         source=source_with(("昨晚收尾", at(13, 23, 0))),
     )
 
-    before = engine.view()
+    before = engine.tasks_in("工作").items
     assert engine.status().logical_day == date(2026, 3, 14)
-    assert [group.kind for group in before.groups] == [GroupKind.OVERDUE]
-    assert before.groups[0].items[0].due_text == "昨天 23:00"
+    assert [(item.title, item.overdue, item.due_text) for item in before] == [
+        ("昨晚收尾", True, "昨天 23:00")
+    ]
 
     assert engine.set_day_end("04:00") is True
 
-    after = engine.view()
+    after = engine.tasks_in("工作").items
     assert engine.status().logical_day == date(2026, 3, 13), "当前逻辑日被重新推导"
-    assert [group.kind for group in after.groups] == [GroupKind.TODAY]
-    assert after.groups[0].items[0].due_text == "今天 23:00"
+    assert [(item.title, item.overdue, item.due_text) for item in after] == [
+        ("昨晚收尾", False, "今天 23:00")
+    ]
 
     assert engine.set_day_end("04:00") is False, "日界没变就不算变过"
 

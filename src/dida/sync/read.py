@@ -1,9 +1,8 @@
 """v2 的三种读形状（#33）：清单索引 / 某个容器的任务列表 / 单条任务的详情。
 
-v1 的读入口只有一个 :meth:`~dida.sync.engine.SyncEngine.view`，返回一个为「今日」硬编码了
-三个分区的 :class:`~dida.sync.view.TodayView`：未来的任务整条丢掉、没有日期的任务不分清单地
-汇成一区、也表达不了「现在打开的是哪个清单」。v2 的三层页面要的是三种形状，这里是它们
-的类型与组装纯函数（TUI 只画，判断都在这一层）：
+v1 的读入口只有一个为「今日」硬编码的 ``view() -> TodayView``（未来的任务整条丢掉、没有日期的
+任务不分清单地汇成一区、也表达不了「现在打开的是哪个清单」），#58 把它连同那个类型一起删掉了。
+v2 的三层页面要的是三种形状，这里是它们的类型与组装纯函数（TUI 只画，判断都在这一层）：
 
 - :func:`list_index` —— **清单索引**：内置视图、自定义视图、真实清单三种行（:class:`ListKind`），
   每行带未完成条数；真实清单还带颜色、项目组、``kind``、``permission``。
@@ -170,12 +169,20 @@ class ViewRow:
     行上的未完成条数由 :func:`list_index` 从缓存里数**成员里未完成的那些**——索引里的数字与
     进去看到的列表因此来自同一次求值，不可能对不上（「最近完成」那种视图里也有已完成的成员，
     所以条数不是 ``len(task_ids)``）。
+
+    ``definition`` 是这一行的**过滤条件**（内置的是三个写死的定义，自定义的是本地库读出来的
+    那一份）：行上的身份、名字、成员都是它算出来的，而「在这个视图里新建的任务带不带日期」
+    同样是它的语义（:func:`dida.sync.views.implied_due_for`）。所以它随行一起上来——读模型
+    因此按**定义**回答，而不是按 id 去三个内置定义里查（#58 的 S1：那样查的话，窗口与
+    「今天」完全一样的自建视图会拿到 ``None``）。``None`` = 这一行没有定义（只可能是手工
+    拼出来的行），那时什么都不隐含。
     """
 
     id: str
     name: str
     task_ids: tuple[str, ...] = ()
     builtin: bool = False
+    definition: ViewDefinition | None = None
 
 
 @dataclass(frozen=True)
@@ -205,8 +212,10 @@ class TaskList:
     """在这个容器里新建一条任务时，它自动该带上的截止时间（``None`` = 不带，#39）。
 
     用户故事 35：「如果视图隐含了日期（比如在「今天」里建），新任务自动带上那个日期」。
-    只有「今天」隐含（就是当前逻辑日那个日期，写法是全天任务的日期标记）；真实清单与
-    另外两个内置视图都不隐含——理由写在 :func:`dida.sync.views.implied_due_for` 一处。
+    答案出自这个容器的**定义**（:func:`dida.sync.views.implied_due_for` 逐档写下了那五档
+    截止条件各隐含什么）：今天在截止窗口里、而且今天就是它最新的那一天（``last == 0``）
+    才隐含，隐含的就是当前逻辑日那一个日期标记。所以内置「今天」与窗口一样的**自建**视图
+    给同一天（#58 的 S1），而真实清单、另外两个内置视图与其余几档截止条件都不隐含。
 
     它与 :attr:`shows_list_name` 是同一个判断的两面（两者都由「这个容器是不是视图」决定），
     所以一起在这里给：调用方读这一个字段就够，不必自己认识视图。
@@ -448,10 +457,11 @@ def container_tasks(
         )
     else:
         # 视图不是容器：成员与顺序都由视图求值给（#35 的内置视图 / #36 的自定义视图）。
-        members = _view_members(container_id, tasks, now=now, day_end=day_end, views=views)
+        view_row = _view_row_for(container_id, tasks, now=now, day_end=day_end, views=views)
+        members = _members_of(view_row, tasks)
         completed = CompletedSection()
         shows_list_name = True
-        implied_due = _implied_due(container_id, now=now, day_end=day_end)
+        implied_due = _implied_due(view_row, now=now, day_end=day_end)
         items = tuple(task_item(snapshot, names, now=now, day_end=day_end) for snapshot in members)
     return TaskList(
         container_id=container_id,
@@ -462,26 +472,20 @@ def container_tasks(
     )
 
 
-def _implied_due(container_id: str, *, now: datetime, day_end: str) -> datetime | None:
-    """这个视图隐含的日期（#39）：在它里面新建的任务自动带上的那个截止时间。
+def _implied_due(row: ViewRow | None, *, now: datetime, day_end: str) -> datetime | None:
+    """这个视图隐含的日期（#39 / #58）：在它里面新建的任务自动带上的那个截止时间。
 
-    只有**内置视图的定义**才隐含日期，所以这里查 :func:`builtin_view_definitions`——自定义
-    视图（#36）没有这个语义，``None`` 就是「不隐含」。哪一个是哪一天写在
-    :func:`dida.sync.views.implied_due_for` 一处，这里只负责按 id 找到那个定义。
+    **按定义回答，不按身份回答**：判断整个在
+    :func:`dida.sync.views.implied_due_for` 一处（它逐档写下了那五档截止条件各隐含什么），
+    这里只把这一行的定义递过去。所以窗口与内置「今天」一样的自建视图拿到的是同一天——
+    「内置与自定义视图走同一条求值路径」这句话在读模型这一层是有内容的，不是口号（#58 的
+    S1：原来这里按 id 去 ``builtin_view_definitions()`` 里查，自建的一律 ``None``）。
 
-    **自定义视图不在这一条里是故意的**（#39 的边界，报告里写过）：用户自建的视图可能带一个
-    「截止于今天」的窗口，但它的**定义**（``ViewDefinition``）没有随 ``TaskList`` 上来——
-    ``container_tasks`` 手里只有 :class:`~dida.sync.read.ViewRow`（id / 名字 / 成员
-    id），要按它的条件推日期就得再从本地库那份定义接一条线（#36 的接缝）。今天的选择是
-    只认「今天」这个内置视图，换句话说：**在内置「今天」里建会自动带上今天，在自建视图里建
-    不带日期**。要改这条边界，先决定「自建视图的条件算不算隐含」，再把定义接过来。
+    ``row`` 是 ``None``（容器认不出来）或者这一行没有定义时都不隐含：不知道就什么都不带。
     """
-    definition = next(
-        (item for item in builtin_view_definitions() if item.id == container_id), None
-    )
-    if definition is None:
+    if row is None or row.definition is None:
         return None
-    return implied_due_for(definition, now=now, day_end=day_end)
+    return implied_due_for(row.definition, now=now, day_end=day_end)
 
 
 def task_detail(
@@ -536,6 +540,7 @@ def builtin_view_rows(
                 for item in evaluate_view(definition, tasks, now=now, day_end=day_end)
             ),
             builtin=True,
+            definition=definition,
         )
         for definition in builtin_view_definitions()
     )
@@ -564,6 +569,7 @@ def custom_view_rows(
                 for item in evaluate_view(definition, tasks, now=now, day_end=day_end)
             ),
             builtin=False,
+            definition=definition,
         )
         for definition in definitions
     )
@@ -578,20 +584,28 @@ def _unfinished_counts(tasks: Sequence[TaskSnapshot]) -> dict[str, int]:
     return counts
 
 
-def _view_members(
+def _view_row_for(
     view_id: str,
     tasks: Sequence[TaskSnapshot],
     *,
     now: datetime,
     day_end: str,
     views: Sequence[ViewRow],
-) -> list[TaskSnapshot]:
-    """视图的成员：求值结果给的那些任务 id，**按求值给的顺序**（已经不在缓存里的 id 跳过）。
+) -> ViewRow | None:
+    """这个容器是哪一个视图行（内置那三行 + 本地库那几行里找）；认不出来就是 ``None``。
 
-    顺序是承重的：视图的排序（逾期置顶）由求值决定，这里再排一遍就把它盖掉了。
+    行上带着它的**定义**（:attr:`ViewRow.definition`），所以调用方读到的成员与隐含日期都
+    出自同一份条件——成员走 :func:`_members_of`，隐含日期走 :func:`_implied_due`。
     """
     rows = builtin_view_rows(tasks, now=now, day_end=day_end) + tuple(views)
-    row = next((item for item in rows if item.id == view_id), None)
+    return next((item for item in rows if item.id == view_id), None)
+
+
+def _members_of(row: ViewRow | None, tasks: Sequence[TaskSnapshot]) -> list[TaskSnapshot]:
+    """这一行的成员：求值结果给的那些任务 id，**按求值给的顺序**（已经不在缓存里的 id 跳过）。
+
+    顺序是承重的：视图的排序（逾期置顶、已完成沉底）由求值决定，这里再排一遍就把它盖掉了。
+    """
     if row is None:
         return []
     by_id = {snapshot.id: snapshot for snapshot in tasks}
