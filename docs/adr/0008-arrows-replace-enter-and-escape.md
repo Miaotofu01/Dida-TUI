@@ -18,6 +18,17 @@ v2 的键位一直是「`enter` 向下、`esc` 向上」（[ADR-0004](0004-termi
 
 - **代价**：想放弃一段刚打的字，只能自己改回去。
 - **缓解是真的**：写操作只写变化的（ADR-0001 的本地比对），没动过的字段不会产生一次写；新建表单有「没写标题」的守卫（`tui/messages.py:35` 的 `NO_TITLE_MESSAGE`，用在 `tui/app.py:664`）。所以误按 `esc` 落地的大多是一次空写而不是一次坏写。
+
+  > **事后更正（#66 落地后）**：上面那句「没动过的字段不会产生一次写」在写下来的时候**不是真的**
+  > ——至少在两张**改**表单（改清单 / 改视图）上不是。`esc` 保存时表单把整份值原样交回去，而
+  > `update_list` / `update_view` 拿起来就写，不比当前值。实测（integration 工作树，清单列表页，
+  > `e` → `esc`，一个字段都没动）：`updated_lists == [("work", "工作", None)]`——一次真的入队
+  > 加一轮推送；视图那一半是同一天发生在本地库上的一次重写。**#66 补上了这一层判断之后它才是
+  > 真的**：判据只有一份（`sync/lists.py` 的 `is_list_edit` 与 `sync/views.py` 的 `is_view_edit`），
+  > 引擎与界面两个时刻各问一次（与 `is_a_move` 同一个形状）。随之作废的还有上面最后那半句：
+  > 没动过的表单现在落地的不是「一次空写」，而是**什么都不落**。详细页内联编辑器
+  > （`DetailPage._finish_edit` 里的同值收敛）与三个挑选器（`app._apply_pick`）当时就是真的，
+  > 不在这次更正的范围里。
 - **会红的测试有六条**，名字全是「escape cancels … without writing anything」：`tests/test_list_overlay.py:134`、`tests/test_create_task.py:183`、`tests/test_picker_fields.py:395` 与 `:642`、`tests/test_view_overlay.py:151` 与 `:309`。
 - 文本框里 `enter` **保留**为同一个结果（`Input` 原生把它绑给 `submit`，`FormOverlay.on_input_submitted` 收的正是它）：两个键同一个结果，不去改输入框。
 

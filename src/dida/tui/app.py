@@ -50,6 +50,8 @@ from dida.sync.engine import (
     ViewDefinition,
     ViewFormProblem,
     is_a_move,
+    is_list_edit,
+    is_view_edit,
     parse_view_form,
 )
 from dida.tui import messages, theme
@@ -1028,6 +1030,12 @@ class DidaApp(App[None]):
 
         颜色是空串就**不发** ``color`` 字段（那是「默认」，不是「清空」）；名字空着则
         什么都不做，只如实说一句。
+
+        改的那一路先问 :func:`dida.sync.engine.is_list_edit`：交回来的那一份与本地那一行
+        **逐字段相同**就不是一次改动，引擎一个字都不用写（#66 的验收标准 3 / 用户故事 134）。
+        ``esc`` 从 #66 起是「保存并退出」，所以「开了表单又没改」这条路真的会走到。判据只有
+        引擎那一份，这里问的是**同一个**函数——与 :meth:`_apply_pick` 问 ``is_a_move``
+        同一个形状（接缝一上的假后端自己实现写路径，界不问就会为一次没发生的改动记下一笔）。
         """
         if values is None:
             return
@@ -1042,6 +1050,14 @@ class DidaApp(App[None]):
             if editing is None:
                 self.engine.create_list(name, color=color)
             else:
+                row = self.index_page().row(editing)
+                if row is not None and not is_list_edit(
+                    current_name=row.name,
+                    current_color=row.color,
+                    name=name,
+                    color=color,
+                ):
+                    return
                 self.engine.update_list(editing, name=name, color=color)
         except DidaError as exc:
             self._write_status(messages.list_write_failed_message(exc))
@@ -1053,6 +1069,11 @@ class DidaApp(App[None]):
 
         读不成定义时（认不出的清单名、永远筛不出任务的组合）**不保存**，把理由写进状态栏
         并把用户填的那一份原样还回表单里——七个格子重填一遍是这一屏最不该有的惩罚。
+
+        改的那一路先问 :func:`dida.sync.engine.is_view_edit`：读出来的定义与本地那一行
+        **逐字段相同**就不是一次改动，本地那一行不重写（#66 的验收标准 3）。判据只有引擎那
+        一份，这里问的是**同一个**函数——与清单那条、以及 :meth:`_apply_pick` 问
+        ``is_a_move`` 同一个形状。
         """
         if values is None:
             return
@@ -1072,6 +1093,9 @@ class DidaApp(App[None]):
             if editing is None:
                 self.engine.create_view(parsed)
             else:
+                current = self.engine.view_definition(editing)
+                if current is not None and not is_view_edit(current, parsed):
+                    return
                 self.engine.update_view(parsed)
         except DidaError as exc:
             self._write_status(messages.view_write_failed_message(exc))

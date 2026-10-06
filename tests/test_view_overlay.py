@@ -375,6 +375,30 @@ async def test_e_opens_the_conditions_prefilled_and_the_change_takes_effect_at_o
     assert "整理桌面" in inside, "中优先级的那条现在也在里面了"
 
 
+async def test_esc_on_an_untouched_view_form_writes_nothing():
+    """没动过的条件不产生一次写（#66 的验收标准 3 / 用户故事 134）。
+
+    ``esc`` 从 #66 起是「保存并退出」，于是「开了表单、什么都没改就退出」这条路变成可达的。
+    视图只在本地（ADR-0005：API 没有「保存一组过滤条件」这个接口），所以这一次「写」不是
+    一次 API 调用，而是本地库那一行的覆盖式重写——它仍然是一次写，不该为一次没发生的改动
+    发生（与清单那条同一条规矩，判据同样只有一份）。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        name = await new_high_priority_view(pilot, app)
+
+        await move_cursor_to(pilot, app.index_page(), name)
+        await pilot.press("e")
+        await pilot.pause()
+        await pilot.press("escape")  # 什么都没动
+        await pilot.pause()
+
+    assert fake.updated_views == [], f"没动过却写了一笔：{fake.updated_views}"
+
+
 # ------------------------------------------------------------------ d：删视图（一次 y/n）
 
 

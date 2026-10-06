@@ -96,6 +96,7 @@ __all__ = [
     "ProjectWriter",
     "UnknownListError",
     "is_addressable",
+    "is_list_edit",
     "is_local_list_id",
 ]
 
@@ -261,6 +262,38 @@ def is_addressable(change: PendingListChange) -> bool:
     return not wire.addresses_an_id or not is_local_list_id(change.list_id)
 
 
+def is_list_edit(
+    *,
+    current_name: object,
+    current_color: object,
+    name: str | None = None,
+    color: str | None = None,
+) -> bool:
+    """这次改清单与**本地那一份**比，是不是一次真改动——**判据只此一处**（工单 #66）。
+
+    没给的字段（``None``）不算改动：``update_list`` 的合同就是「``None`` = 别动这一格」
+    （``color=None`` 是「别动颜色」，不是「清空颜色」）。给了的字段与当前值相同也不算——
+    一次「保存」把原样交回来的那份写下去，与它根本不该发生是同一条。
+
+    **两个时刻各问一次**，与 :func:`dida.sync.writes.is_a_move` 同一个形状：
+
+    - 引擎在 :meth:`ListMixin.update_list` 里问它，决定**写不写**（不入队、不排推送）。这条
+      判断长在引擎这一层，是因为 ``update_list`` 是公开的写入口——谁都可能调它。
+    - 界面在 :meth:`~dida.tui.app.DidaApp._finish_list_form` 里问它，决定**叫不叫**引擎写。
+      那一问不是多余：接缝一上的假后端自己实现写路径（与 ``FakeBackend.move_task`` 同一条），
+      界面不问就会为一次没发生的改动记下一笔（``tests/test_list_overlay.py`` 钉着那句
+      「一笔都没有」）。
+
+    参数是**两个当前值**而不是一份本地原文：两个调用方手里各是一份形状不同的底稿（引擎是
+    ``list_payload`` 那份词典、界面是清单索引里那一行 ``ListRow``），而这条判据只该认值。
+    """
+    if name is not None and name != current_name:
+        return True
+    if color is not None and color != current_color:
+        return True
+    return False
+
+
 class AmbiguousLocalListError(DidaError):
     """一个本地临时 id 上那几条记录说的**不是同一条清单**（#57）。
 
@@ -400,11 +433,23 @@ class ListMixin:
         没给的字段**不动**（``color=None`` 是「别动颜色」，不是「清空颜色」）：请求体里
         只有这次真的要改的那些，其余的由客户端在推送时从本地原文里 echo 回去
         （``sortOrder`` 尤其要紧——文档写着 "default 0"，省略它可能把清单顺序重置）。
+
+        给的字段**都与本地那一份相同**时什么都不写（#66 的验收标准 3，判据在
+        :func:`is_list_edit`）：不入队、不排推送。``esc`` 从 #66 起是「保存并退出」，
+        所以「开了表单又没改」这条路真的会走到——写一笔没发生的改动不是「多带了一笔」，
+        它会让状态栏那个「待推送」为一个空操作亮着。
         """
         target = self._list_target()
         current = target.list_payload(list_id)
         if current is None:
             raise UnknownListError(list_id)
+        if not is_list_edit(
+            current_name=current.get("name"),
+            current_color=current.get("color"),
+            name=name,
+            color=color,
+        ):
+            return
         changes: dict[str, Any] = {}
         if name is not None:
             changes["name"] = name

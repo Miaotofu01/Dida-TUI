@@ -217,6 +217,36 @@ async def test_a_rename_shows_at_once_and_echoes_the_sort_order_back(store):
     assert engine.status().pending_count == 0
 
 
+async def test_a_rename_to_the_same_values_writes_nothing_but_a_real_one_pushes_once(store):
+    """没动过的字段不产生一次写，也不排一轮推送（#66 的验收标准 3 / 用户故事 134）。
+
+    界面那一半在 ``tests/test_list_overlay.py``（它决定「叫不叫」引擎写）；这一半是引擎自己
+    ——``update_list`` 是公开的写入口，谁都可能调它。断的是外部行为：队列里没多出一笔，
+    服务端一个请求都没收到。``esc`` 从 #66 起是「保存并退出」，所以这条路真的会走到。
+
+    真的改了名字就照旧正好一次——这条同时钉住收敛没有把真改动一起挡掉。
+    """
+    transport = FakeTransport(json={"id": "p1", "name": "购物", "color": "#F18181"})
+    engine = make_engine(store, transport)
+    engine.create_list("购物", color="#F18181")
+    await engine.wait_for_pushes()
+    after_create = len(transport.requests)
+
+    engine.update_list("p1", name="购物")  # 只给名字，且与原值相同
+    engine.update_list("p1", name="购物", color="#F18181")  # 两格都原样交回来
+    await engine.wait_for_pushes()
+
+    assert engine.status().pending_count == 0, "没改就不该有「待推送」"
+    assert len(transport.requests) == after_create, "没改却打了一次服务端"
+    assert "购物" in names_of(engine), "本地那一行照旧"
+
+    engine.update_list("p1", name="买买买", color="#F18181")
+    await engine.wait_for_pushes()
+
+    assert len(transport.requests) == after_create + 1, "真改了就正好一次"
+    assert transport.last_json["name"] == "买买买"
+
+
 async def test_a_rename_that_cannot_be_pushed_stays_queued_and_is_retried(store):
     """推不动就进重试队列（验收标准 6）：本地那一份照旧生效，到点了再推一次。"""
     clock = ManualClock(T0)

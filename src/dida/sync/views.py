@@ -86,6 +86,7 @@ __all__ = [
     "due_window_of",
     "evaluate_view",
     "implied_due_for",
+    "is_view_edit",
     "order_key",
     "parse_view_form",
     "view_form_values",
@@ -759,6 +760,27 @@ class ViewStore(Protocol):
         ...
 
 
+def is_view_edit(current: ViewDefinition, definition: ViewDefinition) -> bool:
+    """这份表单交回来的定义与本地那一行比，是不是一次真改动——**判据只此一处**（工单 #66）。
+
+    比的是**整份定义的值**：:class:`ViewDefinition` 是 frozen dataclass，逐字段相等，所以六个
+    维度一维都不用在这里重数一遍。在界面那一侧逐格重比一份是不行的——加一维（#36 就是这么
+    加的）就会漏掉一处，而漏掉的那一处正是「改了那一维却不写」。
+
+    **两个时刻各问一次**，与 :func:`dida.sync.lists.is_list_edit` / ``is_a_move`` 同一个形状：
+
+    - 引擎在 :meth:`ViewMixin.update_view` 里问它，决定**写不写**（本地那一行不重写）。
+    - 界面在 :meth:`~dida.tui.app.DidaApp._finish_view_form` 里问**同一个**函数，决定**叫不叫**
+      引擎写。那一问不是多余：接缝一上的假后端自己实现视图写路径（``FakeBackend.update_view``
+      记一笔再交给真引擎），界面不问就会为一次没发生的改动记下一笔
+      （``tests/test_view_overlay.py`` 钉着那句「一笔都没有」）。
+
+    本地没有那一行时**不归它管**：那是 :meth:`ViewMixin.update_view` 的 ``UnknownViewError``
+    ——「不存在」与「没改」是两件事，混成一个判断会让前者静默变成后者。
+    """
+    return current != definition
+
+
 class ViewMixin:
     """自定义视图的建 / 改 / 删：**只写本地库**，一条改动都不入队（工单 #36）。
 
@@ -783,10 +805,19 @@ class ViewMixin:
         return view_id
 
     def update_view(self, definition: ViewDefinition) -> None:
-        """改一个视图的条件与名字：那一行原地换掉（位置不动，建完再改不会跳到末尾）。"""
+        """改一个视图的条件与名字：那一行原地换掉（位置不动，建完再改不会跳到末尾）。
+
+        交回来的那份与本地那一行**逐字段相同**时什么都不写（#66 的验收标准 3 / 用户故事 134）
+        ——判据在 :func:`is_view_edit`，这里不另写一遍。``esc`` 从 #66 起是「保存并退出」，
+        所以「开了表单又没改」这条路真的会走到；为一次没发生的改动重写本地那一行，就是
+        「一次写」发生了。
+        """
         target = self._view_target()
-        if target.view_definition(definition.id) is None:
+        current = target.view_definition(definition.id)
+        if current is None:
             raise UnknownViewError(definition.id)
+        if not is_view_edit(current, definition):
+            return
         target.save_view(definition)
 
     def delete_view(self, view_id: str) -> None:

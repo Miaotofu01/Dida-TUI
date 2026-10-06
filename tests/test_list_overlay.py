@@ -310,6 +310,10 @@ async def test_the_colour_of_a_list_stays_when_only_the_name_changes():
 
     手机端挑的颜色客户端不认识（文档只有 ``#F18181`` 一个样例）；改个名字顺手把它换成
     别的颜色，与「改名把清单顺序重置成 0」是同一类静默破坏。
+
+    名字那一格打开时是全选的，所以直接打就是整个换掉——这条**真的**改一次名字（它一直
+    这么写着，但从 #42 起落到屏幕上的那一下其实是「什么都没改就确认」；#66 让「没改就不
+    写」成为规矩之后，那一下不再产生一笔，这条测试于是补上它名字里说的那次改名）。
     """
     fake = backend()
     fake.add_list("海外", id="abroad", color="#123456")
@@ -321,11 +325,50 @@ async def test_the_colour_of_a_list_stays_when_only_the_name_changes():
         await pilot.press("e")
         await pilot.pause()
         shown = field_value(screen_text(app), "颜色")
+        await pilot.press(*"haiwai")  # 全选着，直接打就是整个换掉名字
         await pilot.press("enter")
         await pilot.pause()
 
     assert shown == "< #123456 >", "认不出来的颜色自成一档，原样显示"
-    assert fake.updated_lists == [("abroad", "海外", "#123456")], "原样回写"
+    assert fake.updated_lists == [("abroad", "haiwai", "#123456")], "改了名字，颜色原样回写"
+
+
+async def test_esc_on_an_untouched_list_form_writes_nothing_but_a_real_rename_writes_once():
+    """没动过的字段不产生一次写（#66 的验收标准 3 / 用户故事 134）。
+
+    ``esc`` 从 #66 起是「保存并退出」，于是「开了表单、什么都没改就退出」这条路变成可达的；
+    在那之前它是「取消」，一笔都不写。表单交回来的那一份与本地那一行**逐字段相同**时不算
+    一次改动：写一笔没发生的改动会进待推送队列，离线时状态栏那个数就为一个空操作亮着
+    （与 ``tests/test_picker_fields.py`` 钉着的「挑回原来那一档不写一笔」同一条规矩）。
+
+    带颜色的清单也走一遍：表单把当前颜色**原样**填回来，而「原样交回去」同样不是一次改动。
+
+    真的改了名字就照旧正好一笔——这一条同时钉住那条收敛没有把真改动一起挡掉。
+    """
+    fake = backend()
+    fake.add_list("海外", id="abroad", color="#123456")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        for row_id in ("work", "abroad"):
+            await move_cursor_to(pilot, app.index_page(), row_id)
+            await pilot.press("e")
+            await pilot.pause()
+            await pilot.press("escape")  # 什么都没动
+            await pilot.pause()
+        assert fake.updated_lists == [], f"没动过却写了一笔：{fake.updated_lists}"
+
+        await move_cursor_to(pilot, app.index_page(), "work")
+        await pilot.press("e")
+        await pilot.pause()
+        await pilot.press(*"renamed")
+        await pilot.press("escape")
+        await pilot.pause()
+
+    assert fake.updated_lists == [("work", "renamed", None)], (
+        f"真改了就正好一笔（一次没动的那种不该在里面）：{fake.updated_lists}"
+    )
 
 
 # ------------------------------------------------------------------ d：删清单

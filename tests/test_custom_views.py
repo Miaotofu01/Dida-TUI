@@ -481,6 +481,36 @@ def make_engine(store, *, now: datetime = T0, day_end: str = "24:00") -> SyncEng
     return SyncEngine(clock=ManualClock(now), day_end=day_end, source=store)
 
 
+class CountingViewWrites:
+    """把 ``save_view`` 数一笔的本地副本（包着真 ``Store``）。
+
+    「引擎有没有写那一行」在真存储上**看不出来**：对同一份定义再写一次，行、位置、JSON 都
+    一模一样（``Store.save_view`` 是 ``INSERT OR REPLACE``）。所以这个观察只能落在一个数着
+    调用的副本上——它只实现视图那一侧的五个方法，正好是 ``ViewStore`` 的公开面。
+    """
+
+    def __init__(self, inner: Store) -> None:
+        self._inner = inner
+        self.saves = 0
+        """``save_view`` 被调用了几次。"""
+
+    def view_definitions(self) -> tuple[ViewDefinition, ...]:
+        return self._inner.view_definitions()
+
+    def view_definition(self, view_id: str) -> ViewDefinition | None:
+        return self._inner.view_definition(view_id)
+
+    def save_view(self, definition: ViewDefinition) -> None:
+        self.saves += 1
+        self._inner.save_view(definition)
+
+    def drop_view(self, view_id: str) -> None:
+        self._inner.drop_view(view_id)
+
+    def new_view_id(self) -> str:
+        return self._inner.new_view_id()
+
+
 def seed(store) -> None:
     """一份够用的缓存：两个清单、四条任务（高 / 中 / 已完成 / 没日期）。"""
     store.apply_refresh(
@@ -605,6 +635,29 @@ def test_editing_a_view_keeps_its_place_in_the_index(store):
 
     assert [item.name for item in store.view_definitions()] == ["改过的", "第二个"]
     assert [row.id for row in engine.list_index()][4:6] == [first, second]
+
+
+def test_updating_a_view_to_what_it_already_is_skips_the_local_write(store):
+    """没动过的条件不产生一次写（#66 的验收标准 3 / 用户故事 134）——引擎那一半。
+
+    界面那一半在 ``tests/test_view_overlay.py``（它决定「叫不叫」引擎写）；``update_view`` 是
+    公开的写入口，谁都可能调它，所以引擎自己也要挡。断的是外部行为：注入的那个本地副本一次
+    都没被写。真的改了名字就照旧正好一次——收敛不许把真改动一起挡掉。
+    """
+    writes = CountingViewWrites(store)
+    engine = make_engine(writes)
+    view_id = engine.create_view(ViewDefinition(id="", name="高优先级未完成", priorities=(5,)))
+    after_create = writes.saves
+
+    engine.update_view(engine.view_definition(view_id))  # 逐字段相同
+
+    assert writes.saves == after_create, "没动过却重写了本地那一行"
+    assert engine.view_definition(view_id).name == "高优先级未完成"
+
+    engine.update_view(replace(engine.view_definition(view_id), name="改过的"))
+
+    assert writes.saves == after_create + 1, "真改了就正好写一次"
+    assert engine.view_definition(view_id).name == "改过的"
 
 
 def test_editing_a_view_that_is_no_longer_there_is_refused(store):

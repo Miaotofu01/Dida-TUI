@@ -83,6 +83,7 @@ from dida.sync.lists import (
     ListWriteTarget,
     ProjectWriter,
     UnknownListError,
+    is_list_edit,
 )
 from dida.sync.priority import PriorityMixin
 from dida.sync.push import PushMixin, TaskWriter, backoff_delay
@@ -167,6 +168,7 @@ from dida.sync.views import (
     due_window_of,
     evaluate_view,
     implied_due_for,
+    is_view_edit,
     order_key,
     parse_view_form,
     view_form_values,
@@ -255,8 +257,10 @@ __all__ = [
     "implied_due_for",
     "is_a_move",
     "is_inbox_id",
+    "is_list_edit",
     "is_local_id",
     "is_local_list_id",
+    "is_view_edit",
     "list_index",
     "logical_day",
     "next_priority",
