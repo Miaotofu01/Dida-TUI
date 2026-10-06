@@ -424,7 +424,6 @@ def project_in(payload: object) -> str | None:
     :mod:`dida.sync.push` 里逐字又写了一份——``push`` 本来就 import 这一层，所以那第二份
     是纯粹的重复，而重复是会漂的：一边改了形状、另一边没改，只有真走到那条路才炸。
     """
-
     if not isinstance(payload, Mapping):
         return None
     named = payload.get("projectId")
