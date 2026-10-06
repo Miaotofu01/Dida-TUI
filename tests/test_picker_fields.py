@@ -392,10 +392,12 @@ async def test_the_inbox_is_offered_as_a_move_target_too():
     assert "收集箱" in field_row(after, "清单"), f"搬完那一格没变：\n{after}"
 
 
-async def test_escape_closes_the_picker_without_writing_anything():
-    """``esc`` 关掉挑选浮层：一个字节都不写（与表单那条规矩同一条）。
+async def test_escape_saves_the_picked_list_just_like_enter():
+    """``esc`` 在挑选浮层里也是**保存**：挑中的那个清单当场搬过去（#66 / ADR-0008 二）。
 
-    出口必须是 ``Esc``：这一层没有文本框，``q`` 在表单里本来就不绑（#42 的决定，继承不重定）。
+    这一层没有文本框，``q`` 在表单里本来就不绑（#42 的决定，继承不重定），出口只有 ``Esc``
+    与 ``Ctrl+C``——``Esc`` 现在与 ``Enter`` 落到同一个确认上，交回的是挑中的那一档。写出去
+    的仍然是**搬运**（``moved``），不是一次普通字段更新（``writes``）。
     """
     fake = backend()
     app = DidaApp(fake)
@@ -406,14 +408,15 @@ async def test_escape_closes_the_picker_without_writing_anything():
         await walk_to(pilot, app, "list")
         await pilot.press("enter")
         await pilot.pause()
-        await pilot.press("right")
+        await pilot.press("right")  # 工作 → 生活
         await pilot.press("escape")
         await pilot.pause()
         text = screen_text(app)
 
-    assert fake.moved == [] and fake.writes == [], "取消不该写任何东西"
+    assert fake.moved == [("t1", "life")], "Esc 交回挑中的那一档，任务真的搬过去"
+    assert fake.writes == [], "搬运不是一次普通字段更新"
     assert "搬到哪个清单" not in text, f"浮层没有关掉：\n{text}"
-    assert field_row(text, "清单").startswith(theme.CURSOR_MARK), f"没有回到字段列表：\n{text}"
+    assert "生活" in field_row(text, "清单"), f"搬完那一格没跟着变：\n{text}"
 
 
 def picked_option(text: str) -> str:
@@ -639,13 +642,14 @@ async def test_a_picker_with_no_tags_at_all_still_opens_and_says_where_to_make_o
     assert "这个客户端不做新建标签" in picker, f"没说清要去哪儿建：\n{picker}"
 
 
-async def test_escape_closes_the_tag_picker_while_the_multi_select_has_focus():
-    """``Esc`` 是出口，而且**焦点在多选那一格上时也到得了**（#42 那条规矩的落点）。
+async def test_escape_saves_the_tag_picker_while_the_multi_select_has_focus():
+    """``Esc`` 在多选那一格上也是**保存**，焦点在它身上时照样到得了（#66 / ADR-0008 二）。
 
-    这一层没有文本框，``q`` 在表单里本来就不绑（字母归输入框，继承不重定）——所以出口只有
+    这一层没有文本框，``q`` 在表单里本来就不绑（字母归输入框，继承不重定）——出口只有
     ``Esc`` 与 ``Ctrl+C``。键必须绑在**浮层**上：浮层开着时 app 的绑定够不着（#47 实测）。
+    存下去的是**只动过的那一格**：这一笔里没有别的字段，任务上两个标签去掉了一个。
     """
-    fake = backend()
+    fake = backend()  # 任务上已经打着 工作 / 季度
     fake.set_tags("工作", "季度")
     app = DidaApp(fake)
 
@@ -655,15 +659,19 @@ async def test_escape_closes_the_tag_picker_while_the_multi_select_has_focus():
         await walk_to(pilot, app, "tags")
         await pilot.press("enter")
         await pilot.pause()
+        opened = screen_text(app)
         focused = app.focused
-        await pilot.press("space")
+        await pilot.press("space")  # 光标停在第一档「工作」上，把它取消
         await pilot.press("escape")
         await pilot.pause()
         text = screen_text(app)
 
     assert focused is not None and focused.id == "field-tags", "焦点不在多选那一格上"
-    assert fake.writes == [], "取消不该写任何东西"
-    assert field_row(text, "标签").startswith(theme.CURSOR_MARK), f"没有回到字段列表：\n{text}"
+    assert "Enter 或 Esc 保存" in opened, f"底部那行提示说的是新语义：\n{opened}"
+    assert fake.writes == [("t1", {"tags": ["季度"]})], (
+        f"Esc 交回打上的那几个标签，而且只写标签这一格：{fake.writes}"
+    )
+    assert "季度" in field_row(text, "标签"), f"回到字段列表，那一格跟着变了：\n{text}"
 
 
 async def test_ctrl_c_still_quits_from_the_multi_select():
