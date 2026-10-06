@@ -196,7 +196,11 @@ def test_the_window_cutoff_is_a_pure_function_of_now_and_the_hours():
 
 
 def test_the_completed_section_keeps_only_the_last_seven_days():
-    """更早完成的不占屏幕（用户故事：已完成只显示最近 7 天）。"""
+    """更早完成的不占屏幕（用户故事：已完成只显示最近 7 天）。
+
+    这里只问**留下了哪些**——顺序自 #64 起是正常排序键的事，由
+    :func:`test_the_completed_section_sorts_by_the_normal_key_not_by_completion_time` 单独钉。
+    """
     section = completed_section(
         [
             snapshot("t1", "六天前做完的", completed_at=T0 - timedelta(days=6)),
@@ -209,7 +213,47 @@ def test_the_completed_section_keeps_only_the_last_seven_days():
         window_hours=168,
     )
 
-    assert [item.title for item in section.items] == ["刚刚做完的", "六天前做完的"]
+    assert {item.title for item in section.items} == {"刚刚做完的", "六天前做完的"}
+
+
+def completed_row(
+    id: str,
+    title: str,
+    *,
+    completed_at: datetime,
+    due: datetime | None = None,
+    priority: int = 0,
+) -> TaskSnapshot:
+    """已完成区排序用的一条快照：完成时刻、截止时间、优先级各摆各的。"""
+    return TaskSnapshot(
+        id=id,
+        title=title,
+        list_id="work",
+        due=due,
+        priority=priority,
+        completed=True,
+        completed_at=completed_at,
+    )
+
+
+def test_the_completed_section_sorts_by_the_normal_key_not_by_completion_time():
+    """已完成段按正常排序键排（工单 #64 验收标准 1）：截止时间升序，**不再**按完成时刻倒序。
+
+    甲 是刚做完的那条、乙 更早完成——按完成时刻倒序会排成 甲/乙（旧行为）。乙 的截止
+    （03-16）比 甲（03-20）早，按正常排序键应排成 乙/甲。
+    """
+    section = completed_section(
+        [
+            completed_row("t1", "甲", completed_at=at(14, 14, 0), due=at(20, 9, 0)),
+            completed_row("t2", "乙", completed_at=at(14, 13, 0), due=at(16, 9, 0)),
+        ],
+        [ListSnapshot(id="work", name="工作")],
+        now=T0,
+        day_end="24:00",
+        window_hours=168,
+    )
+
+    assert [item.title for item in section.items] == ["乙", "甲"]
 
 
 # ------------------------------------------------------------------ 已完成流：按状态过滤
