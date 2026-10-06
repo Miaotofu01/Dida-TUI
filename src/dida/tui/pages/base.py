@@ -134,6 +134,29 @@ class CursorPage(VerticalScroll):
         callable``——报错点在 Textual 的 widget.py 里，离现场很远。
         """
 
+    def allow_focus(self) -> bool:
+        """**只有当前那一层**的这一页可以被聚焦（工单 #60）。
+
+        三层并排停在 :class:`~dida.tui.app.Stage` 上，只有当前那一层在可见区内——另外两层在
+        屏外，可它们照样「可聚焦」（Textual 的 ``visible`` 说的是 CSS 可见，不是「在这一屏
+        里」）。于是 ``tab`` / ``shift+tab``（``Screen.BINDINGS`` 的 ``focus_next`` /
+        ``focus_previous``）按**控件树**把焦点交给一个用户看不见的页面：屏幕纹丝不动，接下来
+        按的键却全落在别处——与 #59 的 ``home`` 同一类，**屏幕和状态对不上**。
+
+        这里盖的是 Textual **文档上说可以盖**的那个钩子（``Widget.allow_focus``：「may be
+        overridden if additional logic is required」），也正是 ``Screen.focus_chain`` 逐个
+        问的那一句。所以挡住的不是 ``tab`` 这一个键，而是**「屏外的页面能不能拿到焦点」这件
+        事**：``shift+tab``、程序化的 ``focus_next``、``set_focus`` 全都问同一句，将来多出
+        别的聚焦入口也一样。（在页面上解绑 ``tab`` 只堵一个键：``shift+tab`` 立刻漏，而且
+        页面上那条绑定会连它的**子控件**一起挡住——详细页的编辑器亮出来时那几格是在屏上的，
+        本来就该能 tab 进去。）
+
+        答案**现算**、不靠换层时设下的一个标志位：谁问都是当下这一层的答案，不会因为某条
+        路径忘了更新那个标志而变旧。``getattr`` 是给「不在 :class:`DidaApp` 里的裸页面」
+        留的退路（没有「当前是哪一层」这件事，就照旧可聚焦）。
+        """
+        return self.can_focus and self.id == getattr(self.app, "layer", self.id)
+
     def compose(self) -> ComposeResult:
         # 一页只有两块：正文（重画就是换它）与那条装饰光标条。都给 id，好让后来加的控件
         # 不与它们混淆。

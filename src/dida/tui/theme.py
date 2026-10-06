@@ -483,10 +483,23 @@ Screen {
     width: 100%;
     background: {page};
 }
+/* 平移轨道：三页并排停在这里，换层是**程序**把它横向滚过一整屏（Stage.show / on_resize，
+   它们走 scroll_to(force=True)）。
+
+   overflow-x 是 **hidden 而不是 scroll**，这一条是承重的（工单 #59）：这一格只要可滚，
+   Textual 的每一个用户滚动入口就都活着——滚动键（← / → / home / end / ctrl+pageup…）、
+   滚轮（shift / ctrl / 横向倾斜）、以及聚焦时「把控件滚进可见区」那一下（tab 会把别层的
+   页面直接拖到眼前，而 app 还认为你在原来那一层）。实测：三条路每一种都推得动它，而那正是
+   用户报的「按 ← / → 会穿帮」——页面挪一格、通栏细线少一格。
+
+   hidden 之后 allow_horizontal_scroll 为假，上面那些入口在 Textual 自己那一层就不成立了
+   （action 直接 SkipAction、滚轮处理器连条件都不进、scroll_to_region 把 x 抹掉），所以挡住
+   的不是「我们记住的那几个键」，而是**这一轴上的全部用户输入**；将来 Textual 再长出一个
+   滚动入口也一并挡着。app 自己照旧滑：scroll_to(force=True) 是绕过这个闸的正当口子。 */
 #stage {
     height: 1fr;
     width: 100%;
-    overflow-x: scroll;
+    overflow-x: hidden;
     overflow-y: hidden;
     scrollbar-size-horizontal: 0;
     scrollbar-size-vertical: 0;
