@@ -545,3 +545,36 @@ def test_no_two_modules_define_the_same_function_body():
         "同名的函数体在两个模块里各有一份——让其中一个 import 另一个，别再抄一遍：\n"
         + "\n".join(offenders)
     )
+
+
+def _equality_with_attribute(source: str, attribute: str) -> list[int]:
+    """源码里 ``… .attribute == …`` 这种**相等比较**的行号。"""
+    found: list[int] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Compare):
+            continue
+        if not any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
+            continue
+        operands = [node.left, *node.comparators]
+        if any(isinstance(item, ast.Attribute) and item.attr == attribute for item in operands):
+            found.append(node.lineno)
+    return found
+
+
+def test_the_same_list_judgement_is_asked_of_the_engine_not_written_twice():
+    """「搬到它已经在的那个清单 = 没改」只实现一次，界面**问引擎**（工单 #58 的 T6）。
+
+    判据本体是 :func:`dida.sync.writes.is_a_move`，两个时刻各问一次（与
+    ``is_addressable_task`` 同一个形状）：引擎在 ``move_task`` 里问它决定**写不写**，
+    界面在 ``_apply_pick`` 里问它决定**推不推**。
+
+    界面那一问非有不可：``move_task`` 回不了话（它的签名是 ``-> None``），不问就会为一次
+    根本没发生的改动推一轮——``tests/test_picker_fields.py`` 钉着那句 ``pushes == 0``。
+    但**判据**只有一处，所以这里扫两件事：界面确实问了引擎，而且没有自己再比一遍。
+    """
+    source = (ROOT / "src" / "dida" / "tui" / "app.py").read_text(encoding="utf-8")
+
+    assert "is_a_move(" in source, "界面没有问引擎那条判据：它是不是又自己比了一遍？"
+    assert _equality_with_attribute(source, "list_id") == [], (
+        "界面自己判了「同一个清单」——这条判断归引擎（dida.sync.writes.is_a_move）"
+    )

@@ -49,6 +49,7 @@ from dida.sync.engine import (
     UnknownTaskError,
     ViewDefinition,
     ViewFormProblem,
+    is_a_move,
     parse_view_form,
 )
 from dida.tui import messages, theme
@@ -762,9 +763,16 @@ class DidaApp(App[None]):
     def _apply_pick(self, task_id: str, field: str, values: dict[str, str]) -> bool:
         """挑完的那一份怎么变成一次写（三条路各自的形状只在这一个地方）。
 
-        **挑回原来那一档 = 没改**（与逐字段编辑那条规矩同一条）：一笔都不写。写一笔没发生的
-        改动会进待推送队列，离线时状态栏那个数就为一个空操作亮着。清单那一路的「同一个清单」
-        由引擎自己挡（``move_task``），这里挡的是优先级与标签。
+        **挑回原来那一档 = 没改**（与逐字段编辑那条规矩同一条）：一笔都不写，也**不排推送**。
+        写一笔没发生的改动会进待推送队列，离线时状态栏那个数就为一个空操作亮着。
+
+        清单那一路的「同一个清单」**由引擎自己挡**（``move_task`` 里问
+        :func:`dida.sync.writes.is_a_move`）——下面这一行问的是**同一个函数**，不是又写一遍
+        那个比较：判据只有一份，两个时刻各问一次（与 ``is_addressable_task`` 同一个形状）。
+        这里非问不可，是因为 ``move_task`` 回不了话（它的签名是 ``-> None``），不问就会为一次
+        根本没发生的改动推一轮（``tests/test_picker_fields.py`` 钉着那句 ``pushes == 0``）；
+        工单 #58 的 T6 之前，这里确实是自己又比了一遍，而注释还写着「由引擎自己挡」。
+        优先级与标签那两档是**界面自己的**判断：``write()`` 不做同值收敛，所以只有这里能挡。
 
         ``int(...)`` 那一下是**线上编码**：选项的值是 ``0/1/3/5``、标签是用户语言
         （``PRIORITY_NAMES``，唯一一张表——本体的家在 ``dida.sync.view``，经引擎的公开面
@@ -777,7 +785,7 @@ class DidaApp(App[None]):
         if detail is None:
             raise UnknownTaskError(task_id)
         if field == LIST_FIELD:
-            if values[LIST_FIELD] == detail.list_id:
+            if not is_a_move(detail.list_id, values[LIST_FIELD]):
                 return False
             self.engine.move_task(task_id, to_list_id=values[LIST_FIELD])
             return True

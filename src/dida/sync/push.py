@@ -25,6 +25,7 @@ from dida.sync.writes import (
     UnknownTaskError,
     WireCall,
     WriteKind,
+    is_a_move,
     is_addressable,
     is_addressable_task,
     is_local_list_id,
@@ -268,7 +269,10 @@ class PushMixin:
         推送排在事件循环上立刻跑，推不动就留在队列里退避重试——与其余几条写同一条口径。
 
         ``to_list_id`` 与当前清单相同时**什么都不写**：那不是一次改动，凭空入队只会让状态栏
-        多出一个永远没有意义的数。本地没有这条任务的底稿时与 :meth:`write` 一样当场抛
+        多出一个永远没有意义的数。这条判断的**本体在** :func:`~dida.sync.writes.is_a_move`
+        （「目标为空」与「就是它现在待的那个清单」两种都算没改）——界面那一侧问的是同一个
+        函数（工单 #58 的 T6：它以前在这里与 ``app._apply_pick`` 各写了一遍同一个比较）。
+        本地没有这条任务的底稿时与 :meth:`write` 一样当场抛
         :class:`~dida.sync.writes.UnknownTaskError`——``fromProjectId`` 只存在于那份底稿里，
         拼不出请求的改动永远推不出去（工单 #25）。
 
@@ -280,7 +284,7 @@ class PushMixin:
         current = "" if payload is None else str(payload.get("projectId") or "")
         if not current:
             raise UnknownTaskError(task_id)
-        if current == to_list_id or not to_list_id:
+        if not is_a_move(current, to_list_id):
             return
         self.write(task_id, changes={"projectId": to_list_id}, kind=WriteKind.MOVE)
 

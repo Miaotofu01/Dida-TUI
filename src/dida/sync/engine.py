@@ -135,6 +135,7 @@ from dida.sync.writes import (
     WireCall,
     WriteKind,
     WriteTarget,
+    is_a_move,
     is_local_id,
     is_local_list_id,
 )
@@ -260,6 +261,7 @@ __all__ = [
     "fuzzy_match",
     "group_tasks",
     "implied_due_for",
+    "is_a_move",
     "is_inbox_id",
     "is_local_id",
     "is_local_list_id",

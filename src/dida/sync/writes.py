@@ -55,6 +55,7 @@ __all__ = [
     "WireCall",
     "WriteKind",
     "WriteTarget",
+    "is_a_move",
     "is_addressable",
     "is_addressable_task",
     "is_local_id",
@@ -384,6 +385,30 @@ def is_addressable_task(
     if kind.wire is WireCall.CREATE_TASK:
         return True
     return not is_local_id(task_id)
+
+
+def is_a_move(current_list_id: str | None, target_list_id: str | None) -> bool:
+    """这一下「搬到某个清单」算不算一次**真**改动——**判据只此一处**（工单 #58 的 T6）。
+
+    不算的两种：目标是空的（没挑清单，不成一次搬运），或者目标就是它**现在待的那个清单**
+    （那不是一次改动；凭空入队一笔「同一个清单之间搬」只会让状态栏那个数多一个没有意义的
+    数，服务端那边也没人知道该怎么理解它）。
+
+    **两个时刻各问一次**，与 :func:`is_addressable_task` 同一个形状：
+
+    - 引擎在 :meth:`~dida.sync.push.PushMixin.move_task` 里问它，决定**写不写**（一次
+      真改动才乐观落库、才入队、才排推送）。这条判断长在引擎这一层，是因为 ``move_task``
+      是公开的写入口——谁都可能调它。
+    - 界面在 :meth:`~dida.tui.app.DidaApp._apply_pick` 里问它，决定**推不推**。那一问不是
+      多余：``move_task`` 的签名是 ``-> None``，回不了话，界面不问就会为一次根本没发生的
+      改动推一轮（``tests/test_picker_fields.py`` 钉着那句 ``pushes == 0``）。
+
+    以前这两处各写了一遍同一个比较，而界面那处的注释还写着「由引擎自己挡（``move_task``）」
+    ——注释说引擎管、代码下面又自己管了一遍，而且两份会漂。现在实现只有这一份。
+    """
+    if not target_list_id:
+        return False
+    return (current_list_id or "") != target_list_id
 
 
 def project_in(payload: object) -> str | None:
