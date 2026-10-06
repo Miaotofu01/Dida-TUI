@@ -18,7 +18,7 @@
 
 列表页的行**裁断不折行**（:attr:`CursorPage.CLIP_ROWS`，ADR-0007 的「截断与折行按页分工」）：
 一条长标题不会把自己折成两行、把光标标记挤到单独一行去、把滚动的位置算错。所以「第几个
-Row」就是「第几屏行」，滚动与装饰光标条的位置都能直接算出来——**详细页是另一半**（那里
+Row」就是「第几屏行」，滚动的位置也能直接算出来——**详细页是另一半**（那里
 折行，光标与滚动按屏幕行偏移表算），归 #43。
 """
 
@@ -30,8 +30,6 @@ from typing import Sequence
 from rich.text import Text
 from textual.app import ComposeResult
 from textual.containers import VerticalScroll
-from textual.geometry import Offset
-from textual.reactive import reactive
 from textual.widgets import Static
 
 from dida.tui import theme
@@ -116,9 +114,6 @@ class CursorPage(VerticalScroll):
     接手时把这个开关关掉，并把光标与滚动换成屏幕行偏移表。
     """
 
-    bar_pos: reactive[float] = reactive(0.0)
-    """装饰性光标条当前停在第几屏行（滑动期间是小数）。"""
-
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(id=id)
         self._rows: tuple[Row, ...] = ()
@@ -126,13 +121,6 @@ class CursorPage(VerticalScroll):
         """光标在第几个**可停**的行上（不是第几行文本）。"""
         self._selected_id: str | None = None
         """光标那一行的 id；没有可停的行时是 ``None``。"""
-        self._motion = False
-        """要不要画那条会追赶的装饰光标条；由 app 按 ``animations`` 开关设一次。
-
-        ⚠ 名字**不能**是 ``_animate``：``Widget._animate`` 是 Textual 自己那个绑好的
-        animator，盖掉它之后 ``self.animate(...)`` 会抛 ``TypeError: 'bool' object is not
-        callable``——报错点在 Textual 的 widget.py 里，离现场很远。
-        """
 
     def allow_focus(self) -> bool:
         """**只有当前那一层**的这一页可以被聚焦（工单 #60）。
@@ -158,10 +146,8 @@ class CursorPage(VerticalScroll):
         return self.can_focus and self.id == getattr(self.app, "layer", self.id)
 
     def compose(self) -> ComposeResult:
-        # 一页只有两块：正文（重画就是换它）与那条装饰光标条。都给 id，好让后来加的控件
-        # 不与它们混淆。
+        # 一页只有一块：正文（重画就是换它）。给它 id，好让后来加的控件不与它混淆。
         yield Static(theme.styled(self.EMPTY_TEXT, EMPTY_STYLE), id="page-body")
-        yield Static(id="cursor-bar")
 
     # ---------------------------------------------------------------- 数据
 
@@ -172,10 +158,6 @@ class CursorPage(VerticalScroll):
         这是页面给外层的口子：``o`` 要知道当前是哪条任务，``→`` 要知道进哪一个清单。
         """
         return self._selected_id
-
-    def set_animate(self, enabled: bool) -> None:
-        """这一页要不要动（由 app 按 ``auto|on|off`` 开关设一次，见 ADR-0007 三）。"""
-        self._motion = enabled
 
     def set_rows(self, rows: Sequence[Row], *, keep_cursor: bool = True) -> None:
         """换一份行，并按**行 id** 把光标认回原来那一行。
@@ -198,7 +180,6 @@ class CursorPage(VerticalScroll):
             self._cursor = 0
         self._selected_id = selectable[self._cursor] if selectable else None
         self._redraw()
-        self._land_bar()
         self.scroll_cursor_into_view()
 
     # ---------------------------------------------------------------- 光标
@@ -215,24 +196,17 @@ class CursorPage(VerticalScroll):
         selectable = [row.id for row in self._rows if row.id is not None]
         if not selectable:
             return
-        from_line = self._line_of_cursor()
         self._cursor = min(max(self._cursor + step, 0), len(selectable) - 1)
         self._selected_id = selectable[self._cursor]
-        # **选中立刻到位**：这一行以下除了那条装饰条，没有任何东西是延迟的。终端无法在两条
-        # 之间画半格，所以「滑动」只能是一根独立的条子自己追；若让滑动承担选中，那 ~120ms
-        # 里用户看到的位置与实际选中不一致，按下 space 会打中另一条——这不是手感问题，是
-        # 看起来像 bug 的正确性问题（ADR-0007 三）。
+        # **选中立刻到位**，而这就是全部：屏幕上的变化只有一个 ``❯`` 与强调色的瞬时切换，
+        # 没有任何东西随后追上（工单 #62 / ADR-0008 四——那条装饰条会把整行擦掉，实测推翻）。
         self._redraw()
         self.scroll_cursor_into_view()
-        self._flash_bar(from_line)
 
     # ---------------------------------------------------------------- 画
 
     def _body(self) -> Static:
         return self.query_one("#page-body", Static)
-
-    def _bar(self) -> Static:
-        return self.query_one("#cursor-bar", Static)
 
     def _row_width(self) -> int:
         """正文那一块当前的宽度（格）——通栏细线要铺满它。"""
@@ -283,10 +257,6 @@ class CursorPage(VerticalScroll):
         """
         return (1,) * len(self._rows)
 
-    def _total_lines(self) -> int:
-        """正文一共几屏行——装饰条就排在它下面（:meth:`watch_bar_pos`）。"""
-        return sum(self._row_lines())
-
     def _cursor_lines(self) -> int:
         """光标那个 Row 占几屏行（一张折行块可能有五六行）。"""
         lines = self._row_lines()
@@ -309,48 +279,6 @@ class CursorPage(VerticalScroll):
         """宽度变了：通栏细线得按新的宽度重新铺满（它是按格算的）。"""
         if self._rows:
             self._redraw()
-
-    # ---------------------------------------------------------------- 会追赶的装饰光标条
-
-    def watch_bar_pos(self, value: float) -> None:
-        """装饰条的位置变了（滑动期间是小数）：把它挪到那一**屏行**上。
-
-        条子排在正文**后面**（DOM 顺序），所以它的落位本来就是「正文有多高」——正文折行之后
-        那是 ``_total_lines()``，不是 ``len(self._rows)``。
-        """
-        self._bar().styles.offset = Offset(0, int(round(value)) - self._total_lines())
-
-    def _flash_bar(self, from_line: int) -> None:
-        """选中已经落地，装饰条**从旧位置**追上来（追到了就自己退场）。
-
-        条子画在正文**后面**（Textual 里后挂的控件画在上面），所以飞行中它会盖住它经过的
-        那两格——那正是它要的效果；到站之后它退场，``❯`` 与强调色一直都在。
-        """
-        if not self._motion or len(self._rows) <= 1:
-            return
-        bar = self._bar()
-        bar.update(theme.styled("  ", theme.BAR))
-        bar.styles.visibility = "visible"
-        self.bar_pos = float(from_line)
-        # ``on_complete`` 是承重的：没有它，条子会永远停在它落到的位置，用自己那两个空格
-        # 盖住 ``❯``。原型里真出过这个 bug，用户报的是「上下键选中的行会消失」。
-        self.animate(
-            "bar_pos",
-            float(self._line_of_cursor()),
-            duration=theme.CURSOR_BAR_MS / 1000,
-            easing="out_cubic",
-            on_complete=self._land_bar,
-        )
-
-    def _land_bar(self) -> None:
-        """条子到站：退场。选中本来就画在正文里，所以它这一退没有任何东西跟着消失。
-
-        用 ``visibility: hidden`` 而不是「透明的背景」：一个还在画的控件会把底下那一行擦掉，
-        哪怕它什么都不涂（原型实测）。
-        """
-        bar = self._bar()
-        bar.styles.visibility = "hidden"
-        bar.update(Text(""))
 
     def scroll_cursor_into_view(self) -> None:
         """让光标那一段留在可见区里（清单比一屏长时这一步就是「能滚动」）。

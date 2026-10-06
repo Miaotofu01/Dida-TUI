@@ -352,6 +352,35 @@ def by_due(items: Sequence[TaskItem]) -> list[TaskItem]:
 # ------------------------------------------------------------------ 已完成流（t12）
 
 
+@dataclass(frozen=True)
+class _CompletedRowFacts:
+    """把 :class:`TaskSnapshot` 摆成 :class:`dida.sync.rows.RowFacts` 的形状，只为借一次排序键。
+
+    ``row_sort_key`` 认的是 ``task_id``，快照上那个字段叫 ``id``——只差一个名字。这层适配
+    只能放在读模型这一侧：:mod:`dida.sync.rows` 不 import 读模型（那边模块注释写了为什么），
+    而读形状不为排序长字段。**排序键本身不重写**，:func:`row_sort_key` 仍是唯一一处规矩。
+    """
+
+    task_id: str
+    title: str
+    due: datetime | None
+    priority: int
+    completed: bool
+
+
+def _completed_row_key(snapshot: TaskSnapshot) -> tuple:
+    """已完成段一行的位置：借 :func:`dida.sync.rows.row_sort_key`（不重写它）。"""
+    return row_sort_key(
+        _CompletedRowFacts(
+            task_id=snapshot.id,
+            title=snapshot.title,
+            due=snapshot.due,
+            priority=snapshot.priority,
+            completed=snapshot.completed,
+        )
+    )
+
+
 def completed_section(
     tasks: Sequence[TaskSnapshot],
     lists: Sequence[ListSnapshot],
@@ -360,36 +389,43 @@ def completed_section(
     day_end: str,
     window_hours: int,
 ) -> CompletedSection:
-    """已完成区：窗口 ``[now - window_hours, …]`` 内完成的任务，最近的排在最前。
+    """已完成区：窗口 ``[now - window_hours, …]`` 内完成的任务，按正常排序键排。
 
     「完成于何时」只认服务端的 ``completedTime``（``completed_at``），不认本地那条
-    ``status``：那是 ADR-0001 里唯一能被服务端过滤的变化时间戳，也是这条流唯一有意义的
-    排序与过滤依据。本地刚按了完成、服务端还没认过的任务因此不会出现在这里——它要等
-    下一次已完成流把它带着真正的完成时刻带回来。没有上界：服务端时钟快一点不该让用户
-    刚做完的任务消失。
+    ``status``：那是 ADR-0001 里唯一能被服务端过滤的变化时间戳，也是这条流的唯一窗口依据。
+    本地刚按了完成、服务端还没认过的任务因此不会出现在这里——它要等下一次已完成流把它
+    带着真正的完成时刻带回来。没有上界：服务端时钟快一点不该让用户刚做完的任务消失。
+
+    **顺序不是完成时刻倒序**（工单 #64）：与未完成段同一套键
+    （:func:`dida.sync.rows.row_sort_key`，截止升序 → 优先级降序 → 无日期在后），
+    「已完成沉底」是那个键的第一个元组位——它管的是未完成段那一侧，这一段里它恒定。
+    所以刚做完的一条不会因为「刚」就跳到段首，它落在它自己的位置上。
 
     纯函数：「现在」与窗口大小都从参数进来，这一层不读时钟（t12 的窗口由引擎按注入的
     配置给）。
     """
     window_start = completed_window_start(now, window_hours)
     names = list_names(lists)
-    rows = [
-        CompletedItem(
-            task_id=snapshot.id,
-            title=snapshot.title,
-            list_name=names.get(snapshot.list_id, snapshot.list_id),
-            completed_at=snapshot.completed_at,
-            completed_text=format_due(
-                snapshot.completed_at, all_day=False, now=now, day_end=day_end
-            ),
-        )
+    kept = [
+        snapshot
         for snapshot in tasks
         if snapshot.completed
         and snapshot.completed_at is not None
         and snapshot.completed_at >= window_start
     ]
     return CompletedSection(
-        items=tuple(sorted(rows, key=lambda row: (row.completed_at, row.title), reverse=True))
+        items=tuple(
+            CompletedItem(
+                task_id=snapshot.id,
+                title=snapshot.title,
+                list_name=names.get(snapshot.list_id, snapshot.list_id),
+                completed_at=snapshot.completed_at,
+                completed_text=format_due(
+                    snapshot.completed_at, all_day=False, now=now, day_end=day_end
+                ),
+            )
+            for snapshot in sorted(kept, key=_completed_row_key)
+        )
     )
 
 

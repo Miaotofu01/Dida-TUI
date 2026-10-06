@@ -131,7 +131,10 @@ async def test_ctrl_c_quits_after_the_user_confirms():
 
 
 async def test_ctrl_c_cancelled_stays_and_the_prompt_can_be_raised_again():
-    """``n`` / ``Esc`` 是留下，而且第二遍还得能拦（浮层不能只拦一次）。"""
+    """``n`` / ``Esc`` 是留下，而且第二遍还得能拦（浮层不能只拦一次）。
+
+    ``Esc`` 那一半在 :func:`test_escape_on_the_quit_confirm_also_stays`。
+    """
     app = DidaApp(backend(pending=2))
 
     async with app.run_test(size=WIDE) as pilot:
@@ -141,6 +144,33 @@ async def test_ctrl_c_cancelled_stays_and_the_prompt_can_be_raised_again():
         await pilot.press("n")
         await pilot.pause()
         assert app.is_running, "取消不是退出"
+
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert app.is_running, "再按一次还是拦"
+        assert "2 处" in screen_text(app)
+
+
+async def test_escape_on_the_quit_confirm_also_stays():
+    """退出确认框里 ``Esc`` 仍然是**「没做」**：app 还在跑，框也收掉了（#66 的例外）。
+
+    确认框与表单是**两个意思**的 ``Esc``（ADR-0008 二）：表单里它是保存，这里它是对那件
+    不可挽回的事说「没做」；删除与退出共用这一个框，所以两处都例外（删除那一侧见
+    ``tests/test_task_delete_defer.py`` 与 ``tests/test_list_overlay.py``）。
+    """
+    app = DidaApp(backend(pending=2))
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("ctrl+c")
+        await pilot.pause()
+        assert app.is_running, "先确认它确实被拦住了"
+
+        await pilot.press("escape")
+        await pilot.pause()
+
+        assert app.is_running, "Esc 不是退出"
+        assert confirm_panels(app) == 0, "框收掉了，不是留着一个等着再按一次"
 
         await pilot.press("ctrl+c")
         await pilot.pause()

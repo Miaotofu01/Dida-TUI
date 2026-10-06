@@ -218,8 +218,12 @@ def snapshot(
     )
 
 
-def test_the_section_keeps_the_window_and_puts_the_newest_first():
-    """纯函数（无接缝，直接测）：窗口过滤、最近的在前、读法用同一套 format_due。"""
+def test_the_section_keeps_the_window_and_sorts_by_the_normal_key():
+    """纯函数（无接缝，直接测）：窗口过滤、按正常排序键排、读法用同一套 format_due。
+
+    **不是完成时刻倒序**（工单 #64）：留下的两条都没有截止时间、优先级也一样，所以顺序
+    由标题断开——「一小时前做完的」在「刚做完的」前面，哪怕后者完成得更晚。
+    """
     section = completed_section(
         [
             snapshot("t1", "一小时前做完的", completed_at=at(14, 11, 3)),
@@ -233,10 +237,10 @@ def test_the_section_keeps_the_window_and_puts_the_newest_first():
         window_hours=24,
     )
 
-    assert [item.completed_text for item in section.items] == ["今天 12:00", "今天 11:03"]
+    assert [item.completed_text for item in section.items] == ["今天 11:03", "今天 12:00"]
     assert [(item.task_id, item.title, item.list_name) for item in section.items] == [
-        ("t3", "刚做完的", "工作"),
         ("t1", "一小时前做完的", "工作"),
+        ("t3", "刚做完的", "工作"),
     ]
     assert section.count == 2
 

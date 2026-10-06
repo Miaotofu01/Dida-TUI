@@ -1,4 +1,4 @@
-"""视觉地基里「看得见的那一半」：顶栏、平移、会追赶的光标条、转圈、toast（工单 #51）。
+"""视觉地基里「看得见的那一半」：顶栏、平移、光标行、转圈、toast（工单 #51）。
 
 **接缝一**：真 ``DidaApp`` + ``FakeBackend`` + Pilot，断的是外部行为——「我按了这个键，
 屏幕上出现了什么」。这里不断控件树、不断内部状态；读的「里面」只有 ``selected_id``
@@ -25,7 +25,7 @@ from dida.testing import FakeBackend, ManualClock
 from dida.tui import theme
 from dida.tui.app import DidaApp, Stage
 from dida.tui.keys import LAYER_DETAIL, LAYER_INDEX, LAYER_TASKS
-from support import screen_sgr, screen_text
+from support import sample_frames, screen_sgr, screen_text
 
 TZ = timezone(timedelta(hours=8))
 T0 = datetime(2026, 3, 14, 12, 3, tzinfo=TZ)
@@ -290,10 +290,10 @@ async def test_content_that_overflows_keeps_its_gutter_and_its_ellipsis(width: i
     """会溢出的**内容**行照旧：两格行首空档 + 按格裁到页边 + 行尾一个 ``…``。
 
     细线不要那两格，内容行要——光标字形与标题之间的那一列不能跟着一起消失。纯 ASCII 那条
-    标题是个算式：页面有 ``width`` 格，行首两格归光标，**再两格归优先级标记那一列**
-    （工单 #37 加的行首列），裁断记号自己占一格，所以标题看得见的部分正好是前 ``width - 5``
-    格。汉字那条也在（他的 locale 是 ``zh_CN.UTF-8``）：一个汉字两格，断在哪一格按格算，
-    不按字符数。
+    标题是个算式：页面有 ``width`` 格，行首两格归光标，**再两格归行首那一列**（勾选框 +
+    它后面那一格，工单 #37 加、#63 改成勾选框），裁断记号自己占一格，所以标题看得见的部分
+    正好是前 ``width - 5`` 格。汉字那条也在（他的 locale 是 ``zh_CN.UTF-8``）：一个汉字两格，
+    断在哪一格按格算，不按字符数。
     """
     ascii_title = "abcdefghij" * 12
     cjk_title = "把这一条标题写得足够长，让每一个宽度上都溢出页面——窄终端、普通终端、宽屏都得裁断，而裁断的位置要按格算不按字符数"
@@ -310,8 +310,8 @@ async def test_content_that_overflows_keeps_its_gutter_and_its_ellipsis(width: i
         text = screen_text(app)
 
     ascii_row = line_with(text, "abcdefghij")
-    # 行首两格是光标空档，紧跟的两格是优先级标记那一列（``.`` = 低/无，工单 #37）。
-    assert ascii_row == f"❯ . {ascii_title[: width - 5]}{theme.ELLIPSIS}", (
+    # 行首两格是光标空档，紧跟的两格是勾选框那一列（``☐`` = 未完成，工单 #63）。
+    assert ascii_row == f"❯ {theme.TODO_MARK} {ascii_title[: width - 5]}{theme.ELLIPSIS}", (
         f"@{width} 的行首空档或裁断位置变了：{ascii_row!r}"
     )
     cjk_row = line_with(text, "把这一条标题")
@@ -647,7 +647,7 @@ async def test_up_and_down_move_the_cursor_and_do_not_push_the_track(layer: int)
 
 LAYER_BODY_ROW = {
     LAYER_INDEX: ("▪ 收集箱", 2),
-    LAYER_TASKS: (". 写周报", 2),
+    LAYER_TASKS: ("☐ 写周报", 2),
     LAYER_DETAIL: ("标题", 2),
 }
 """每一层正文里**只有这一层有**的那一行，以及它在屏幕上该停在第几格（工单 #59）。
@@ -829,8 +829,8 @@ async def test_neither_the_app_nor_the_pages_shadow_textuals_animator():
     抛 ``TypeError: 'bool' object is not callable``，而报错点在 ``textual/`` 里面，离现场很远。
     今天没有生产代码调它，所以这是**潜在**的——真按一下才知道。
 
-    ``pages/base.py`` 的 ``_motion`` 是对的做法（那里第 130 行起的文档就写着这个坑）；这条
-    顺手把三张页面也真按一次，不靠「以为它是干净的」。
+    ``pages/base.py`` 曾经用一个 ``_motion`` 布尔开关（那是对的做法：名字没占用 ``_animate``），
+    ADR-0008 四撤掉光标条时它跟着删了；这条顺手把三张页面也真按一次，不靠「以为它是干净的」。
 
     ⚠ 便宜的守卫查的是**类**上有没有这个名字，不能查 ``vars(app)``：``App.__init__`` 自己就
     往实例上放了 ``_animate``（绑好的 animator），所以它一直都在实例名字空间里——查那儿的
@@ -874,53 +874,106 @@ async def test_resizing_the_window_keeps_you_on_the_page_you_were_on():
     assert lines(after)[0].count("▸") == 2, "顶栏还写着两段路径（没有回到清单列表页）"
 
 
-# ------------------------------------------------------------------ 会追赶的光标条
+# ------------------------------------------------------------------ 光标：只有 ❯ 与强调色
 
 
-async def test_the_cursor_marker_survives_the_travelling_bar():
-    """光标条是**装饰**：它飞过去、到站退场，``❯`` 与标题一个字都不能少。
+def cursor_row(emitted: str) -> str:
+    """屏幕上带 ``❯`` 的那一行（去掉 ANSI 之后）；这一帧上没有就是空串。"""
+    for line in emitted.splitlines():
+        plain = SGR.sub("", line)
+        if plain.startswith(theme.CURSOR_MARK):
+            return plain
+    return ""
 
-    原型里这条没有 ``on_complete``，条子就永远停在落点，用自己那两个空格盖住 ``❯``——
-    用户报的是「上下键选中的行会消失」。这条测试盯的就是那个报告。
+
+def cursor_row_sgr(emitted: str) -> set[int]:
+    """那一行发出去的 SGR 参数（比参数不比整串：Textual 把前景与背景并进同一条序列）。"""
+    for line in emitted.splitlines():
+        if SGR.sub("", line).startswith(theme.CURSOR_MARK):
+            return sgr_parameters(line)
+    return set()
+
+
+async def test_moving_the_cursor_never_blanks_a_row_and_never_draws_a_bar():
+    """上下移动光标时那一行**不许整行消失**（工单 #62）。
+
+    真 app + ``animations="on"``：默认 ``auto`` 在测试环境里把动效关掉，就复现不出来。
+    两个断言都是外部的——那两条任务的标题**每一帧都在**屏幕上（装饰条还在时，它压在旧行、
+    新行上会把那一整行擦掉，ADR-0008 四），而且**每一帧**都不出现强调色实心块
+    （SGR 46 = 青底，就是那条装饰条本身）。
     """
     app = DidaApp(backend(), animations="on")
 
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
         await enter_work(pilot, app)
-        before = line_with(screen_text(app), "写周报")
-        await pilot.press("j")
-        instant = line_with(screen_text(app), "交水费")
-        await pilot.pause(0.4)  # 远超过 120ms：条子早就该退场了
-        after = line_with(screen_text(app), "交水费")
+        frames = await sample_frames(app, lambda: pilot.press("j"), screen_sgr)
+        await pilot.pause(0.3)
+        selected = app.tasks_page().selected_id
 
-    assert before.startswith("❯"), "进清单时光标在第一条任务上"
-    assert instant.startswith("❯"), "数据选中必须**立刻**到位，不能等装饰条"
-    assert after.startswith("❯"), "条子飞过之后，光标记号还得在"
-    assert "交水费" in after, "条子不许盖住标题"
-    # 行首多一列优先级标记（``.`` = 低/无）——工单 #37 给任务行加的那一列。
-    assert after.lstrip().startswith("❯ . 交水费"), "条子退场之后那一行与平时一模一样"
+    assert frames, "一帧都没采到"
+    assert selected == "t2", "这一次按键没落到下一条任务上——采样之后的第一次 press 是已知的坑"
+    blanked = [
+        index
+        for index, frame in enumerate(frames)
+        if "写周报" not in SGR.sub("", frame) or "交水费" not in SGR.sub("", frame)
+    ]
+    assert not blanked, f"这些帧上有一整行被擦掉了（装饰条压在那一行上）：{blanked[:5]}"
+    barred = [index for index, frame in enumerate(frames) if 46 in sgr_parameters(frame)]
+    assert not barred, f"这些帧上出现了强调色实心的装饰光标条：{barred[:5]}"
 
 
-async def test_the_travelling_bar_is_a_short_lived_accent_block():
-    """飞行途中屏幕上多一块**强调色实心**（SGR 46 = 青底），到站之后它必须消失。
+async def test_the_cursor_row_is_the_mark_and_the_accent_at_once_and_then_still():
+    """光标行的反馈只有 ``❯`` 与强调色，而且**一次到位、之后不动**（工单 #62 / ADR-0008 四）。
 
-    「必须消失」就是那个 ``on_complete``：原型里漏了它，条子会永远停在落点。
+    逐帧读那一行：从「写周报」换成「交水费」只发生一次，换过去的那一帧就已经带强调色
+    （ANSI 36），之后每一帧都还是它。装饰条还在时，中途会有几帧那一行整个不见——条子正压在
+    它上面。
     """
     app = DidaApp(backend(), animations="on")
 
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
         await enter_work(pilot, app)
-        frames = await sample_while(
-            lambda: pilot.press("j"),
-            lambda: 46 in sgr_parameters(screen_sgr(app)),
-        )
-        await pilot.pause(0.2)
-        landed = sgr_parameters(screen_sgr(app))
+        before = cursor_row(screen_sgr(app))
+        frames = await sample_frames(app, lambda: pilot.press("j"), screen_sgr)
+        await pilot.pause(0.3)
 
-    assert any(frames), f"飞行途中该有一块强调色实心的条子在动：{frames}"
-    assert 46 not in landed, "到站之后条子要退场：屏幕上不再多任何东西"
+    rows = [cursor_row(frame) for frame in frames]
+    assert "写周报" in before, f"按键之前光标不在第一条任务上：{before!r}"
+    assert any("交水费" in row for row in rows), f"光标行一直没走到第二条任务上：{rows}"
+    first = next(index for index, row in enumerate(rows) if "交水费" in row)
+    assert all("写周报" in row for row in rows[:first]), f"换过去之前光标行不是第一条：{rows[:first]}"
+    assert all("交水费" in row for row in rows[first:]), (
+        f"光标行换过去之后又空了或又动了——那就是装饰条盖住了它：{rows[first:]}"
+    )
+    accents = [36 in cursor_row_sgr(frame) for frame in frames[first:]]
+    assert all(accents), f"光标行换过去之后有几帧没有强调色：{accents}"
+
+
+async def test_the_cursor_row_is_the_same_whether_animations_are_on_or_off(monkeypatch):
+    """``DIDA_ANIM=on|off`` 只影响换层：光标行的画法**完全一样**（工单 #62）。
+
+    两个 app 只差这一个环境变量（照 #51 那条开关测试的做法），都在任务列表页把光标从第一条
+    移到第二条；屏幕上带 ``❯`` 的那一行必须逐字相同——光标自己不再有任何装饰动效。
+    """
+
+    async def row_after_move(mode: str) -> str:
+        monkeypatch.setenv("DIDA_ANIM", mode)
+        app = DidaApp(backend())
+
+        async with app.run_test(size=WIDE) as pilot:
+            await pilot.pause()
+            await enter_work(pilot, app)
+            await pilot.press("j")
+            await pilot.pause(0.3)
+            return cursor_row(screen_sgr(app))
+
+    moving = await row_after_move("on")
+    still = await row_after_move("off")
+
+    assert "交水费" in moving and "交水费" in still, (moving, still)
+    assert moving == still, f"DIDA_ANIM=off 与 on 下的光标行不一样：{still!r} != {moving!r}"
 
 
 # ------------------------------------------------------------------ 同步转圈

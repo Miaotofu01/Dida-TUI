@@ -1,8 +1,9 @@
 """层二：任务列表页——当前清单（或视图）里的全部任务。
 
-行的样子归这一页：优先级标记、标题、人类可读的截止时间、标签、重复与提醒标记；已完成的
-划掉、沉在列表最底（工单 #37）。**判断不在这一层**：哪条算逾期、截止时间读作什么、按什么
-顺序排，全是引擎给的成品（``Engine.tasks_in``），这一页只把成品画成一行行文字。
+行的样子归这一页：行首一个勾选框（``☐`` / ``☑``，工单 #63）、标题、人类可读的截止时间、
+标签、重复与提醒标记；已完成的划掉、沉在列表最底（工单 #37）。**优先级不进列表行**（它仍在
+详细页的字段与挑选器里，排序也仍按它）。**判断不在这一层**：哪条算逾期、截止时间读作什么、
+按什么顺序排，全是引擎给的成品（``Engine.tasks_in``），这一页只把成品画成一行行文字。
 
 ## 一行 = 一屏一行
 
@@ -43,6 +44,7 @@ __all__ = [
     "DONE_MARK",
     "NEW_TASK_TITLE_FIELD",
     "TITLE_GAP",
+    "TODO_MARK",
     "TasksPage",
     "completed_line",
     "new_task_form_fields",
@@ -63,7 +65,14 @@ def new_task_form_fields() -> tuple[FormField, ...]:
     return (FormField(name=NEW_TASK_TITLE_FIELD, label="标题"),)
 
 DONE_MARK = theme.DONE_MARK
-"""已完成那一行的前缀字符（它站在优先级标记那一列上）。"""
+"""已完成那一行的前缀字符（``☑``）。"""
+
+TODO_MARK = theme.TODO_MARK
+"""未完成那一行的前缀字符（``☐``）。
+
+这一列从此只表示「做完没有」（工单 #63）：优先级不进列表行，但概念本身没动——详细页
+仍有它的字段、挑得动，排序也仍然按它（``row_sort_key``）。
+"""
 
 COMPLETED_STYLE = theme.DONE
 """已完成的行：暗灰 + 删除线（用户故事 54）。
@@ -174,7 +183,7 @@ def task_line(item: TaskItem, *, width: int, show_list_name: bool = False) -> Te
     故事 54）只有跟着**行上那一位**才可能两处一致——按「它从哪一段出来」判，视图那一边
     就会把做完的画成没做完，``space`` 也就跟着朝反方向写（工单 #38 / #58）。
     """
-    prefix = f"{DONE_MARK if item.completed else item.priority_mark} "
+    prefix = f"{DONE_MARK if item.completed else TODO_MARK} "
     annotations = _annotations(item, show_list_name=show_list_name)
     kept = _keep_what_fits(prefix, item.title, annotations, width)
     # 逾期整行标红：颜色只有一个出处（theme.OVERDUE = 槽 1），而且它进的是 **span**
@@ -190,8 +199,9 @@ def task_line(item: TaskItem, *, width: int, show_list_name: bool = False) -> Te
 def completed_line(item: CompletedItem, *, width: int = 0) -> Text:
     """已完成的一条：划掉、沉在列表最底，右边写它是什么时候完成的。
 
-    前缀是 ``☑`` 而不是优先级标记——它已经做完了，优先级不再有意义。完成的时刻与截止
-    时间一样是注解：宽度不够时先丢它，标题留着（与未完成的行同一条规矩）。
+    前缀是 ``☑``：这一条做完了，行首那一列说的就是这件事（与未完成的 ``☐`` 同一个位置，
+    工单 #63）。完成的时刻与截止时间一样是注解：宽度不够时先丢它，标题留着（与未完成的行
+    同一条规矩）。
     """
     prefix = f"{DONE_MARK} "
     annotations = [("due", item.completed_text)] if item.completed_text else []

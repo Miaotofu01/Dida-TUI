@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import asyncio
 import json
 import re
 from datetime import datetime, timedelta, timezone
@@ -325,68 +324,6 @@ async def test_the_cursor_scrolls_into_view_by_screen_lines():
     assert field_row(text, "标签").startswith(theme.CURSOR_MARK), (
         f"光标走到最后一个字段时它不在屏上：\n{text}"
     )
-
-
-async def sample_while(action, project) -> list:
-    """一边按键一边**逐帧**取一个观测量（动效只有并发采样的人看得见）。
-
-    ``pilot.press`` 会等到这一屏静下来，所以按完再抓屏只能看到落定后的样子。
-    """
-    frames: list = []
-
-    async def sample() -> None:
-        while True:
-            frames.append(project())
-            await asyncio.sleep(0.005)
-
-    sampler = asyncio.create_task(sample())
-    try:
-        await action()
-    finally:
-        sampler.cancel()
-    return frames
-
-
-def bar_row(app: DidaApp) -> int | None:
-    """屏幕上那块**强调色实心**（装饰光标条）在第几行；它退场了就是 ``None``。"""
-    for index, line in enumerate(screen_sgr(app).splitlines()):
-        if 46 in sgr_parameters(line):
-            return index
-    return None
-
-
-async def test_the_travelling_cursor_bar_flies_to_the_wrapped_blocks_own_line():
-    """装饰光标条按**屏幕行**落位：一个字段占几行，条子就停到它那一行上。
-
-    条子排的位置是「正文有多高」（折行之后是屏行总数，不是字段个数）。按字段个数算的话，
-    它会整整差出前面那几段折行的行数——落点在描述块**内部**，用它那两个空格盖掉正文。
-    这里一直盯着那块实心在第几行：飞行的最后一帧必须落在备注那一行上。
-    """
-    app = DidaApp(backend(content=LONG_CONTENT), animations="on")
-
-    async with app.run_test(size=(60, 24)) as pilot:
-        await pilot.pause()
-        await enter_detail(pilot, app)
-        await pilot.press("j")  # 标题 → 描述（一段折行块）
-        await pilot.pause(0.3)  # 条子退场，落定
-        frames = await sample_while(lambda: pilot.press("j"), lambda: bar_row(app))
-        await pilot.pause(0.3)
-        text = screen_text(app)
-
-    targets = [row for row in frames if row is not None]
-    assert targets, f"整段飞行里一帧都没看见那条实心：{frames}"
-    noted = next(
-        index
-        for index, line in enumerate(text.splitlines())
-        if line[2:].startswith("备注")
-    )
-    assert targets[-1] == noted, (
-        f"条子落到了第 {targets[-1]} 行，而备注在第 {noted} 行——它停在折行块里了：\n{text}"
-    )
-    assert min(targets) >= noted - len(wrapped_block(text, "描述", "备注")), "起飞的落点太靠上了"
-    assert field_row(text, "备注").startswith(theme.CURSOR_MARK), f"记号不在备注那一行：\n{text}"
-    block = "".join(part.strip() for part in wrapped_block(text, "描述", "备注"))
-    assert block.removeprefix("描述") == LONG_CONTENT, f"折行块被条子吃掉了几个字：{block!r}"
 
 
 # ------------------------------------------------------------------ 逐字段编辑

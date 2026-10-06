@@ -77,9 +77,9 @@ async def open_container(pilot, page, row_id: str) -> None:
 async def test_n_asks_for_a_title_and_nothing_else():
     """``n`` 弹出的是**只填标题**的输入框：不问截止时间，也不问优先级（用户故事 44）。
 
-    顺带钉住「这块浮层排得下」：字段只有一格，所以底部那行提示（``Esc`` 是出口）不会被裁掉
-    ——#36 实测过七格的视图表单在 30 行终端上要 30 行、而浮层只给 24 行，底部那几个字段与
-    提示会被整个裁掉。这一票的表单永远只有一格，这条断言就是它的下限。
+    顺带钉住「这块浮层排得下」：字段只有一格，所以底部那行提示（``Esc`` / ``Enter`` 保存）
+    不会被裁掉——#36 实测过七格的视图表单在 30 行终端上要 30 行、而浮层只给 24 行，底部
+    那几个字段与提示会被整个裁掉。这一票的表单永远只有一格，这条断言就是它的下限。
     """
     app = DidaApp(backend())
 
@@ -92,7 +92,7 @@ async def test_n_asks_for_a_title_and_nothing_else():
 
     assert "标题" in form, "表单里要有一格写标题"
     assert "截止" not in form and "优先级" not in form, "这一步不问日期与优先级"
-    assert "Esc 取消" in form, "底部那行提示不许被裁掉：它是「怎么退出这张表单」的唯一说明"
+    assert "Esc 保存" in form, "底部那行提示不许被裁掉：它是「怎么保存退出」的唯一说明"
     assert messages.NO_TITLE_MESSAGE not in form, "刚打开时还没提交，不该报错"
 
 
@@ -158,8 +158,38 @@ async def test_you_can_keep_creating_without_leaving_the_list():
     assert "标题" not in after, "第二条建完浮层也关掉了"
 
 
-async def test_an_empty_title_is_refused_and_the_form_stays_open():
-    """空标题不许建，而且要如实说一句（引擎的 docstring：拦它的是调用方）。"""
+async def test_an_empty_title_is_refused_and_says_why():
+    """``Esc`` 保存时空标题照样不许建，而且要如实说一句（#66 的验收标准 4）。
+
+    新建表单只有标题一格（#39），所以「只填了日期 / 标签、没写标题」在这一屏上就是「一格都
+    没填」：壳子照旧把 ``{title: ""}`` 交出去，「不建」这个决定在调用方
+    （:meth:`~dida.tui.app.DidaApp._finish_new_task`）——没有「取消」之后，这一句就是误按
+    ``Esc`` 时唯一的护栏（ADR-0008 二）。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_container(pilot, app.index_page(), "work")
+        await pilot.press("n")
+        await pilot.pause()
+        await pilot.press("escape")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert fake.created == [], "空标题不许走到引擎"
+    assert messages.NO_TITLE_MESSAGE in after, "拦住之后要说清为什么"
+
+
+async def test_an_empty_title_pressed_with_enter_is_refused_too():
+    """``Enter`` 那条保存键同样拦住空标题：两条键一个结果（ADR-0008 二）。
+
+    这一条原来叫 ``test_an_empty_title_is_refused_and_the_form_stays_open``，而那句
+    「the form stays open」是假的：调用方收下那一份、拒掉写入、把理由写进状态栏，浮层照旧
+    关掉（``NO_TITLE_MESSAGE`` 里就有「标题」两个字，于是 ``"标题" in after`` 一直为真）。
+    这里改成断真正发生的事。
+    """
     fake = backend()
     app = DidaApp(fake)
 
@@ -171,17 +201,17 @@ async def test_an_empty_title_is_refused_and_the_form_stays_open():
         await pilot.press("enter")
         await pilot.pause()
         after = screen_text(app)
-        still_open = "标题" in after
-        await pilot.press("escape")
-        await pilot.pause()
 
     assert fake.created == [], "空标题不许走到引擎"
-    assert messages.NO_TITLE_MESSAGE in after
-    assert still_open, "报错之后用户可以接着把标题打进去"
+    assert messages.NO_TITLE_MESSAGE in after, "两条保存键都要说清为什么"
 
 
-async def test_escape_cancels_without_writing_anything():
-    """``esc`` 关掉表单：一个字节都不写（表单壳子 #42 的出口规矩）。"""
+async def test_escape_saves_the_new_task_like_enter():
+    """``esc`` 交回刚打的标题，任务真的建出来（ADR-0008 二：编辑态没有「取消」）。
+
+    这一条原来是 ``test_escape_cancels_without_writing_anything``；同一天改的是**语义**，
+    不是这条测试关心的事——它现在断的是「``Esc`` 与 ``Enter`` 落到同一个确认上」。
+    """
     fake = backend()
     app = DidaApp(fake)
 
@@ -195,9 +225,10 @@ async def test_escape_cancels_without_writing_anything():
         await pilot.pause()
         after = screen_text(app)
 
-    assert fake.created == []
-    assert "标题" not in after
-    assert "工作" in after, "浮层关掉，回到下面那一层"
+    assert fake.created == ["写周报"], "Esc 交回标题，任务建下了"
+    assert placed(fake, "work") == [("写周报", None, False)], "还落在当前打开的这个清单里"
+    assert "标题" not in after, "浮层关掉，回到下面那一层"
+    assert "工作" in after, "回到任务列表页"
 
 
 # ------------------------------------------------------------------ 视图：收集箱 + 隐含日期

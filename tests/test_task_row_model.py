@@ -67,10 +67,18 @@ def snapshot(
     completed_at: datetime | None,
     completed: bool = True,
     list_id: str = "work",
+    due: datetime | None = None,
+    priority: int = 0,
 ) -> TaskSnapshot:
     """缓存里的一条任务快照。"""
     return TaskSnapshot(
-        id=id, title=title, list_id=list_id, completed=completed, completed_at=completed_at
+        id=id,
+        title=title,
+        list_id=list_id,
+        due=due,
+        priority=priority,
+        completed=completed,
+        completed_at=completed_at,
     )
 
 
@@ -196,7 +204,11 @@ def test_the_window_cutoff_is_a_pure_function_of_now_and_the_hours():
 
 
 def test_the_completed_section_keeps_only_the_last_seven_days():
-    """更早完成的不占屏幕（用户故事：已完成只显示最近 7 天）。"""
+    """更早完成的不占屏幕（用户故事：已完成只显示最近 7 天）。
+
+    留下的两条都没有截止时间、优先级也一样，顺序由标题断开（六 U+516D < 刚 U+521A）——
+    **不是**完成时刻倒序（工单 #64 把那个倒序拿掉了）。
+    """
     section = completed_section(
         [
             snapshot("t1", "六天前做完的", completed_at=T0 - timedelta(days=6)),
@@ -209,7 +221,47 @@ def test_the_completed_section_keeps_only_the_last_seven_days():
         window_hours=168,
     )
 
-    assert [item.title for item in section.items] == ["刚刚做完的", "六天前做完的"]
+    assert [item.title for item in section.items] == ["六天前做完的", "刚刚做完的"]
+
+
+def test_the_completed_section_sorts_by_the_normal_key_not_by_completion_time():
+    """已完成段按正常排序键排（工单 #64 验收标准 1）：截止时间升序，**不再**按完成时刻倒序。
+
+    甲 是刚做完的那条、乙 更早完成——按完成时刻倒序会排成 甲/乙（旧行为）。乙 的截止
+    （03-16）比 甲（03-20）早，按正常排序键应排成 乙/甲。
+    """
+    section = completed_section(
+        [
+            snapshot("t1", "甲", completed_at=at(14, 14, 0), due=at(20, 9, 0)),
+            snapshot("t2", "乙", completed_at=at(14, 13, 0), due=at(16, 9, 0)),
+        ],
+        [ListSnapshot(id="work", name="工作")],
+        now=T0,
+        day_end="24:00",
+        window_hours=168,
+    )
+
+    assert [item.title for item in section.items] == ["乙", "甲"]
+
+
+def test_a_completed_task_without_a_due_date_sinks_below_one_that_has_a_due_date():
+    """没有截止时间的排在有截止时间的后面（工单 #64 验收标准 1 的那条链）。
+
+    无日期的「A 无日期」完成得更晚、优先级也更高——按完成时刻倒序或按优先级它都会排在最
+    前。正常排序键把「有没有日期」摆在优先级之前，所以它沉到「Z 有日期」后面。
+    """
+    section = completed_section(
+        [
+            snapshot("t1", "Z 有日期", completed_at=at(14, 10, 0), due=at(20, 9, 0)),
+            snapshot("t2", "A 无日期", completed_at=at(14, 15, 0), priority=5),
+        ],
+        [ListSnapshot(id="work", name="工作")],
+        now=T0,
+        day_end="24:00",
+        window_hours=168,
+    )
+
+    assert [item.title for item in section.items] == ["Z 有日期", "A 无日期"]
 
 
 # ------------------------------------------------------------------ 已完成流：按状态过滤
@@ -324,10 +376,11 @@ def one_row(**fields) -> "TaskItem":
     return engine_with(source).tasks_in("work").items[0]
 
 
-def test_a_row_reads_the_priority_mark_the_title_the_due_the_tags_and_the_marks():
-    """一行读成：优先级标记、标题、标签、重复标记、提醒标记、人类可读的截止时间。
+def test_a_row_reads_its_checkbox_the_title_the_due_the_tags_and_the_marks():
+    """一行读成：**勾选框**、标题、标签、重复标记、提醒标记、人类可读的截止时间（工单 #63）。
 
     注解块**贴着行的右边缘**（截止时间因此是一列），所以这一行正好是 ``width`` 格。
+    这一条带的是**高优先级**（``!``）：列表行从此只表示「做完没有」，优先级不进这一列。
     """
     item = one_row(
         due=at(14, 18, 0),
@@ -339,16 +392,45 @@ def test_a_row_reads_the_priority_mark_the_title_the_due_the_tags_and_the_marks(
 
     line = task_line(item, width=60)
 
-    assert line.plain.startswith("! 写周报")
+    assert line.plain.startswith(f"{theme.CHECK_OFF} 写周报"), (
+        f"未完成的行首是 {theme.CHECK_OFF}，不再是优先级标记：{line.plain!r}"
+    )
+    assert "!" not in line.plain, f"列表行里不该再出现高优先级字形：{line.plain!r}"
     assert line.plain.endswith("#工作  ↻ ⚑  今天 18:00")
     assert cell_len(line.plain) == 60, "注解块贴着右边缘，所以这一行正好是 width 格"
+
+
+def test_the_leading_column_is_a_checkbox_and_says_nothing_about_priority():
+    """行首那一列只说「做完没有」：未完成 ``☐``、已完成 ``☑``，三个优先级字形都不出现。
+
+    优先级这个概念本身没动——详细页仍有它的字段、挑得动、排序仍按它（验收标准 3、4）；
+    不再显示的只是**列表行**里那一个字形。
+    """
+    open_row = task_line(one_row(title="高优先级的", priority=5), width=40)
+    done_row = completed_line(
+        CompletedItem(
+            task_id="t1",
+            title="做完了的",
+            list_name="工作",
+            completed_at=at(14, 11, 0),
+            completed_text="今天 11:00",
+        ),
+        width=40,
+    )
+
+    assert open_row.plain.startswith(f"{theme.CHECK_OFF} 高优先级的"), open_row.plain
+    assert done_row.plain.startswith(f"{theme.CHECK_ON} 做完了的"), done_row.plain
+    for glyph in (priority_mark(1), priority_mark(3), priority_mark(5)):
+        assert not open_row.plain.startswith(glyph), (
+            f"行首那一列还是优先级字形 {glyph!r}：{open_row.plain!r}"
+        )
 
 
 def test_a_plain_task_row_carries_no_marks_at_all():
     """没有标签、不重复、没有提醒的任务，行里一个多余的字形都不出现。"""
     line = task_line(one_row(due=at(14, 18, 0)), width=40)
 
-    assert line.plain.startswith(". 写周报")
+    assert line.plain.startswith(f"{theme.CHECK_OFF} 写周报")
     assert line.plain.endswith("今天 18:00")
     assert cell_len(line.plain) == 40
     for absent in ("#", theme.REPEAT_MARK, theme.REMINDER_MARK):
@@ -369,8 +451,14 @@ def test_every_mark_that_goes_into_a_column_is_width_unambiguous():
     两处都会错，而且两处都已经发生过：``☰`` 是「rich 量 2 格、Unicode 说中性」（每行宽一
     格），``·``（低优先级）与 ``—``（没有截止时间）是「rich 量 1 格、Unicode 说是歧义宽度」
     （CJK 字体下终端可能画 2 格）。用户 ``LANG=zh_CN.UTF-8``——**一旦有列，歪的就是整列**。
+
+    勾选框是工单 #63 起任务行首那一列的**唯一**内容；三个优先级字形仍然列在这里，因为
+    ``TaskItem.priority_mark`` 还是读模型的口子（``test_read_model.py`` 钉着它）——列表行
+    不画它了，可它哪天再进某一列，宽度这一条仍然得成立。
     """
     glyphs = {
+        "未完成勾选框": theme.TODO_MARK,
+        "已完成勾选框": theme.DONE_MARK,
         "低优先级标记": priority_mark(1),
         "中优先级标记": priority_mark(3),
         "高优先级标记": priority_mark(5),
@@ -588,15 +676,15 @@ def crowded_row(**fields) -> TaskItem:
     ("width", "expected"),
     [
         # 47 格：标签放不下了（先丢它），其余都在
-        (47, ". 回邮件给产品经理        工作  ↻ ⚑  昨天 18:00"),
+        (47, "☐ 回邮件给产品经理        工作  ↻ ⚑  昨天 18:00"),
         # 40 格：标记也丢了，只剩所属清单与截止时间
-        (40, ". 回邮件给产品经理      工作  昨天 18:00"),
+        (40, "☐ 回邮件给产品经理      工作  昨天 18:00"),
         # 35 格：截止时间也丢了，所属清单留着（视图里它是验收标准要求必须显示的）
-        (35, ". 回邮件给产品经理             工作"),
+        (35, "☐ 回邮件给产品经理             工作"),
         # 23 格：注解一个都不留，标题**一个字都不少**
-        (23, ". 回邮件给产品经理"),
+        (23, "☐ 回邮件给产品经理"),
         # 16 格：实在放不下才截标题，按格截、带省略号
-        (16, ". 回邮件给产品 …"),
+        (16, "☐ 回邮件给产品 …"),
     ],
 )
 def test_the_discard_order_is_tags_then_marks_then_due_then_the_title(width, expected):
@@ -615,7 +703,7 @@ def test_a_row_that_fits_puts_its_annotations_against_the_right_edge():
     """放得下时注解块贴着右边缘：截止时间因此落在每一行的同一个位置上（一列）。"""
     line = task_line(crowded_row(), width=60, show_list_name=True)
 
-    assert line.plain.startswith(". 回邮件给产品经理")
+    assert line.plain.startswith(f"{theme.CHECK_OFF} 回邮件给产品经理")
     assert line.plain.endswith("工作  #周报  ↻ ⚑  昨天 18:00")
     assert cell_len(line.plain) == 60
 
@@ -624,7 +712,7 @@ def test_the_title_keeps_its_cells_when_the_row_gets_narrow():
     """窄到只剩标题时，标题拿满它要的格——「一行只放一条任务」的另一半。"""
     line = task_line(crowded_row(), width=23, show_list_name=True)
 
-    assert line.plain == ". 回邮件给产品经理"
+    assert line.plain == f"{theme.CHECK_OFF} 回邮件给产品经理"
     assert theme.ELLIPSIS not in line.plain
 
 
