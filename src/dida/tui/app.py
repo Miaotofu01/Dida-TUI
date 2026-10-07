@@ -623,6 +623,10 @@ class DidaApp(App[None]):
         不发生，用户会以为它成了。**这一条路没有 ``await``**：``complete`` / ``uncomplete``
         都是同步的（推送排在事件循环上，写的人当场返回），所以写完之后碰 DOM 不需要
         「先问 ``is_running``」那道守卫；重画与 toast 各自还有一道，见它们的说明。
+
+        **完成这一下顺手排一次已完成流**（:meth:`pull_completed`，工单 #74）：本地刚完成的任务
+        还没有 ``completedTime``（服务端要等推送落地才写），而周期泵只管推、不拉——不去拉它，
+        那个时间戳永远回不来。取消完成不用拉：本地的 ``status`` 当场说了算（#38）。
         """
         try:
             if event.completed:
@@ -633,6 +637,8 @@ class DidaApp(App[None]):
             self._write_status(messages.toggle_complete_failed_message(exc))
             return
         self.refresh_view()
+        if not event.completed:
+            self.pull_completed()
         self._notify_step(
             messages.uncompleted_message(event.title)
             if event.completed
@@ -1225,6 +1231,38 @@ class DidaApp(App[None]):
         self._manual_sync = manual
         self._arm_spinner()
         self.run_worker(self._sync(), group=SYNC_GROUP, exclusive=True, description="同步")
+
+    def pull_completed(self) -> None:
+        """完成了一笔之后，把服务端认下的 ``completedTime`` 拉回来（工单 #74）。
+
+        周期泵（:meth:`push_tick`）**只管推**，app 里没有任何周期性刷新——所以完成之后没人去
+        拉已完成流，服务端的完成时刻永远回不来，除非用户自己按 ``r``。这一下就是那个缺失的
+        触发，也是**所有**完成路径的唯一出口（今天只有任务列表页的 ``space`` 一条）。
+
+        **拉最窄的那一条**：``refresh_completed()`` 带回来的就是这个时间戳，而全量刷新要逐清单
+        拉一遍未完成任务（ADR-0001）——为一个完成时刻做那么多网络调用不值当。推一轮排在它前面：
+        服务端得先认下这一笔（状态真的变成完成），已完成流才会把它带回来；写路径排下的那一轮
+        与这里共用引擎那把推送锁，所以「先推后拉」是确定的，不是碰运气。
+
+        与 ``r`` 共用 :data:`SYNC_GROUP` 且 ``exclusive=True``：同步不会叠在一起（同一份缓存被
+        两个协程交替写），而且走的还是那条既有的同步路。界面不等它——活干在事件循环上。
+
+        **失败什么都不说**：那一笔留在队列里，状态栏那个「待推送 N」说的就是这件事，而屏幕上
+        任务照旧在已完成段里（本地乐观写 + #74 的占位）。用户刚按下的那一下已经有回声了，
+        再弹一句是噪音。
+        """
+        self.run_worker(
+            self._pull_completed(), group=SYNC_GROUP, exclusive=True, description="拉已完成流"
+        )
+
+    async def _pull_completed(self) -> None:
+        """推一轮、再拉一次已完成流，然后重画。失败照旧不假装拉到了（``DidaError`` 收在这里）。"""
+        try:
+            await self.engine.push_pending()
+            await self.engine.refresh_completed()
+        except DidaError:
+            return
+        self.refresh_view()
 
     async def _sync(self) -> None:
         """一轮同步：全量刷新 → 推待推送改动 → 拉已完成流。
