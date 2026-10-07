@@ -44,6 +44,9 @@ T0 = datetime(2026, 3, 14, 12, 3, tzinfo=TZ)
 COMPLETED_AT = "2026-03-14T11:00:00+0800"
 """服务端给过的完成时间戳：取消完成**不会**把它清掉（spec 的实测事实第 1 条）。"""
 
+SECOND_TASK_ID = "t9"
+"""「完成之后不许消失」那几条里的第二条任务（还没做完的那一条）。"""
+
 
 def at(day: int, hour: int = 0, minute: int = 0) -> datetime:
     """2026-03 里的一个时刻（带时区）。"""
@@ -78,6 +81,20 @@ def completed_task(**extra: object) -> dict:
         "completedTime": COMPLETED_AT,
         **extra,
     }
+
+
+def open_task(
+    id: str = TASK_ID, title: str = "写周报", *, due: datetime | None = None
+) -> dict:
+    """一条**服务端说未完成**的任务原文（``status`` 是 0，没有完成时刻）。
+
+    ``due`` 给截止时刻（服务端字段名 ``dueDate``）：两条任务的先后靠它定死，不然
+    「光标落在哪一条上」会随标题的码位漂。
+    """
+    payload = {"id": id, "projectId": PROJECT_ID, "title": title, "status": UNCOMPLETED}
+    if due is not None:
+        payload["dueDate"] = due.isoformat()
+    return payload
 
 
 def make_engine(store: Store, transport: FakeTransport | None = None) -> SyncEngine:
@@ -525,3 +542,197 @@ async def test_space_on_the_list_index_page_does_nothing_at_all():
 
     assert (fake.completed, fake.uncompleted) == ([], []), "层一按 space 不许完成任何东西"
     assert after == before, f"层一按 space 屏幕不该有任何变化：\n{after}"
+
+
+# ---------------------------------------------------------------- 完成之后不许从屏幕上消失（#74）
+
+
+def two_open_tasks() -> FakeBackend:
+    """一个清单、两条都还没做完的任务（写周报 18:00 在前、交水费 20:00 在后）。
+
+    两条都有截止时间，所以「在哪一段」不用赌行号：未完成段画 ``☐``、已完成段画 ``☑``。
+    """
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id=PROJECT_ID)
+    fake.add_task("写周报", list_name=PROJECT_ID, id=TASK_ID, due=at(14, 18, 0))
+    fake.add_task("交水费", list_name=PROJECT_ID, id=SECOND_TASK_ID, due=at(14, 20, 0))
+    return fake
+
+
+def row_of(text: str, marker: str, title: str) -> int:
+    """屏幕上「行首是 ``marker`` 的那条任务行」的行号。
+
+    ``marker`` 那一位不能省：反馈 toast 里也写着同一个标题（``已完成「写周报」``），
+    只按标题找会找到那条回声上——它没有行首记号，也不在列表里。
+    """
+    for index, line in enumerate(text.splitlines()):
+        if f"{marker} {title}" in line:
+            return index
+    raise AssertionError(f"屏幕上没有「{marker} {title}」这一行：\n{text}")
+
+
+async def settle(app: DidaApp, pilot) -> None:
+    """等挂上来的同步 worker 跑完、推送也落地，再断言屏幕。
+
+    假后端没有 ``wait_for_pushes``（它没有队列），所以那一半按可选处理——与
+    ``test_app_sync.py::settle`` 同一条口径。
+    """
+    await app.workers.wait_for_complete()
+    pushes = getattr(app.engine, "wait_for_pushes", None)
+    if pushes is not None:
+        await pushes()
+    await pilot.pause()
+
+
+class Unreachable:
+    """假传输：每个请求都连不上（断网那一条路，#74 验收标准 3）。"""
+
+    def __init__(self) -> None:
+        self.requests: list[httpx.Request] = []
+
+    async def send(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        raise httpx.ConnectError("连不上服务器")
+
+
+async def test_space_keeps_the_task_on_screen_in_the_completed_section_at_once():
+    """按 ``space`` 完成：那条任务**当场**沉到已完成段，不从屏幕上消失（#74 验收标准 1）。
+
+    真 app + 假后端 + 真按键，断的是屏幕上看得见的那一半：另一条未完成的还在上面，
+    刚做完的这条在它下面、行首是已完成记号。假后端不会自己补服务端时间戳，所以这一条
+    走的正是「本地刚完成、服务端还没认过」那一路（占位时刻）。
+    """
+    fake = two_open_tasks()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_the_list(pilot, app)
+        await pilot.press("space")
+        await pilot.pause(0.2)
+        await settle(app, pilot)
+        text = screen_text(app)
+
+    assert fake.completed == [TASK_ID], "这一下走的是完成"
+    todo = row_of(text, theme.TODO_MARK, "交水费")
+    done = row_of(text, theme.DONE_MARK, "写周报")
+    assert done > todo, f"刚完成的要落在未完成那一段下面：\n{text}"
+    assert f"{theme.TODO_MARK} 写周报" not in text, "它已经不是未完成的样子了"
+
+
+async def test_space_while_offline_keeps_the_task_on_screen_and_in_the_queue(store):
+    """断网时同一条规矩：完成之后那一笔留在队列里，任务照旧在已完成段里看得见（#74 验收标准 3）。
+
+    真引擎 + 真库 + 全失败的假传输：本地乐观写当场生效（ADR-0002），推送留在队列里等重试。
+    屏幕上那条任务**不许**因为「网断了、服务端的完成时刻拉不到」而消失。
+    """
+    transport = Unreachable()
+    seed(
+        store,
+        open_task(TASK_ID, "写周报", due=at(14, 18, 0)),
+        open_task(SECOND_TASK_ID, "交水费", due=at(14, 20, 0)),
+    )
+    engine = make_engine(store, transport)
+    app = DidaApp(engine)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_the_list(pilot, app)
+        await pilot.press("space")
+        await pilot.pause(0.2)
+        await settle(app, pilot)
+        text = screen_text(app)
+
+    assert row_of(text, theme.DONE_MARK, "写周报") > row_of(text, theme.TODO_MARK, "交水费")
+    assert [change.kind for change in store.pending()] == [ChangeKind.COMPLETE], (
+        "网断了这一笔就留在队列里"
+    )
+    assert engine.status().pending_count == 1, "状态栏那个「待推送 1」照旧说着这件事"
+    assert any(
+        request.url.path == "/open/v1/task/completed" for request in transport.requests
+    ), "断网时也去试过拉已完成流（只是没拉到）"
+
+
+async def test_completing_pulls_the_completed_stream_without_pressing_r():
+    """完成之后自动拉一次已完成流把服务端的时间戳带回来；不按 ``r``、也不做全量刷新（#74 验收标准 2）。
+
+    「拉了没有」由假后端说了算：``completed_pulls`` 是 ``refresh_completed()`` 收到的次数，
+    ``refreshes`` 是全量刷新。**要最窄的那一条**——完成一次不该顺带把每个清单都拉一遍。
+    """
+    fake = two_open_tasks()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_the_list(pilot, app)
+        await pilot.press("space")
+        await settle(app, pilot)
+
+    assert fake.completed_pulls == 1, "完成之后要自动拉一次已完成流"
+    assert fake.refreshes == 0, "为了一个完成时刻做一次全量刷新太重了"
+    assert fake.pushes >= 1, "拉之前先把这一笔推上去（服务端才有得给我们）"
+
+
+async def test_the_pull_replaces_the_placeholder_and_leaves_exactly_one_row(store):
+    """服务端的 ``completedTime`` 回来之后：那一条仍在已完成段里、**只有一行**、读的是服务端的时刻。
+
+    接缝二那一条完整的路：真引擎 + 真库 + 假传输。请求顺序钉住两件事——推的是完成端点、
+    拉的只有已完成流这一条（没有逐清单的全量）。占位（``今天 12:03``）被服务端的
+    ``今天 11:00`` 换掉，这正是「下一次刷新把它换成权威那一份」那句承诺。
+    """
+    transport = FakeTransport()
+    transport.enqueue(httpx.Response(200, json={}))
+    transport.enqueue(httpx.Response(200, json=[completed_task()]))
+    seed(
+        store,
+        open_task(TASK_ID, "写周报", due=at(14, 18, 0)),
+        open_task(SECOND_TASK_ID, "交水费", due=at(14, 20, 0)),
+    )
+    engine = make_engine(store, transport)
+    app = DidaApp(engine)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_the_list(pilot, app)
+        await pilot.press("space")
+        await pilot.pause(0.2)
+        await settle(app, pilot)
+        text = screen_text(app)
+
+    assert [request.url.path for request in transport.requests] == [
+        f"/open/v1/project/{PROJECT_ID}/task/{TASK_ID}/complete",
+        "/open/v1/task/completed",
+    ], "完成之后只拉已完成流这一条，不是全量刷新"
+    rows = [line for line in text.splitlines() if f"{theme.DONE_MARK} 写周报" in line]
+    assert len(rows) == 1, f"完成的那一刻只许有一行（重复了就是两段都收了）：\n{text}"
+    assert "今天 11:00" in rows[0], f"读的该是服务端的完成时刻：{rows[0]!r}"
+    assert "今天 12:03" not in rows[0], f"占位该被服务端那一份换掉：{rows[0]!r}"
+
+
+async def test_space_again_puts_the_task_back_in_the_open_section():
+    """再按 ``space`` 取消完成：它回到未完成段，占位不许把它粘在已完成段里（#74 验收标准 4）。
+
+    光标在第一次完成之后跟着这一条走到已完成段（按行 id 认回），所以第二下按在同一
+    条任务上。回来之后屏幕上只有 ``☐`` 的那一行，没有 ``☑`` 的那一行。
+    """
+    fake = two_open_tasks()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_the_list(pilot, app)
+        await pilot.press("space")  # 完成
+        await pilot.pause(0.2)
+        await settle(pilot=pilot, app=app)
+        assert app.tasks_page().selected_id == TASK_ID, "光标该跟着这一条走到已完成段"
+
+        await pilot.press("space")  # 取消完成
+        await pilot.pause(0.2)
+        await settle(pilot=pilot, app=app)
+        text = screen_text(app)
+
+    assert fake.uncompleted == [TASK_ID], "第二下走的是取消完成"
+    assert row_of(text, theme.TODO_MARK, "写周报") < row_of(text, theme.TODO_MARK, "交水费"), (
+        f"取消完成之后它回到未完成段（按截止时间排在前面）：\n{text}"
+    )
+    assert f"{theme.DONE_MARK} 写周报" not in text, "占位不许把它粘在已完成段里"

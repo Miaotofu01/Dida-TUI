@@ -626,8 +626,10 @@ class FakeBackend:
         （``Store`` 的乐观写把 ``status`` 写成 2），只记录的话接缝一看不到「按下去这一行
         就变了」——而完成 / 取消完成正是要按键才看得见的那一类。
 
-        ``completedTime`` 照真引擎的样子**不动**：服务端还没认过这一笔，屏幕上的完成时刻
-        要等已完成流把它带回来（#37 的 ``completed_section`` 只认服务端那个时间戳）。
+        ``completedTime`` 照真引擎的样子**不动**：服务端还没认过这一笔，屏幕上那一条的完成
+        时刻先用「现在」占位（#74 的 ``completed_section``），要等已完成流把服务端那个时间戳
+        带回来才换成权威的那一份——而「拉一次已完成流」是 app 的事（``completed_pulls`` 数它），
+        替身只把状态改掉。
         """
         self.completed.append(task_id)
         self.source.set_completed(task_id, completed=True)
