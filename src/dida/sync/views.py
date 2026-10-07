@@ -51,11 +51,12 @@ from __future__ import annotations
 
 import re
 from dataclasses import asdict, dataclass, replace
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime, timedelta
 from enum import Enum
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import DidaError
+from dida.api.guards import all_day_date
 from dida.logical_day import logical_day
 from dida.sync.rows import row_order_tail
 from dida.sync.view import PRIORITY_CYCLE, PRIORITY_NAMES, TaskSnapshot, due_day, is_overdue
@@ -236,7 +237,8 @@ def implied_due_for(definition: ViewDefinition, *, now: datetime, day_end: str) 
     - 「无日期」``DueWindow(dated=False, undated=True)`` → 不隐含：这一屏要的正是**没有**
       日期的任务，替它带上日期就是跟这个视图对着干。
 
-    返回的是**全天任务的日期标记**（那个逻辑日的 00:00，承重：``due_day`` 认这个形状），
+    返回的是**全天任务的日期标记**（那个逻辑日的 UTC 午夜，``YYYY-MM-DDT00:00:00+0000``，
+    承重：``due_day`` 按 UTC 认这个形状；写成本地午夜在本 app 与手机端都会偏一天，#73），
     不是「现在」——「今天要做、没说几点」正是这样一条任务。
 
     判断写在这里而不是 TUI 里的理由：哪一个视图隐含哪一天，是**视图定义**的语义，而定义
@@ -248,7 +250,7 @@ def implied_due_for(definition: ViewDefinition, *, now: datetime, day_end: str) 
     today = logical_day(now, day_end).label
     if window.last != 0 or not window.covers(today, today=today):
         return None
-    return datetime.combine(today, time(), tzinfo=now.tzinfo)
+    return all_day_date(today)
 
 
 @dataclass(frozen=True)

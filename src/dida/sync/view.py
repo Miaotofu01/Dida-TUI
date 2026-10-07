@@ -72,7 +72,8 @@ class TaskSnapshot:
     title: str
     list_id: str
     due: datetime | None = None
-    """截止时刻（带时区）；全天任务的时刻是当天 00:00，看 ``all_day`` 分辨。"""
+    """截止时刻（带时区）；``all_day=True`` 时它是个**日期标记**，按 ``.date()`` 读
+    （写出去的正常形状是那一天的 UTC 午夜，#73；修好之前的历史数据可能是本地午夜）。"""
 
     all_day: bool = False
     priority: int = 0

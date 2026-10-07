@@ -14,7 +14,7 @@
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import date, datetime, time, timezone
 from typing import Any, Mapping, Sequence
 
 from dida.api.errors import DatelessRepeatError, FieldIgnoredError, InvalidDateError
@@ -101,6 +101,41 @@ def api_date(value: Any, *, field: str) -> str:
     if parsed.tzinfo is None:  # 正则已保证带 offset，这里是兜底
         raise InvalidDateError(f"{field} 缺少时区偏移：{value!r}", field=field)
     return value
+
+
+def all_day_date(day: date) -> datetime:
+    """全天任务的日期标记：``day`` 那一天的 **UTC 午夜**（全 app 一条口径，#73）。
+
+    形状永远是 ``YYYY-MM-DDT00:00:00+0000``。这不是「哪一刻」：读侧按 UTC 取日期
+    （``storage/store.py`` 的 ``_parse_time`` 保留 ``+0000``，``sync/view.py`` 的
+    ``due_day(all_day=True)`` 取 ``.date()``），而服务端与官方客户端存的也是这一形状
+    （实测：官方客户端写 ``2026-10-06T00:00:00.000+0000``）。
+
+    写成「本地午夜 + 本地偏移」（``2026-10-06T16:00:00+0800`` 表示 10-07 的 00:00）
+    在读侧会被读成 **10-06**——偏一天。所以构造全天日期时一律经过这里，不要自己
+    ``datetime.combine(day, time(), tzinfo=...)``：那个 ``tzinfo`` 就是 bug 的来源。
+    """
+    return datetime.combine(day, time(0, 0), tzinfo=timezone.utc)
+
+
+def due_wire_fields(due: datetime | None, *, all_day: bool) -> dict[str, Any]:
+    """``{dueDate, isAllDay}`` 这一对的**唯一**出处——写边界的守卫（#73）。
+
+    三个分支：
+
+    - ``due is None``：显式 ``None``（清除；见 :func:`dida.sync.schedule._date_changes`）。
+    - ``all_day=True``：``dueDate`` 一律是**那一天（按它自己的墙钟）的 UTC 午夜**
+      （:func:`all_day_date`）——``due`` 只贡献日历日，它的时刻与偏移都写不出去。
+    - ``all_day=False``：**原样**走 :func:`api_date`，用户墙钟 + 原偏移，不换时区
+      （「不换时区」那条规矩照旧）。
+
+    新建与改期都从这里拿这一对，所以以后的构造点即使漂了，写出去的全天标记也还是这个形状；
+    而带时刻的任务走的是上面第三条，一个字都不改。
+    """
+    if due is None:
+        return {"dueDate": None, "isAllDay": all_day}
+    marker = all_day_date(due.date()) if all_day else due
+    return {"dueDate": api_date(marker, field="dueDate"), "isAllDay": all_day}
 
 
 def _fraction(value: datetime) -> str:

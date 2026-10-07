@@ -253,10 +253,11 @@ async def test_creating_in_a_view_lands_in_the_inbox():
 
 
 async def test_creating_in_today_gives_the_task_todays_date():
-    """在「今天」里建：新任务自动带上**今天**那个日期（验收标准 5、用户故事 35）。
+    """在「今天」里建：新任务自动带上**今天**那一天（验收标准 5、用户故事 35）。
 
     「今天」隐含的是当前**逻辑日**（日界 24:00 时就是自然日 03-14），写法是全天任务的
-    日期标记（当天 00:00）——「今天要做、没说几点」正是这样一条任务。
+    日期标记——那一天的 **UTC 午夜**（``2026-03-14T00:00:00+0000``，#73）。「今天要做、
+    没说几点」正是这样一条任务；本地午夜会被读成前一天（用户看到「昨天」）。
     """
     fake = backend()
     app = DidaApp(fake)
@@ -270,7 +271,9 @@ async def test_creating_in_today_gives_the_task_todays_date():
         await pilot.press("enter")
         await pilot.pause()
 
-    assert placed(fake, INBOX_ID) == [("今天要做", at(14, 0, 0), True)]
+    assert placed(fake, INBOX_ID) == [
+        ("今天要做", datetime(2026, 3, 14, tzinfo=timezone.utc), True)
+    ]
 
 
 async def test_creating_in_a_custom_view_with_todays_window_gives_todays_date():
@@ -294,9 +297,9 @@ async def test_creating_in_a_custom_view_with_todays_window_gives_todays_date():
         await pilot.press("enter")
         await pilot.pause()
 
-    assert placed(fake, INBOX_ID) == [("自建的今天", at(14, 0, 0), True)], (
-        "自建视图里的新建：落收集箱，而且带上今天那个日期标记"
-    )
+    assert placed(fake, INBOX_ID) == [
+        ("自建的今天", datetime(2026, 3, 14, tzinfo=timezone.utc), True)
+    ], "自建视图里的新建：落收集箱，而且带上今天那个日期标记（那一天的 UTC 午夜，#73）"
 
 
 async def test_creating_in_a_view_without_a_date_leaves_the_date_empty():

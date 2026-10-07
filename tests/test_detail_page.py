@@ -1058,9 +1058,9 @@ async def test_typing_a_date_and_a_time_reschedules_the_task_to_that_moment():
 async def test_the_all_day_switch_flips_between_a_time_and_a_date_only():
     """「全天」开关在「有具体时刻」与「只有日期」之间切换（验收标准 2）。
 
-    两条路都走一遍：先 ``x`` 打开全天（时刻那一格空着 → 写的是那一天的 00:00，``isAllDay``
-    是 ``True``），再 ``x`` 关掉它（时刻那一格回来，写的是那一刻）。开关的当前档必须画在
-    屏上——一个按下去看不出状态的开关等于没有开关。
+    两条路都走一遍：先 ``x`` 打开全天（时刻那一格空着 → 写的是那一天的 **UTC 午夜**
+    （#73），``isAllDay`` 是 ``True``），再 ``x`` 关掉它（时刻那一格回来，写的是那一刻）。
+    开关的当前档必须画在屏上——一个按下去看不出状态的开关等于没有开关。
     """
     fake = backend()
     app = DidaApp(fake)
@@ -1087,8 +1087,8 @@ async def test_the_all_day_switch_flips_between_a_time_and_a_date_only():
         toggled_off = screen_text(app)
         time_shown = app.detail_page().query_one("#due-time").display
 
-    assert fake.rescheduled_due[0] == T0.replace(day=15, hour=0, minute=0), (
-        f"全天写的是那一天 00:00 这个日期标记：{fake.rescheduled_due}"
+    assert fake.rescheduled_due[0] == datetime(2026, 3, 15, tzinfo=timezone.utc), (
+        f"全天写的是那一天 UTC 午夜这个日期标记（#73）：{fake.rescheduled_due}"
     )
     assert fake.rescheduled_all_day == [True], f"全天那一档没写出去：{fake.rescheduled_all_day}"
     # 全天任务的读法是「明天」（引擎按 ``due.date()`` 读日期标记，不画 00:00）——那一格确实
@@ -1235,8 +1235,8 @@ async def test_esc_in_the_due_editor_commits_the_typed_date_and_the_all_day_swit
         landed_on = app.detail_page().selected_id
 
     assert fake.rescheduled == ["t1"], f"``esc`` 没有把这一刻写出去：{fake.rescheduled}"
-    assert fake.rescheduled_due == [T0.replace(day=15, hour=0, minute=0)], (
-        f"``esc`` 提交的不是编辑器里那一刻：{fake.rescheduled_due}"
+    assert fake.rescheduled_due == [datetime(2026, 3, 15, tzinfo=timezone.utc)], (
+        f"``esc`` 提交的全天标记是那一天 UTC 午夜（#73）：{fake.rescheduled_due}"
     )
     assert fake.rescheduled_all_day == [True], (
         f"``x`` 的全天开关在 ``esc`` 上丢了：{fake.rescheduled_all_day}"

@@ -723,12 +723,12 @@ async def test_space_again_puts_the_task_back_in_the_open_section():
         await enter_the_list(pilot, app)
         await pilot.press("space")  # 完成
         await pilot.pause(0.2)
-        await settle(pilot=pilot, app=app)
+        await settle(app, pilot)
         assert app.tasks_page().selected_id == TASK_ID, "光标该跟着这一条走到已完成段"
 
         await pilot.press("space")  # 取消完成
         await pilot.pause(0.2)
-        await settle(pilot=pilot, app=app)
+        await settle(app, pilot)
         text = screen_text(app)
 
     assert fake.uncompleted == [TASK_ID], "第二下走的是取消完成"
