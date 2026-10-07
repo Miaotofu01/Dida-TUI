@@ -213,7 +213,7 @@ def test_enqueue_lands_a_pending_change_and_takes_effect_locally(store):
 
 
 def test_attempt_count_next_retry_and_last_error_round_trip(store):
-    """t10 的指数退避要读的四个字段（创建时间、尝试次数、下次重试、最后一次错误）。"""
+    """t10 的退避重试要读的四个字段（创建时间、尝试次数、下次重试、最后一次错误）。"""
     store.apply_refresh(tasks=[task()])
     change = store.enqueue(
         task_id="t1", kind=ChangeKind.UPDATE, payload={"priority": 5}, now=at(4, 9, 30)

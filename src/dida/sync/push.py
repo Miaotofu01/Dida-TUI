@@ -1,8 +1,9 @@
 """写路径：乐观入队、立即推送、退避重试（t10；完成 t11、删除 t16）。
 
 这一片只管一件事：**一次本地写怎么变成一次服务端写**——乐观地落进本地库并入队，推送排在
-事件循环上立刻跑，推不动就留在队列里按注入的钟退避重试。什么时候该重试由 :func:`_is_due`
-算，等多久由 :func:`backoff_delay` 算，两者都是纯函数（不掷骰子、不睡眠）。
+事件循环上立刻跑，推不动就留在队列里按注入的钟退避重试。这一轮该不该试由 :func:`can_attempt`
+一处判定（还没放弃、而且到点了；已经放弃的只有手动同步 ``r`` 才试，工单 #71），等多久由
+:func:`backoff_delay` 按 :data:`RETRY_SCHEDULE` 算，两者都是纯函数（不掷骰子、不睡眠）。
 
 :class:`PushMixin` 的方法挂在组装好的 :class:`~dida.sync.engine.SyncEngine` 上：它们要用
 ``self._clock`` / ``self._source`` / ``self._write_target()``，单独一个 mixin 不完整。
@@ -37,43 +38,46 @@ if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能�
     from dida.storage.store import PendingChange
 
 
-DEFAULT_BACKOFF_BASE = timedelta(seconds=2)
-"""第一次推送失败之后等多久再试（之后每次翻倍）。"""
+RETRY_SCHEDULE: tuple[timedelta, ...] = (
+    timedelta(seconds=5),
+    timedelta(seconds=30),
+    timedelta(minutes=1),
+    timedelta(minutes=5),
+)
+"""自动重试的等待表（工单 #71）：失败一次等一格，从 5 秒一路拉到 5 分钟。
+
+四格等待对应五次尝试（写完之后立刻那一次 + 四次重试）。表就是策略本身——读这张表
+不需要再读 :func:`backoff_delay` 的函数体。
+"""
+
+MAX_PUSH_ATTEMPTS = 5
+"""自动重试的次数上限（工单 #71）：试满五次就不再自动重试了。
+
+正好是 :data:`RETRY_SCHEDULE` 那四格等待用完的那一刻：``attempts`` 是**已经失败过的次数**，
+够到它就说明五次尝试都失败过。放弃**不是丢弃**——改动留在队列里，状态栏照旧数它，
+只有手动同步（``r``）还能再试一次（见 :func:`is_given_up`）。
+"""
 
 
-DEFAULT_BACKOFF_CAP = timedelta(minutes=5)
-"""两次重试之间最多等多久。断网一整天也不该攒出一个巨大的间隔。"""
-
-
-def backoff_delay(
-    attempts: int,
-    *,
-    base: timedelta = DEFAULT_BACKOFF_BASE,
-    cap: timedelta = DEFAULT_BACKOFF_CAP,
-) -> timedelta:
-    """失败 ``attempts`` 次之后再推要等多久：``base``、``2×base``、``4×base``…封顶 ``cap``。
+def backoff_delay(attempts: int) -> timedelta:
+    """失败 ``attempts`` 次之后再推要等多久：照 :data:`RETRY_SCHEDULE` 取一格，封顶 5 分钟。
 
     ``attempts`` 是**已经失败过的次数**（存储层在 ``record_attempt`` 里 +1），所以第一次
-    失败等 ``base``。纯函数，参数从外面进来：没有时钟、没有随机抖动——抖动会让测试变成
-    掷骰子，而这个 app 的重试节奏本来就由用户的下一次按键与状态栏那个数兜着。
+    失败等 5 秒。纯函数：没有时钟、没有随机抖动——抖动会让测试变成掷骰子，而这个 app 的
+    重试节奏本来就由用户的下一次按键与状态栏那个数兜着。
 
-    一步一步翻倍、够到 ``cap`` 就停，**不写 ``base * 2**attempts``**：``attempts`` 只被
-    「失败过几次」推着涨，放着断网的那天也能攒到四十几，而 ``timedelta`` 装不下 ``2**46``
-    秒（``2 × 2**46`` 秒 = 1628906115 天，上限是 999999999 天）。写成整段乘法的话，第一条
-    装不下的 ``attempts`` 会把**算退避**这一步变成 ``OverflowError``：网络一通、推送成功、
-    这条改动出队，就绕开了；可只要网络还没通，**每次开 app 都会崩在这一跳**——连本地缓存
-    那一屏都看不到（用户故事 62 的「没网也能分诊」当场失效）。这个函数对任何 ``attempts``
-    都得给出一个不超过 ``cap`` 的间隔。
+    查表而不是算 ``base * 2**attempts``：``attempts`` 只被「失败过几次」推着涨，放着断网的
+    那天也能攒到四十几，而 ``timedelta`` 装不下 ``2**46`` 秒（``2 × 2**46`` 秒 = 1628906115
+    天，上限是 999999999 天）。写成整段乘法的话，第一条装不下的 ``attempts`` 会把**算退避**
+    这一步变成 ``OverflowError``：网络一通、推送成功、这条改动出队，就绕开了；可只要网络还没
+    通，**每次开 app 都会崩在这一跳**——连本地缓存那一屏都看不到（用户故事 62 的「没网也能
+    分诊」当场失效）。查表对任何 ``attempts`` 都给出一个不超过最后一格的间隔。
     """
-    delay = base
-    for _ in range(attempts):
-        if delay >= cap:
-            break
-        if delay > cap - delay:
-            # 再翻一倍就越过 cap 了，答案直接是 cap；真翻过去只会在这一步溢出。
-            return cap
-        delay *= 2
-    return min(delay, cap)
+    if attempts < 0:
+        return RETRY_SCHEDULE[0]
+    if attempts >= len(RETRY_SCHEDULE):
+        return RETRY_SCHEDULE[-1]
+    return RETRY_SCHEDULE[attempts]
 
 
 def _is_due(change: PendingChange, now: datetime) -> bool:
@@ -82,6 +86,31 @@ def _is_due(change: PendingChange, now: datetime) -> bool:
     「到点」是 ``<=``：注入的钟刚好走到 ``next_retry_at`` 时就算到期。
     """
     return change.next_retry_at is None or change.next_retry_at <= now
+
+
+def is_given_up(attempts: int) -> bool:
+    """自动重试是不是已经放弃这条改动（工单 #71）：失败次数够到 :data:`MAX_PUSH_ATTEMPTS`。
+
+    「还要不要自动重试」只有这一处判据——任务的推送循环（本模块的 :meth:`PushMixin.push_pending`）
+    与清单的推送循环（:meth:`~dida.sync.lists.ListMixin._push_lists`）问的是同一个函数，不是
+    各写一遍。放弃**不删任何东西**：改动留在队列里、状态栏照旧数它，只有手动同步（``r``）
+    能再问它一次。
+    """
+    return attempts >= MAX_PUSH_ATTEMPTS
+
+
+def can_attempt(change: PendingChange, now: datetime, *, manual: bool) -> bool:
+    """这一轮推送该不该试这条改动（工单 #71）：还没放弃、而且到点了。
+
+    这是两个推送循环共同问的那句话。``manual`` = 用户按了 ``r``（手动同步）：豁免**放弃**
+    那道闸，已经放弃的改动再试一次；写完之后立刻那次推送与周期泵都不豁免，所以重启不会
+    悄悄把重试循环接回去。手动对已放弃的改动连 ``next_retry_at`` 那道时间闸也一并豁免
+    ——它已经不上日程了，手动是唯一还能再问一次的路，问的时候不该再等一个已经没有意义的
+    时刻（非放弃的改动照旧要到点，手动不改变它们原来的节奏）。
+    """
+    if is_given_up(change.attempts):
+        return manual
+    return _is_due(change, now)
 
 
 def _unaddressable(
@@ -304,12 +333,16 @@ class PushMixin:
             return
         self.write(task_id, changes={"projectId": to_list_id}, kind=WriteKind.MOVE)
 
-    async def push_pending(self) -> int:
-        """推一轮：把**到期**的待推送改动依次推给服务端，返回推成功的条数。
+    async def push_pending(self, *, manual: bool = False) -> int:
+        """推一轮：把**该试**的待推送改动依次推给服务端，返回推成功的条数。
 
         这是重试队列唯一的泵。「什么时候该重试」由注入的钟判定：没排过重试的立刻推，
         排过的要等到 ``next_retry_at``。**没有 ``time.sleep``、没有真时钟、没有后台线程**
         ——等待发生在调用方（t14 那种定时器或下一次写），引擎只负责算清楚什么时候能推。
+
+        ``manual=True`` 是用户按了 ``r``：已经放弃（失败够 :data:`MAX_PUSH_ATTEMPTS` 次）的
+        改动再试一次，放弃之前的那几种改动照旧按到点判定。默认 ``False``——写完之后立刻那次
+        推送与周期泵（``push_tick``）都是自动路径，放弃的改动它们一律不发。
 
         一条失败不影响后面那些：队列按发生顺序走完，失败的留在队列里等下一次。
 
@@ -317,17 +350,28 @@ class PushMixin:
         排在后面的改动挪到服务端给的 id 上（``Store.adopt_created``），同一轮里紧接着的那一笔
         必须看见新的 id——拿开头读进来的快照，它仍然会带着 ``local-…`` 去推。形状与清单版的
         :meth:`~dida.sync.lists.ListMixin._push_lists` 同一份（#42 两件都做了）。循环一定会停：
-        每一轮要么删掉一行、要么把它的 ``next_retry_at`` 推到将来。
+        每一轮要么删掉一行、要么把它的 ``next_retry_at`` 推到将来、要么把它记进
+        ``attempted``——``manual`` 对已放弃的改动不看 ``next_retry_at``（#71），少了这本账
+        同一笔会在这一轮里被反复重试。
         """
         target = self._write_target()
         writer = self._writer()
         pushed = 0
+        attempted: set[int] = set()
         async with self._push_lock:
             while True:
                 now = self._clock.now()
-                change = next((item for item in target.pending() if _is_due(item, now)), None)
+                change = next(
+                    (
+                        item
+                        for item in target.pending()
+                        if item.id not in attempted and can_attempt(item, now, manual=manual)
+                    ),
+                    None,
+                )
                 if change is None:
                     return pushed
+                attempted.add(change.id)
                 try:
                     await self._send(writer, target, change)
                 except DidaError as exc:

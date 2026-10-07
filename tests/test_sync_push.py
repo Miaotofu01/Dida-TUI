@@ -1,4 +1,4 @@
-"""同步引擎的写路径（t10）：乐观写 → 待推送改动 → 指数退避重试。
+"""同步引擎的写路径（t10）：乐观写 → 待推送改动 → 固定节奏退避重试（工单 #71）。
 
 接缝是 ``SyncEngine`` 的两个公开入口：``write()``（写）与 ``push_pending()``（推），
 接真的 ``Store``（t08）与真的 ``DidaApiClient``（t07）。网络钉在**接缝二**（传输层可注入）上，
@@ -8,8 +8,8 @@
 钉死的规矩（ADR-0002 + CONTEXT）：
 
 - 写先在本地生效并**立即返回**，网络结果不是它的前置条件；
-- 推失败留在队列里，按**注入的时钟**指数退避重试——没有 ``time.sleep``、没有真时钟、
-  也没有测试管不住的线程；
+- 推失败留在队列里，按**注入的时钟**照固定节奏（5s / 30s / 1min / 5min）重试——没有
+  ``time.sleep``、没有真时钟、也没有测试管不住的线程；
 - 待推送数量是状态栏常驻的那一个数，它从 0 变 1，推成功后再变回 0。
 """
 
@@ -194,7 +194,7 @@ async def test_a_write_schedules_the_push_without_making_the_caller_wait(store):
 async def test_a_failed_push_stays_queued_until_the_clock_reaches_the_backoff(store):
     """推失败：改动留在队列里、错误与下次重试时刻都记下，状态栏那个数不归零。
 
-    「等多久」按失败次数指数增长（2s、4s…），全部由注入的钟判定：钟没走到点一次都不许
+    「等多久」按失败次数查那张固定表（5s、30s…），全部由注入的钟判定：钟没走到点一次都不许
     再发，走到了才发。没有 ``time.sleep``、没有真时钟、也没有测试管不住的线程。
     """
     transport = FakeTransport()
@@ -211,7 +211,7 @@ async def test_a_failed_push_stays_queued_until_the_clock_reaches_the_backoff(st
     queued = store.pending()
     assert len(queued) == 1, "推不动就留在队列里，不许悄悄丢掉"
     assert queued[0].attempts == 1
-    assert queued[0].next_retry_at == T0 + timedelta(seconds=2), "第一次失败等 2 秒"
+    assert queued[0].next_retry_at == T0 + timedelta(seconds=5), "第一次失败等 5 秒"
     assert "连不上" in (queued[0].last_error or "")
     assert engine.status().pending_count == 1, "本地比服务端新，这个数就是给用户看的"
     assert titles(engine) == ["写周报（我改的）"], "推失败不许撤销用户刚做的操作"
@@ -219,15 +219,15 @@ async def test_a_failed_push_stays_queued_until_the_clock_reaches_the_backoff(st
     assert await engine.push_pending() == 0, "还没到点：一次都不许再发"
     assert len(transport.requests) == 1
 
-    clock.advance(timedelta(seconds=2))
+    clock.advance(timedelta(seconds=5))
     assert await engine.push_pending() == 0, "到点重试了，但这次还是失败"
 
     queued = store.pending()
     assert len(transport.requests) == 2, "到点才重试，而且只重试一次"
     assert queued[0].attempts == 2
-    assert queued[0].next_retry_at == T0 + timedelta(seconds=2 + 4), "第二次失败等 4 秒"
+    assert queued[0].next_retry_at == T0 + timedelta(seconds=5 + 30), "第二次失败等 30 秒"
 
-    clock.advance(timedelta(seconds=4))
+    clock.advance(timedelta(seconds=30))
 
     assert await engine.push_pending() == 1, "钟走到点，第三次才成功"
     assert len(transport.requests) == 3
@@ -235,14 +235,20 @@ async def test_a_failed_push_stays_queued_until_the_clock_reaches_the_backoff(st
     assert engine.status().pending_count == 0, "重试成功后这个数才回到 0"
 
 
-def test_backoff_doubles_each_attempt_and_stops_at_the_cap():
-    """退避的节奏是纯函数，直接钉住：2s、4s、8s…最多 5 分钟。
+def test_backoff_follows_the_fixed_schedule_and_stops_at_five_minutes():
+    """退避的节奏是纯函数，直接钉住：5s、30s、1min，用完就停在 5 分钟（工单 #71）。
 
-    期望值来自策略本身（写在这里的字面量），不是照代码再算一遍。
+    期望值来自票面上那张表（字面量），不是照代码再算一遍。
     """
-    assert [backoff_delay(n).total_seconds() for n in range(5)] == [2, 4, 8, 16, 32]
+    assert [backoff_delay(n) for n in range(4)] == [
+        timedelta(seconds=5),
+        timedelta(seconds=30),
+        timedelta(minutes=1),
+        timedelta(minutes=5),
+    ]
+    assert backoff_delay(0) == timedelta(seconds=5), "第一次失败等 5 秒"
+    assert backoff_delay(4) == timedelta(minutes=5), "表用完了，停在最后一格"
     assert backoff_delay(20) == timedelta(minutes=5), "封顶，不许涨到天上去"
-    assert backoff_delay(0) == timedelta(seconds=2)
 
 
 def test_backoff_saturates_instead_of_overflowing_at_high_attempt_counts():
@@ -258,14 +264,61 @@ def test_backoff_saturates_instead_of_overflowing_at_high_attempt_counts():
     assert backoff_delay(10_000) == timedelta(minutes=5), "再大也一样：cap 是上界"
 
 
-async def test_a_change_that_failed_forty_six_times_retries_instead_of_crashing(store):
-    """一条攒到 ``attempts=46`` 的改动：记下失败与下次时刻，不许把 app 打崩。
+async def test_a_change_that_has_given_up_is_not_retried_and_is_kept(store):
+    """试满 5 次自动重试就放弃：自动路径再也不发它，但**一个字节都不许丢**（工单 #71）。
 
-    接缝是 ``push_pending()``——周期泵（``push_tick``）与手动同步每次按键走的就是这一条，
-    真存储 + 真客户端 + 假传输。
+    来路是实测的用户机器：``all_proxy`` 指向 socks5 而本机没装 ``socksio``，每次推送都失败，
+    队列里那条改动一路攒到 ``attempts=47``，周期泵就一直重试一个注定失败的请求。现在自动
+    重试在第 5 次之后停下（写完之后立刻那次 + 四次重试）；那条改动留在队列里，状态栏那个数
+    照旧数它，按 ``r`` 还能再试一次。接缝是 ``push_pending()``——周期泵（``push_tick``）与
+    启动刷新走的就是这一条，真存储 + 真客户端 + 假传输。
     """
     transport = FakeTransport()
-    for _ in range(46):
+    for _ in range(10):
+        transport.enqueue(NetworkError("连不上服务端：Using SOCKS proxy"))
+    seed(store, task(id="t1", title="刷一道算法题"))
+    clock = ManualClock(T0)
+    engine = make_engine(store, transport, clock=clock)
+
+    engine.write("t1", changes={"title": "刷一道算法题（我改的）"})
+    await engine.wait_for_pushes()  # 自动第 1 次：写完之后立刻推
+    assert len(transport.requests) == 1
+
+    for wait in (
+        timedelta(seconds=5),
+        timedelta(seconds=30),
+        timedelta(minutes=1),
+        timedelta(minutes=5),
+    ):
+        clock.advance(wait)
+        assert await engine.push_pending() == 0, "还是推不上去"
+    assert len(transport.requests) == 5, "自动路径一共试了 5 次"
+
+    queued = store.pending()
+    assert len(queued) == 1, "放弃不是丢弃：改动还在队列里"
+    assert queued[0].attempts == 5, f"应该正好失败 5 次，实际 {queued[0].attempts}"
+    # #69 修的那个崩溃在这一跳上：算退避不许溢出，给的就是封顶值。
+    assert queued[0].next_retry_at == clock.now() + timedelta(minutes=5), "封顶，不是溢出"
+
+    # 之后无论钟走多远，自动路径一次都不再发它——这就是「试满 5 次就放弃」。
+    clock.advance(timedelta(days=1))
+    assert await engine.push_pending() == 0, "放弃之后自动路径不再重试"
+    assert len(transport.requests) == 5, "假传输上一条新请求都没有"
+    assert store.pending()[0].attempts == 5, "放弃本身不算一次失败"
+
+    assert [change.task_id for change in store.pending()] == ["t1"], "队列里还留着它"
+    assert engine.status().pending_count == 1, "「待推送」那个数必须还看得见它"
+
+
+async def test_a_manual_sync_retries_a_given_up_change_once(store):
+    """``r`` 是唯一还能再问一次的路：已放弃的改动被手动同步再试一次（工单 #71）。
+
+    接缝是 ``push_pending(manual=True)``——``DidaApp.action_refresh`` 走的就是这一条。失败就
+    留在队列里、回到「已放弃」；成功才出队、状态栏归零。手动**不等到点**：那条改动已经不上
+    日程了（这一条由「钟一步都没走也发得出去」钉住）。
+    """
+    transport = FakeTransport()
+    for _ in range(6):
         transport.enqueue(NetworkError("连不上服务端：Using SOCKS proxy"))
     seed(store, task(id="t1", title="刷一道算法题"))
     clock = ManualClock(T0)
@@ -273,28 +326,27 @@ async def test_a_change_that_failed_forty_six_times_retries_instead_of_crashing(
 
     engine.write("t1", changes={"title": "刷一道算法题（我改的）"})
     await engine.wait_for_pushes()
+    for wait in (5, 30, 60, 300):
+        clock.advance(timedelta(seconds=wait))
+        assert await engine.push_pending() == 0
+    assert store.pending()[0].attempts == 5, "先走到自动放弃"
 
-    for _ in range(45):
-        clock.advance(timedelta(minutes=5))
-        assert await engine.push_pending() == 0, "还是推不上去"
+    # 手动再来一次：钟没动也必须发出去；还是失败 → 留在队列里，回到「已放弃」。
+    assert await engine.push_pending(manual=True) == 0
+    assert len(transport.requests) == 6, "手动同步真的又发了一次"
+    assert store.pending()[0].attempts == 6, "手动那一次失败也记在账上"
+    assert engine.status().pending_count == 1, "失败仍在队列里，一个字节都没丢"
 
-    queued = store.pending()
-    assert len(queued) == 1, "攒了 46 次失败也还在队列里，不许悄悄丢掉"
-    assert queued[0].attempts == 46, f"应该正好攒到 46 次，实际 {queued[0].attempts}"
+    # 之后自动路径照旧不发它——手动不会把重试循环接回去。
+    clock.advance(timedelta(days=1))
+    assert await engine.push_pending() == 0
+    assert len(transport.requests) == 6
 
-    # 关键的那一跳：已经失败过 46 次的改动**再失败一次**，旧代码在这里算 ``base * 2**46``
-    # 抛 OverflowError（`record_attempt` 那行在 `except DidaError` 里，OverflowError 不是
-    # DidaError，会一路穿出去）。所以这一跳才是「打不开 app」的那一步。
-    clock.advance(timedelta(minutes=5))
-    assert await engine.push_pending() == 0, "还是推不上去，但 app 不许崩"
-    queued = store.pending()
-    assert queued[0].attempts == 47, f"应该记下第 47 次，实际 {queued[0].attempts}"
-    assert queued[0].next_retry_at == clock.now() + timedelta(minutes=5), "封顶，不是溢出"
-
+    # 网络回来了，手动再来一次 → 出队，状态栏归零。
     transport.enqueue(httpx.Response(200, json={}))
-    clock.advance(timedelta(minutes=5))
-    assert await engine.push_pending() == 1, "网络回来了就该推得出去"
+    assert await engine.push_pending(manual=True) == 1
     assert store.pending() == ()
+    assert engine.status().pending_count == 0
 
 
 async def test_completing_through_the_write_path_uses_the_complete_endpoint(store):
@@ -407,7 +459,7 @@ async def test_a_restart_still_has_the_queue_and_pushes_it(tmp_path):
         assert reopened.pending_count() == 1, "进程结束不等于队列没了：它在本地库那张表里"
 
         ok = FakeTransport(json={"id": "t1"})
-        # 重启发生在几分钟之后：退避（2s × 2ⁿ，封顶 5 分钟）已经到点
+        # 重启发生在几分钟之后：退避（5s → 30s → 1min → 5min）已经到点
         later = make_engine(reopened, ok, clock=ManualClock(T0 + timedelta(minutes=10)))
         pushed = await later.push_pending()
 
