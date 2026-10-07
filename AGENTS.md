@@ -4,19 +4,27 @@
 
 技术栈：Python 3.12 + Textual。安装后以 `dida` 命令启动。
 
-当前状态：**正在从 v1 转向 v2。** v1 已实现，跑在 `feat/v1-today-console` 分支上（PR #28 尚未合并）——它是「今日执行台」：三栏、只显示与今天有关的任务、清单栏是装饰性的。真实使用后判定不可用，v2 改成通用客户端：一栏、三层页面（清单列表 → 任务列表 → 任务详细页），「今天」降级成内置视图之一。**v2 spec 落地前，不要按 v1 的定位去扩展代码。**
+当前状态：**v2 已落地并进 `main`**（PR #50；spec 是 [issue #30](https://github.com/Miaotofu01/Dida-TUI/issues/30) 与后续的 [issue #61](https://github.com/Miaotofu01/Dida-TUI/issues/61)，两张都已关闭）。v1 的三栏「今日执行台」实测判定不可用，已整条删除；现在是通用客户端：一栏、三层页面（清单列表 → 任务列表 → 任务详细页），「今天」降级成三个内置视图之一。
 
-- 现状（#34 落地后）：`uv run pytest` 全绿（400+ 条，约半分钟），`uv run dida` 起的是 **v2 的一栏三层页面**
+- `uv run pytest` 全绿（**约 4 分钟**，近千条——跑得久不等于挂了），`uv run dida` 起的就是那一栏三层页面
   （清单列表页 → 任务列表页 → 任务详细页，`→` 进入、`←` 退回；`enter` / `esc` 在这三页上不再导航，
-  详细页上 `esc` 只结束编辑＝保存）。v1 的三栏布局、`Tab` 焦点切换、
-  清单浮层、窄屏响应式降级与日期解析器都已删除；每层剩下的能力按 #35–#48 补齐，键位表在
-  `src/dida/tui/keys.py`（应用内按 `h` 看到的就是它）。
-- v2 的设计决定已经落进 [GLOSSARY.md](GLOSSARY.md) 与 [docs/adr/](docs/adr/)——尤其看
+  详细页上 `esc` 只结束编辑＝保存）。键位表在 `src/dida/tui/keys.py`（应用内按 `h` 看到的就是它）。
+- 设计决定落进 [GLOSSARY.md](GLOSSARY.md) 与 [docs/adr/](docs/adr/)——尤其看
   [ADR-0004](docs/adr/0004-terminal-client-not-today-console.md)（定位转变，含作废与保留清单）、
   [ADR-0002](docs/adr/0002-immediate-push-irreversible-complete.md)（「完成不可逆」已被实测推翻）、
-  [ADR-0006](docs/adr/0006-disable-kitty-keyboard-protocol.md)（为什么关掉 kitty 协议推送——别顺手删）。
-- v1 spec 在 [issue #1](https://github.com/Miaotofu01/Dida-TUI/issues/1)；v2 spec 会另起一份并取代它。
+  [ADR-0006](docs/adr/0006-disable-kitty-keyboard-protocol.md)（为什么关掉 kitty 协议推送——别顺手删）、
+  [ADR-0008](docs/adr/0008-arrows-replace-enter-and-escape.md)（`→` / `←` 与 `h`，以及编辑态 `esc` 保存）。
 - 模块边界、依赖方向与两个测试接缝见 [docs/architecture.md](docs/architecture.md)；面向使用者的入口是 [README.md](README.md)。
+
+## 工作笔记（`notes/`）
+
+编排的 brief、进度日志与派活模板都在仓库里的 **[`notes/`](notes/)**（索引：[`notes/README.md`](notes/README.md)）：
+
+- [`notes/brief.md`](notes/brief.md)——交付决定、**按后果分流**的路由规则（开工前先读它，它决定这张票要不要独立分支）、**测试预算**，以及各轮实测出来的地雷。
+- [`notes/progress.md`](notes/progress.md)——append-only 的进度日志。[`notes/implementer-template.md`](notes/implementer-template.md) / [`notes/merger-template.md`](notes/merger-template.md)——派活用。
+- [`notes/codebase-map.md`](notes/codebase-map.md)、[`notes/terminal-input-evidence.md`](notes/terminal-input-evidence.md)、[`notes/openapi-dida365.md`](notes/openapi-dida365.md)——代码地图、终端实测、官方 API 文档。
+
+仓库注释里写的 `notes/...` 指的就是这个目录——它现在在仓库里，grep 得到。
 
 ## Agent skills
 

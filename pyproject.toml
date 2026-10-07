@@ -1,7 +1,7 @@
 [project]
 name = "dida-tui"
 version = "0.1.0"
-description = "终端里的滴答清单今日执行台"
+description = "终端里的滴答清单客户端"
 requires-python = ">=3.12"
 dependencies = [
     "textual>=8.2.8",
