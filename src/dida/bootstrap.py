@@ -102,23 +102,22 @@ def default_transport(factory: Callable[[], Transport] | None = None) -> Transpo
 
 
 def _unreachable_message(error: NetworkError) -> str:
-    """「连不上服务端」时要说的话：真实原因 + 两条能照着做的出路。
+    """「连不上服务端」时要说的话：真实原因 + 一句能照着做的下一步。
 
     首次运行这一步**必须**联网（token 要真的被服务端认一次才落盘，用户故事 2），所以这里
-    不能糊过去。但也不能把环境问题说成凭据问题——用户在这一屏能做的事只有两件：让代理
-    能用，或者绕开代理。
+    不能糊过去。但也不能把环境问题说成凭据问题——用户在那一屏能做的事只有一件：先确认这台
+    机器上别的联网工具（浏览器、``curl``）能不能通，再回头试。
 
-    两条触发路径共用这一段话：传输层根本建不出来（本机 ``all_proxy`` 缺 ``socksio``），
-    以及建出来了但请求发失败（断网、超时）。两者都是「这台机器发不出请求」。
+    两条触发路径共用这一段话：传输层根本建不出来（极少见），以及建出来了但请求发失败
+    （断网、超时、服务端不可达）。两者都是「这台机器发不出请求」。
+
+    **这里不再提代理**：``HttpxTransport`` 从 #72 起不读环境里的代理设置（理由写在那个类上），
+    所以「``all_proxy`` 缺 ``socksio``」那条路已经不存在了，再指给用户只会把人引偏。
     """
     return (
         f"连不上服务端：{error}\n"
         "这不是 token 的问题，再粘一次也一样——是这台机器发不出请求。\n"
-        "两条出路：\n"
-        "  1. 让代理能用（本机 all_proxy 指向 socks5，需要 socksio）：\n"
-        "     uv tool install --with socksio dida-tui\n"
-        "  2. 绕开代理再跑（只在不需要代理也能上外网时有用）：\n"
-        "     env -u all_proxy -u ALL_PROXY -u http_proxy -u https_proxy dida"
+        "先确认这台机器能上外网（浏览器或 curl 试一下 api.dida365.com），再重跑 dida。"
     )
 
 
