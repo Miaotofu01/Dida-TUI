@@ -95,11 +95,31 @@ def test_unreachable_transport_is_reported_as_an_environment_problem(monkeypatch
         main()
 
     message = str(caught.value)
-    assert SOCKS_ERROR in message, "要说清真实原因（用户才知道去查代理）"
+    assert SOCKS_ERROR in message, "要说清真实原因"
     assert "不是 token 的问题" in message, "别让用户去怀疑自己的 token"
-    assert "socksio" in message, "给出路一：让代理能用"
-    assert "all_proxy" in message, "给出路二：绕开代理"
+    assert "api.dida365.com" in message, "给一句能照着做的下一步"
+    # 注入的 error 文本里本来就带 socksio（那是真实报错原文），所以这里查的是**建议**那半句
+    assert "uv tool install" not in message, "代理那条出路从 #72 起不存在了，别再把人往那儿引"
+    assert "all_proxy" not in message, "同上"
     assert "重新粘贴" not in message, "「再粘一次」在这条路径上帮不上忙，不许作为建议出现"
+
+
+def test_a_socks_proxy_in_the_environment_no_longer_breaks_the_transport(monkeypatch):
+    """终端里设了走不了的 socks 代理，也不该让整个 app 没网（#72）。
+
+    真实一幕：``all_proxy=socks5://…`` 而没装 ``socksio``，``httpx.AsyncClient()`` 在**构造**
+    时就抛 ``ImportError``，于是 ``default_transport()`` 退化成 ``_UnusableTransport``——
+    app 只能看缓存，连自己的 token 都验不了。传输层现在不读环境里的代理，这一幕不再发生。
+    """
+    import dida.bootstrap as bootstrap
+    from dida.api.transport import HttpxTransport
+
+    for name in ("all_proxy", "ALL_PROXY", "http_proxy", "https_proxy"):
+        monkeypatch.setenv(name, "socks5://127.0.0.1:2080")
+
+    transport = bootstrap.default_transport()
+    assert isinstance(transport, HttpxTransport), "不该再退化成「建不出来」那一个"
+    assert not isinstance(transport, bootstrap._UnusableTransport)
 
 
 def test_a_rejected_token_still_says_credentials(monkeypatch, tmp_path):
