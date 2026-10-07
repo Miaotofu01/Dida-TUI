@@ -208,7 +208,7 @@ async def test_a_write_on_the_old_id_lands_on_the_real_row(tmp_path):
 
 
 async def test_the_alias_does_not_outlive_the_process(tmp_path):
-    """别名只在本次进程里有效：重开这个库，旧 id 就没人认了（ADR-0009 二）。"""
+    """别名只在**这一次打开**期间有效：重开这个库，旧 id 就没人认了（ADR-0009 二）。"""
     path = tmp_path / "dida.sqlite3"
     store = Store(path)
     engine = make_engine(store, Server())
@@ -219,7 +219,7 @@ async def test_the_alias_does_not_outlive_the_process(tmp_path):
 
     again = Store(path)
     assert [task.id for task in again.tasks()] == ["srv1"], "那一行还是服务端 id 那一行"
-    assert again.task_payload(local) is None, "新进程里没有界面握着那个旧 id，别名清掉了"
+    assert again.task_payload(local) is None, "重开之后没有界面还握着那个旧 id，别名清掉了"
     again.close()
 
 
@@ -384,10 +384,10 @@ async def test_editing_a_just_created_list_from_the_index_page(tmp_path):
 
     **这一条能分辨**：``_finish_list_form`` 的重画也排在推送之前，所以清单列表页那一行的行 id
     认领之后仍然是 ``local-list-1``——按 ``e`` 交回引擎的正是那个旧 id。（清单那一行的 id 不
-    刷新就不会变，这一点与「光标那一行的 id 每次重画都新读」的错觉相反。）
+    刷新就不会变，与「光标那一行的 id 每次重画都新读」的错觉相反。）
 
-    表单本身怎么填不在这里测（``tests/test_list_overlay.py`` 管那一条）：按 ``e`` 让 app 进入
-    「改这一行」的状态之后，直接把 ``_finish_list_form`` 交回去——那正是浮层保存时调的那个口子。
+    全程走键（``e`` → 打字 → ``enter``，与 ``tests/test_list_overlay.py`` 那条同一套）：
+    名字那一格是**全选**的，直接打就是整个换掉。
     """
     store = open_store(tmp_path)
     server = Server()
@@ -410,7 +410,8 @@ async def test_editing_a_just_created_list_from_the_index_page(tmp_path):
 
         await pilot.press("e")
         await pilot.pause()
-        app._finish_list_form({"name": "改名", "color": ""})
+        await pilot.press(*"改名")
+        await pilot.press("enter")
         await pilot.pause()
         await app.engine.wait_for_pushes()
         await pilot.pause()
