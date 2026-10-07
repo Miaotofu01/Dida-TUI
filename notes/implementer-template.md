@@ -10,10 +10,10 @@ branch, in your own worktree.
 
 ## Read first, in this order
 
-1. `/home/tofu/dida-v2-worktrees/notes/brief.md` — the orchestration brief: where everything is, the repo
+1. `notes/brief.md`（仓库里；任何 worktree 都读得到） — the orchestration brief: where everything is, the repo
    conventions, delivery decisions, how to report back, and the landmines already verified by a previous
    audit. **Follow it.**
-2. `/home/tofu/dida-v2-worktrees/notes/codebase-map.md` — a line-referenced map of the codebase produced
+2. `notes/codebase-map.md` — a line-referenced map of the codebase produced
    for exactly this batch of tickets. Skim its table of contents, then read the sections your ticket
    touches. It will save you most of the exploration.
 3. Your ticket: `gh api repos/Miaotofu01/Dida-TUI/issues/<NN> --jq .body` (comments too). The spec it
@@ -23,7 +23,7 @@ branch, in your own worktree.
 
 ## Your worktree
 
-`/home/tofu/dida-v2-worktrees/t<NN>`, branch `ticket/<NN>-<slug>`. `cd` there, `uv sync`, then confirm
+`.worktrees/t<NN>`（仓库里）, branch `ticket/<NN>-<slug>`. `cd` there, `uv sync`, then confirm
 you are genuinely based on the integration branch:
 `git merge-base --is-ancestor feat/v2-terminal-client HEAD && echo BASED_OK`
 If that fails, `git reset --hard feat/v2-terminal-client` before starting.
