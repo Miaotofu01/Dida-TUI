@@ -269,6 +269,40 @@ async def test_a_rename_that_cannot_be_pushed_stays_queued_and_is_retried(store)
     assert transport.last_json["name"] == "买买买"
 
 
+async def test_a_list_change_that_has_given_up_follows_the_same_gate(store):
+    """清单改动与任务改动**同一套规矩**（工单 #71）：试满 5 次自动放弃，``r`` 还能再试一次。
+
+    判据在 :func:`~dida.sync.push.can_attempt` 一处——``lists.py`` 的推送循环与任务那个
+    循环问的是同一个函数。放弃**不丢弃**：那一笔留在队列里，状态栏照旧数它，本地那份改名
+    照旧生效（ADR-0002 的待推送豁免）。
+    """
+    clock = ManualClock(T0)
+    transport = FakeTransport(json={"id": "p1", "name": "购物"})
+    engine = make_engine(store, transport, clock=clock)
+    engine.create_list("购物")
+    await engine.wait_for_pushes()  # 建好了：p1 是服务端认的 id
+    sent = len(transport.requests)
+
+    for _ in range(5):
+        transport.enqueue(NetworkError("连不上服务端：Using SOCKS proxy"))
+    engine.update_list("p1", name="买买买")
+    await engine.wait_for_pushes()  # 自动第 1 次：写完之后立刻推
+    for wait in (5, 30, 60, 300):
+        clock.advance(timedelta(seconds=wait))
+        assert await engine.push_pending() == 0, "还是推不上去"
+    assert len(transport.requests) == sent + 5, "自动路径一共试了 5 次"
+
+    clock.advance(timedelta(days=1))
+    assert await engine.push_pending() == 0, "放弃之后自动路径不再发它"
+    assert len(transport.requests) == sent + 5, "假传输上一条新请求都没有"
+    assert engine.status().pending_count == 1, "「待推送」照旧数着它，一个字节都没丢"
+    assert "买买买" in names_of(engine), "本地那份改名照旧生效"
+
+    assert await engine.push_pending(manual=True) == 1, "按 r 手动同步还能再试一次"
+    assert engine.status().pending_count == 0
+    assert transport.last_json["name"] == "买买买", "发出去的还是用户要改的那个名字"
+
+
 async def test_a_deleted_list_is_gone_at_once_and_the_delete_goes_out(store):
     """删掉立刻看不见；推送走 ``DELETE .../project/{id}``。"""
     transport = FakeTransport(json={"id": "p1", "name": "购物"})

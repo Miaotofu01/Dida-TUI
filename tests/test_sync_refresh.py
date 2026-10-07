@@ -755,7 +755,7 @@ async def test_a_failed_push_survives_a_full_refresh_and_then_succeeds(store):
     ]
 
     transport.enqueue(httpx.Response(200, json={}))
-    clock.advance(timedelta(seconds=2))
+    clock.advance(timedelta(seconds=5))
 
     assert await engine.push_pending() == 1
 

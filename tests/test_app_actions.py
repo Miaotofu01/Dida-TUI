@@ -227,6 +227,31 @@ async def test_r_asks_the_engine_for_all_three_things():
     assert (fake.refreshes, fake.pushes, fake.completed_pulls) == (1, 1, 1)
 
 
+async def test_only_r_counts_as_a_manual_sync():
+    """手动标记只跟着 ``r`` 走（工单 #71）：启动刷新与周期泵都是自动的。
+
+    自动路径跳过已经放弃的改动，手动那一次才再试一遍。重启如果被算成手动，重试循环就会
+    在每个开屏悄悄接回去——而用户从来没按过那个键。
+    """
+    fake = backend()
+    app = DidaApp(fake, refresh_on_start=True)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+        assert fake.manual_pushes == [False], "启动刷新是自动的"
+
+        await app.push_tick()
+        assert fake.manual_pushes == [False, False], "周期泵也是自动的"
+
+        await pilot.press("r")
+        await app.workers.wait_for_complete()
+        await pilot.pause()
+
+    assert fake.manual_pushes == [False, False, True], "只有 r 是手动"
+
+
 # ------------------------------------------------------------------ q：退出拦截
 
 
