@@ -251,6 +251,12 @@ class PushMixin:
         snapshot = target.task_payload(task_id)
         if snapshot is None or not snapshot.get("projectId"):
             raise UnknownTaskError(task_id)
+        # 认领换过名的话，这一行现在叫另一个 id（工单 #75 / ADR-0009）：``task_payload`` 已经按
+        # 别名解析过，所以底稿里那个 ``id`` 就是它现在的名字，拿它当准。**必须在这里定下来**
+        # ——下面每一步都按 id 走：``is_addressable_task`` 会把临时 id 判成「服务端没见过」而
+        # 拒绝这一笔（而它其实已经被认领了），进队那一行要是带着临时 id 更糟——那是一条永远推不
+        # 出去的改动（#53 挡的正是这一类安静错误）。
+        task_id = str(snapshot.get("id") or task_id)
         project = str(snapshot["projectId"])
         target_project = project_in(changes)
         if not is_addressable_task(

@@ -383,6 +383,16 @@ class InMemorySource:
     def tasks(self) -> tuple[TaskSnapshot, ...]:
         return tuple(self._tasks.values())
 
+    def resolve_id(self, id: str) -> str:
+        """照 ``ViewSource`` 那一口实现：替身这里认不出别名，所以原样给回去。
+
+        这不是「说假话」：替身的 ``create`` 直接给真 id（``t1`` 这种），认领换名在它这半边
+        根本不存在，所以没有别名可认。**代价要说清**（工单 #75 / ADR-0009）：那一整类问题在
+        接缝一上复现不出来，回归测试只能落在真 ``Store`` 那条接缝上
+        （``tests/test_local_id_after_claim.py``）。
+        """
+        return id
+
     def sync_state(self) -> SyncState:
         return self.state
 

@@ -609,9 +609,13 @@ class SyncEngine(
         """读：某个容器的任务列表——它的**全部**未完成任务（未来的也在）+ 已完成的那部分。
 
         认不出来的容器给空列表（清单被删了、光标停在一条已经不在了的行上）。
+
+        ``container_id`` 可能是**认领换名之前**的那个清单 id（人正站在一个刚建好的清单里，
+        工单 #75）：先解析成它现在的名字，不然这一屏会是空的（读法见 ``ViewSource.resolve_id``）。
         """
         if self._source is None:
             return TaskList(container_id=container_id)
+        container_id = self._source.resolve_id(container_id)
         tasks = tuple(self._source.tasks())
         return container_tasks(
             container_id,
@@ -624,9 +628,15 @@ class SyncEngine(
         )
 
     def task_detail(self, task_id: str) -> TaskDetail | None:
-        """读：单条任务的详情（重复规则、提醒、子任务、原文里的未知字段都在这）。"""
+        """读：单条任务的详情（重复规则、提醒、子任务、原文里的未知字段都在这）。
+
+        ``task_id`` 可能是**认领换名之前**的那个临时 id（屏幕上那一行就是旧的，工单 #75）：
+        先解析成它现在的名字，不然这一页会说「这条任务已经不在本地缓存里了」——而那正是用户
+        报上来的那句话。
+        """
         if self._source is None:
             return None
+        task_id = self._source.resolve_id(task_id)
         tasks = tuple(self._source.tasks())
         snapshot = next((item for item in tasks if item.id == task_id), None)
         if snapshot is None:

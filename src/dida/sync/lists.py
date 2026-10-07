@@ -443,6 +443,10 @@ class ListMixin:
         current = target.list_payload(list_id)
         if current is None:
             raise UnknownListError(list_id)
+        # 认领换过名的话，这一行现在叫另一个 id（工单 #75 / ADR-0009）：原文里那个 ``id`` 就是
+        # 它现在的名字，拿它当准——否则下面 ``is_local_list_id`` 会把一个**已经被认领**的清单
+        # 判成「还没推出去」，那一笔改名会被并进一条早就不该在的队列记录里。
+        list_id = str(current.get("id") or list_id)
         if not is_list_edit(
             current_name=current.get("name"),
             current_color=current.get("color"),
@@ -507,6 +511,9 @@ class ListMixin:
         current = target.list_payload(list_id)
         if current is None:
             raise UnknownListError(list_id)
+        # 与 :meth:`update_list` 同一处、同一个理由（工单 #75 / ADR-0009）：被认领过的清单拿旧 id
+        # 来删，要落成一次真删除，而不是被当成「还没推出去的那一行」挂进认领记录等 id。
+        list_id = str(current.get("id") or list_id)
         if is_local_list_id(list_id):
             self._park_delete(target, list_id)
             return
