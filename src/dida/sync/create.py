@@ -69,6 +69,11 @@ class CreateMixin:
         """
         target = self._write_target()
         local_id = _local_task_id()
+        # 落点可能是**认领换名之前**的那个清单 id（人正站在一个刚建好的清单里，工单 #75）：
+        # 界面交进来的就是它手里的 `_container_id`，而那个值不会自己变（`tui/app.py` 只在进层
+        # 那一下写它）。不解析的话下面那道判据会把一个**已经同步完**的清单拒掉，屏幕上说的是
+        # 「这个清单还没同步完」——一句假话。
+        list_id = target.resolve_id(list_id)
         if not is_addressable_task(local_id, WriteKind.CREATE, project_id=list_id):
             # 只有一种可能：要落进去的那个清单还没被认领——任务那一半对新建不算数（它的 URL
             # 里没有 id）。判据仍然只有 is_addressable_task 那一处。

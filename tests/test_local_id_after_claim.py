@@ -18,6 +18,7 @@ from pathlib import Path
 import httpx
 
 from dida.api.client import DidaApiClient
+from dida.api.errors import NetworkError
 from dida.storage.store import Store
 from dida.sync.engine import SyncEngine
 from dida.testing import ManualClock
@@ -42,13 +43,32 @@ def project(id: str = "work", name: str = "工作") -> dict:
 class Server:
     """假服务端：新建真的回一个带服务端 id 的原文（认领就发生在这里），其余照常应答。
 
-    ``create_gate`` 把新建那一个请求拦在闸门上，好让「人已经站在详细页上、推送才落地」这一
-    瞬间可以被断言（工单 #75 判据 3）。
+    ``create_gate`` 把**任务**新建那一个请求拦在闸门上，好让「人已经站在详细页上、推送才落地」
+    这一瞬间可以被断言（工单 #75 判据 3）。
+
+    ``no_id_create`` 是 #54 那一格：建清单回了 ``201`` 空体（服务端建好了，但没告诉我们 id），
+    于是认领要等到下一次全量刷新按名字对上（``ListMixin._identify_created_lists``）。
     """
 
-    def __init__(self, *, create_gate: asyncio.Event | None = None) -> None:
+    def __init__(
+        self,
+        *,
+        create_gate: asyncio.Event | None = None,
+        list_gate: asyncio.Event | None = None,
+        no_id_create: bool = False,
+        task_error: Exception | None = None,
+    ) -> None:
         self.create_gate = create_gate
+        self.list_gate = list_gate
+        self.no_id_create = no_id_create
+        self.task_error = task_error
+        """摆了异常就让**改任务**那一个请求抛它：那一笔改动会留在队列里，好直接读它的 ``task_id``。"""
         self.requests: list[httpx.Request] = []
+        self.created: list[dict] = []
+        """``POST /open/v1/task`` 收到的那些请求体（断落点用）。"""
+        self.lists = [inbox(), project()]
+        """清单索引（``GET /open/v1/project`` 给的就是它）；测试可以直接往里加一行。"""
+        self.tasks: dict[str, list[dict]] = {}
         self.next_id = 1
         self.next_list_id = 1
 
@@ -63,6 +83,7 @@ class Server:
             if self.create_gate is not None:
                 await self.create_gate.wait()
             body = json.loads(request.content)
+            self.created.append(body)
             created = {
                 "id": f"srv{self.next_id}",
                 "projectId": body.get("projectId"),
@@ -72,6 +93,10 @@ class Server:
             self.next_id += 1
             return httpx.Response(200, json=created)
         if path == "/open/v1/project" and request.method == "POST":
+            if self.list_gate is not None:
+                await self.list_gate.wait()
+            if self.no_id_create:
+                return httpx.Response(201)
             body = json.loads(request.content)
             created = {
                 "id": f"srvlist{self.next_list_id}",
@@ -79,17 +104,24 @@ class Server:
                 "sortOrder": 5,
             }
             self.next_list_id += 1
+            self.lists.append(created)
             return httpx.Response(200, json=created)
         if path == "/open/v1/project":
-            return httpx.Response(200, json=[inbox(), project()])
+            return httpx.Response(200, json=self.lists)
         if path.endswith("/data"):
             list_id = path.split("/")[4]
+            row = next((item for item in self.lists if item["id"] == list_id), inbox())
             return httpx.Response(
-                200,
-                json={"project": project() if list_id == "work" else inbox(), "tasks": []},
+                200, json={"project": row, "tasks": self.tasks.get(list_id, [])}
             )
         if path == "/open/v1/task/completed":
             return httpx.Response(200, json=[])
+        if path.startswith("/open/v1/task/") and request.method == "POST":
+            # 改一条任务（``POST /open/v1/task/{taskId}``）：摆了 ``task_error`` 就抛，
+            # 那一笔改动会留在队列里等重试——好直接读队列行上的 ``task_id``。
+            if self.task_error is not None:
+                raise self.task_error
+            return httpx.Response(200, json={})
         if request.method in ("POST", "DELETE"):
             return httpx.Response(200, json={})
         raise AssertionError(f"这张测试的假服务端没准备这条路径：{path}")
@@ -232,6 +264,160 @@ async def test_a_reissued_local_list_id_does_not_point_at_the_old_list(tmp_path)
 
     assert [row.name for row in store.lists() if row.id == "srvlist1"] == ["第一"], "改的是第二条"
     assert any(row.name == "第二（改）" for row in store.lists())
+    store.close()
+
+
+async def test_a_task_created_in_a_just_claimed_list_lands_in_it(tmp_path):
+    """在一条**刚被认领**的清单里新建任务：落点是服务端认的那个清单 id。
+
+    界面交进来的落点就是它手里的 ``_container_id``（``tui/app.py`` 的 ``_finish_new_task``），
+    而那个值在认领之后还是旧的——不过这一道的话，新建会被 :class:`UnclaimedListError` 拒掉，
+    屏幕上说的是「这个清单还没同步完」，而它明明已经同步完了。
+    """
+    store = open_store(tmp_path)
+    server = Server()
+    engine = make_engine(store, server)
+
+    local = engine.create_list("工作")
+    await engine.wait_for_pushes()
+    assert [row.id for row in store.lists() if row.name == "工作"] == ["srvlist1"]
+
+    engine.create("买牛奶", local)
+    await engine.wait_for_pushes()
+
+    assert server.created[0]["projectId"] == "srvlist1", "落点是服务端认的那个清单"
+    assert [task.list_id for task in store.tasks() if task.title == "买牛奶"] == ["srvlist1"]
+    store.close()
+
+
+async def test_a_list_claimed_at_refresh_time_still_answers_its_old_id(tmp_path):
+    """#54 那一格：建清单时服务端没回 id，认领发生在**下一次全量刷新按名字对上**。
+
+    那条认领走的是 ``Store.identify_list``（不是 ``adopt_created_list``），所以别名也得在那里
+    落账——不然「旧 id 继续认」这条只覆盖推送那一条路。
+    """
+    store = open_store(tmp_path)
+    server = Server(no_id_create=True)
+    engine = make_engine(store, server)
+
+    local = engine.create_list("新清单")
+    await engine.wait_for_pushes()
+    assert store.list_payload(local) is not None, "没回 id，所以认领还没发生——本地那一行照旧在"
+    assert store.resolve_id(local) == local
+
+    server.lists.append({"id": "srvlist9", "name": "新清单", "sortOrder": 5})
+    await engine.refresh()
+    assert store.list_payload("srvlist9") is not None, "刷新按名字把这一条认回来了"
+
+    assert store.list_payload(local) is not None, "认领之后旧 id 仍然读得到这一行"
+    engine.update_list(local, name="改名")
+    await engine.wait_for_pushes()
+    assert "/open/v1/project/srvlist9" in server.paths, "改名打在服务端认的那个清单 id 上"
+    store.close()
+
+
+async def test_standing_in_a_just_created_list_shows_its_name_not_the_local_id(tmp_path):
+    """人**已经站在**那个刚建好的清单里、认领才发生：抬头写的是它的名字，不是 ``local-list-1``。
+
+    这一层手里只有一份 ``_container_id``，它撑起抬头与新建的落点；光标那一行的行 id 来自读模型，
+    认领之后是新的。两处对同一个容器各说一个名字的话，抬头那一段会把原始 id 画给用户看
+    （``_container_name`` 认不出来时照原样写 id）。
+    """
+    store = open_store(tmp_path)
+    gate = asyncio.Event()
+    server = Server(list_gate=gate)
+    app = make_app(store, server)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        app._finish_list_form({"name": "新清单", "color": ""})
+        await pilot.pause()
+
+        index = app.index_page()
+        for _ in range(12):
+            if (index.selected_id or "").startswith("local-list"):
+                break
+            index.action_cursor_down()
+        else:
+            raise AssertionError(f"光标没能走到刚建的那一行上，停在 {index.selected_id}")
+        await pilot.press("right")
+        await pilot.pause()
+        assert (app._container_id or "").startswith("local-list"), "推送还挂在闸门上，进的是临时 id"
+
+        gate.set()
+        await app.engine.wait_for_pushes()
+        await pilot.pause()
+        app.refresh_view()  # 认领之后第一次重画（真实使用时是用户的下一个动作带上来的）
+        await pilot.pause()
+        shown = screen_text(app)
+
+        assert "local-list" not in shown, "抬头不许把本地临时 id 画给用户看"
+        assert "新清单" in shown, "抬头写的是这个清单的名字"
+
+    store.close()
+
+
+async def test_the_change_queued_under_the_old_id_carries_the_real_task_id(tmp_path):
+    """拿旧 id 写的那一笔，**排进队列的是真 id**——直读队列行，不看「推完队列空了」这种效果。
+
+    队列里带临时 id 的改动永远推不出去（服务端没有那个任务，#53），所以这一条是这一票最要紧的
+    不变量；用「推不动」的服务端把它留在队列里，是为了能直接读那一行的 ``task_id``。
+    """
+    store = open_store(tmp_path)
+    server = Server(task_error=NetworkError("连不上"))
+    engine = make_engine(store, server)
+
+    local = engine.create("买牛奶", "work")
+    await engine.wait_for_pushes()  # 新建推成功 → 认领换名
+    engine.write(local, changes={"title": "买牛奶（改）"})
+    await engine.wait_for_pushes()  # 这一笔推不动，留在队列里
+
+    queued = store.pending()
+    assert len(queued) == 1, "那一笔还在队列里等重试"
+    assert queued[0].task_id == "srv1", "队列行上是服务端认的那个 id，不是临时 id"
+    assert queued[0].list_id == "work"
+    store.close()
+
+
+async def test_editing_a_just_created_list_from_the_index_page(tmp_path):
+    """工单判据 4 的界面那一半：建完清单、推送落地之后，在那一行上按 ``e`` 能改。
+
+    **这一条能分辨**：``_finish_list_form`` 的重画也排在推送之前，所以清单列表页那一行的行 id
+    认领之后仍然是 ``local-list-1``——按 ``e`` 交回引擎的正是那个旧 id。（清单那一行的 id 不
+    刷新就不会变，这一点与「光标那一行的 id 每次重画都新读」的错觉相反。）
+
+    表单本身怎么填不在这里测（``tests/test_list_overlay.py`` 管那一条）：按 ``e`` 让 app 进入
+    「改这一行」的状态之后，直接把 ``_finish_list_form`` 交回去——那正是浮层保存时调的那个口子。
+    """
+    store = open_store(tmp_path)
+    server = Server()
+    app = make_app(store, server)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        app._finish_list_form({"name": "新清单", "color": ""})
+        await pilot.pause()
+        await app.engine.wait_for_pushes()
+        await pilot.pause()
+
+        index = app.index_page()
+        for _ in range(12):
+            if (index.selected_id or "").startswith("local-list"):
+                break
+            index.action_cursor_down()
+        else:
+            raise AssertionError(f"光标没能走到刚建的那一行上，停在 {index.selected_id}")
+
+        await pilot.press("e")
+        await pilot.pause()
+        app._finish_list_form({"name": "改名", "color": ""})
+        await pilot.pause()
+        await app.engine.wait_for_pushes()
+        await pilot.pause()
+
+        assert "/open/v1/project/srvlist1" in server.paths, "改名打在服务端认的那个清单 id 上"
+        assert any(row.name == "改名" for row in store.lists()), "改的是这一行"
+
     store.close()
 
 

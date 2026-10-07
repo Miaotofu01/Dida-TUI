@@ -512,13 +512,19 @@ class DidaApp(App[None]):
         self._view_day = self.engine.logical_day()
         rows = self.engine.list_index()
         self.index_page().show_lists(rows)
+        task_list = None if self._container_id is None else self.engine.tasks_in(self._container_id)
+        if task_list is not None:
+            # 读模型说这个容器**现在**叫什么（认领换过名的话就是新的那个，工单 #75 / ADR-0009），
+            # 认回来。不认的话这一层会拿着旧 id 干三件事：抬头把 `local-list-1` 原样画出来
+            # （``_container_name`` 的兜底），新建任务拿它当落点，而光标那一行的行 id 早就换成真
+            # 的了——两处对同一个容器各说一个名字。视图与已经删掉的容器解析出来还是原样，所以这
+            # 一步对它们是空的。
+            self._container_id = task_list.container_id
         self._container_title = (
             None if self._container_id is None else self._container_name(rows, self._container_id)
         )
-        if self._container_id is not None:
-            self.tasks_page().show_tasks(
-                self.engine.tasks_in(self._container_id), name=self._container_title or ""
-            )
+        if task_list is not None:
+            self.tasks_page().show_tasks(task_list, name=self._container_title or "")
         if self._detail_task_id is not None:
             detail = self.engine.task_detail(self._detail_task_id)
             self._detail_title = None if detail is None else detail.title

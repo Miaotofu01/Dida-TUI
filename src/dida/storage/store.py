@@ -7,8 +7,8 @@
 - 待推送改动（Pending Change）：创建时间、尝试次数、下次重试时间、最后一次错误，
 - 同步状态：已完成流游标、上次刷新完成时间、上次算出的逻辑日，
 - **自定义视图**（#36）：过滤条件的原文 + 它在清单列表页上的位置，
-- **id 别名**（#75 / ADR-0009）：认领换过名的那几个本地 id 现在是哪个 id——只在本次进程里
-  有效（开库时清空），见 :meth:`Store.resolve_id`。
+- **id 别名**（#75 / ADR-0009）：认领换过名的那几个本地 id 现在是哪个 id——只在**这一次打开**
+  期间有效（开库时清空，见 :meth:`Store.resolve_id` 与 ADR-0009 二）。
 
 自定义视图**只存在这里**（ADR-0005）：``config.toml`` 是放 token 的文件，为了改一个过滤
 条件去手写凭据是不对的；而 API 里没有「保存一组过滤条件」这个接口，所以它也不进待推送
@@ -310,9 +310,11 @@ class Store:
         self._db.execute("PRAGMA foreign_keys = ON")
         self._db.executescript(_SCHEMA)
         self._migrate()
-        # id 别名**只活这一次进程**（ADR-0009 二）：一个旧 id 只可能被这一个进程已经画出去的
-        # 界面握着，重启之后没有任何界面还握着它。清在这里而不是剪在某处，是因为「有效期」这件
-        # 事没有别的答案——按时间剪要一只这一层没有的钟，按条数剪是编一个数。
+        # id 别名**只活这一次打开**（ADR-0009 二）：一个旧 id 只可能被这一次打开期间已经画出去的
+        # 界面握着，重开之后没有任何界面还握着它。清在这里而不是剪在某处，是因为「有效期」这件事
+        # 没有别的答案——按时间剪要一只这一层没有的钟，按条数剪是编一个数。
+        # 措辞是「这一次打开」而不是「这个进程」：同进程再开一个 Store 会把前一个实例的别名清掉，
+        # 生产上走不到（组合根只建一个），要精确的是这句 ADR 对应的话。
         self._db.execute("DELETE FROM id_aliases")
         self._db.commit()
 
@@ -847,12 +849,18 @@ class Store:
         3. ``row`` 给出来就把它写成真 id 那一行（改名并进去过的那一份：用户要的名字 / 颜色）。
            ``remove=True`` 是另一头——用户已经删了这一条清单，而刷新刚把服务端那行写进来，
            这里要把它**摘掉**，否则屏幕上就是「删掉的清单又回来了」。
+
+        **别名也在这里落账**（#75 / ADR-0009）：这是认领清单的**第二条**路（推送回 201 空体时，
+        认领推迟到下一次刷新按名字对上，#54），而屏幕上的那一行不认路——它拿着的还是旧 id。
+        记在这个方法里而不是三个调用点上，是因为三条路（``AWAIT_ID`` / 改名并进去 / 用户已经
+        删了）共用这一步，记漏一条就是半修。
         """
         with self._db:
             if remove:
                 self._db.execute("DELETE FROM lists WHERE id = ?", (real_id,))
             elif row is not None:
                 self._write_list(dict(row))
+            self._remember_alias(local_id, real_id)
             self._db.execute("DELETE FROM lists WHERE id = ?", (local_id,))
             self._db.execute(
                 "UPDATE pending_list_changes SET list_id = ? WHERE list_id = ?",

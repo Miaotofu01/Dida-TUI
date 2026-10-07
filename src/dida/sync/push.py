@@ -248,15 +248,14 @@ class PushMixin:
         改动，而它们都会自愈（下一次全量刷新把真 id 带回来），所以诚实的回答是「等同步完」。
         """
         target = self._write_target()
+        # 认领换过名的话，这一行现在叫另一个 id（工单 #75 / ADR-0009），先解析成真那个。
+        # **必须在这里定下来**——下面每一步都按 id 走：``is_addressable_task`` 会把临时 id 判成
+        # 「服务端没见过」而拒绝这一笔（而它其实已经被认领了），进队那一行要是带着临时 id 更糟
+        # ——那是一条永远推不出去的改动（#53 挡的正是这一类安静错误）。
+        task_id = target.resolve_id(task_id)
         snapshot = target.task_payload(task_id)
         if snapshot is None or not snapshot.get("projectId"):
             raise UnknownTaskError(task_id)
-        # 认领换过名的话，这一行现在叫另一个 id（工单 #75 / ADR-0009）：``task_payload`` 已经按
-        # 别名解析过，所以底稿里那个 ``id`` 就是它现在的名字，拿它当准。**必须在这里定下来**
-        # ——下面每一步都按 id 走：``is_addressable_task`` 会把临时 id 判成「服务端没见过」而
-        # 拒绝这一笔（而它其实已经被认领了），进队那一行要是带着临时 id 更糟——那是一条永远推不
-        # 出去的改动（#53 挡的正是这一类安静错误）。
-        task_id = str(snapshot.get("id") or task_id)
         project = str(snapshot["projectId"])
         target_project = project_in(changes)
         if not is_addressable_task(
@@ -337,6 +336,8 @@ class PushMixin:
             raise UnknownTaskError(task_id)
         if not is_a_move(current, to_list_id):
             return
+        # ``task_id`` 可能是认领换名之前的那个（光标停在一行刚建出来的任务上，工单 #75）：
+        # 交给 ``write`` 去解析（它那一处是唯一的判据），这里只把「搬不搬」问清楚。
         self.write(task_id, changes={"projectId": to_list_id}, kind=WriteKind.MOVE)
 
     async def push_pending(self, *, manual: bool = False) -> int:
