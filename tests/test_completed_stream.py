@@ -211,10 +211,16 @@ def snapshot(
     completed_at: datetime | None,
     completed: bool = True,
     list_id: str = "work",
+    due: datetime | None = None,
 ) -> TaskSnapshot:
     """一条缓存里的任务快照。"""
     return TaskSnapshot(
-        id=id, title=title, list_id=list_id, completed=completed, completed_at=completed_at
+        id=id,
+        title=title,
+        list_id=list_id,
+        completed=completed,
+        completed_at=completed_at,
+        due=due,
     )
 
 
@@ -245,22 +251,59 @@ def test_the_section_keeps_the_window_and_sorts_by_the_normal_key():
     assert section.count == 2
 
 
-def test_a_locally_completed_task_waits_for_the_server_to_say_when():
-    """本地刚按了完成的任务还没有完成时刻：它不进已完成区，等已完成流把它带回来。
+def test_a_locally_completed_task_shows_up_now_and_the_server_time_replaces_it():
+    """本地刚按了完成、服务端还没认过的任务：**当场**进已完成区，完成时刻先用「现在」占位（#74）。
 
-    这条是**刻意的**：窗口的判据只有服务端的 ``completedTime``（ADR-0001 里唯一能被
-    服务端过滤的变化时间戳），本地时间是自己编的。
+    本地刚按了完成的任务是 ``completed=true``、``completedTime`` 还没有——服务端要等推送
+    落地之后才补上那个时间戳。以前两段都不收它（未完成段按 ``completed`` 筛、这一段按
+    ``completed_at is not None`` 筛），于是任务从屏幕上凭空消失。占位只说「就是现在完成的」，
+    服务端认下之后那一次已完成流会把它换成真正的 ``completedTime``（``completed_at`` 是
+    权威的那一份）。
+
+    顺带钉住另外两半：没做完的（哪怕没有时间戳）不进这一段；窗口只筛**真的**时间戳，
+    八天前完成的不因为占位这条路而漏进来。
     """
     section = completed_section(
-        [snapshot("t1", "刚按了完成的", completed_at=None)],
+        [
+            snapshot("t1", "刚按了完成的", completed_at=None),
+            snapshot("t2", "还没做完的", completed_at=None, completed=False),
+            snapshot("t3", "八天前做完的", completed_at=at(6, 12, 3)),
+        ],
         [],
         now=T0,
         day_end="24:00",
-        window_hours=24,
+        window_hours=168,
     )
 
-    assert section.items == ()
-    assert section.count == 0
+    assert [(item.task_id, item.completed_at) for item in section.items] == [("t1", T0)]
+    assert section.items[0].completed_text == "今天 12:03", "占位读出来就是「现在」"
+    assert section.count == 1, "没做完的不进这一段，窗口外那条也不进"
+
+
+def test_the_placeholder_does_not_change_the_order_of_the_completed_section():
+    """占位的那一条落在**它自己的位置**上，不是段首也不是段尾（#74 验收标准 1 的后半句）。
+
+    排序键还是 :func:`dida.sync.rows.row_sort_key`（工单 #64）：截止时间升序。刚完成的
+    那条截止更早，所以它排在更早完成、截止更晚的那条前面——**完成时刻在这套键里一位都不占**，
+    拿掉占位换回服务端时间戳也不会换位置。
+    """
+    section = completed_section(
+        [
+            snapshot("t1", "刚完成的（截止更早）", completed_at=None, due=at(15, 9)),
+            snapshot(
+                "t2", "更早完成的（截止更晚）", completed_at=at(14, 10, 0), due=at(20, 9)
+            ),
+        ],
+        [],
+        now=T0,
+        day_end="24:00",
+        window_hours=168,
+    )
+
+    assert [item.title for item in section.items] == [
+        "刚完成的（截止更早）",
+        "更早完成的（截止更晚）",
+    ]
 
 
 class StubCompletedReader:
