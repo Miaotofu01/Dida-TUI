@@ -153,24 +153,40 @@ def test_deferring_a_week_lands_on_the_same_weekday_next_week(store):
     assert due_of(store) == "2026-03-21T23:00:00+0800"
 
 
-def test_deferring_an_all_day_task_moves_its_date_marker(store):
-    """全天任务的截止是**日期标记**（服务端写当天 00:00），顺延只换日期、不套时刻那套偏移。
+def test_deferring_an_all_day_task_keeps_the_utc_date_marker(store):
+    """全天任务的截止是**那一天的 UTC 午夜**（#73）：顺延只换日期，形状不变。
 
     全天任务的归属看 ``due.date()``（t06/t14 的约定），所以 03-14 顺延到 03-15 的全天；
-    拿区间去推会把它挪成 03-16，用户会以为「交房租」晚了一天。
+    拿区间去推会把它挪成 03-16，用户会以为「交房租」晚了一天。顺延之后仍得是 UTC 日期标记
+    ——写成本地午夜会被读侧按 UTC 读成前一天，用户会觉得这一下根本没动。
     """
-    seed(store, task(id="t1", title="交房租", dueDate="2026-03-14T00:00:00+0800", isAllDay=True))
+    seed(store, task(id="t1", title="交房租", dueDate="2026-03-14T00:00:00+0000", isAllDay=True))
     clock = ManualClock(at(15, 2, 0))  # 逻辑日 03-14
     engine = make_engine(store, clock=clock)
 
     engine.defer("t1")
 
-    assert due_of(store) == "2026-03-15T00:00:00+0800"
+    assert due_of(store) == "2026-03-15T00:00:00+0000"
     assert store.task_payload("t1")["isAllDay"] is True, "全天标记本身不动"
 
     clock.set(at(15, 9, 0))  # 逻辑日 03-15：这条全天任务读作今天
     items = engine.tasks_in("work").items
     assert [(item.title, item.due_text) for item in items] == [("交房租", "今天")]
+
+
+def test_deferring_an_all_day_task_normalises_a_legacy_local_midnight_marker(store):
+    """老数据里那种「本地午夜」的全天标记，顺延一次之后回到 UTC 口径（#73）。
+
+    修好之前写出去的是 ``2026-03-14T00:00:00+0800``（本地午夜 + 本地偏移）。顺延只换日历日，
+    所以那一刻的时刻与偏移都不该跟着走：落点是目标日的 UTC 午夜。不归一的话这条任务会一直
+    带着旧形状，读侧按 UTC 取日期就还是偏一天。
+    """
+    seed(store, task(id="t1", title="交房租", dueDate="2026-03-14T00:00:00+0800", isAllDay=True))
+    engine = make_engine(store, clock=ManualClock(at(15, 2, 0)))
+
+    engine.defer("t1")
+
+    assert due_of(store) == "2026-03-15T00:00:00+0000"
 
 
 async def test_deferring_pushes_the_new_due_and_leaves_every_other_field_alone(store):
