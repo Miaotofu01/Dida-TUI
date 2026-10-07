@@ -377,6 +377,16 @@ def _completed_row_key(snapshot: TaskSnapshot) -> tuple:
     )
 
 
+def _completion_moment(snapshot: TaskSnapshot, now: datetime) -> datetime:
+    """这一行的完成时刻：服务端的 ``completedTime``；本地刚完成、服务端还没认过的用 ``now`` 占位（#74）。
+
+    占位只是一个「完成于此时」的读法，不会被写回存储层：服务端认下之后那一次已完成流把真正的
+    ``completedTime`` 带回来，下一次读就是权威的那一份了（ADR-0002 的本地豁免只保护改动碰过的
+    ``status`` 那一位，``completedTime`` 照旧服务端说了算）。
+    """
+    return now if snapshot.completed_at is None else snapshot.completed_at
+
+
 def completed_section(
     tasks: Sequence[TaskSnapshot],
     lists: Sequence[ListSnapshot],
@@ -409,10 +419,7 @@ def completed_section(
     # 没有服务端时间戳的那条用「现在」占位，但**窗口这一关它不参加**：`completed_at is None`
     # 不是「八天前完成」，拿 `now` 去过一遍窗口过滤只会把同一个判断写两遍。
     kept = [
-        (
-            snapshot,
-            now if snapshot.completed_at is None else snapshot.completed_at,
-        )
+        snapshot
         for snapshot in tasks
         if snapshot.completed
         and (snapshot.completed_at is None or snapshot.completed_at >= window_start)
@@ -423,12 +430,12 @@ def completed_section(
                 task_id=snapshot.id,
                 title=snapshot.title,
                 list_name=names.get(snapshot.list_id, snapshot.list_id),
-                completed_at=completed_at,
+                completed_at=_completion_moment(snapshot, now),
                 completed_text=format_due(
-                    completed_at, all_day=False, now=now, day_end=day_end
+                    _completion_moment(snapshot, now), all_day=False, now=now, day_end=day_end
                 ),
             )
-            for snapshot, completed_at in sorted(kept, key=lambda pair: _completed_row_key(pair[0]))
+            for snapshot in sorted(kept, key=_completed_row_key)
         )
     )
 
