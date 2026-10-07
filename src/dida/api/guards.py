@@ -1,6 +1,6 @@
 """四个本地守卫：服务端对它们一声不吭。
 
-服务端的静默行为（见 ``Dida-TUI-notes/api-contracts.md`` 与 spec 的 traps 一节）：
+服务端的静默行为（见 ``notes/api-shapes.md`` 与 ``notes/openapi-dida365.md``，以及 spec 的 traps 一节）：
 
 1. 写不进去的日期被**静默忽略**——任务看起来建好了，日期不在；
 2. 没有截止/开始时间的任务，重复规则被**静默清空**；
