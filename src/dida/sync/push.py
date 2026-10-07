@@ -37,43 +37,46 @@ if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能�
     from dida.storage.store import PendingChange
 
 
-DEFAULT_BACKOFF_BASE = timedelta(seconds=2)
-"""第一次推送失败之后等多久再试（之后每次翻倍）。"""
+RETRY_SCHEDULE: tuple[timedelta, ...] = (
+    timedelta(seconds=5),
+    timedelta(seconds=30),
+    timedelta(minutes=1),
+    timedelta(minutes=5),
+)
+"""自动重试的等待表（工单 #71）：失败一次等一格，从 5 秒一路拉到 5 分钟。
+
+四格等待对应五次尝试（写完之后立刻那一次 + 四次重试）。表就是策略本身——读这张表
+不需要再读 :func:`backoff_delay` 的函数体。
+"""
+
+MAX_PUSH_ATTEMPTS = 5
+"""自动重试的次数上限（工单 #71）：试满五次就不再自动重试了。
+
+正好是 :data:`RETRY_SCHEDULE` 那四格等待用完的那一刻：``attempts`` 是**已经失败过的次数**，
+够到它就说明五次尝试都失败过。放弃**不是丢弃**——改动留在队列里，状态栏照旧数它，
+只有手动同步（``r``）还能再试一次（见 :func:`is_given_up`）。
+"""
 
 
-DEFAULT_BACKOFF_CAP = timedelta(minutes=5)
-"""两次重试之间最多等多久。断网一整天也不该攒出一个巨大的间隔。"""
-
-
-def backoff_delay(
-    attempts: int,
-    *,
-    base: timedelta = DEFAULT_BACKOFF_BASE,
-    cap: timedelta = DEFAULT_BACKOFF_CAP,
-) -> timedelta:
-    """失败 ``attempts`` 次之后再推要等多久：``base``、``2×base``、``4×base``…封顶 ``cap``。
+def backoff_delay(attempts: int) -> timedelta:
+    """失败 ``attempts`` 次之后再推要等多久：照 :data:`RETRY_SCHEDULE` 取一格，封顶 5 分钟。
 
     ``attempts`` 是**已经失败过的次数**（存储层在 ``record_attempt`` 里 +1），所以第一次
-    失败等 ``base``。纯函数，参数从外面进来：没有时钟、没有随机抖动——抖动会让测试变成
-    掷骰子，而这个 app 的重试节奏本来就由用户的下一次按键与状态栏那个数兜着。
+    失败等 5 秒。纯函数：没有时钟、没有随机抖动——抖动会让测试变成掷骰子，而这个 app 的
+    重试节奏本来就由用户的下一次按键与状态栏那个数兜着。
 
-    一步一步翻倍、够到 ``cap`` 就停，**不写 ``base * 2**attempts``**：``attempts`` 只被
-    「失败过几次」推着涨，放着断网的那天也能攒到四十几，而 ``timedelta`` 装不下 ``2**46``
-    秒（``2 × 2**46`` 秒 = 1628906115 天，上限是 999999999 天）。写成整段乘法的话，第一条
-    装不下的 ``attempts`` 会把**算退避**这一步变成 ``OverflowError``：网络一通、推送成功、
-    这条改动出队，就绕开了；可只要网络还没通，**每次开 app 都会崩在这一跳**——连本地缓存
-    那一屏都看不到（用户故事 62 的「没网也能分诊」当场失效）。这个函数对任何 ``attempts``
-    都得给出一个不超过 ``cap`` 的间隔。
+    查表而不是算 ``base * 2**attempts``：``attempts`` 只被「失败过几次」推着涨，放着断网的
+    那天也能攒到四十几，而 ``timedelta`` 装不下 ``2**46`` 秒（``2 × 2**46`` 秒 = 1628906115
+    天，上限是 999999999 天）。写成整段乘法的话，第一条装不下的 ``attempts`` 会把**算退避**
+    这一步变成 ``OverflowError``：网络一通、推送成功、这条改动出队，就绕开了；可只要网络还没
+    通，**每次开 app 都会崩在这一跳**——连本地缓存那一屏都看不到（用户故事 62 的「没网也能
+    分诊」当场失效）。查表对任何 ``attempts`` 都给出一个不超过最后一格的间隔。
     """
-    delay = base
-    for _ in range(attempts):
-        if delay >= cap:
-            break
-        if delay > cap - delay:
-            # 再翻一倍就越过 cap 了，答案直接是 cap；真翻过去只会在这一步溢出。
-            return cap
-        delay *= 2
-    return min(delay, cap)
+    if attempts < 0:
+        return RETRY_SCHEDULE[0]
+    if attempts >= len(RETRY_SCHEDULE):
+        return RETRY_SCHEDULE[-1]
+    return RETRY_SCHEDULE[attempts]
 
 
 def _is_due(change: PendingChange, now: datetime) -> bool:

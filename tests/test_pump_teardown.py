@@ -154,7 +154,7 @@ async def test_a_push_in_flight_when_the_screen_tears_down_does_not_raise(tmp_pa
 
         server.error = None  # 网络回来了
         server.gate = gate  # 但服务端现在慢慢答
-        clock.advance(timedelta(seconds=2))  # 走过退避点，这一推真的会发出去
+        clock.advance(timedelta(seconds=5))  # 走过退避点，这一推真的会发出去
         in_flight = asyncio.create_task(app.push_tick())
         await pilot.pause()
         assert not in_flight.done(), "这一次推送还挂在网络上——下一句就是拆屏"
@@ -187,7 +187,7 @@ async def test_the_push_that_lands_after_the_screen_is_gone_still_reaches_the_se
 
         server.error = None
         server.gate = gate
-        clock.advance(timedelta(seconds=2))
+        clock.advance(timedelta(seconds=5))
         in_flight = asyncio.create_task(app.push_tick())
         await pilot.pause()
         assert not in_flight.done()

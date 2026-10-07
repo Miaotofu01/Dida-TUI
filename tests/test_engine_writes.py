@@ -331,10 +331,10 @@ async def test_a_failed_create_push_stays_in_the_retry_queue(store):
     assert [change.kind for change in queued] == [ChangeKind.CREATE]
     assert queued[0].task_id == local_id
     assert queued[0].payload["title"] == "买牛奶"
-    assert queued[0].next_retry_at == T0 + timedelta(seconds=2), "第一次失败等 2 秒"
+    assert queued[0].next_retry_at == T0 + timedelta(seconds=5), "第一次失败等 5 秒"
     assert store.task_payload(local_id)["title"] == "买牛奶", "推失败不许撤销本地那条"
 
-    clock.advance(timedelta(seconds=2))
+    clock.advance(timedelta(seconds=5))
     transport.enqueue(httpx.Response(200, json={"id": "srv-9", "projectId": "inbox"}))
 
     assert await engine.push_pending() == 1, "钟走到点，这一次推成功"
@@ -460,7 +460,7 @@ async def test_a_change_queued_behind_a_create_follows_it_to_the_real_id(store):
     )
     assert local_id.startswith(LOCAL_TASK_PREFIX), "认领之前它是本地临时 id"
 
-    clock.advance(timedelta(seconds=2))  # 退避到点，轮到这一笔了
+    clock.advance(timedelta(seconds=5))  # 退避到点，轮到这一笔了
     await engine.push_pending()
 
     assert store.pending() == (), "认领之后队列该清空（那笔改动跟着挪到真 id 上了）"
@@ -511,7 +511,7 @@ async def test_an_edit_after_an_unclaimed_create_is_refused_not_queued(store):
     local_id = engine.create("写周报", list_id="work")
     await engine.wait_for_pushes()
 
-    clock.advance(timedelta(seconds=2))  # 那一笔退避到点了
+    clock.advance(timedelta(seconds=5))  # 那一笔退避到点了
     transport.enqueue(httpx.Response(201))  # 服务端只回一个空 body
     assert await engine.push_pending() == 1, "新建那一笔算推成功了"
 
@@ -536,7 +536,7 @@ async def test_a_completion_after_an_unclaimed_create_is_refused_too(store):
 
     local_id = engine.create("写周报", list_id="work")
     await engine.wait_for_pushes()
-    clock.advance(timedelta(seconds=2))
+    clock.advance(timedelta(seconds=5))
     transport.enqueue(httpx.Response(201))
     await engine.push_pending()
 
@@ -763,10 +763,10 @@ async def test_a_failed_reschedule_push_stays_in_the_retry_queue(store):
     queued = store.pending()
     assert [change.kind for change in queued] == [ChangeKind.UPDATE]
     assert queued[0].payload == {"dueDate": "2026-03-20T14:00:00+0800", "isAllDay": False}
-    assert queued[0].next_retry_at == T0 + timedelta(seconds=2), "第一次失败等 2 秒"
+    assert queued[0].next_retry_at == T0 + timedelta(seconds=5), "第一次失败等 5 秒"
     assert engine.status().pending_count == 1
 
-    clock.advance(timedelta(seconds=2))
+    clock.advance(timedelta(seconds=5))
     transport.enqueue(httpx.Response(200, json={"id": "t1"}))
 
     assert await engine.push_pending() == 1, "钟走到点，这一次推成功"
