@@ -110,17 +110,25 @@ def test_a_date_and_a_time_become_an_aware_moment_in_the_tasks_zone():
     assert change.utcoffset() == timedelta(hours=8), "offset 原样，不换时区"
 
 
-def test_an_all_day_change_lands_on_midnight_of_that_day():
-    """全天 = 那一天的 **00:00**，是日期标记（``sync/schedule._defer_changes`` 的既定口径）。
+def test_an_all_day_change_is_the_utc_midnight_of_that_day():
+    """全天 = 那一天的 **UTC 午夜**（#73）：全天标记只有这一种形状。
 
-    它按 ``due.date()`` 被读成「今天 / 明天」，所以 00:00 是它的形状，不是它的时刻。
+    它按 ``due.date()`` 被读成「今天 / 明天」，所以 00:00 是它的形状、``+0000`` 是它的口径
+    ——读侧按 UTC 取日期，写成本地午夜（这里 ``reference`` 是 ``+0800``）会被读成**前一天**，
+    app 里与手机端都偏一天。这个答案与参考时刻的时区、以及传进来的本地时区都无关。
     """
     change = due_change(
         DueInput(day=date(2026, 3, 15), at=None, all_day=True),
         reference=datetime(2026, 3, 10, 12, 0, tzinfo=TZ),
     )
 
-    assert change == datetime(2026, 3, 15, 0, 0, tzinfo=TZ)
+    assert change == datetime(2026, 3, 15, 0, 0, tzinfo=timezone.utc)
+    assert change is not None and change.strftime("%Y-%m-%dT%H:%M:%S%z") == (
+        "2026-03-15T00:00:00+0000"
+    ), "写出去的就是文档那一份形状"
+    assert due_change(
+        DueInput(day=date(2026, 3, 15), at=None, all_day=True), reference=None, tz=TZ
+    ) == change, "任务本来没有截止时间时也一样：全天标记不认任何本地时区"
 
 
 def test_a_task_with_no_date_yet_falls_back_to_the_given_zone():

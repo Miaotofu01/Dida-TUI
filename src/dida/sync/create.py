@@ -1,7 +1,8 @@
 """新建（t15 / #39）：本地先造一条（临时 id），推送走 ``POST /open/v1/task``。
 
 这一片只管一件事：**新建一条任务要发什么、本地那条长什么样**。只写用户真的写了的字段
-（没写日期就不带 ``dueDate``），日期原样写回（不换时区）。
+（没写日期就不带 ``dueDate``），带时刻的日期原样写回（不换时区），**全天**的写成那一天的
+UTC 午夜（#73；两种形状都在写边界那一处守卫里，这一片不自己归一）。
 
 **落点是参数**（#39）：在清单里建就落在那个清单里，在视图里建落在收集箱（视图不是容器），
 而「视图隐含的日期」由读模型给（``TaskList.implied_due``，判断写在
@@ -15,7 +16,7 @@ from datetime import datetime
 from typing import Any, Sequence
 from uuid import uuid4
 
-from dida.api.guards import api_date
+from dida.api.guards import due_wire_fields
 from dida.sync.writes import (
     LOCAL_TASK_PREFIX,
     UnclaimedListError,
@@ -114,16 +115,16 @@ def _create_payload(
     """新建任务的请求体（也是本地那份原文）。
 
     只写用户真的写了的字段：没写日期就不带 ``dueDate``——凭空带一个日期字段正是
-    「服务端静默忽略」的入口。日期走 :func:`dida.api.guards.api_date`，按它自己的 offset
-    写成文档形式，不换时区（换时区就是静默位移那个 trap）。
+    「服务端静默忽略」的入口。``dueDate`` / ``isAllDay`` 这一对走写边界那一处守卫
+    （:func:`dida.api.guards.due_wire_fields`）：带时刻的原样按自己的 offset 写、不换时区；
+    全天的写成**那一天的 UTC 午夜**（#73，见那里的理由）。这一片不自己归一日期。
 
     ``isAllDay`` 只跟 ``dueDate`` 一起出现：没有截止时间时它没有意义。``priority`` 同理——
     没写优先级就不写这个字段，服务端的默认值本来就是「无」。
     """
     payload: dict[str, Any] = {"title": title, "projectId": project_id}
     if due is not None:
-        payload["dueDate"] = api_date(due, field="dueDate")
-        payload["isAllDay"] = all_day
+        payload.update(due_wire_fields(due, all_day=all_day))
     if priority is not None:
         payload["priority"] = priority
     if tags:

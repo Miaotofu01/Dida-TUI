@@ -66,6 +66,7 @@ from datetime import date, datetime
 from typing import TYPE_CHECKING, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import AuthError, DidaError
+from dida.api.guards import all_day_date
 from dida.clock import Clock
 from dida.logical_day import logical_day
 from dida.sync.completed import (
@@ -245,6 +246,7 @@ __all__ = [
     "WireCall",
     "WriteKind",
     "WriteTarget",
+    "all_day_date",
     "backoff_delay",
     "builtin_view_definitions",
     "builtin_view_rows",

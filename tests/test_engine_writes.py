@@ -258,12 +258,13 @@ async def test_a_create_lands_locally_first_and_pushes_the_whole_line(store):
     )
 
 
-async def test_an_all_day_create_writes_the_date_marker_verbatim(store):
-    """全天任务的截止是**日期标记**：照 ``due.date()`` 写成那天的 00:00，不按逻辑日区间挪。
+async def test_an_all_day_create_writes_the_utc_date_marker(store):
+    """全天任务的截止是**那一天的 UTC 午夜**（#73）：形状只有 ``YYYY-MM-DDT00:00:00+0000``。
 
-    边界 04:00、凌晨两点（逻辑日仍是 03-14）：建一条「今天」的全天任务，请求体里必须是
-    ``2026-03-14T00:00:00+0800`` 与 ``isAllDay: true``。把它「挪进当前逻辑日」的那种算法
-    会写成 03-15 00:00——那条任务就成了明天的，从今天的屏幕上消失。
+    边界 04:00、凌晨两点（逻辑日仍是 03-14）：交进来的 ``due`` 是 03-14（几点几分的墙钟
+    只是那一天的载体，写不出去）。写成本地午夜 ``2026-03-14T00:00:00+0800`` 就是原来的
+    bug——读侧按 UTC 取 ``.date()``，于是这条「今天」的全天任务读成 03-13（app 里与手机端
+    都偏一天）；而写成 03-15 00:00 是另一种错：那条任务变成明天的，从今天的屏幕上消失。
     """
     seed(store, lists=[inbox()])
     transport = FakeTransport(
@@ -271,7 +272,7 @@ async def test_an_all_day_create_writes_the_date_marker_verbatim(store):
             "id": "srv-2",
             "projectId": "inbox",
             "title": "还信用卡",
-            "dueDate": "2026-03-14T00:00:00+0800",
+            "dueDate": "2026-03-14T00:00:00+0000",
             "isAllDay": True,
         }
     )
@@ -280,13 +281,35 @@ async def test_an_all_day_create_writes_the_date_marker_verbatim(store):
     engine.create("还信用卡", list_id=INBOX_ID, due=at(14, 0, 0), all_day=True)
     await engine.wait_for_pushes()
 
-    assert transport.last_json["dueDate"] == "2026-03-14T00:00:00+0800"
+    assert transport.last_json["dueDate"] == "2026-03-14T00:00:00+0000"
     assert transport.last_json["isAllDay"] is True
     assert "priority" not in transport.last_json, "没写优先级就不写这个字段，服务端默认就是「无」"
     items = engine.tasks_in(INBOX_ID).items
     assert [(item.title, item.due_text, item.all_day) for item in items] == [
         ("还信用卡", "今天", True)
     ], "全天任务的「今天」要读成日期标记，且不许读成「今天 00:00」"
+
+
+async def test_the_write_boundary_leaves_a_timed_due_date_alone(store):
+    """守卫**只**认 ``isAllDay``：带时刻的任务原样写回用户墙钟 + 原偏移（#73 的回归闸）。
+
+    这条时刻在东八区的 03-14 00:30，而它的 UTC 日期是 **03-13**——按「改成 UTC 的某一天」
+    去处理它，用户写的 00:30 与 +0800 就一起没了（那正是 ``api_date`` 的「不换时区」规矩
+    要挡的静默位移）。判据只能是 ``isAllDay``，不是「UTC 日期和本地日期一不一样」。
+    """
+    seed(store, lists=[inbox()])
+    transport = FakeTransport(
+        json={"id": "srv-4", "projectId": "inbox", "title": "夜里的活"}
+    )
+    engine = make_engine(store, transport)
+
+    engine.create("夜里的活", list_id=INBOX_ID, due=at(14, 0, 30), all_day=False)
+    await engine.wait_for_pushes()
+
+    assert transport.last_json["dueDate"] == "2026-03-14T00:30:00+0800", (
+        "带时刻的截止不许被 UTC 化：墙钟与偏移都是用户写的"
+    )
+    assert transport.last_json["isAllDay"] is False
 
 
 async def test_a_thin_create_response_does_not_drop_what_the_user_wrote(store):
@@ -376,8 +399,11 @@ async def test_a_create_from_a_view_that_implies_a_date_carries_that_date(store)
     """视图隐含的日期（「今天」）：在视图里建就是「收集箱 + 今天」这一条（#39、用户故事 35）。
 
     ``tasks_in()`` 的读模型给的就是这一条：视图不是容器（``shows_list_name=True``），而
-    「今天」隐含**当前逻辑日**那个日期（``implied_due``），写法是全天任务的日期标记。
-    这一层因此不必自己认识哪个视图叫什么——它照读模型给的那一份拼请求。
+    「今天」隐含**当前逻辑日**那一天的 UTC 午夜（``implied_due``），写法是全天任务的日期
+    标记。这一层因此不必自己认识哪个视图叫什么——它照读模型给的那一份拼请求。
+
+    **往返也在这里钉住**（#73 的验收）：写出去的那一串喂回读模型要读成「今天」。原来的
+    本地午夜会让它读成 03-13，用户看到的就是「昨天」。
     """
     seed(
         store,
@@ -389,7 +415,7 @@ async def test_a_create_from_a_view_that_implies_a_date_carries_that_date(store)
             "id": "srv-8",
             "projectId": "inbox",
             "title": "随手记一笔",
-            "dueDate": "2026-03-14T00:00:00+0800",
+            "dueDate": "2026-03-14T00:00:00+0000",
             "isAllDay": True,
         }
     )
@@ -397,7 +423,9 @@ async def test_a_create_from_a_view_that_implies_a_date_carries_that_date(store)
 
     today = engine.tasks_in("today")
     assert today.shows_list_name is True, "视图不是容器（哪一份判断在这一处）"
-    assert today.implied_due == T0.replace(hour=0, minute=0, second=0, microsecond=0)
+    assert today.implied_due == datetime(2026, 3, 14, tzinfo=timezone.utc), (
+        "隐含日期是那个逻辑日的 UTC 午夜"
+    )
 
     engine.create("随手记一笔", list_id=INBOX_ID, due=today.implied_due, all_day=True)
     await engine.wait_for_pushes()
@@ -405,9 +433,14 @@ async def test_a_create_from_a_view_that_implies_a_date_carries_that_date(store)
     assert transport.last_json == {
         "title": "随手记一笔",
         "projectId": "inbox",
-        "dueDate": "2026-03-14T00:00:00+0800",
+        "dueDate": "2026-03-14T00:00:00+0000",
         "isAllDay": True,
     }
+    items = engine.tasks_in("today").items
+    created = [item for item in items if item.title == "随手记一笔"]
+    assert [(item.due_text, item.all_day) for item in created] == [("今天", True)], (
+        "写出去的那一串喂回读模型要读成「今天」——用户看得见的那条验收"
+    )
 
 
 async def test_a_create_from_a_view_without_a_date_carries_no_date(store):
@@ -700,21 +733,23 @@ async def test_reschedule_changes_only_the_due_date_and_merges_the_snapshot(stor
     assert store.pending_count() == 0, "推成功了就该出队"
 
 
-async def test_an_all_day_reschedule_is_written_verbatim_as_a_date_marker(store):
-    """``all_day=True`` 时 ``due`` 是**日期标记**，照写，不按逻辑日区间挪。
+async def test_an_all_day_reschedule_is_written_as_the_utc_date_marker(store):
+    """``all_day=True`` 时 ``due`` 只贡献**日历日**：写出去的是那一天的 UTC 午夜（#73）。
 
-    边界 04:00、凌晨两点（逻辑日仍是 03-14）：「今天」是 03-14 00:00。把它「挪进当前逻辑日」
-    的那种算法会写成 03-15 00:00——那条任务就变成**未来**的，既不在逾期区也不在今日区，
-    等于从这一屏上消失。
+    边界 04:00、凌晨两点（逻辑日仍是 03-14）：「今天」是 03-14。时刻与偏移都不写出去
+    ——写成本地午夜读侧会读成 03-13（偏差一天），而按逻辑日区间挪成 03-15 00:00 会让这条
+    任务变成**未来**的，既不在逾期区也不在今日区，等于从这一屏上消失。
     """
-    seed(store, task(id="t1", title="还信用卡", dueDate="2026-03-10T00:00:00+0800", isAllDay=True))
+    seed(store, task(id="t1", title="还信用卡", dueDate="2026-03-10T00:00:00+0000", isAllDay=True))
     transport = FakeTransport(json={"id": "t1"})
     engine = make_engine(store, transport, clock=ManualClock(at(15, 2, 0)), day_end="04:00")
 
-    engine.reschedule("t1", due=at(14, 0, 0), all_day=True)
+    engine.reschedule("t1", due=at(14, 22, 30), all_day=True)
     await engine.wait_for_pushes()
 
-    assert transport.last_json["dueDate"] == "2026-03-14T00:00:00+0800"
+    assert transport.last_json["dueDate"] == "2026-03-14T00:00:00+0000", (
+        "全天标记是那一天的 UTC 午夜：墙钟 22:30 与 +0800 都不写出去"
+    )
     assert transport.last_json["isAllDay"] is True
     items = engine.tasks_in("work").items
     assert [(item.title, item.due_text, item.all_day) for item in items] == [

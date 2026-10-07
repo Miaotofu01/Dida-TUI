@@ -12,6 +12,11 @@
 时刻一律**带时区**：给出去的那个 offset 是这条任务**当前**的截止时间的 offset（``reference``），
 没有就用调用方给的本地时区（``tz``）。不换算、不改写——换时区就是「静默位移」那个坑
 （api-shapes §D17：文档对写错时区会怎样一个字都没写）。
+
+**全天那一档是例外，而且是唯一的例外**：它给的是那一天的 UTC 午夜（``+0000``），不看任何
+本地时区（#73）。全天标记是一个日历日，不是一刻；写成本地午夜在读侧会偏一天。所以从引擎
+那一侧借 :func:`dida.api.guards.all_day_date`——形状只有那一处定义（TUI 只许 import 引擎，
+不能直接 import ``dida.api``）。
 """
 
 from __future__ import annotations
@@ -19,6 +24,8 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import date, datetime, time, tzinfo
+
+from dida.sync.engine import all_day_date
 
 __all__ = ["DueInput", "due_change", "format_time_input", "parse_date", "parse_time"]
 
@@ -87,14 +94,17 @@ def due_change(entry: DueInput, *, reference: datetime | None, tz: tzinfo | None
 
     - **带时刻**：那一天的那一刻，offset 取 ``reference`` 自己那个（任务当前的截止时间）；
       ``reference`` 没有或没有时区时用 ``tz``（本地时区）。
-    - **全天**（时刻留空）：那一天的 ``00:00``——它是**日期标记**，读法是 ``due.date()``
-      （``sync/schedule`` 的既定口径）。
+    - **全天**（时刻留空）：那一天的 **UTC 午夜**（``YYYY-MM-DDT00:00:00+0000``，全 app 一条
+      口径，#73）。它是**日期标记**，读法是 ``due.date()``；写成「本地午夜 + 本地偏移」在
+      读侧会被读成前一天。这一档不看 ``reference`` 也不看 ``tz``：一个日历日没有时区。
     - **日期那一格清空**：``None``。清除不是「改成一个很早的时刻」。
     """
     if entry.day is None:
         return None
+    if entry.all_day:
+        return all_day_date(entry.day)
     zone = _zone_of(reference) or tz
-    at = time(0, 0) if entry.all_day else (entry.at or time(0, 0))
+    at = entry.at or time(0, 0)
     landed = datetime.combine(entry.day, at)
     return landed if zone is None else landed.replace(tzinfo=zone)
 

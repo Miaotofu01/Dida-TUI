@@ -46,6 +46,11 @@ def at(day: int, hour: int = 0, minute: int = 0) -> datetime:
     return datetime(2026, 3, day, hour, minute, tzinfo=TZ)
 
 
+def utc(day: int) -> datetime:
+    """2026-03 里那一天的 UTC 午夜——全天任务日期标记的**唯一**形状（#73）。"""
+    return datetime(2026, 3, day, tzinfo=timezone.utc)
+
+
 T0 = at(14, 12, 3)
 
 
@@ -565,12 +570,12 @@ def test_the_read_model_says_which_date_a_view_implies_for_a_new_task():
     - 「所有」连截止时间都不看；
     - 真实清单根本不是日期视图（它那一屏里什么日期的都有）。
 
-    期望值是测试直接给出的 ``at(14)``，不是照 ``logical_day`` 再算一遍。
+    期望值是测试直接给出的 ``utc(14)``（那一天的 UTC 午夜），不是照 ``logical_day`` 再算一遍。
     """
     source = work_source()
     engine = engine_with(source)
 
-    assert engine.tasks_in("today").implied_due == at(14), "「今天」隐含的是那个逻辑日"
+    assert engine.tasks_in("today").implied_due == utc(14), "「今天」隐含的是那个逻辑日"
     assert engine.tasks_in("next7").implied_due is None, "七天是一段窗口，藏不进一个日期"
     assert engine.tasks_in("all").implied_due is None
     assert engine.tasks_in("work").implied_due is None, "清单不隐含日期"
@@ -585,14 +590,14 @@ def test_a_custom_view_with_the_same_due_window_implies_the_same_date():
     的语义。按 id 在三个内置定义里查的那一版会让自建的拿到 ``None``——同一屏里两种行为，
     用户看不出为什么。
 
-    期望值是测试直接给出的 ``at(14)``，不是照 ``logical_day`` 再算一遍。
+    期望值是测试直接给出的 ``utc(14)``（那一天的 UTC 午夜），不是照 ``logical_day`` 再算一遍。
     """
     source = work_source()
     source.add_view("今天到期", id="mine", due=DueWindow(first=None, last=0))
     engine = engine_with(source)
 
-    assert engine.tasks_in("today").implied_due == at(14), "内置「今天」隐含那个逻辑日"
-    assert engine.tasks_in("mine").implied_due == at(14), (
+    assert engine.tasks_in("today").implied_due == utc(14), "内置「今天」隐含那个逻辑日"
+    assert engine.tasks_in("mine").implied_due == utc(14), (
         "自建视图只要窗口一样，答案就得一样（判断跟着定义走）"
     )
     assert engine.tasks_in("mine").implied_due == engine.tasks_in("today").implied_due, (
@@ -625,7 +630,29 @@ def test_every_due_preset_says_what_it_implies_for_a_new_task(preset, implies_to
 
     implied = implied_due_for(definition, now=T0, day_end="24:00")
 
-    assert implied == (at(14) if implies_today else None)
+    assert implied == (utc(14) if implies_today else None)
+
+
+def test_the_implied_date_is_the_utc_midnight_of_the_logical_day():
+    """隐含日期是那个逻辑日的**UTC 午夜**（#73）：全天标记只有这一种形状。
+
+    读侧按 UTC 取日期（``due_day(all_day=True)`` 取 ``.date()``），所以写「本地午夜 +
+    本地偏移」在机器不是 UTC、且偏移为正时会读成**前一天**——app 里与手机端都偏一天的那个
+    bug。这个形状与机器在哪个时区无关：``now`` 的时区只用来定逻辑日，不用来定偏移。
+    """
+    definition = ViewDefinition(id="custom-today", name="今天到期", due=due_window_of("today"))
+
+    marker = implied_due_for(definition, now=at(14, 12, 3), day_end="24:00")
+
+    assert marker == utc(14)
+    assert marker is not None and marker.strftime("%Y-%m-%dT%H:%M:%S%z") == (
+        "2026-03-14T00:00:00+0000"
+    ), "写出去的形状就是文档那一份：当天 00:00:00+0000"
+
+    machine_behind = datetime(2026, 3, 14, 12, 3, tzinfo=timezone(timedelta(hours=-5)))
+    assert implied_due_for(definition, now=machine_behind, day_end="24:00") == marker, (
+        "机器在哪个时区都不改变这个答案：全天标记是一个无时区的日历日"
+    )
 
 
 def test_the_implied_date_follows_the_logical_day_not_the_natural_one():
@@ -637,7 +664,7 @@ def test_the_implied_date_follows_the_logical_day_not_the_natural_one():
     source = work_source()
     engine = SyncEngine(clock=ManualClock(at(15, 2, 0)), day_end="04:00", source=source)
 
-    assert engine.tasks_in("today").implied_due == at(14), "凌晨两点仍是逻辑日 03-14"
+    assert engine.tasks_in("today").implied_due == utc(14), "凌晨两点仍是逻辑日 03-14"
 
 
 def test_the_implied_date_of_a_custom_view_follows_the_logical_day_too():
@@ -650,7 +677,7 @@ def test_the_implied_date_of_a_custom_view_follows_the_logical_day_too():
     source.add_view("今天到期", id="mine", due=DueWindow(first=None, last=0))
     engine = SyncEngine(clock=ManualClock(at(15, 2, 0)), day_end="04:00", source=source)
 
-    assert engine.tasks_in("mine").implied_due == at(14), "凌晨两点仍是逻辑日 03-14"
+    assert engine.tasks_in("mine").implied_due == utc(14), "凌晨两点仍是逻辑日 03-14"
     assert engine.tasks_in("mine").implied_due == engine.tasks_in("today").implied_due
 
 
