@@ -50,6 +50,7 @@ class Server:
         self.create_gate = create_gate
         self.requests: list[httpx.Request] = []
         self.next_id = 1
+        self.next_list_id = 1
 
     @property
     def paths(self) -> list[str]:
@@ -72,9 +73,13 @@ class Server:
             return httpx.Response(200, json=created)
         if path == "/open/v1/project" and request.method == "POST":
             body = json.loads(request.content)
-            return httpx.Response(
-                200, json={"id": "srvlist1", "name": body.get("name", ""), "sortOrder": 5}
-            )
+            created = {
+                "id": f"srvlist{self.next_list_id}",
+                "name": body.get("name", ""),
+                "sortOrder": 5,
+            }
+            self.next_list_id += 1
+            return httpx.Response(200, json=created)
         if path == "/open/v1/project":
             return httpx.Response(200, json=[inbox(), project()])
         if path.endswith("/data"):
@@ -201,6 +206,32 @@ async def test_the_old_id_of_a_just_created_list_still_works(tmp_path):
 
     assert "/open/v1/project/srvlist1" in server.paths, "改名打在服务端认的那个清单 id 上"
     assert any(row.name == "改名" for row in store.lists())
+    store.close()
+
+
+async def test_a_reissued_local_list_id_does_not_point_at_the_old_list(tmp_path):
+    """别名记着那个号，那个号就**不许再发出去**（#57 的规矩不能因为别名松掉）。
+
+    清单的临时 id 是发号器给的（任务那边是 uuid，撞不上），所以认领之后那个号会被重新发出去
+    ——而别名还记着「local-list-1 现在指 srvlist1」。真发出去的话，第二条清单拿自己的 id 改名会
+    落到**第一条**上：那正是 #57 那条「拿另一条清单的名字去改服务端上的一行」。
+    """
+    store = open_store(tmp_path)
+    server = Server()
+    engine = make_engine(store, server)
+
+    first = engine.create_list("第一")
+    await engine.wait_for_pushes()
+    assert first == "local-list-1", "第一个本地清单 id 是 1 号"
+
+    second = engine.create_list("第二")
+    assert second != first, "1 号还被别名占着（它现在指 srvlist1），不许再发一次"
+
+    engine.update_list(second, name="第二（改）")
+    await engine.wait_for_pushes()
+
+    assert [row.name for row in store.lists() if row.id == "srvlist1"] == ["第一"], "改的是第二条"
+    assert any(row.name == "第二（改）" for row in store.lists())
     store.close()
 
 

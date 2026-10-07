@@ -688,14 +688,20 @@ class Store:
         服务端建好之后才给真 id，而「建完立刻出现在清单列表页」是 ADR-0002 的手感要求。
         取最小的空号而不是计数器：上一次没推成功的那一行还占着它的号，重开也不会撞上它。
 
-        **占着号的有两处**（#57）：``lists`` 里那一行，以及队列里还挂着它记录的那些 id
-        （:meth:`_held_local_list_ids`）。只看行是不够的——一行可以**在记录还在的时候**被剪掉
-        （服务端索引里找不到它、而它又没有「还没到服务端的改动」，见 :meth:`_prune_lists`），
-        那个号就从行那一侧空了出来；再发一次就是两条清单用同一个临时 id，而按 id 找记录的
-        地方会挑错**一条**，最坏是拿另一条清单的名字去删服务端上的一行（#57 的探针）。
+        **占着号的有三处**（#57 / #75）：``lists`` 里那一行、队列里还挂着它记录的那些 id，
+        以及**本进程里认领换过名的那些别名**（:meth:`_held_local_list_ids`）。只看行是不够的
+        ——一行可以**在记录还在的时候**被剪掉（服务端索引里找不到它、而它又没有「还没到服务端的
+        改动」，见 :meth:`_prune_lists`），那个号就从行那一侧空了出来；再发一次就是两条清单用同
+        一个临时 id，而按 id 找记录的地方会挑错**一条**，最坏是拿另一条清单的名字去删服务端上的
+        一行（#57 的探针）。别名那一处是 #75 加上的：认领之后号确实空出来了，但别名还记着它现在
+        指哪一行——真发出去的话，新那条拿自己的 id 改名会落到**老那条**上。
 
-        所以规矩一句话：**临时 id 的所有权跟着记录走**——记录还在，这个号就不许再发。
-        行的寿命与记录的寿命因此可以不一样长（剪枝只剪行），而号永远是安全的。
+        所以规矩一句话：**临时 id 的所有权跟着记录走，而记过别名的那几个号一直要等到本进程
+        结束**——记录还在，这个号就不许再发；别名还在，也一样。行的寿命与记录的寿命因此可以
+        不一样长（剪枝只剪行），而号永远是安全的。
+
+        任务那边的临时 id 是 uuid（``sync/create.py::_local_task_id``），撞不上，所以这条只
+        管清单这一族的发号器。
         """
         used = {
             int(value[len(LOCAL_LIST_PREFIX) :])
@@ -708,16 +714,21 @@ class Store:
         return f"{LOCAL_LIST_PREFIX}{number}"
 
     def _held_local_list_ids(self) -> set[str]:
-        """本地临时 id 的**全部**占用者：``lists`` 里的行 + 队列里的记录（#57）。
+        """本地临时 id 的**全部**占用者：``lists`` 里的行 + 队列里的记录 + 认领换名留下的别名。
 
-        「这是不是本地临时 id」只在 :func:`~dida.sync.lists.is_local_list_id` 一处判断
-        （这里不写 ``LIKE`` 之类第二条判据），所以两张表先各取一列、在 Python 这边筛。
+        前两处是 #57 的，第三处是 #75 的（:meth:`resolve_id` 那张表）：一个号被认领（行挪到服务端
+        id 上、记录也出队）之后看起来是空的，但别名还指着它——再发一次就会撞上「同一个临时 id 两个
+        意思」。
+
+        「这是不是本地临时 id」只在 :func:`~dida.sync.lists.is_local_list_id` 一处判断（这里不写
+        ``LIKE`` 之类第二条判据），所以几张表先各取一列、在 Python 这边筛。
         """
         values = {str(row["id"]) for row in self._db.execute("SELECT id FROM lists")}
         values |= {
             str(row["list_id"])
             for row in self._db.execute("SELECT list_id FROM pending_list_changes")
         }
+        values |= {str(row["from_id"]) for row in self._db.execute("SELECT from_id FROM id_aliases")}
         return {value for value in values if is_local_list_id(value)}
 
     def enqueue_list(

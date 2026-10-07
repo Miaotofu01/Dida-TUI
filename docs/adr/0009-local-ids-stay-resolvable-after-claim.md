@@ -32,6 +32,7 @@ D 清单  ：清单列表页行上 local-list-1 ／库里 ['srvlist1']（同一�
   - 读路径 `SyncEngine.task_detail`（`engine.py:626-641`，它拿 `task_id` 去 `tasks()` 里找那条快照）与 `tasks_in(container_id)`。
   - 清单那三种写（`update_list` / `delete_list` / 建的那一支）——与写路径同一个形状，真 id 从 `list_payload` 那份原文里取。清单与任务的本地前缀不重叠（`sync/writes.py` 的 `is_local_id` 一族），所以**同一张表能装两族**。
 - 另外那两个 payload 口子（`task_payload` / `list_payload`）自己也解析：它们回答的是「这条任务 / 这个清单**现在**的原文」，拿旧 id 问也该拿到东西——上面「真 id 从底稿里取」那句话正是靠这一点成立的。
+- **别名把那个号占住，直到本进程结束**（`_held_local_list_ids` 多认一处）。这条是别名与 #57 的接缝，写代码时才发现：清单的临时 id 是**发号器**给的（`new_local_list_id` 取最小空号），认领之后那个号看起来空了——行挪走了、队列记录也出队了——但别名还记着「`local-list-1` 现在指 `srvlist1`」。真把它重发出去，第二条清单拿自己的 id 改名就会解析到**第一条**上，那正是 #57 探针里那条「拿另一条清单的名字去改服务端上的一行」。所以 #57 那句「临时 id 的所有权跟着记录走」加一档：**记录还在不许发，别名还在也不许发**（`tests/test_local_id_after_claim.py::test_a_reissued_local_list_id_does_not_point_at_the_old_list` 钉着它）。任务那一族的临时 id 是 uuid（`sync/create.py::_local_task_id`），撞不上，所以受影响的是清单这一个发号器。
 
 ## 二、别名只在本进程里有效
 
