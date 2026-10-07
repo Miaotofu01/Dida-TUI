@@ -10,7 +10,7 @@ integration worktree green.
 
 ## Read first
 
-1. `/home/tofu/dida-v2-worktrees/notes/brief.md` — paths, conventions, delivery decisions.
+1. `notes/brief.md` — paths, conventions, delivery decisions.
 2. The ticket: `gh api repos/Miaotofu01/Dida-TUI/issues/<NN> --jq .body` (and its `/comments`).
    `gh issue view` is broken in this repo — use `gh api`.
 3. The ticket's own branch, so you know what it *meant* to do:
@@ -19,7 +19,7 @@ integration worktree green.
 ## Work in the integration worktree — nothing else
 
 ```
-cd /home/tofu/dida-v2-worktrees/integration
+cd .worktrees/integration
 git status --short                 # must be clean; if not, STOP and report
 git log --oneline -1               # note the pre-merge SHA
 git merge --no-ff <branch>

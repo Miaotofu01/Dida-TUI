@@ -4,7 +4,7 @@ Deliberately NOT the implementer's test: this walks the frame sequence itself an
 which task titles vanish from the screen mid-move, so a fix cannot pass by pinning a
 different invariant than the user-visible one.
 
-Run from a worktree root:  uv run python /home/tofu/dida-v2-worktrees/notes/probe62.py
+Run from a worktree root:  uv run python notes/probe62.py
 """
 
 from __future__ import annotations

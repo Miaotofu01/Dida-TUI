@@ -14,3 +14,6 @@ config.toml
 
 # 本地草稿与临时工作区
 .scratch/
+
+# 并行开工用的 worktree（agent 用；内容都在仓库里，不进版本控制）
+.worktrees/

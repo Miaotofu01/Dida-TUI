@@ -62,7 +62,7 @@ gh api --method PATCH repos/Miaotofu01/Dida-TUI/pulls/50  -F body=@/tmp/body.md 
 `gh api`, `gh issue comment`, `gh issue list`, `gh pr create` and `gh pr view` all work normally. `-f` does not
 accept `@file`; that needs `-F`.
 
-## Shared notes you should read (in `/home/tofu/dida-v2-worktrees/notes/`)
+## Shared notes you should read (in `notes/`, in this repo)
 
 | File | What it gives you |
 |---|---|
@@ -106,9 +106,9 @@ user's `~/.ssh/config`; just bypass it per command.
 | Thing | Path |
 |---|---|
 | **Integration branch (the deliverable)** | `feat/v2-terminal-client` |
-| **Integration worktree** | `/home/tofu/dida-v2-worktrees/integration` |
-| Your ticket worktree | `/home/tofu/dida-v2-worktrees/t<NN>` |
-| Shared notes (exploration, decisions) | `/home/tofu/dida-v2-worktrees/notes/` |
+| **Integration worktree** | `.worktrees/integration`（**在仓库里**，已 gitignore） |
+| Your ticket worktree | `.worktrees/t<NN>`（同上；`git worktree add .worktrees/t<NN> -b ticket/<NN>-<slug> feat/v2-terminal-client`） |
+| Shared notes (exploration, decisions) | `notes/`——**在仓库里**，任何 worktree 里都能按相对路径读到 |
 | The user's own checkout — **do not touch** | `/home/tofu/我的项目/Tips` (sitting on `docs/v2-domain-model`) |
 
 Every worktree is a worktree of the *same* clone, so `gh` works from any of them (the remote is
