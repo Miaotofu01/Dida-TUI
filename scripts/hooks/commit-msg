@@ -1,0 +1,20 @@
+#!/bin/sh
+# 仓库的规矩：每个提交都要在信息里写票号 #NN——**合并提交也算**。
+#
+# 为什么这条值得一个 hook：Spec 复核靠从 `git log` 里刮 `#NN` 来定位 spec，所以一个没写票号的
+# 提交对那一轴是隐形的（#62–#66 那一轮真发生过一次）。规则只有这一份，装在
+# `.git/hooks/commit-msg` 的那份是个转发用的 shim。
+set -e
+
+msg_file="$1"
+
+if ! grep -qE '#[0-9]+' "$msg_file"; then
+    cat >&2 <<'EOF'
+提交信息里没有票号。请在主题或正文里写 #NN，例如：
+
+    fix(cursor): 撤掉装饰光标条，光标行瞬间到位 (#62)
+
+合并提交也一样（别用 git 默认的 "Merge branch 'x' into y"）。理由：Spec 复核从 git log 里刮 #NN。
+EOF
+    exit 1
+fi
