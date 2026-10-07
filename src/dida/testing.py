@@ -410,6 +410,9 @@ class FakeBackend:
         self.pushes = 0
         """``push_pending()`` 被调用的次数（t21 的周期泵与手动同步）。"""
 
+        self.manual_pushes: list[bool] = []
+        """每次 ``push_pending()`` 收到的 ``manual``（工单 #71），按调用顺序。"""
+
         self.completed_pulls = 0
         """``refresh_completed()`` 被调用的次数（t21 的 ``r``）。"""
 
@@ -528,13 +531,15 @@ class FakeBackend:
         self.refreshes += 1
         return RefreshReport()
 
-    async def push_pending(self) -> int:
+    async def push_pending(self, *, manual: bool = False) -> int:
         """推一轮待推送改动（t21 的周期泵会调它）。
 
         假后端没有队列，也没有网络，所以推出去 0 条——但调用本身要记下来，好让「泵真的在泵」
-        这件事在接缝一上看得见。
+        这件事在接缝一上看得见。``manual`` 也记下来（工单 #71）：「按 ``r`` 时传的是
+        ``manual=True``、启动刷新与周期泵传 ``False``」这条接线在这一层看得最清楚。
         """
         self.pushes += 1
+        self.manual_pushes.append(manual)
         return 0
 
     async def refresh_completed(self) -> CompletedReport:

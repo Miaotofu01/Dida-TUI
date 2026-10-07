@@ -77,7 +77,7 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import DidaError
-from dida.sync.push import backoff_delay
+from dida.sync.push import backoff_delay, can_attempt
 from dida.sync.view import ListSnapshot, ViewSource
 from dida.sync.writes import LOCAL_LIST_PREFIX, is_local_list_id
 
@@ -650,31 +650,36 @@ class ListMixin:
             target.resolve_list(change.id)
         return 1
 
-    async def push_pending(self) -> int:
+    async def push_pending(self, *, manual: bool = False) -> int:
         """推一轮：**先清单那几种，再交给任务那一份**（两边共用引擎那一把推送锁）。
 
         清单的改动排在前面只是顺序，不是优先级：两边的失败都各自留在自己的队列里，
         返回值是这一轮推成功的**总条数**（状态栏那句「已推送 N 处改动」说的是它）。
-        """
-        pushed = await self._push_lists()
-        return pushed + await super().push_pending()  # type: ignore[misc]
 
-    async def _push_lists(self) -> int:
-        """把到期的清单改动依次推给服务端，返回推成功的条数。
+        ``manual`` 照原样交给两边（工单 #71）：清单与任务**同一套规矩**——自动路径跳过已经
+        放弃的改动，用户按 ``r`` 时两边都再试一次。
+        """
+        pushed = await self._push_lists(manual=manual)
+        return pushed + await super().push_pending(manual=manual)  # type: ignore[misc]
+
+    async def _push_lists(self, *, manual: bool) -> int:
+        """把所有**该试**的清单改动依次推给服务端，返回推成功的条数。
 
         与任务的 :meth:`~dida.sync.push.PushMixin.push_pending` 同一条口径：一条失败不影响
-        后面那些，失败的记一次尝试并按 ``backoff_delay`` 排下一次。等待发生在调用方
-        （周期泵、``r``、下一次写），这一层不睡。
+        后面那些，失败的记一次尝试并按 :func:`~dida.sync.push.backoff_delay` 排下一次；
+        「该不该试」问的是同一个 :func:`~dida.sync.push.can_attempt`（#71），放弃的改动只有
+        ``manual`` 才试。等待发生在调用方（周期泵、``r``、下一次写），这一层不睡。
 
         **每一笔都重新取一次队列**（不是先取一份快照再遍历）：新建推成功会把这一条清单排在
         后面的改动挪到服务端给的 id 上（``Store.adopt_created_list``），同一轮里紧接着的那
         一笔必须看见新的 id。循环一定会停：每一轮要么删掉一行、要么把它的 ``next_retry_at``
-        推到将来、要么让它变成**不可寻址**（新建回了 201 空 body，那一笔成了认领记录）——
-        三种结果都让它不再是「到期的第一笔」。
+        推到将来、要么把它记进 ``attempted``、要么让它变成**不可寻址**（新建回了 201 空 body，
+        那一笔成了认领记录）——四种结果都让它不再是这一轮该试的第一笔。
         """
         target = self._list_target()
         writer = self._list_writer()
         pushed = 0
+        attempted: set[int] = set()
         async with self._push_lock:
             while True:
                 now = self._clock.now()
@@ -685,12 +690,14 @@ class ListMixin:
                         # 发不出去的（认领记录、打在临时 id 上的改 / 删）不挑：挑了就只会
                         # 得到 404，或者干脆什么都不该做——它们等认领，不在这里等重试。
                         if is_addressable(item)
-                        and (item.next_retry_at is None or item.next_retry_at <= now)
+                        and item.id not in attempted
+                        and can_attempt(item, now, manual=manual)
                     ),
                     None,
                 )
                 if change is None:
                     return pushed
+                attempted.add(change.id)
                 try:
                     resolved = await self._send_list(writer, target, change)
                 except DidaError as exc:

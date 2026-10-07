@@ -87,6 +87,31 @@ def _is_due(change: PendingChange, now: datetime) -> bool:
     return change.next_retry_at is None or change.next_retry_at <= now
 
 
+def is_given_up(attempts: int) -> bool:
+    """自动重试是不是已经放弃这条改动（工单 #71）：失败次数够到 :data:`MAX_PUSH_ATTEMPTS`。
+
+    「还要不要自动重试」只有这一处判据——任务的推送循环（本模块的 :meth:`PushMixin.push_pending`）
+    与清单的推送循环（:meth:`~dida.sync.lists.ListMixin._push_lists`）问的是同一个函数，不是
+    各写一遍。放弃**不删任何东西**：改动留在队列里、状态栏照旧数它，只有手动同步（``r``）
+    能再问它一次。
+    """
+    return attempts >= MAX_PUSH_ATTEMPTS
+
+
+def can_attempt(change: PendingChange, now: datetime, *, manual: bool) -> bool:
+    """这一轮推送该不该试这条改动（工单 #71）：还没放弃、而且到点了。
+
+    这是两个推送循环共同问的那句话。``manual`` = 用户按了 ``r``（手动同步）：豁免**放弃**
+    那道闸，已经放弃的改动再试一次；写完之后立刻那次推送与周期泵都不豁免，所以重启不会
+    悄悄把重试循环接回去。手动对已放弃的改动连 ``next_retry_at`` 那道时间闸也一并豁免
+    ——它已经不上日程了，手动是唯一还能再问一次的路，问的时候不该再等一个已经没有意义的
+    时刻（非放弃的改动照旧要到点，手动不改变它们原来的节奏）。
+    """
+    if is_given_up(change.attempts):
+        return manual
+    return _is_due(change, now)
+
+
 def _unaddressable(
     task_id: str, *, project: str | None, target_project: str | None
 ) -> DidaError:
@@ -307,12 +332,16 @@ class PushMixin:
             return
         self.write(task_id, changes={"projectId": to_list_id}, kind=WriteKind.MOVE)
 
-    async def push_pending(self) -> int:
-        """推一轮：把**到期**的待推送改动依次推给服务端，返回推成功的条数。
+    async def push_pending(self, *, manual: bool = False) -> int:
+        """推一轮：把**该试**的待推送改动依次推给服务端，返回推成功的条数。
 
         这是重试队列唯一的泵。「什么时候该重试」由注入的钟判定：没排过重试的立刻推，
         排过的要等到 ``next_retry_at``。**没有 ``time.sleep``、没有真时钟、没有后台线程**
         ——等待发生在调用方（t14 那种定时器或下一次写），引擎只负责算清楚什么时候能推。
+
+        ``manual=True`` 是用户按了 ``r``：已经放弃（失败够 :data:`MAX_PUSH_ATTEMPTS` 次）的
+        改动再试一次，放弃之前的那几种改动照旧按到点判定。默认 ``False``——写完之后立刻那次
+        推送与周期泵（``push_tick``）都是自动路径，放弃的改动它们一律不发。
 
         一条失败不影响后面那些：队列按发生顺序走完，失败的留在队列里等下一次。
 
@@ -320,17 +349,28 @@ class PushMixin:
         排在后面的改动挪到服务端给的 id 上（``Store.adopt_created``），同一轮里紧接着的那一笔
         必须看见新的 id——拿开头读进来的快照，它仍然会带着 ``local-…`` 去推。形状与清单版的
         :meth:`~dida.sync.lists.ListMixin._push_lists` 同一份（#42 两件都做了）。循环一定会停：
-        每一轮要么删掉一行、要么把它的 ``next_retry_at`` 推到将来。
+        每一轮要么删掉一行、要么把它的 ``next_retry_at`` 推到将来、要么把它记进
+        ``attempted``——``manual`` 对已放弃的改动不看 ``next_retry_at``（#71），少了这本账
+        同一笔会在这一轮里被反复重试。
         """
         target = self._write_target()
         writer = self._writer()
         pushed = 0
+        attempted: set[int] = set()
         async with self._push_lock:
             while True:
                 now = self._clock.now()
-                change = next((item for item in target.pending() if _is_due(item, now)), None)
+                change = next(
+                    (
+                        item
+                        for item in target.pending()
+                        if item.id not in attempted and can_attempt(item, now, manual=manual)
+                    ),
+                    None,
+                )
                 if change is None:
                     return pushed
+                attempted.add(change.id)
                 try:
                     await self._send(writer, target, change)
                 except DidaError as exc:
