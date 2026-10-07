@@ -245,6 +245,58 @@ def test_backoff_doubles_each_attempt_and_stops_at_the_cap():
     assert backoff_delay(0) == timedelta(seconds=2)
 
 
+def test_backoff_saturates_instead_of_overflowing_at_high_attempt_counts():
+    """断网攒到四十几次失败时，退避照样算得出，而且就是那个封顶值。
+
+    实测的来路：``all_proxy`` 指向 socks5 而本机没装 ``socksio``，每次推送都失败，队列里
+    那条改动攒到 ``attempts=46``。旧的 ``base * 2**attempts`` 装不进 ``timedelta``（上限
+    999999999 天），于是在**算退避**这一步抛 ``OverflowError``——把「推不上去」升级成
+    「打不开 app」，而且撤掉梯子也好不了：崩在记下一次重试之前，跟网络没关系了。
+    """
+    assert backoff_delay(45) == timedelta(minutes=5), "溢出前的最后一次：已经是 cap"
+    assert backoff_delay(46) == timedelta(minutes=5), "46 次只该封顶，不许抛 OverflowError"
+    assert backoff_delay(10_000) == timedelta(minutes=5), "再大也一样：cap 是上界"
+
+
+async def test_a_change_that_failed_forty_six_times_retries_instead_of_crashing(store):
+    """一条攒到 ``attempts=46`` 的改动：记下失败与下次时刻，不许把 app 打崩。
+
+    接缝是 ``push_pending()``——周期泵（``push_tick``）与手动同步每次按键走的就是这一条，
+    真存储 + 真客户端 + 假传输。
+    """
+    transport = FakeTransport()
+    for _ in range(46):
+        transport.enqueue(NetworkError("连不上服务端：Using SOCKS proxy"))
+    seed(store, task(id="t1", title="刷一道算法题"))
+    clock = ManualClock(T0)
+    engine = make_engine(store, transport, clock=clock)
+
+    engine.write("t1", changes={"title": "刷一道算法题（我改的）"})
+    await engine.wait_for_pushes()
+
+    for _ in range(45):
+        clock.advance(timedelta(minutes=5))
+        assert await engine.push_pending() == 0, "还是推不上去"
+
+    queued = store.pending()
+    assert len(queued) == 1, "攒了 46 次失败也还在队列里，不许悄悄丢掉"
+    assert queued[0].attempts == 46, f"应该正好攒到 46 次，实际 {queued[0].attempts}"
+
+    # 关键的那一跳：已经失败过 46 次的改动**再失败一次**，旧代码在这里算 ``base * 2**46``
+    # 抛 OverflowError（`record_attempt` 那行在 `except DidaError` 里，OverflowError 不是
+    # DidaError，会一路穿出去）。所以这一跳才是「打不开 app」的那一步。
+    clock.advance(timedelta(minutes=5))
+    assert await engine.push_pending() == 0, "还是推不上去，但 app 不许崩"
+    queued = store.pending()
+    assert queued[0].attempts == 47, f"应该记下第 47 次，实际 {queued[0].attempts}"
+    assert queued[0].next_retry_at == clock.now() + timedelta(minutes=5), "封顶，不是溢出"
+
+    transport.enqueue(httpx.Response(200, json={}))
+    clock.advance(timedelta(minutes=5))
+    assert await engine.push_pending() == 1, "网络回来了就该推得出去"
+    assert store.pending() == ()
+
+
 async def test_completing_through_the_write_path_uses_the_complete_endpoint(store):
     """完成：本地**当场**标记完成（从今日视图里消失），推送走无请求体的 complete 端点。
 

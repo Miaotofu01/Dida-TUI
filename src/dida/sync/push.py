@@ -56,8 +56,24 @@ def backoff_delay(
     ``attempts`` 是**已经失败过的次数**（存储层在 ``record_attempt`` 里 +1），所以第一次
     失败等 ``base``。纯函数，参数从外面进来：没有时钟、没有随机抖动——抖动会让测试变成
     掷骰子，而这个 app 的重试节奏本来就由用户的下一次按键与状态栏那个数兜着。
+
+    一步一步翻倍、够到 ``cap`` 就停，**不写 ``base * 2**attempts``**：``attempts`` 只被
+    「失败过几次」推着涨，放着断网的那天也能攒到四十几，而 ``timedelta`` 装不下 ``2**46``
+    秒（``2 × 2**46`` 秒 = 1628906115 天，上限是 999999999 天）。写成整段乘法的话，第一条
+    装不下的 ``attempts`` 会把**算退避**这一步变成 ``OverflowError``：网络一通、推送成功、
+    这条改动出队，就绕开了；可只要网络还没通，**每次开 app 都会崩在这一跳**——连本地缓存
+    那一屏都看不到（用户故事 62 的「没网也能分诊」当场失效）。这个函数对任何 ``attempts``
+    都得给出一个不超过 ``cap`` 的间隔。
     """
-    return min(base * 2**attempts, cap)
+    delay = base
+    for _ in range(attempts):
+        if delay >= cap:
+            break
+        if delay > cap - delay:
+            # 再翻一倍就越过 cap 了，答案直接是 cap；真翻过去只会在这一步溢出。
+            return cap
+        delay *= 2
+    return min(delay, cap)
 
 
 def _is_due(change: PendingChange, now: datetime) -> bool:
