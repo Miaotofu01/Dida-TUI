@@ -333,6 +333,13 @@ class DidaApp(App[None]):
         """正在改的是哪个自定义视图（#36）；``None`` = 那一次是新建视图。"""
         self._announce_sync = False
         """这一轮同步要不要用 toast 报完成——``r`` 要，启动刷新不要（那会每次开屏都弹一下）。"""
+        self._manual_sync = False
+        """这一轮推送要不要再试已经放弃的改动（工单 #71）——``r`` 要，启动刷新与周期泵不要。
+
+        与 :attr:`_announce_sync` 同一段寿命、同一处写下（:meth:`start_sync`）、同一处读一次
+        （:meth:`_sync`）。分开两个名字而不是共用一个：toast 是给用户看的回声，「再试一次」
+        是队列的策略，将来其中一个变了不会顺手把另一个带偏。
+        """
         self._spinning = False
         self._spinner_frame = 0
         self._spinner_timer: Timer | None = None
@@ -1198,9 +1205,9 @@ class DidaApp(App[None]):
         所以这一轮同步成不成功都与它无关（``_sync()`` 里的重画在 ``else:`` 成功分支里）。
         """
         self.reload_day_boundary()
-        self.start_sync(announce=True)
+        self.start_sync(announce=True, manual=True)
 
-    def start_sync(self, *, announce: bool = False) -> None:
+    def start_sync(self, *, announce: bool = False, manual: bool = False) -> None:
         """把一轮同步排到事件循环上（不等它）。``r`` 与启动刷新都走这里。
 
         ``exclusive=True``：连按 ``r`` 不会让两轮同步叠在一起（同一份缓存被两个协程交替写）。
@@ -1209,8 +1216,13 @@ class DidaApp(App[None]):
 
         ``announce`` 决定这一轮要不要用 toast 报完成：``r`` 要（用户按了键，他在等一个回声），
         启动刷新不要——每天早上开屏弹一下是噪音，那一行的「已同步 HH:MM」本来就是记录。
+
+        ``manual`` 是「这一轮推送要不要再试那些已经放弃的改动」（工单 #71）：只有 ``r`` 传
+        ``True``，启动刷新与周期泵都不传。它与 ``announce`` 同一段寿命（都在这里写下、都在
+        :meth:`_sync` 里读一次），所以一个读者看到的是同一种走法。
         """
         self._announce_sync = announce
+        self._manual_sync = manual
         self._arm_spinner()
         self.run_worker(self._sync(), group=SYNC_GROUP, exclusive=True, description="同步")
 
@@ -1234,8 +1246,10 @@ class DidaApp(App[None]):
             message = messages.refresh_failed_message(exc)
             self._notify_failed(message)
         else:
-            # 队列里那些到点的改动顺手推一轮：`r` 是用户能按的那个「现在再试一次」。
-            pushed = await self.engine.push_pending()
+            # 队列里那些该试的改动顺手推一轮：`r` 是用户能按的那个「现在再试一次」——
+            # 它也是唯一把 ``manual=True`` 传下去的人，所以已经放弃的改动这里能再试一次
+            # （工单 #71）；启动刷新走的是同一个 ``_sync()``，但那个标记是 ``False``。
+            pushed = await self.engine.push_pending(manual=self._manual_sync)
             try:
                 await self.engine.refresh_completed()
             except DidaError as exc:

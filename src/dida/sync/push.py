@@ -1,8 +1,9 @@
 """写路径：乐观入队、立即推送、退避重试（t10；完成 t11、删除 t16）。
 
 这一片只管一件事：**一次本地写怎么变成一次服务端写**——乐观地落进本地库并入队，推送排在
-事件循环上立刻跑，推不动就留在队列里按注入的钟退避重试。什么时候该重试由 :func:`_is_due`
-算，等多久由 :func:`backoff_delay` 算，两者都是纯函数（不掷骰子、不睡眠）。
+事件循环上立刻跑，推不动就留在队列里按注入的钟退避重试。这一轮该不该试由 :func:`can_attempt`
+一处判定（还没放弃、而且到点了；已经放弃的只有手动同步 ``r`` 才试，工单 #71），等多久由
+:func:`backoff_delay` 按 :data:`RETRY_SCHEDULE` 算，两者都是纯函数（不掷骰子、不睡眠）。
 
 :class:`PushMixin` 的方法挂在组装好的 :class:`~dida.sync.engine.SyncEngine` 上：它们要用
 ``self._clock`` / ``self._source`` / ``self._write_target()``，单独一个 mixin 不完整。
