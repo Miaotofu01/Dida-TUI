@@ -25,18 +25,22 @@ D 清单  ：清单列表页行上 local-list-1 ／库里 ['srvlist1']（同一�
 
 **认领换 id 的时候，存储层记下「旧 id → 新 id」，并且把它认识的那几个入口都改成先解析再干活。** 界面一个字都不用改，**也不许知道认领这回事**。
 
-- 别名的家在存储层（`id_aliases(from_id TEXT PRIMARY KEY, to_id TEXT NOT NULL)`），与那次认领**同一个事务**——不会出现「行挪走了、别名没落下」。
-- 解析只有一处实现（`resolve_id(id) -> str`，查不到就是它自己），挂在读侧那个既有的口子上（`ViewSource`，`sync/view.py:122`）。
-- 解析点只放**「调用方递进来的 id」**那几个边界，也就是界面手里的那些：
-  - 写路径 `PushMixin.write`（`push.py:250-259`）——它本来就要读那份底稿，真 id 就在底稿里（`snapshot["id"]`），拿它当准。这一处尤其要紧：**队列必须拿到真 id**，否则就是一条永远推不出去的改动（#53 挡的正是这一类安静错误）。
-  - 读路径 `SyncEngine.task_detail`（`engine.py:626-641`，它拿 `task_id` 去 `tasks()` 里找那条快照）与 `tasks_in(container_id)`。
-  - 清单那三种写（`update_list` / `delete_list` / 建的那一支）——与写路径同一个形状，真 id 从 `list_payload` 那份原文里取。清单与任务的本地前缀不重叠（`sync/writes.py` 的 `is_local_id` 一族），所以**同一张表能装两族**。
-- 另外那两个 payload 口子（`task_payload` / `list_payload`）自己也解析：它们回答的是「这条任务 / 这个清单**现在**的原文」，拿旧 id 问也该拿到东西——上面「真 id 从底稿里取」那句话正是靠这一点成立的。
+- 别名的家在存储层（`id_aliases(from_id TEXT PRIMARY KEY, to_id TEXT NOT NULL)`），与那次认领**同一个事务**——不会出现「行挪走了、别名没落账」。
+- 认领有**两条路**，两条都落账：推送成功那一条（`adopt_created` / `adopt_created_list`）与 #54 那一条（服务端回 `201 No Content`，认领推迟到下一次全量刷新按名字对上 → `Store.identify_list`）。记在 `identify_list` 里面而不是它的三个调用点上，是因为那三条分支（`AWAIT_ID` / 改名并进去 / 用户已经删了）共用这一步，记漏一条就是半修。
+- 解析只有一处实现（`resolve_id(id) -> str`，查不到就是它自己），名字只有这一个；解析点放在**「调用方递进来的 id」**那些边界上，也就是界面手里的那些：
+  - 写路径 `PushMixin.write`（`push.py:250`）开头一处。**必须在这里定下来**：下面 `is_addressable_task` 会把临时 id 判成「服务端没见过」而拒绝一笔**已经认领**的写，进队那一行要是带着临时 id 更糟——那是一条永远推不出去的改动（#53 挡的正是这一类安静错误）。
+  - **新建的落点** `CreateMixin.create(title, list_id)`：界面交进来的是它手里的 `_container_id`（`tui/app.py` 的 `_finish_new_task`），不解析的话「站在一个刚认领的清单里按 `n`」会被 `UnclaimedListError` 拒掉，屏幕上说的是「这个清单还没同步完」——一句假话。
+  - 清单的改 / 删 `ListMixin.update_list` / `delete_list`：不解析的话 `is_local_list_id` 会把一个**已经认领**的清单判成「还没推出去」，那一笔改名会被并进一条早就不该在的队列记录里。
+  - 读路径 `SyncEngine.task_detail`（`engine.py:626-641`，它拿 `task_id` 去 `tasks()` 里找那条快照）与 `tasks_in(container_id)`；`DidaApp.refresh_view` 再把读模型回的 `container_id` **认回来**——不然这一层会拿着旧 id 拼抬头（`_container_name` 认不出来就照原样写 id，用户看到 `local-list-1`），而光标那一行的行 id 早就是真的了。
+  - 另外两个 payload 口子（`task_payload` / `list_payload`）**自己也解析**：它们回答的是「这条任务 / 这个清单**现在**的原文」，拿旧 id 问也该拿到东西。这是存储层对外的承诺，所以 `subtasks` / `_payload_of` 这一类只读口子不必各自再解析一次。
+  - 清单与任务的本地前缀不重叠（`sync/writes.py` 的 `is_local_id` 一族），所以**同一张表能装两族**。
 - **别名把那个号占住，直到本进程结束**（`_held_local_list_ids` 多认一处）。这条是别名与 #57 的接缝，写代码时才发现：清单的临时 id 是**发号器**给的（`new_local_list_id` 取最小空号），认领之后那个号看起来空了——行挪走了、队列记录也出队了——但别名还记着「`local-list-1` 现在指 `srvlist1`」。真把它重发出去，第二条清单拿自己的 id 改名就会解析到**第一条**上，那正是 #57 探针里那条「拿另一条清单的名字去改服务端上的一行」。所以 #57 那句「临时 id 的所有权跟着记录走」加一档：**记录还在不许发，别名还在也不许发**（`tests/test_local_id_after_claim.py::test_a_reissued_local_list_id_does_not_point_at_the_old_list` 钉着它）。任务那一族的临时 id 是 uuid（`sync/create.py::_local_task_id`），撞不上，所以受影响的是清单这一个发号器。
 
-## 二、别名只在本进程里有效
+## 二、别名的有效期 = 这个本地库打开着
 
-开库时清空。理由是一句可以断言的事实：**一个旧 id 只可能被这一个进程已经画出去的界面握着**——重启之后没有任何界面还握着它（待推送队列里那几笔在认领时已经重指过了，不是靠别名）。这条同时免掉两件没有好答案的事：给存储层塞一只时钟（这一层没有钟，「现在」永远是注入的），以及编一个剪枝策略（别名的有效寿命不是时间，是「这个进程还活着吗」）。
+开库时清空（`Store.__init__` 里一条 `DELETE FROM id_aliases`）。理由是一句可以断言的事实：**一个旧 id 只可能被这一次打开期间已经画出去的界面握着**——重开之后没有任何界面还握着它（待推送队列里那几笔在认领时已经重指过了，不是靠别名）。这条同时免掉两件没有好答案的事：给存储层塞一只时钟（这一层没有钟，「现在」永远是注入的），以及编一个剪枝策略（别名的寿命不是时间，是「这一次打开还活着吗」）。
+
+**措辞要精确**：有效期是「这个 `Store` 打开着」，不是「这个进程活着」——同一个进程里再开一个 `Store`（同一个文件、或另一个文件）会把别名的表清掉，于是**前一个实例**的界面手里的旧 id 就没人认了。生产上走不到：组合根只建一个 `Store`（`bootstrap.build_engine`），所以那一天不会来。写在这里是给下一个人看的——真要在同一个进程里开第二个 `Store`，先把这条读一遍。
 
 ## 三、被否的两条备选
 
