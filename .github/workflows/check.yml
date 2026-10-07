@@ -30,8 +30,12 @@ jobs:
       - name: 每个提交都写了票号
         run: |
           base='${{ github.event.pull_request.base.sha }}'
+          # 用 head.sha 而不是 HEAD：checkout 默认落在 GitHub 合成的那条
+          # 「Merge <sha> into <sha>」上，它永远不带票号，会让这条检查假红。
+          # head.sha 是本 PR 真正的顶端，**包含**你自己造的合并提交——那些按规矩也要写票号。
+          head='${{ github.event.pull_request.head.sha }}'
           bad=0
-          for sha in $(git rev-list "$base"..HEAD); do
+          for sha in $(git rev-list "$base".."$head"); do
             msg=$(git log -1 --format='%s%n%b' "$sha")
             if ! printf '%s' "$msg" | grep -qE '#[0-9]+'; then
               echo "::error::$sha 的提交信息里没有票号：$(git log -1 --format=%s "$sha")"
