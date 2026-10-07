@@ -16,15 +16,15 @@
   [ADR-0008](docs/adr/0008-arrows-replace-enter-and-escape.md)（`→` / `←` 与 `h`，以及编辑态 `esc` 保存）。
 - 模块边界、依赖方向与两个测试接缝见 [docs/architecture.md](docs/architecture.md)；面向使用者的入口是 [README.md](README.md)。
 
-## 本机的工作笔记（不在仓库里）
+## 工作笔记（`notes/`）
 
-编排的 brief、进度日志与派活模板都在 **`/home/tofu/dida-v2-worktrees/notes/`**：
+编排的 brief、进度日志与派活模板都在仓库里的 **[`notes/`](notes/)**（索引：[`notes/README.md`](notes/README.md)）：
 
-- `brief.md`——交付决定、**按后果分流**的路由规则（开工前先读它，它决定这张票要不要独立分支），以及各轮实测出来的地雷。
-- `progress.md`——append-only 的进度日志。`implementer-template.md` / `merger-template.md`——派活用。
-- `codebase-map.md`、`terminal-input-evidence.md`、`openapi-dida365.md`——代码地图、终端实测、官方 API 文档。
+- [`notes/brief.md`](notes/brief.md)——交付决定、**按后果分流**的路由规则（开工前先读它，它决定这张票要不要独立分支）、**测试预算**，以及各轮实测出来的地雷。
+- [`notes/progress.md`](notes/progress.md)——append-only 的进度日志。[`notes/implementer-template.md`](notes/implementer-template.md) / [`notes/merger-template.md`](notes/merger-template.md)——派活用。
+- [`notes/codebase-map.md`](notes/codebase-map.md)、[`notes/terminal-input-evidence.md`](notes/terminal-input-evidence.md)、[`notes/openapi-dida365.md`](notes/openapi-dida365.md)——代码地图、终端实测、官方 API 文档。
 
-**仓库注释里写的 `notes/...`（以及 `Dida-TUI-notes/...` 这种拼法）指的都是这个目录**：它不在仓库里，所以 grep 不到，要读就按上面的绝对路径直接打开。
+仓库注释里写的 `notes/...` 指的就是这个目录——它现在在仓库里，grep 得到。
 
 ## Agent skills
 
