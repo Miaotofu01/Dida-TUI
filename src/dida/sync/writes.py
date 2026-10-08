@@ -80,9 +80,6 @@ __all__ = [
     "project_in",
 ]
 
-TEXT_FIELDS = frozenset({"title", "content", "desc"})
-"""本地原文里那几段**文字**：缺省读作空串——定义在 :mod:`dida.vocabulary`（与本地库共用）。"""
-
 
 def is_a_change(
     current: Mapping[str, Any] | None, changes: Mapping[str, Any] | None
