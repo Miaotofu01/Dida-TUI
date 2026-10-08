@@ -588,8 +588,26 @@ def test_the_duplicate_body_guard_catches_a_second_copy():
     )
 
 
+def _is_the_local_value(node: ast.AST) -> bool:
+    """这一边是不是「**界面自己那份值**」：裸名字 / 下标 / 调用 / 字面量。
+
+    ``values[LIST_FIELD]``（下标）、``int(picked)``（调用）、``value``（裸名字）都是界面手里
+    那一份。**属性不是**——属性说的是「另一个对象手里的那一份」，两边都是属性就是两个对象之间
+    的比较（挑选项回填那种：``option.value == detail.list_id``，见
+    :func:`_equality_against_a_bare_name` 的同一条口径）。
+    """
+    return isinstance(node, (ast.Name, ast.Subscript, ast.Call, ast.Constant))
+
+
 def _equality_with_attribute(source: str, attribute: str) -> list[int]:
-    """源码里 ``… .attribute == …`` 这种**相等比较**的行号。"""
+    """源码里 ``<引擎那一份 .attribute> == <界面自己那份值>`` 这种**相等比较**的行号。
+
+    两件事同时才算：有一边是那个引擎属性（``detail.list_id`` / ``detail.priority`` /
+    ``detail.tags``），**而且**另一边是界面自己手里的值（见 :func:`_is_the_local_value`）。
+    两边都是属性不算（``option.value == detail.list_id``：那是在问「当前这个值在不在这一份
+    选项里」，是回填不是判改动，``pages/detail.py`` 的 ``list_picker`` 正是这么用的；
+    ``mine.list_id == other.list_id`` 同理，那是两个对象之间的比较）。
+    """
     found: list[int] = []
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Compare):
@@ -597,7 +615,15 @@ def _equality_with_attribute(source: str, attribute: str) -> list[int]:
         if not any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
             continue
         operands = [node.left, *node.comparators]
-        if any(isinstance(item, ast.Attribute) and item.attr == attribute for item in operands):
+        engines = [
+            item
+            for item in operands
+            if isinstance(item, ast.Attribute) and item.attr == attribute
+        ]
+        if not engines:
+            continue
+        others = [item for item in operands if all(item is not engine for engine in engines)]
+        if any(_is_the_local_value(item) for item in others):
             found.append(node.lineno)
     return found
 
@@ -678,27 +704,42 @@ def test_the_interface_never_judges_whether_something_changed():
 
 
 def test_the_interface_does_not_inline_the_comparisons_it_used_to_make():
-    """界面也不许把那个比较**手写**回来（工单 #79）：import 与内联两种形状都要拦。
+    """界面里**任何一处**都不许把那个比较**手写**回来（工单 #79）：import 与内联两种形状都要拦。
 
-    拦的是两组，#79 之前它们逐处写在界面里、比的是屏幕上那一份（而不是引擎手里的本地原文）：
+    **覆盖整个 ``tui/``，不是只扫 ``app.py``**（工单 #83）：这几处曾经逐处写在 ``app.py`` 里、
+    比的是屏幕上那一份（而不是引擎手里的本地原文）。#83 把挑选型字段那一格搬进了
+    ``dida/tui/write_flow.py``——搬走的代码照样是界面，只认文件名的写法从那一刻起就没有覆盖，
+    所以这里扫的是 ``rglob("*.py")``：以后再往 ``tui/`` 里添模块，它一并被守着。
 
-    - ``app._apply_pick`` 里那几格（清单 / 优先级 / 标签）的属性比较；
+    拦的是两组：
+
+    - 挑选型字段那几格（清单 / 优先级 / 标签）的属性比较（``values[LIST_FIELD] == detail.list_id``）；
     - ``pages/detail.py`` 自由文本框退出时「编辑器里那段文字与 ``Field.value`` 相等」那一下
       （形状是**裸名字 vs 属性**：``value == field.value``）。
     """
-    app = (ROOT / "src" / "dida" / "tui" / "app.py").read_text(encoding="utf-8")
-    detail = (ROOT / "src" / "dida" / "tui" / "pages" / "detail.py").read_text(encoding="utf-8")
-
-    inlined = {
-        attribute: _equality_with_attribute(app, attribute)
-        for attribute in ("list_id", "priority", "tags")
+    sources = {
+        str(path.relative_to(ROOT)): path.read_text(encoding="utf-8")
+        for path in sorted((ROOT / "src" / "dida" / "tui").rglob("*.py"))
     }
-    assert inlined == {"list_id": [], "priority": [], "tags": []}, (
+
+    inlined = [
+        f"{name}:{attribute}:{lineno}"
+        for name, source in sources.items()
+        for attribute in ("list_id", "priority", "tags")
+        for lineno in _equality_with_attribute(source, attribute)
+    ]
+    assert inlined == [], (
         "界面又自己比了一遍「改了没有」（比的是屏幕上那一份）：这条判断归引擎\n" + repr(inlined)
     )
-    assert _equality_against_a_bare_name(detail, "value") == [], (
+
+    against_a_bare_name = [
+        f"{name}:{lineno}"
+        for name, source in sources.items()
+        for lineno in _equality_against_a_bare_name(source, "value")
+    ]
+    assert against_a_bare_name == [], (
         "详细页又自己比了一遍「编辑器里那段文字与字段当前值相等」——这条判断归引擎"
-        "（dida.sync.writes.is_a_change），写的那一次回报布尔"
+        "（dida.sync.writes.is_a_change），写的那一次回报布尔\n" + repr(against_a_bare_name)
     )
 
 
@@ -718,15 +759,28 @@ def test_the_interface_judgement_guard_catches_both_shapes():
 
 
 def test_the_inlined_comparison_guard_catches_a_second_copy():
-    """内联那一条的守卫自己也要有人守：再写一遍那个比较当场红。"""
+    """内联那一条的守卫自己也要有人守：再写一遍那个比较当场红。
+
+    「两边都是属性」那一档是**故意**不算的（工单 #83 扩覆盖时定下来的口径）：它说的是两个
+    对象之间的比较，而 ``pages/detail.py`` 的 ``list_picker`` 真的在用它问「当前这个值在不在
+    这一份选项里」。#79 的判据形状永远是「**界面自己那份值** vs 引擎那份原文」——那一侧是
+    下标 / 调用 / 裸名字。
+    """
     inlined = "if field == LIST_FIELD:\n    if values[LIST_FIELD] == detail.list_id:\n        return False\n"
 
     assert _equality_with_attribute(inlined, "list_id") == [2]
     assert _equality_with_attribute("self.engine.move_task(task_id, to_list_id=x)\n", "list_id") == [], (
         "把 id 当参数传出去不是「自己判」"
     )
-    assert _equality_with_attribute("if other.list_id == mine.list_id:\n    pass\n", "list_id") == [1]
-    assert _equality_with_attribute("if int(picked) == detail.priority:\n    pass\n", "priority") == [1]
+    assert _equality_with_attribute("if int(picked) == detail.priority:\n    pass\n", "priority") == [1], (
+        "调用那一侧（``int(picked)``）也是界面自己那份值"
+    )
+    assert _equality_with_attribute(
+        "if any(option.value == detail.list_id for option in options):\n    pass\n", "list_id"
+    ) == [], "两边都是属性：挑选项回填那种正当比较（list_picker 正是这么用的）"
+    assert _equality_with_attribute("if other.list_id == mine.list_id:\n    pass\n", "list_id") == [], (
+        "同上：两个对象之间的比较不是「拿我这份值比对引擎那份原文」"
+    )
 
     free_text = "value = self._editor_value()\nif value == field.value:\n    return\n"
     assert _equality_against_a_bare_name(free_text, "value") == [2]
