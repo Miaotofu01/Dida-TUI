@@ -15,7 +15,7 @@
 | 4 | 本地存储 | `dida/storage/store.py` | `Store`：清单、任务快照、待推送改动、同步状态；它 import 的共用词汇全部从 `dida.vocabulary` 来，**不再 import 任何 `dida.sync.*`**（#78） | t08 已实现 |
 | 5 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` + `dida/sync/read.py` + `dida/sync/views.py` + `dida/sync/lists.py` | `SyncEngine(clock=, day_end=, source=, client=)`、`status() -> SyncStatus`、`logical_day() -> date`、**整份读模型**（#81）：`read_model() -> ReadModel \| None`（从当下这一份本地副本**一次装配**，没有缓存），**三种读形状是它的投影**（#33）：`list_index() -> tuple[ListRow, ...]`、`tasks_in(container_id) -> TaskList`、`task_detail(task_id) -> TaskDetail \| None`、`refresh() -> RefreshReport`（**async**）、`complete(task_id)`、`defer(task_id, days=) -> bool`、`push_pending()`、`set_day_end(day_end) -> bool`（换日界，#46）、**清单的建 / 改 / 删**（#42）：`create_list(name, color=)`、`update_list(list_id, name=, color=) -> bool`、`delete_list(list_id)`；行的字段与纯读法（截止时间读法、优先级标记、排序、逾期判定）在 `dida/sync/view.py`，读模型在 `dida/sync/read.py`，视图求值在 `dida/sync/views.py`（#35），清单的写路径与颜色档在 `dida/sync/lists.py`（#42；#54 加了「建好但服务端没回 id」时的认领：认领记录、按名字唯一对上、认领前不改 / 删那个临时 id）；**判据只有一个家、出口只有一道门**（#58）：优先级四档的用户语言 `PRIORITY_NAMES`（家在 `dida/sync/view.py`，与 `PRIORITY_CYCLE` 同一片词汇）与「搬到它已经在的那个清单不算一次改动」`is_a_move`（家在 `dida/sync/writes.py`）都经这里转出；**写的那一次自己回话「改了 / 没改」**（#79）：判据本体 `is_a_change`（`dida/sync/writes.py`，拿这次要盖上去的字段与**本地那一份原文**逐位比，归一化口径由 `dida/vocabulary.py` 的 `read_text` 一族与本地库共用）——改字段 `write(...) -> bool`、搬运 `move_task(...) -> bool`、改期 `reschedule(...) -> bool`、顺延 `defer(...) -> bool`、改清单 `update_list(...) -> bool`、改视图 `update_view(...) -> bool`；**删除 / 完成 / 取消完成不做同值收敛**（它们没有「什么都没改」这一档），签名不动；**v1 的 `view() -> TodayView` 已由 #58 删除**，三种读形状是唯一的读面 | t05 / t09 / t10 已实现；读形状 #33；视图求值 #35；清单写 #42；日界重读 #46；单一出处 #58；共用词汇 #78；改了没改 #79；读一次只算一遍 #81 |
 | 6 | 逻辑日 | `dida/logical_day.py` | `parse_day_end(text) -> timedelta`、`logical_day(now, day_end) -> LogicalDay`（`label` / `start` / `end`，半开区间） | t04 已实现 |
-| 7 | TUI | `dida/tui/` | `DidaApp(engine)`；三层页面 `dida/tui/pages/`（`index` / `tasks` / `detail`）、按层的键位表 `dida/tui/keys.py`、浮层 `dida/tui/overlays.py`、**视觉常量唯一出处 `dida/tui/theme.py`**（颜色 / 字形 / 间距 / 动效）、顶栏 `#top-bar`（`top_line()`，词标 + 导航路径）、状态栏 `#status-bar`（`status_line()` / `format_status()`） | v1 t05 / t18；一栏三层 #34；视觉地基 #51 |
+| 7 | TUI | `dida/tui/` | `DidaApp(engine)`；三层页面 `dida/tui/pages/`（`index` / `tasks` / `detail`）、按层的键位表 `dida/tui/keys.py`、浮层 `dida/tui/overlays.py`、**写入的后半段 `dida/tui/write_flow.py`**（#83）、**视觉常量唯一出处 `dida/tui/theme.py`**（颜色 / 字形 / 间距 / 动效）、顶栏 `#top-bar`（`top_line()`，词标 + 导航路径）、状态栏 `#status-bar`（`status_line()` / `format_status()`） | v1 t05 / t18；一栏三层 #34；视觉地基 #51；写入的后半段 #83 |
 
 `SyncStatus` 字段：`checked_at`（来自时钟）、`pending_count`、`last_refresh_at`、`logical_day`。
 状态栏文本由 `dida.tui.app.status_line()` 生成（纯文本那一份是 `format_status()`），措辞按 GLOSSARY
@@ -249,6 +249,29 @@ app = DidaApp(backend)
 说不说「已保存」；什么都没改时它**不出声**（不新增「没有改动」这类提示）。
 `tests/test_architecture.py` 用 AST 守着两件事：「`tui/` 里一处都不许出现那几个判据的名字」，
 以及那几处内联比较（挑选器的属性比较、详细页自由文本框那一下）不许被写回来。
+
+## 写路径：写出去之后（#83）
+
+「**一次写入的完整后果**」只有一份实现，在 `dida/tui/write_flow.py`（`WriteFlow` 混入
+`DidaApp`）：**执行一次写 → 分拣两类失败（本地没有这条 / 服务端与网络）→ 挑出那一句话与
+它的落点（状态栏 · 详细页底部）→ 推一轮 → 重画**。十一个处理函数只声明两件事：
+**写了什么**（`Write.perform`，那一次引擎调用）与**成功那句说什么**（`Write.said`）；挑哪一支
+`Reply` 就定下了失败怎么说与落在哪。次序、落点、以及 `await` 之后「屏幕还在不在」的守卫都
+长在那一个模块里，全程序只有一种说法。
+
+- **两处落点**（`Landing`）：报告落在**详细页底部**的那几笔（改字段 / 改期 / 搬运）要**等
+  这一轮推送落地**再重画——那一行说的就是「你刚才那一下出去没有」（`已保存` /
+  `待推送（N）`），不等它就说不准，这就是「先推再刷」那条次序的由来；落在**状态栏**的那几笔
+  （新建 / 删除 / 顺延 / 清单 / 视图）不等，引擎自己排了一轮立刻推送（ADR-0002），状态栏那个
+  「待推送 N」自己会跟上。失败那句话写在重画**之后**（重画会把底部那一行重写掉）。
+- **浮层交回来的字符串值 → 一次写**的翻译也在这里（`pick_write` / `_apply_pick`）：哪一格、
+  值怎么读（优先级 `0/1/3/5`、标签按多选那一格的切法）只在这一处，表单回调只把值递进来。
+- **「没改」的界面那一半**也在这里：`perform` 回 `False`（#79 的回报值）就不推、不重画、
+  不出声——界面是那个回报值的**纯消费者**，不自己再判一遍。
+- 这一层只调用 app 那几道已经带守卫的门（`refresh_view` / `_write_status` /
+  `_write_save_line` / `_notify_step`），所以十一个入口都不必再记得那道守卫。
+- 加一种新的写：键位 / 页面那一处 + 处理函数里那一处声明（挑一支现成的 `Reply`）。写路径的
+  判据只有一个家（#58 / #79），这一层不新增判断。
 
 ## 屏幕文本怎么断言
 
