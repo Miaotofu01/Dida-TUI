@@ -13,7 +13,7 @@
 | 2 | 滴答 API 客户端 | `dida/api/` | `DidaApiClient(token=, transport=, base_url=)`：`list_projects(offset=, limit=)`、`get_project_data(project_id)`、`get_task(project_id, task_id)`、`list_tags()`、`list_completed(project_ids=, start_date=, end_date=)`、`create_task(body)`、`update_task(project_id, task_id, changes, snapshot=)`、`complete_task(project_id, task_id)`、`delete_task(project_id, task_id)`、**清单的建 / 改 / 删**（#42）：`create_project(body)`、`update_project(project_id, changes, snapshot=)`、`delete_project(project_id)`——三条都有 `200 → Project` 与 `201 No Content` 两种成功形状，所以后两者返回「那一份清单，或者 `None`」；失败一律是 `dida.api.errors.DidaError` 的子类（`NetworkError` / `AuthError` / `ServerRejectionError` / `FieldIgnoredError`，守卫另有 `InvalidDateError` / `DatelessRepeatError` / `MalformedResponseError`） | t07 已实现 |
 | 3 | 共用词汇 | `dida/vocabulary.py` | 本地副本与引擎**都要用**的那点类型与常量，**谁都不依赖**（#78）：任务 / 清单快照与同步状态（`TaskSnapshot` / `ListSnapshot` / `SyncState` / `INBOX_ID`）、待推送改动（`PendingChange` / `PendingListChange`）、刷新报告（`RefreshReport` / `FieldOverride`）、存储侧同步状态（`StoredSyncState`）、完成 / 未完成两个状态码（`COMPLETED_STATUS` / `UNCOMPLETED_STATUS`）、写入种类与线路调用形状（`WriteKind` / `WireCall` / `LocalEffect` / `ListWriteKind` / `ListWire` / `ListLocalEffect` 及两张行为表，表上还有一位 `converges`）、本地 id 前缀（`LOCAL_TASK_PREFIX` / `LOCAL_LIST_PREFIX` 与 `is_local_id` 一族）、**读本地那一份原文的口径**（#79：`read_text` / `read_time` / `read_priority` / `read_tags`——本地库怎么读、写路径的判据就怎么比，两个口径是**同一份代码**）、视图定义与它落库的原文（`ViewDefinition` / `DueWindow` / `Completion` / `view_payload` / `view_from_payload`） | #78 已实现；读口径 #79 |
 | 4 | 本地存储 | `dida/storage/store.py` | `Store`：清单、任务快照、待推送改动、同步状态；它 import 的共用词汇全部从 `dida.vocabulary` 来，**不再 import 任何 `dida.sync.*`**（#78） | t08 已实现 |
-| 5 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` + `dida/sync/read.py` + `dida/sync/views.py` + `dida/sync/lists.py` | `SyncEngine(clock=, day_end=, source=, client=)`、`status() -> SyncStatus`、`logical_day() -> date`、**三种读形状**（#33）：`list_index() -> tuple[ListRow, ...]`、`tasks_in(container_id) -> TaskList`、`task_detail(task_id) -> TaskDetail \| None`、`refresh() -> RefreshReport`（**async**）、`complete(task_id)`、`defer(task_id, days=) -> bool`、`push_pending()`、`set_day_end(day_end) -> bool`（换日界，#46）、**清单的建 / 改 / 删**（#42）：`create_list(name, color=)`、`update_list(list_id, name=, color=) -> bool`、`delete_list(list_id)`；行的字段与纯读法（截止时间读法、优先级标记、排序、逾期判定）在 `dida/sync/view.py`，读模型在 `dida/sync/read.py`，视图求值在 `dida/sync/views.py`（#35），清单的写路径与颜色档在 `dida/sync/lists.py`（#42；#54 加了「建好但服务端没回 id」时的认领：认领记录、按名字唯一对上、认领前不改 / 删那个临时 id）；**判据只有一个家、出口只有一道门**（#58）：优先级四档的用户语言 `PRIORITY_NAMES`（家在 `dida/sync/view.py`，与 `PRIORITY_CYCLE` 同一片词汇）与「搬到它已经在的那个清单不算一次改动」`is_a_move`（家在 `dida/sync/writes.py`）都经这里转出；**写的那一次自己回话「改了 / 没改」**（#79）：判据本体 `is_a_change`（`dida/sync/writes.py`，拿这次要盖上去的字段与**本地那一份原文**逐位比，归一化口径由 `dida/vocabulary.py` 的 `read_text` 一族与本地库共用）——改字段 `write(...) -> bool`、搬运 `move_task(...) -> bool`、改期 `reschedule(...) -> bool`、顺延 `defer(...) -> bool`、改清单 `update_list(...) -> bool`、改视图 `update_view(...) -> bool`；**删除 / 完成 / 取消完成不做同值收敛**（它们没有「什么都没改」这一档），签名不动。**v1 的 `view() -> TodayView` 已由 #58 删除**，三种读形状是唯一的读面 | t05 / t09 / t10 已实现；读形状 #33；视图求值 #35；清单写 #42；日界重读 #46；单一出处 #58；共用词汇 #78；改了没改 #79 |
+| 5 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` + `dida/sync/read.py` + `dida/sync/views.py` + `dida/sync/lists.py` | `SyncEngine(clock=, day_end=, source=, client=)`、`status() -> SyncStatus`、`logical_day() -> date`、**整份读模型**（#81）：`read_model() -> ReadModel \| None`（从当下这一份本地副本**一次装配**，没有缓存），**三种读形状是它的投影**（#33）：`list_index() -> tuple[ListRow, ...]`、`tasks_in(container_id) -> TaskList`、`task_detail(task_id) -> TaskDetail \| None`、`refresh() -> RefreshReport`（**async**）、`complete(task_id)`、`defer(task_id, days=) -> bool`、`push_pending()`、`set_day_end(day_end) -> bool`（换日界，#46）、**清单的建 / 改 / 删**（#42）：`create_list(name, color=)`、`update_list(list_id, name=, color=) -> bool`、`delete_list(list_id)`；行的字段与纯读法（截止时间读法、优先级标记、排序、逾期判定）在 `dida/sync/view.py`，读模型在 `dida/sync/read.py`，视图求值在 `dida/sync/views.py`（#35），清单的写路径与颜色档在 `dida/sync/lists.py`（#42；#54 加了「建好但服务端没回 id」时的认领：认领记录、按名字唯一对上、认领前不改 / 删那个临时 id）；**判据只有一个家、出口只有一道门**（#58）：优先级四档的用户语言 `PRIORITY_NAMES`（家在 `dida/sync/view.py`，与 `PRIORITY_CYCLE` 同一片词汇）与「搬到它已经在的那个清单不算一次改动」`is_a_move`（家在 `dida/sync/writes.py`）都经这里转出；**写的那一次自己回话「改了 / 没改」**（#79）：判据本体 `is_a_change`（`dida/sync/writes.py`，拿这次要盖上去的字段与**本地那一份原文**逐位比，归一化口径由 `dida/vocabulary.py` 的 `read_text` 一族与本地库共用）——改字段 `write(...) -> bool`、搬运 `move_task(...) -> bool`、改期 `reschedule(...) -> bool`、顺延 `defer(...) -> bool`、改清单 `update_list(...) -> bool`、改视图 `update_view(...) -> bool`；**删除 / 完成 / 取消完成不做同值收敛**（它们没有「什么都没改」这一档），签名不动；**v1 的 `view() -> TodayView` 已由 #58 删除**，三种读形状是唯一的读面 | t05 / t09 / t10 已实现；读形状 #33；视图求值 #35；清单写 #42；日界重读 #46；单一出处 #58；共用词汇 #78；改了没改 #79；读一次只算一遍 #81 |
 | 6 | 逻辑日 | `dida/logical_day.py` | `parse_day_end(text) -> timedelta`、`logical_day(now, day_end) -> LogicalDay`（`label` / `start` / `end`，半开区间） | t04 已实现 |
 | 7 | TUI | `dida/tui/` | `DidaApp(engine)`；三层页面 `dida/tui/pages/`（`index` / `tasks` / `detail`）、按层的键位表 `dida/tui/keys.py`、浮层 `dida/tui/overlays.py`、**视觉常量唯一出处 `dida/tui/theme.py`**（颜色 / 字形 / 间距 / 动效）、顶栏 `#top-bar`（`top_line()`，词标 + 导航路径）、状态栏 `#status-bar`（`status_line()` / `format_status()`） | v1 t05 / t18；一栏三层 #34；视觉地基 #51 |
 
@@ -116,6 +116,24 @@ v1 的读入口只有一个为「今日」硬编码的 `view() -> TodayView`；#
 （「不知道在哪个清单」），**不再**猜成字面量 `inbox`——那既让深链的兜底分支不可达，又让归类
 一条都对不上。深链拼装（`dida.tui.escape.task_url`）同样只认「真的是收集箱」的 id：
 请求侧别名，或服务端那一串；id 里恰好带 `inbox` 的真实清单不再被改写。
+
+### 一次装配，三种看法（#81）
+
+`read_model()` 从**当下这一份**本地副本装配出 `ReadModel`：清单（收集箱已补齐 / 并好）、
+全部任务快照、以及内置三个加自定义若干个视图**各求值一次**的结果。三个读形状都是它的投影
+（`ReadModel.list_index()` / `tasks_in()` / `task_detail()`），所以：
+
+- 界面一次重画只调 `read_model()` 一次（`DidaApp.refresh_view`）——进一个视图不再为了找那一行
+  把索引连同所有视图重建一遍（探针实测：容器选中时重画 16 → 8 次视图求值、全表扫描 3 → 1 遍）；
+- 同一个视图行上的条数与进去看到的成员来自同一次求值，不可能对不上；
+- 「这个容器是哪一行」只在一处回答（`list_rows()` 给真实清单行、`ReadModel.views` 给视图行）；
+- `move_targets()` 挑搬运目标时只取真实清单那几行，**不装配视图**（8 → 0 次求值）；
+- `task_detail()` 是那条**窄**读法：详情形状不要视图成员，为它把所有视图求值一遍是白付的
+  （实测 500 条任务 / 8 个视图：0.11ms → 31ms），它走同一条 `detail_of()`，只是少装配一样东西。
+
+**这不是缓存层**：`ReadModel` 这个值活不过一次重画，下一次重画从当下那一份本地副本重新装配，
+没有增量、没有过期问题——变的只是算的遍数。`tests/test_read_model.py` 只断三个读形状的
+**内容**（条数、顺序、隐含日期、逾期位）；「求值了几遍」由仓库外的探针量，不进测试。
 
 自定义视图的行由源上的可选能力 `ViewReader.views()` 给（#36 把视图定义落库并求值）；
 内置视图由 `builtin_view_rows()` 算（#35：三个写死的 `ViewDefinition` 走
