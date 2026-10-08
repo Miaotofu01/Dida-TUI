@@ -883,7 +883,8 @@ class DidaApp(App[None]):
         if field == TAGS_FIELD:
             # 多选那一格交回来的是一串值；顺序不是改动的一部分，而这件事由引擎那一份判据
             # （按集合比）说了算，这里只把值递过去。
-            return self.engine.write(task_id, changes={"tags": list(multi_values(values[TAGS_FIELD]))})
+            picked = multi_values(values[TAGS_FIELD])
+            return self.engine.write(task_id, changes={"tags": list(picked)})
         return False
 
     # ---------------------------------------------------------------- 任务的删除与顺延（#40）
