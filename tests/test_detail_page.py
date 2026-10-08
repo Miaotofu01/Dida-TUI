@@ -1283,7 +1283,7 @@ async def test_deleting_the_date_that_was_there_is_a_clear_and_not_a_mistake():
     """把**已有的**日期删掉再提交 = 清除（与上一条成对）。
 
     同一个空值，两种意思：上一条是「还没填」（没动过那一格），这一条是「要清除」（用户把
-    里面的日期删了）。这就是 ``_due_date_touched`` 存在的理由。
+    里面的日期删了）。这就是 ``DueEditor.date_touched`` 存在的理由（#87 之前叫 ``_due_date_touched``）。
     """
     fake = backend()
     app = DidaApp(fake)
@@ -1406,7 +1406,7 @@ async def test_esc_on_an_empty_untouched_date_ends_the_edit_and_says_why():
     「没有取消」不等于「必须写一笔」：用户什么都没改过，于是没有改动可生效。编辑器照规矩
     收起、回到字段列表（编辑器里 ``esc`` 的唯一含义就是这个），而下面那一行说明为什么——
     不能把这一下当成**清除**：「还没填」与「要清除」在请求体里是同一个空值，而清除要求
-    用户真的动过那一格（``_due_date_touched``）。旧行为是悄悄收起：既没写、也没说。
+    用户真的动过那一格（``DueEditor.date_touched``，旧名 ``_due_date_touched``）。旧行为是悄悄收起：既没写、也没说。
     """
     fake = backend()
     fake.add_task("没有日期的任务", list_name="work", id="t2")
