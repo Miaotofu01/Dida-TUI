@@ -1,12 +1,14 @@
 """本地存储（第 3 个深模块）：SQLite（stdlib），无 ORM、无迁移框架。
 
-五类数据：
+六类数据：
 
 - 清单（API 叫 project，界面叫清单）：名称、颜色、排序、项目组、是否收集箱，
 - 任务快照：服务端原始字段 **含未知字段** + 本地已生效的改动，
 - 待推送改动（Pending Change）：创建时间、尝试次数、下次重试时间、最后一次错误，
 - 同步状态：已完成流游标、上次刷新完成时间、上次算出的逻辑日，
-- **自定义视图**（#36）：过滤条件的原文 + 它在清单列表页上的位置。
+- **自定义视图**（#36）：过滤条件的原文 + 它在清单列表页上的位置，
+- **id 别名**（#75 / ADR-0009）：认领换过名的那几个本地 id 现在是哪个 id——只在**这一次打开**
+  期间有效（开库时清空，见 :meth:`Store.resolve_id` 与 ADR-0009 二）。
 
 自定义视图**只存在这里**（ADR-0005）：``config.toml`` 是放 token 的文件，为了改一个过滤
 条件去手写凭据是不对的；而 API 里没有「保存一组过滤条件」这个接口，所以它也不进待推送
@@ -24,8 +26,8 @@
 悄悄撤销掉**。豁免是逐字段的：改动碰过的字段本地值赢，其余字段服务端照旧赢；未推送的删除
 则整条任务豁免。剪枝读的是同一份豁免：有没推成功的改动的任务一个都不剪。
 
-``Store`` 同时是 t05 的 ``ViewSource`` 的生产实现（``lists`` / ``tasks`` / ``sync_state``），
-所以引擎与 TUI 拿到的形状和它们已经写好的测试一致。
+``Store`` 同时是 t05 的 ``ViewSource`` 的生产实现（``lists`` / ``tasks`` / ``sync_state`` /
+``resolve_id``），所以引擎与 TUI 拿到的形状和它们已经写好的测试一致。
 
 时间一律由调用方给（``now`` / ``last_refresh_at``）：这一层没有时钟，
 「现在」永远从注入的 ``Clock`` 来。写操作都是乐观的——``enqueue`` 当场让改动在本地生效，
@@ -34,7 +36,7 @@
 公开接口：
 
 - 开关：``close()``、``with Store(path) as store``；
-- 读（``ViewSource``）：``lists()`` / ``tasks()`` / ``sync_state()``；
+- 读（``ViewSource``）：``lists()`` / ``tasks()`` / ``sync_state()`` / ``resolve_id(id)``；
 - 读（完整记录）：``list_records()`` / ``task_payload(task_id)`` / ``stored_sync_state()``；
 - 写：``apply_refresh(lists=, tasks=, prune_lists=, prune_unfinished_tasks=)``（只写变化、
   顺手剪枝，返回 ``RefreshReport``）、``enqueue(...)`` / ``pending()`` / ``pending_count()`` /
@@ -143,6 +145,11 @@ CREATE TABLE IF NOT EXISTS views (
     id          TEXT PRIMARY KEY,
     definition  TEXT NOT NULL,
     position    INTEGER NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS id_aliases (
+    from_id     TEXT PRIMARY KEY,
+    to_id       TEXT NOT NULL
 );
 """
 
@@ -303,7 +310,43 @@ class Store:
         self._db.execute("PRAGMA foreign_keys = ON")
         self._db.executescript(_SCHEMA)
         self._migrate()
+        # id 别名**只活这一次打开**（ADR-0009 二）：一个旧 id 只可能被这一次打开期间已经画出去的
+        # 界面握着，重开之后没有任何界面还握着它。清在这里而不是剪在某处，是因为「有效期」这件事
+        # 没有别的答案——按时间剪要一只这一层没有的钟，按条数剪是编一个数。
+        # 措辞是「这一次打开」而不是「这个进程」：同进程再开一个 Store 会把前一个实例的别名清掉，
+        # 生产上走不到（组合根只建一个），要精确的是这句 ADR 对应的话。
+        self._db.execute("DELETE FROM id_aliases")
         self._db.commit()
+
+    def resolve_id(self, id: str) -> str:
+        """这个名字**现在是**哪个 id（认领换过名的话给新的那个，否则给原样）。
+
+        认领（:meth:`adopt_created` / :meth:`adopt_created_list`）会把本地那个临时 id 换成
+        服务端给的 id，而**已经画在屏幕上的那个旧 id 并不会跟着变**——界面拿着它再回来找这条
+        任务时，本地这一行已经在真 id 底下了。这一层记下了那次换名，所以「谁手里的旧 id 都还
+        认」（工单 #75 / ADR-0009 一）。
+
+        只跟一跳：别名表的 ``to_id`` 永远是服务端给的 id，而它不会再被认领一次——链不会长出来。
+        认不出来就是它自己，读路径上那与「这个名字确实没有对应任何东西」是同一条口径。
+        """
+        row = self._db.execute(
+            "SELECT to_id FROM id_aliases WHERE from_id = ?", (id,)
+        ).fetchone()
+        return id if row is None else str(row["to_id"])
+
+    def _remember_alias(self, old_id: str, new_id: str) -> None:
+        """记下「这个本地 id 现在叫 ``new_id``」——**必须与那次换名在同一个事务里**。
+
+        分开写会留下一个窗口：行已经挪走了、别名还没落下，那一刻界面拿着旧 id 回来就是
+        「不在本地缓存里了」（正是 #75 报的那句话）。调用点都在 ``with self._db`` 里面。
+        """
+        if old_id == new_id:
+            return
+        self._db.execute(
+            "INSERT INTO id_aliases (from_id, to_id) VALUES (?, ?) "
+            "ON CONFLICT(from_id) DO UPDATE SET to_id = excluded.to_id",
+            (old_id, new_id),
+        )
 
     def _migrate(self) -> None:
         """老库补列：``CREATE TABLE IF NOT EXISTS`` 不给已经存在的表加列。
@@ -417,8 +460,14 @@ class Store:
 
         这就是喂给 ``DidaApiClient.update_task(snapshot=)`` 的那一份：**字典形状**，
         不是领域 dataclass，所以客户端不认识的字段也在里面，回写时不会丢。
+
+        递进来的可能是**认领换名之前**的那个临时 id（界面手里就是旧的，工单 #75）：先过一道
+        :meth:`resolve_id`，所以旧 id 读到的仍然是这一行。返回的那份原文里的 ``id`` 因此是这条
+        任务**现在**的名字——引擎的写路径正是从它那里拿真 id（``PushMixin.write``）。
         """
-        row = self._db.execute("SELECT raw FROM tasks WHERE id = ?", (task_id,)).fetchone()
+        row = self._db.execute(
+            "SELECT raw FROM tasks WHERE id = ?", (self.resolve_id(task_id),)
+        ).fetchone()
         return None if row is None else json.loads(row["raw"])
 
     def lists(self) -> tuple[ListSnapshot, ...]:
@@ -526,10 +575,17 @@ class Store:
         没有那个 id——不挪的话它 POST 到 ``/open/v1/task/local-…``、404、退避重试、
         **永远出不了队**，状态栏那个数一直非零（与 :class:`~dida.sync.writes.UnknownTaskError`
         挡的是同一类安静错误）。形状照抄清单版的 :meth:`adopt_created_list`。
+
+        **第四个持有者也在这一步落账**（#75 / ADR-0009）：屏幕。队列能重指是因为它在库里，
+        而界面手里那个 id 在屏幕上——它不会跟着变，所以这里顺手记一份别名（
+        :meth:`_remember_alias`），让那个旧 id 在本进程里继续认得出这条任务。这一笔与挪行
+        在**同一个事务**里：不然就有一个窗口，屏幕拿着旧 id 回来正好撞上「行已经挪走、别名还没
+        落下」（#75 报的就是那句话）。
         """
         target = str(payload["id"])
         with self._db:
             self._write_task(payload)
+            self._remember_alias(local_id, target)
             if target != local_id:
                 self._db.execute("DELETE FROM tasks WHERE id = ?", (local_id,))
                 self._db.execute(
@@ -606,8 +662,13 @@ class Store:
 
         本地没有这一行就是 ``None``：不猜一个空清单出来（猜出来的请求会打到一个不存在的
         清单上）。
+
+        与 :meth:`task_payload` 同一条口径：递进来的可能是认领换名之前的临时 id（#75），
+        先过一道 :meth:`resolve_id`；返回那份原文里的 ``id`` 是这个清单**现在**的名字。
         """
-        row = self._db.execute("SELECT * FROM lists WHERE id = ?", (list_id,)).fetchone()
+        row = self._db.execute(
+            "SELECT * FROM lists WHERE id = ?", (self.resolve_id(list_id),)
+        ).fetchone()
         return None if row is None else _list_payload(row)
 
     def save_list(self, payload: Mapping[str, Any]) -> None:
@@ -629,14 +690,20 @@ class Store:
         服务端建好之后才给真 id，而「建完立刻出现在清单列表页」是 ADR-0002 的手感要求。
         取最小的空号而不是计数器：上一次没推成功的那一行还占着它的号，重开也不会撞上它。
 
-        **占着号的有两处**（#57）：``lists`` 里那一行，以及队列里还挂着它记录的那些 id
-        （:meth:`_held_local_list_ids`）。只看行是不够的——一行可以**在记录还在的时候**被剪掉
-        （服务端索引里找不到它、而它又没有「还没到服务端的改动」，见 :meth:`_prune_lists`），
-        那个号就从行那一侧空了出来；再发一次就是两条清单用同一个临时 id，而按 id 找记录的
-        地方会挑错**一条**，最坏是拿另一条清单的名字去删服务端上的一行（#57 的探针）。
+        **占着号的有三处**（#57 / #75）：``lists`` 里那一行、队列里还挂着它记录的那些 id，
+        以及**本进程里认领换过名的那些别名**（:meth:`_held_local_list_ids`）。只看行是不够的
+        ——一行可以**在记录还在的时候**被剪掉（服务端索引里找不到它、而它又没有「还没到服务端的
+        改动」，见 :meth:`_prune_lists`），那个号就从行那一侧空了出来；再发一次就是两条清单用同
+        一个临时 id，而按 id 找记录的地方会挑错**一条**，最坏是拿另一条清单的名字去删服务端上的
+        一行（#57 的探针）。别名那一处是 #75 加上的：认领之后号确实空出来了，但别名还记着它现在
+        指哪一行——真发出去的话，新那条拿自己的 id 改名会落到**老那条**上。
 
-        所以规矩一句话：**临时 id 的所有权跟着记录走**——记录还在，这个号就不许再发。
-        行的寿命与记录的寿命因此可以不一样长（剪枝只剪行），而号永远是安全的。
+        所以规矩一句话：**临时 id 的所有权跟着记录走，而记过别名的那几个号一直要等到本进程
+        结束**——记录还在，这个号就不许再发；别名还在，也一样。行的寿命与记录的寿命因此可以
+        不一样长（剪枝只剪行），而号永远是安全的。
+
+        任务那边的临时 id 是 uuid（``sync/create.py::_local_task_id``），撞不上，所以这条只
+        管清单这一族的发号器。
         """
         used = {
             int(value[len(LOCAL_LIST_PREFIX) :])
@@ -649,16 +716,21 @@ class Store:
         return f"{LOCAL_LIST_PREFIX}{number}"
 
     def _held_local_list_ids(self) -> set[str]:
-        """本地临时 id 的**全部**占用者：``lists`` 里的行 + 队列里的记录（#57）。
+        """本地临时 id 的**全部**占用者：``lists`` 里的行 + 队列里的记录 + 认领换名留下的别名。
 
-        「这是不是本地临时 id」只在 :func:`~dida.sync.lists.is_local_list_id` 一处判断
-        （这里不写 ``LIKE`` 之类第二条判据），所以两张表先各取一列、在 Python 这边筛。
+        前两处是 #57 的，第三处是 #75 的（:meth:`resolve_id` 那张表）：一个号被认领（行挪到服务端
+        id 上、记录也出队）之后看起来是空的，但别名还指着它——再发一次就会撞上「同一个临时 id 两个
+        意思」。
+
+        「这是不是本地临时 id」只在 :func:`~dida.sync.lists.is_local_list_id` 一处判断（这里不写
+        ``LIKE`` 之类第二条判据），所以几张表先各取一列、在 Python 这边筛。
         """
         values = {str(row["id"]) for row in self._db.execute("SELECT id FROM lists")}
         values |= {
             str(row["list_id"])
             for row in self._db.execute("SELECT list_id FROM pending_list_changes")
         }
+        values |= {str(row["from_id"]) for row in self._db.execute("SELECT from_id FROM id_aliases")}
         return {value for value in values if is_local_list_id(value)}
 
     def enqueue_list(
@@ -709,10 +781,14 @@ class Store:
         （断网时先建后改，很正常）会留下一条 ``list_id`` 指向本地临时 id 的改动，而服务端
         没有那个清单——不挪的话它永远推不出去，状态栏那个数一直非零，用户读到的是
         「等一下就好」（与 :class:`~dida.sync.writes.UnknownTaskError` 挡的是同一类安静错误）。
+
+        与任务那一版一样，同一个事务里也记一份别名（#75 / ADR-0009）：界面可能正站在这个刚建好
+        的清单里，或者光标正停在它那一行上——那张表两族 id 共用（本地前缀不重叠）。
         """
         target = str(payload["id"])
         with self._db:
             self._write_list(payload)
+            self._remember_alias(local_id, target)
             if target != local_id:
                 self._db.execute("DELETE FROM lists WHERE id = ?", (local_id,))
                 self._db.execute(
@@ -773,12 +849,18 @@ class Store:
         3. ``row`` 给出来就把它写成真 id 那一行（改名并进去过的那一份：用户要的名字 / 颜色）。
            ``remove=True`` 是另一头——用户已经删了这一条清单，而刷新刚把服务端那行写进来，
            这里要把它**摘掉**，否则屏幕上就是「删掉的清单又回来了」。
+
+        **别名也在这里落账**（#75 / ADR-0009）：这是认领清单的**第二条**路（推送回 201 空体时，
+        认领推迟到下一次刷新按名字对上，#54），而屏幕上的那一行不认路——它拿着的还是旧 id。
+        记在这个方法里而不是三个调用点上，是因为三条路（``AWAIT_ID`` / 改名并进去 / 用户已经
+        删了）共用这一步，记漏一条就是半修。
         """
         with self._db:
             if remove:
                 self._db.execute("DELETE FROM lists WHERE id = ?", (real_id,))
             elif row is not None:
                 self._write_list(dict(row))
+            self._remember_alias(local_id, real_id)
             self._db.execute("DELETE FROM lists WHERE id = ?", (local_id,))
             self._db.execute(
                 "UPDATE pending_list_changes SET list_id = ? WHERE list_id = ?",
