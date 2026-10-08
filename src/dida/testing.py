@@ -2,15 +2,16 @@
 
 - :class:`ManualClock` —— 时钟接缝（``dida.clock.Clock``）。
 - :class:`FakeTransport` —— HTTP 传输接缝（``dida.api.transport.Transport``）。
-- :class:`InMemorySource` —— 只读的内存替身（``dida.sync.view.ViewSource``）；写路径够不着它。
+- :class:`InMemorySource` —— 只读的内存替身（``dida.sync.view.ViewSource``）：清单与任务快照
+  是摆进去的，视图那一半走真库；写任务 / 写清单那几件能力它没有。
 - :class:`FakeBackend` —— **接缝一的假后端**：#80 第一步之后它内部装的是**真货**：真
   :class:`~dida.sync.engine.SyncEngine` + 真本地库（``Store(":memory:")``）+ 假传输层，
   对外仍是「摆数据 + 记下调用」那套字段，所以用它的测试文件一行都不用改。
 
 ``FakeBackend`` 记下的那些字段（``writes`` / ``completed`` / ``moved``……）是**对外的账本**：
-#80 的第一步只换内部实现，账本照旧（第二步 #86 才收拾抄来的判断与没人读的数组）。
-写方法一律交给真引擎走真写路径——乐观落库、入队、推送、认领、出队全在引擎与本地库里发生，
-替身不再自己抄一份。**「这一次到底改了没有」也由引擎回答**（#79：判据本体
+读路径与写路径都是真货的，账本只记「这一次调用收到了什么」——**每一格都有人读**，没人读的
+在 #86 退场了。写方法一律交给真引擎走真写路径——乐观落库、入队、推送、认领、出队全在引擎
+与本地库里发生，替身不再自己抄一份。**「这一次到底改了没有」也由引擎回答**（#79：判据本体
 :func:`~dida.sync.writes.is_a_change`，比的是本地那一份原文），替身照它的回报记账：回
 ``False``（空操作）时账本里**不留这一笔**——一次没发生的写不该看起来像发生过（#79 之前旧
 替身自己抄了一份判断，两个时刻各问一次；#80 之后判断只有引擎那一处）。
@@ -31,7 +32,6 @@ from dida.clock import Clock
 from dida.storage.store import (
     COMPLETED_STATUS,
     UNCOMPLETED_STATUS,
-    VIEW_ID_PREFIX,
     RefreshReport,
     Store,
 )
@@ -52,21 +52,6 @@ from dida.sync.view import (
     SyncState,
     TaskSnapshot,
 )
-
-
-_SNAPSHOT_FIELDS = frozenset(
-    {"title", "content", "desc", "priority", "completed", "due", "all_day", "tags"}
-)
-"""一次写里能直接盖进 :class:`TaskSnapshot` 的那些字段名。
-
-引擎给的是**服务端字段名**（``content`` / ``desc`` / ``title``……），快照上那几位恰好同名；
-其余（``dueDate``、``items``、未知字段）只并进服务端原文。替身不自己翻译字段——那一层
-是 ``Store`` 的事，替身照它的口径做最小的那一份。
-
-``tags`` 在里面（#45）：``Store`` 读快照时是从原文里取 ``tags`` 的（``_snapshot``），所以
-一次改标签在真库里当场就反映到读路径上；替身少了这一条就会「写进去了但屏幕上没变」——
-那正是接缝一要断的那句话。
-"""
 
 
 class ManualClock:
@@ -196,8 +181,12 @@ def _list_payload(
 class InMemorySource:
     """本地缓存的内存替身：清单、任务快照、同步状态。
 
-    生产实现是 t08 的 ``Store``；在它落地之前，引擎与 TUI 的测试都用这个。
-    引用一个不存在的清单名时会顺手建出这条清单，这样测试里加任务不必先建清单。
+    生产实现是 ``Store``；这个替身只做「摆数据」那一半——引用一个不存在的清单名时会顺手
+    建出这条清单，这样测试里加任务不必先建清单。**视图那一半用真库**（``Store(":memory:")``）：
+    视图的位置与本地 id 发号只有一份实现，替身不自己再写一遍（#86）。
+
+    它满足 ``ViewReader`` / ``ViewStore``，不满足写任务 / 写清单的那几件能力——
+    「存不下待推送改动」是它的性质，不是错误（#85）。
     """
 
     def __init__(self) -> None:
@@ -206,9 +195,10 @@ class InMemorySource:
 
         self._lists: dict[str, ListSnapshot] = {}
         self._tasks: dict[str, TaskSnapshot] = {}
-        self._views: dict[str, ViewDefinition] = {}
         self._raw: dict[str, Mapping[str, Any]] = {}
         self._seq = 0
+        self._view_store = Store(":memory:")
+        """视图那一半：真库，所以「按用户的顺序排」与「发号」都不是替身说了算。"""
 
     def add_list(
         self,
@@ -239,43 +229,6 @@ class InMemorySource:
         self._lists[snapshot.id] = snapshot
         return snapshot
 
-    def save_list(self, payload: Mapping[str, Any]) -> None:
-        """按一行清单的**原文**写进内存缓存（#42 的乐观写那一份）。
-
-        与 ``Store.save_list`` 同一口径：字段名用服务端的驼峰（``groupId`` / ``isInbox``……），
-        没提的字段当「不知道」（``None``）——替身不自己编，编出来的东西会让「改完之后
-        那一行长什么样」变成空话。
-        """
-        self._lists[str(payload["id"])] = ListSnapshot(
-            id=str(payload["id"]),
-            name=str(payload.get("name") or ""),
-            color=payload.get("color"),
-            group_id=payload.get("groupId"),
-            kind=payload.get("kind"),
-            permission=payload.get("permission"),
-            is_inbox=bool(payload.get("isInbox")),
-        )
-
-    def drop_list(self, list_id: str) -> None:
-        """本地摘掉一行清单（#42 删除的本地效果）。"""
-        self._lists.pop(list_id, None)
-
-    def set_completed(self, task_id: str, *, completed: bool) -> None:
-        """把一条任务标成完成 / 未完成（工单 #38 的乐观写在内存里的那一半）。
-
-        与真 ``Store`` 同一条口径：**只动 ``status``**，``completedTime`` 一个字不动。
-        取消完成之后完成时间戳还留着正是实测行为（spec 的实测事实第 1 条），而「还算不算
-        已完成」只看 ``status``——替身要是顺手把时间戳也清了，接缝一就再也测不到那句话。
-        """
-        snapshot = self._tasks.get(task_id)
-        if snapshot is None:
-            return
-        status = COMPLETED_STATUS if completed else UNCOMPLETED_STATUS
-        self._tasks[task_id] = replace(snapshot, completed=completed)
-        raw = self._raw.get(task_id)
-        if raw is not None:
-            self._raw[task_id] = {**raw, "status": status}
-
     def add_view(self, name: str, *, id: str | None = None, **conditions: Any) -> ViewDefinition:
         """加一个自定义视图（#36）：``conditions`` 就是 :class:`ViewDefinition` 的那几维。
 
@@ -286,7 +239,7 @@ class InMemorySource:
         definition = ViewDefinition(
             id=id if id is not None else name, name=name, **conditions
         )
-        self._views[definition.id] = definition
+        self._view_store.save_view(definition)
         return definition
 
     def add_task(
@@ -339,7 +292,7 @@ class InMemorySource:
         )
         self._lists.setdefault(snapshot.list_id, ListSnapshot(id=snapshot.list_id, name=list_name))
         self._tasks[snapshot.id] = snapshot
-        self._raw[snapshot.id] = {**self._payload_of(snapshot), **(raw or {})}
+        self._raw[snapshot.id] = {**_server_payload(snapshot), **(raw or {})}
         return snapshot
 
     def task_payload(self, task_id: str) -> Mapping[str, Any] | None:
@@ -350,77 +303,29 @@ class InMemorySource:
         """
         return self._raw.get(task_id)
 
-    def _payload_of(self, snapshot: TaskSnapshot) -> dict[str, Any]:
-        """快照 → 服务端原文那样的字典（与 :func:`_server_payload` 同一份实现）。"""
-        return _server_payload(snapshot)
-
     def view_definitions(self) -> tuple[ViewDefinition, ...]:
-        """自定义视图的**定义**（#36），按加进来的顺序。
-
-        与 ``Store.views()`` 同一口径：给定义不给成员——成员要「全量缓存 + 当前逻辑日」
-        才算得出来，替身与存储层一样不读时钟。
-        """
-        return tuple(self._views.values())
+        """自定义视图的**定义**（#36），按用户自己的顺序——真库那一份给的是定义不是成员：
+        成员要「全量缓存 + 当前逻辑日」才算得出来，存储层不读时钟。"""
+        return tuple(self._view_store.view_definitions())
 
     def view_definition(self, view_id: str) -> ViewDefinition | None:
         """一个视图的定义；没加过就是 ``None``。"""
-        return self._views.get(view_id)
+        return self._view_store.view_definition(view_id)
 
     def save_view(self, definition: ViewDefinition) -> None:
-        """写下一行视图（新建与改都是覆盖式地写）；**位置照旧不动**（字典改已有的键
-        不会把它挪到末尾，与 ``Store.save_view`` 保住 ``position`` 是同一件事）。"""
-        self._views[definition.id] = definition
+        """写下一行视图（新建与改都是覆盖式地写；位置照旧不动，由真库说了算）。"""
+        self._view_store.save_view(definition)
 
     def drop_view(self, view_id: str) -> None:
         """本地摘掉一行视图（只动这一行，一条任务都不碰）。"""
-        self._views.pop(view_id, None)
+        self._view_store.drop_view(view_id)
 
     def new_view_id(self) -> str:
-        """一个还没被占用的本地视图 id（与 ``Store.new_view_id`` 同一个前缀与算法）。"""
-        index = 1
-        while f"{VIEW_ID_PREFIX}{index}" in self._views:
-            index += 1
-        return f"{VIEW_ID_PREFIX}{index}"
+        """一个还没被占用的本地视图 id（前缀与算法在真库那一处）。"""
+        return self._view_store.new_view_id()
 
     def lists(self) -> tuple[ListSnapshot, ...]:
         return tuple(self._lists.values())
-
-    def apply_changes(self, task_id: str, changes: Mapping[str, Any]) -> None:
-        """把一次写盖到缓存里那条任务上（假后端 ``write`` 的本地效果）。
-
-        与 ``Store`` 同一条口径：本地当场生效（乐观写），服务端随后到。认得出的字段（标题、
-        描述、备注、优先级、状态）盖进快照，其余原样并进那份服务端原文——详情页的只读字段
-        读的就是原文。
-
-        ``dueDate`` / ``isAllDay`` 多一层翻译：服务端的字段名（``dueDate``）与快照上那两位
-        （``due`` / ``all_day``）不是同一个拼法，而 ``Store._snapshot`` 就是在这两个名字之间
-        翻译的。替身不翻译的话，「改完截止时间屏幕上就变了」这句话在接缝一根本测不到
-        （#44：详细页那一格读的是快照上的 ``due``）。**显式的 ``None`` 是清除**——与 ``Store``
-        把 ``dueDate: null`` 读成「没有日期」同一个口径（``dida.vocabulary.read_time`` 只认字符串）。
-
-        **``projectId`` 那一条是搬运**（#45）：快照上「在哪个清单」那一位叫 ``list_id``，
-        与 ``Store._write_task`` 同一条口径（它也是从 ``projectId`` 算出 ``list_id`` 那一列）。
-        不翻这一下的话，「搬完在读路径上人在新清单里」这句话在接缝一根本测不到。
-        """
-        snapshot = self._tasks.get(task_id)
-        if snapshot is None:
-            return
-        raw = {**self._raw.get(task_id, {}), **changes}
-        if "dueDate" in changes or "isAllDay" in changes:
-            due = raw.get("dueDate")
-            snapshot = replace(
-                snapshot,
-                due=datetime.fromisoformat(due) if isinstance(due, str) else None,
-                all_day=bool(raw.get("isAllDay")),
-            )
-        known = {key: value for key, value in changes.items() if key in _SNAPSHOT_FIELDS}
-        if changes.get("projectId"):
-            known["list_id"] = str(changes["projectId"])
-        if "tags" in known:
-            known["tags"] = tuple(known["tags"])
-        snapshot = replace(snapshot, **known) if known else snapshot
-        self._tasks[task_id] = snapshot
-        self._raw[task_id] = raw
 
     def tasks(self) -> tuple[TaskSnapshot, ...]:
         return tuple(self._tasks.values())
@@ -510,8 +415,9 @@ class FakeBackend:
     / ``status``……）委托给真引擎；**写走真写路径**：真引擎解析 id、真库乐观落库并入队、
     真客户端把请求发到假传输层，推成功之后认领与出队也都在真库上发生。
 
-    对外那套记录字段与旧版一字不差——测试读的就是它们（``writes`` / ``completed`` /
-    ``created_tasks`` / ``moved``……）。替身里抄来的判断与没人读的数组留给第二步（#86）。
+    对外那套记录字段照旧——测试读的就是它们（``writes`` / ``completed`` / ``created_tasks``
+    / ``moved``……）。它们只说「这一次调用收到了什么」，不是第二份实现：读、写、字段翻译、
+    守卫、发号、队列记账全在真引擎与真库里发生（#86 把没人读的那几格与抄来的判断清掉了）。
 
     用法::
 
@@ -562,15 +468,6 @@ class FakeBackend:
 
         self.created: list[str] = []
         """``create(title, ...)`` 收到的标题，按调用顺序（t15 的新建）。"""
-
-        self.created_due: list[datetime | None] = []
-        """每次新建写进去的截止时刻，与 ``created`` 一一对应。"""
-
-        self.created_all_day: list[bool] = []
-        """每次新建是不是全天，与 ``created`` 一一对应。"""
-
-        self.created_priority: list[int | None] = []
-        """每次新建写进去的优先级（API 取值 1/3/5；没写是 ``None``），与 ``created`` 一一对应。"""
 
         self.created_tags: list[tuple[str, ...]] = []
         """每次新建写进去的标签，与 ``created`` 一一对应。"""
@@ -929,9 +826,6 @@ class FakeBackend:
             title, list_id, due=due, all_day=all_day, priority=priority, tags=tags
         )
         self.created.append(title)
-        self.created_due.append(due)
-        self.created_all_day.append(all_day)
-        self.created_priority.append(priority)
         self.created_tags.append(tuple(tags))
         self.created_tasks.append(
             CreatedTask(
