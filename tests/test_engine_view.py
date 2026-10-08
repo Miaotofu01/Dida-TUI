@@ -29,7 +29,7 @@ def make_source() -> InMemorySource:
     source.add_task("写周报", list_name="工作", due=at(14, 18, 0))
     source.add_task("买牛奶", list_name="生活")
     source.add_task("交季度报告", list_name="工作", due=at(11, 9, 0), priority=5)
-    source.state = SyncState(last_refresh_at=at(14, 12, 0), pending_count=2)
+    source.set_sync_state(last_refresh_at=at(14, 12, 0))
     return source
 
 
@@ -57,7 +57,12 @@ def test_reading_without_a_cache_is_empty_not_an_error():
     assert engine.task_detail("t1") is None
 
 
-def test_status_carries_the_logical_day_the_refresh_time_and_the_pending_count():
+def test_status_carries_the_logical_day_and_the_refresh_time():
+    """状态栏快照把注入的那几样原样搬出来：时刻、逻辑日、上次刷新时刻。
+
+    它只证**搬运**（``SyncState`` → ``SyncStatus``）——待推送那个数是本地副本自己算的，
+    只读替身没有队列，所以是 0（#86 之前这里摆过一个 2，那是替身声明的数）。
+    """
     engine = SyncEngine(clock=ManualClock(at(14, 12, 3)), day_end="24:00", source=make_source())
 
     status = engine.status()
@@ -65,7 +70,24 @@ def test_status_carries_the_logical_day_the_refresh_time_and_the_pending_count()
     assert status.checked_at == at(14, 12, 3)
     assert status.logical_day == date(2026, 3, 14)
     assert status.last_refresh_at == at(14, 12, 0)
-    assert status.pending_count == 2
+    assert status.pending_count == 0, "只读替身没有队列：这个 0 是算出来的"
+
+
+def test_a_read_only_sources_pending_count_is_derived_not_declared():
+    """只读替身的待推送数是**算**出来的，不是摆出来的（#86）。
+
+    它手里那个真库没有队列，所以算出来是 0；把 ``sync_state()`` 改回返回一个可摆布的值、
+    或者把这个 0 写成声明的常量，这一条就红。
+    """
+    source = InMemorySource()
+
+    assert source.sync_state().pending_count == 0
+
+    source.set_sync_state(last_refresh_at=at(14, 12, 0))
+
+    assert source.sync_state() == SyncState(last_refresh_at=at(14, 12, 0), pending_count=0), (
+        "摆得进去的只有「上次刷新时刻」；那个数照旧是算出来的 0"
+    )
 
 
 def test_status_logical_day_follows_the_injected_day_end():

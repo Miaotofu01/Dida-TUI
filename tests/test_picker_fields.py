@@ -530,10 +530,14 @@ async def test_a_tag_list_that_cannot_be_fetched_is_said_out_loud_and_local_tags
     可挑的那一份里，否则断网时「取消一个标签」无路可走。
 
     失败摆在**传输层**（``GET /open/v1/tag`` 连不上）：那才是这个错误真正的来源，
-    替身的方法上摆一个异常测不到「请求发出去了、回来的路断了」这一段。
+    替身的方法上摆一个异常测不到「请求发出去了、回来的路断了」这一段。摆法是**钉在端点上**
+    的（``enqueue_for``），不是按发出顺序——按顺序的话，在这之前 app 多发了任何一个请求都会
+    把这个错误吃掉。
     """
     fake = backend()
-    fake.transport.enqueue(httpx.ConnectError("连不上服务器"))
+    fake.transport.enqueue_for(
+        method="GET", path="/open/v1/tag", response=httpx.ConnectError("连不上服务器")
+    )
     app = DidaApp(fake)
 
     async with app.run_test(size=WIDE) as pilot:

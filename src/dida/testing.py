@@ -3,7 +3,7 @@
 - :class:`ManualClock` —— 时钟接缝（``dida.clock.Clock``）。
 - :class:`FakeTransport` —— HTTP 传输接缝（``dida.api.transport.Transport``）。
 - :class:`InMemorySource` —— 只读的内存替身（``dida.sync.view.ViewSource``）：清单与任务快照
-  是摆进去的，视图那一半走真库；写任务 / 写清单那几件能力它没有。
+  是摆进去的，视图与同步状态走真库；写任务 / 写清单那几件能力它没有。
 - :class:`FakeBackend` —— **接缝一的假后端**：#80 第一步之后它内部装的是**真货**：真
   :class:`~dida.sync.engine.SyncEngine` + 真本地库（``Store(":memory:")``）+ 假传输层，
   对外仍是「摆数据 + 记下调用」那套字段，所以用它的测试文件一行都不用改。
@@ -184,23 +184,30 @@ class InMemorySource:
     """本地缓存的内存替身：清单、任务快照、同步状态。
 
     生产实现是 ``Store``；这个替身只做「摆数据」那一半——引用一个不存在的清单名时会顺手
-    建出这条清单，这样测试里加任务不必先建清单。**视图那一半用真库**（``Store(":memory:")``）：
-    视图的位置与本地 id 发号只有一份实现，替身不自己再写一遍（#86）。
+    建出这条清单，这样测试里加任务不必先建清单。**视图与同步状态用真库**
+    （``Store(":memory:")``）：视图的位置与本地 id 发号、以及「待推送几条」都只有一份实现，
+    替身不自己再写一遍（#86）。
 
     它满足 ``ViewReader`` / ``ViewStore``，不满足写任务 / 写清单的那几件能力——
-    「存不下待推送改动」是它的性质，不是错误（#85）。
+    「存不下待推送改动」是它的性质，不是错误（#85）；所以真库算出来的待推送数**永远是 0**，
+    这个 0 是算出来的，不是替身声明的。
     """
 
     def __init__(self) -> None:
-        self.state = SyncState()
-        """同步状态，测试可以直接摆布（``source.state = SyncState(...)``）。"""
-
         self._lists: dict[str, ListSnapshot] = {}
         self._tasks: dict[str, TaskSnapshot] = {}
         self._raw: dict[str, Mapping[str, Any]] = {}
         self._seq = 0
-        self._view_store = Store(":memory:")
-        """视图那一半：真库，所以「按用户的顺序排」与「发号」都不是替身说了算。"""
+        self._store = Store(":memory:")
+        """视图与同步状态那一半：真库。``sync_state().pending_count`` 由它算（没有队列 ⇒ 0）。"""
+
+    def set_sync_state(self, *, last_refresh_at: datetime | None = None) -> None:
+        """摆同步状态里那位**可摆的事实**（上次刷新时刻）；待推送数是真库算的，摆不了。
+
+        与 :class:`~dida.testing.FakeBackend` 的 ``set_sync_state`` 同一条口径：能摆的是
+        「上次什么时候刷的」，「还有几笔没推」永远是本地副本自己数出来的。
+        """
+        self._store.set_sync_state(last_refresh_at=last_refresh_at)
 
     def add_list(
         self,
@@ -241,7 +248,7 @@ class InMemorySource:
         definition = ViewDefinition(
             id=id if id is not None else name, name=name, **conditions
         )
-        self._view_store.save_view(definition)
+        self._store.save_view(definition)
         return definition
 
     def add_task(
@@ -308,23 +315,23 @@ class InMemorySource:
     def view_definitions(self) -> tuple[ViewDefinition, ...]:
         """自定义视图的**定义**（#36），按用户自己的顺序——真库那一份给的是定义不是成员：
         成员要「全量缓存 + 当前逻辑日」才算得出来，存储层不读时钟。"""
-        return tuple(self._view_store.view_definitions())
+        return tuple(self._store.view_definitions())
 
     def view_definition(self, view_id: str) -> ViewDefinition | None:
         """一个视图的定义；没加过就是 ``None``。"""
-        return self._view_store.view_definition(view_id)
+        return self._store.view_definition(view_id)
 
     def save_view(self, definition: ViewDefinition) -> None:
         """写下一行视图（新建与改都是覆盖式地写；位置照旧不动，由真库说了算）。"""
-        self._view_store.save_view(definition)
+        self._store.save_view(definition)
 
     def drop_view(self, view_id: str) -> None:
         """本地摘掉一行视图（只动这一行，一条任务都不碰）。"""
-        self._view_store.drop_view(view_id)
+        self._store.drop_view(view_id)
 
     def new_view_id(self) -> str:
         """一个还没被占用的本地视图 id（前缀与算法在真库那一处）。"""
-        return self._view_store.new_view_id()
+        return self._store.new_view_id()
 
     def lists(self) -> tuple[ListSnapshot, ...]:
         return tuple(self._lists.values())
@@ -343,7 +350,8 @@ class InMemorySource:
         return id
 
     def sync_state(self) -> SyncState:
-        return self.state
+        """同步状态：真库那一份——待推送那个数是它从队列表里**算**出来的（这里没有队列，是 0）。"""
+        return self._store.sync_state()
 
 
 class _FakeBackendServer(FakeTransport):
@@ -357,21 +365,39 @@ class _FakeBackendServer(FakeTransport):
 
     它只做两件事：**记请求**、**回一个说得过去的响应**——没有任何业务判断。
 
-    要试「某一次请求失败了」，就在这上面 :meth:`~dida.testing.FakeTransport.enqueue` 一个异常
-    或一条 4xx/5xx 响应：失败摆在**传输层**，那才是错误真正的来源。摆进来的那一份照旧
-    先于按端点拼的响应出队。
+    要试「某一个端点失败了」，用 :meth:`enqueue_for` 把异常或 4xx/5xx 响应**钉在那个端点上**
+    （认 ``(method, path)``，与之前发过什么请求无关）。基类那个
+    :meth:`~dida.testing.FakeTransport.enqueue` 也照旧可用，但它是**按发出顺序**出队的：只要
+    在它之前 app 多发了任何一个请求，摆好的那一份就被别人吃掉——只在「下一个请求就是它」
+    说得清时才用它。
     """
 
     def __init__(self) -> None:
         super().__init__()
         self._created = 0
+        self._failures: dict[tuple[str, str], deque[httpx.Response | Exception]] = {}
         self.tags: list[dict[str, Any]] = []
         """摆进来的那一份「服务端有的标签」（``GET /open/v1/tag`` 的响应体）。"""
 
+    def enqueue_for(
+        self, *, method: str, path: str, response: httpx.Response | Exception
+    ) -> None:
+        """给**某一个端点**摆一份响应（或异常）；同一端点摆多次就按顺序出队。
+
+        这是「错误真正的来源」那一侧的注入口：认的是 ``(method, path)``，所以 app 在这之前
+        发过什么请求都不影响它。异常照旧直接抛（传输层失败），响应照旧原样交回。
+        """
+        self._failures.setdefault((method, path), deque()).append(response)
+
     async def send(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
-        if self._responses:
-            response = self._responses.popleft()
+        for source in (
+            self._failures.get((request.method, request.url.path)),
+            self._responses,
+        ):
+            if not source:
+                continue
+            response = source.popleft()
             if isinstance(response, Exception):
                 raise response
             return response
@@ -493,13 +519,17 @@ class FakeBackend:
         """
 
         self.write_error: Exception | None = None
-        """摆一个异常进去，``write`` / ``move_task`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。
+        """摆一个异常进去，``write`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。
 
         **这一格是方法级的，故意的**：它模拟的是引擎**同步拒绝**（#25 的
         ``UnknownTaskError``——本地没有这条任务的底稿），不是网络或服务端拒绝。挪到传输层
         复现不出来：那样乐观写会先落地（屏幕上新标题已经变了），而后端才失败——那正是
         ``tests/test_detail_page.py::test_a_refused_save_says_which_refusal_it_was`` 要断的
         反面。真正的网络 / 服务端失败（标签列表、推送）一律摆在传输层。
+
+        只管 ``write``：``move_task`` 原来也认这一格，但全仓库没有一处摆过它又去搬
+        （#86 清掉了那支；引擎那一侧「没底稿就拒绝搬运」见
+        :meth:`~dida.sync.push.PushMixin.move_task`）。
         """
 
         self.delete_error: Exception | None = None
@@ -888,13 +918,9 @@ class FakeBackend:
         搬到它**已经在**的那个清单（或者目标为空）= 引擎什么都不写、回 ``False``——判据是
         引擎的 :func:`~dida.sync.writes.is_a_move`，替身不再自己比一遍；空操作**不记账**
         （``moved`` 里不留这一笔），否则替身会记下一笔「搬了」而生产那一条根本没写——接缝一
-        断的就是这句话。摆了 ``write_error`` 就记完这一笔再抛（与 ``write`` 同一个口子：
-        引擎当场拒绝时界面要说得出具体原因）——抛在交给引擎**之前**，「当场拒绝」的意思就是
-        这一笔没写成。本地没有这条任务的底稿时与 :meth:`write` 一样不当场拒绝，只回 ``False``。
+        断的就是这句话。本地没有这条任务的底稿时与 :meth:`write` 一样不当场拒绝，只回 ``False``
+        （引擎那一侧会抛 ``UnknownTaskError``；这一格的差别是替身刻意保留的契约）。
         """
-        if self.write_error is not None:
-            self.moved.append((task_id, to_list_id))
-            raise self.write_error
         if self.source.task_payload(task_id) is None:
             return False
         changed = self._engine.move_task(task_id, to_list_id=to_list_id)
