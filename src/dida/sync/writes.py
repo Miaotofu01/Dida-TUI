@@ -19,7 +19,7 @@
 顺手写下 ``status``（``marks_completed`` / ``clears_completed`` 这一对，完成与取消完成）、
 冲突裁决时整条任务豁不豁免（``whole_row``）。分派这些行为的地方
 （:meth:`dida.storage.store.Store.enqueue`、:meth:`~dida.storage.store.Store._exempt_fields`、
-:meth:`dida.sync.push.PushMixin._send` / ``_local_effect``）一律**读表**，不再逐个成员写 ``if``：
+:meth:`dida.sync.push.TaskQueue.send` / ``_local_effect``）一律**读表**，不再逐个成员写 ``if``：
 以前新增一种写要在两处枚举、一个换算函数、三处分派里各改一次，现在只在那里加一行。
 
 写路径上共享的另外两样也在这里：本地副本要会的那几件事（:class:`WriteTarget`），以及
@@ -265,8 +265,8 @@ def project_in(payload: object) -> str | None:
     与读路径对脏数据的口径一致，不猜。
 
     **两个时刻各问一次，实现只有这一份**（工单 #58 的 T5）：写入那一侧拼改动时问一次
-    （:meth:`~dida.sync.push.PushMixin.write`），推送循环里问一次
-    （:func:`is_addressable`，以及 ``PushMixin._send`` 归因失败时）。它曾经在
+    （:meth:`~dida.sync.push.PushMixin.write`，拒不出话时说清是哪一半），推送循环里问一次
+    （:func:`is_addressable`，那一台泵用它挑出这一轮该发的那些）。它曾经在
     :mod:`dida.sync.push` 里逐字又写了一份——``push`` 本来就 import 这一层，所以那第二份
     是纯粹的重复，而重复是会漂的：一边改了形状、另一边没改，只有真走到那条路才炸。
     """
