@@ -50,9 +50,8 @@
 from __future__ import annotations
 
 import re
-from dataclasses import asdict, dataclass, replace
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta
-from enum import Enum
 from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import DidaError
@@ -60,6 +59,21 @@ from dida.api.guards import all_day_date
 from dida.logical_day import logical_day
 from dida.sync.rows import row_order_tail
 from dida.sync.view import PRIORITY_CYCLE, PRIORITY_NAMES, TaskSnapshot, due_day, is_overdue
+from dida.vocabulary import (
+    ANY_VALUE,
+    Completion,
+    DueWindow,
+    ViewDefinition,
+    _completed_days_of,
+    _completion_of,
+    view_from_payload,
+    view_payload,
+)
+
+# 视图**定义**与它落本地库的那份原文住在 :mod:`dida.vocabulary`（#78）：本地库要原样存下它
+# 再读回来，而本地库不许 import 这一层。求值、表单与写路径留在本模块。``_completed_days_of``
+# 与 ``_completion_of`` 是「表单那一格的值 → 定义上的字段」那一步，定义读回与表单都走它们，
+# 所以两处共用同一份翻译（不是各写一遍）。
 
 __all__ = [
     "ANY_VALUE",
@@ -99,92 +113,6 @@ __all__ = [
 
 BUILTIN_VIEW_DAYS = 7
 """「最近七天」的窗口：从当前逻辑日起的**七个**逻辑日（spec：今天算第一天）。"""
-
-
-class Completion(Enum):
-    """完成状态那一维（spec 的过滤维度之一）：未完成 / 已完成 / 不限。
-
-    「所有」是**全部未完成**任务，不是「全部任务」——已完成的不进任何内置视图。
-    """
-
-    UNFINISHED = "unfinished"
-    COMPLETED = "completed"
-    ANY = "any"
-
-
-@dataclass(frozen=True)
-class DueWindow:
-    """截止时间落在哪一段，**相对当前逻辑日**表达（spec 的过滤维度之一）。
-
-    ``first`` / ``last`` 是相对「今天」的**天数偏移**（``0`` = 今天，``-1`` = 昨天，
-    ``6`` = 六天后），``None`` 表示那一侧没有边界。``dated`` / ``undated`` 说**有日期的**
-    与**没有日期的**分别收不收——「无日期」是 spec 里独立的一个区间词，不是某一段的边界
-    （所以它没法靠 ``first``/``last`` 表达：任何一段偏移都是「有日期」的一段）。
-
-    于是三个内置视图的截止条件各是一句话：「今天」= ``DueWindow(first=None, last=0)``
-    （上界今天、下界不设 ⇒ 逾期全在）；「最近七天」= ``DueWindow(first=0, last=6)``；
-    「所有」= 不设（``None``），所以没有日期的任务也在。
-    """
-
-    first: int | None = 0
-    last: int | None = 0
-    dated: bool = True
-    undated: bool = False
-
-    def covers(self, day: date | None, *, today: date) -> bool:
-        """这个逻辑日（``None`` = 没有截止时间）落不落在这一段里。"""
-        if day is None:
-            return self.undated
-        if not self.dated:
-            return False
-        if self.first is not None and day < today + timedelta(days=self.first):
-            return False
-        if self.last is not None and day > today + timedelta(days=self.last):
-            return False
-        return True
-
-
-@dataclass(frozen=True)
-class ViewDefinition:
-    """一个视图的**过滤条件 + 名字**（内置与自定义是同一个类型）。
-
-    六个维度全在这一个类型上，判据全在 :func:`_matches` 一处（#35 加了前两维，#36 加了后四维）：
-
-    - ``due``：截止时间落在哪一段（相对当前逻辑日）；
-    - ``completion``：完成状态（未完成 / 已完成 / 不限）；
-    - ``lists``：清单范围——只收列出来的那几个清单里的任务；
-    - ``priorities``：优先级——只收这几档（API 的线上编码 0/1/3/5）；
-    - ``tags``：标签——命中任一个就算；
-    - ``completed_days``：完成时间——完成的**逻辑日**落在最近 N 个逻辑日内（含今天）。
-
-    **后四维的默认值都是「不筛」**（空元组 / ``None``），所以内置视图那三个定义一个字都没改。
-    加一维就是往这里加一个字段、往 ``_matches`` 里加一条判据，不是另写一条求值路径。
-    """
-
-    id: str
-    name: str
-    due: DueWindow | None = None
-    """截止时间的区间；``None`` = 不限（没有日期的任务因此也在）。"""
-
-    completion: Completion = Completion.UNFINISHED
-
-    lists: tuple[str, ...] = ()
-    """清单范围：服务端的 project id；空元组 = 不限（所有清单）。"""
-
-    priorities: tuple[int, ...] = ()
-    """优先级：``0`` / ``1`` / ``3`` / ``5``；空元组 = 不限。"""
-
-    tags: tuple[str, ...] = ()
-    """标签名；空元组 = 不限。"""
-
-    completed_days: int | None = None
-    """完成时间的窗口（最近几个逻辑日，含今天）；``None`` = 不限。
-
-    它与 ``completion`` 是**两维**，各自独立：完成状态说「要不要已完成的」，这一维说
-    「完成于什么时候」。「最近完成」那个例子是两者一起用（``COMPLETED`` + ``7``）。
-    ``Completion.UNFINISHED`` 配上一个窗口是**永远筛不出东西**的组合（未完成的任务没有
-    完成时间），所以表单那一层拒绝它（:class:`ViewFormProblem`）。
-    """
 
 
 TODAY_VIEW = ViewDefinition(id="today", name="今天", due=DueWindow(first=None, last=0))
@@ -392,13 +320,6 @@ def _matches_completion(completion: Completion, snapshot: TaskSnapshot) -> bool:
 
 
 # ------------------------------------------------------------------ 表单的数据模型（#36）
-
-ANY_VALUE = "any"
-"""「不限」那一档的值。
-
-三处「不限」（截止时间 / 完成状态 / 完成时间）用**同一个**值：表单里「不限」只有一个意思，
-三处写法不同的话，读的人就得逐个记住哪个字段用哪个拼法。
-"""
 
 VIEW_NAME_FIELD = "name"
 VIEW_LISTS_FIELD = "lists"
@@ -630,93 +551,6 @@ def _priority_values(text: str) -> tuple[tuple[int, ...], tuple[str, ...]]:
         elif value not in found:
             found.append(value)
     return tuple(found), tuple(unknown)
-
-
-def _completion_of(value: str | None) -> Completion:
-    """那一档的值 → 完成状态；认不出来的（手改过的库）当作默认的「未完成」。"""
-    return next(
-        (item for item in Completion if item.value == value), Completion.UNFINISHED
-    )
-
-
-def _completed_days_of(value: str | None) -> int | None:
-    """那一档的值 → 窗口天数；``ANY_VALUE`` / 认不出来的都是「不限」。"""
-    if not value or value == ANY_VALUE:
-        return None
-    return int(value) if value.isdigit() and int(value) > 0 else None
-
-
-# ------------------------------------------------------------------ 落本地库的那一份原文
-
-
-def view_payload(definition: ViewDefinition) -> dict[str, Any]:
-    """一份定义 → 落库的那份原文（JSON 装得下的纯数据）。
-
-    六个维度都在里面，所以加一维**不必**改表（``views`` 那一行是一份原文，不是六列）。
-    ``id`` 也在里面，好让 :func:`view_from_payload` 能独立把一份定义读回来；不过读的时候
-    以 ``views.id`` 那一列为准（一个定义的身份只有一个来源）。
-    """
-    return {
-        "id": definition.id,
-        "name": definition.name,
-        "due": None if definition.due is None else asdict(definition.due),
-        "completion": definition.completion.value,
-        "lists": list(definition.lists),
-        "priorities": list(definition.priorities),
-        "tags": list(definition.tags),
-        "completed_days": definition.completed_days,
-    }
-
-
-def view_from_payload(payload: Mapping[str, Any], *, view_id: str = "") -> ViewDefinition:
-    """那份原文 → 一份定义；认不出来的部分**退回默认**，不把整屏带走。
-
-    库里那一行读不成样子时（手改过、旧版本写的），读路径上没有「坏一行就整屏空掉」的道理
-    ——与空缓存给空视图、缺失的 ``projectId`` 不猜成字面量 ``inbox`` 同一条口径。认得出来的
-    部分照旧留着。
-    """
-    due = payload.get("due")
-    return ViewDefinition(
-        id=view_id or str(payload.get("id") or ""),
-        name=str(payload.get("name") or ""),
-        due=_due_of(due),
-        completion=_completion_of(payload.get("completion")),
-        lists=_string_tuple(payload.get("lists")),
-        priorities=_int_tuple(payload.get("priorities")),
-        tags=_string_tuple(payload.get("tags")),
-        completed_days=_completed_days_of(str(payload.get("completed_days") or "")),
-    )
-
-
-def _due_of(value: Any) -> DueWindow | None:
-    """原文里那一维 → 一个区间；不是字典、或者四个字段一个都没有，就是**不限**。
-
-    ``{}`` 不能当成 ``DueWindow()``：那是个默认值——``first=0, last=0``，也就是「只收今天
-    到期的」。坏一行就悄悄换成一个筛错东西的视图，比读不出来坏得多。
-    """
-    if not isinstance(value, Mapping):
-        return None
-    known = {key: value[key] for key in ("first", "last", "dated", "undated") if key in value}
-    return DueWindow(**known) if known else None
-
-
-def _string_tuple(value: Any) -> tuple[str, ...]:
-    if not isinstance(value, (list, tuple)):
-        return ()
-    return tuple(str(item) for item in value)
-
-
-def _int_tuple(value: Any) -> tuple[int, ...]:
-    """数字那一维：认不出来的项**丢掉**，不让一个 ``"x"`` 把整行读崩。"""
-    if not isinstance(value, (list, tuple)):
-        return ()
-    out: list[int] = []
-    for item in value:
-        try:
-            out.append(int(item))
-        except (TypeError, ValueError):
-            continue
-    return tuple(out)
 
 
 # ------------------------------------------------------------------ 写路径（只在本地）

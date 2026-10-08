@@ -1,48 +1,58 @@
-"""写词汇：一次乐观写有哪几种、每一种怎么落地（t32）。
+"""写词汇的**行为**那一半：一次乐观写有哪几种、每一种怎么落地（t32 / #78）。
 
-**这个模块是写类型的唯一定义处。** 引擎的 ``WriteKind`` 与存储的 ``ChangeKind`` 说的是同一
-套词汇，指的也是**同一个对象**（``dida.storage.store`` 里那个名字只是别名）：加一种写只需要
-在这里加一个成员，两层立刻都认得它。
+写类型的定义处是 :mod:`dida.vocabulary`（#78 搬过去的）：``WriteKind`` / ``WireCall`` /
+``LocalEffect`` / ``WriteBehaviour`` 与本地 id 前缀都在那里，本地库与写路径两边共用。
+引擎的 ``WriteKind`` 与存储的 ``ChangeKind`` 说的是同一套词汇、指的也是**同一个对象**
+（``dida.storage.store`` 里那个名字只是别名）：加一种写只需要在词表里加一个成员，两层
+立刻都认得它。
 
 在 t32 之前这套词汇被写了两遍——引擎一份、存储一份，成员一字不差地重复，中间还有一个按值
 换算的 ``_storage_kind()``。重复本身不难受，难受的是它能漂：一边加了成员另一边没加，直到真
 走到那条写路径才炸，而那时错误离原因已经很远了。
 
-这一层是叶模块：只 import 标准库与 :mod:`dida.api.errors`，谁先 import 都行。为什么单独一个
-模块，而不是把词表留在存储层：``dida.storage.store`` 在模块级 import ``dida.sync.view``，
-所以引擎**不能**在顶层 import 存储（那条延迟 import 的注释记着这件事）。
+这一层是叶模块：只 import 标准库、:mod:`dida.api.errors` 与共用词汇，谁先 import 都行。
+在 #78 之前它和存储层互相 import，靠「只在类型检查时 import」那一处补丁撑着——共用词汇
+独立成模块之后，那个环不存在了。
 
-**一种写的全部行为都记在同一个地方**：:data:`_BEHAVIOUR` 那张表，每个成员一行——本地快照
-怎么变（``local``）、推送调客户端的哪一个方法（``wire``）、要不要顺手写下 ``status``
-（``marks_completed`` / ``clears_completed`` 这一对，完成与取消完成）、冲突裁决时整条任务
-豁不豁免（``whole_row``）。分派这些行为的地方
+**一种写的全部行为都记在同一个地方**：:data:`dida.vocabulary._WRITE_BEHAVIOUR` 那张表，
+每个成员一行——本地快照怎么变（``local``）、推送调客户端的哪一个方法（``wire``）、要不要
+顺手写下 ``status``（``marks_completed`` / ``clears_completed`` 这一对，完成与取消完成）、
+冲突裁决时整条任务豁不豁免（``whole_row``）。分派这些行为的地方
 （:meth:`dida.storage.store.Store.enqueue`、:meth:`~dida.storage.store.Store._exempt_fields`、
 :meth:`dida.sync.push.PushMixin._send` / ``_local_effect``）一律**读表**，不再逐个成员写 ``if``：
-以前新增一种写要在两处枚举、一个换算函数、三处分派里各改一次，现在只在这里加一行。
+以前新增一种写要在两处枚举、一个换算函数、三处分派里各改一次，现在只在那里加一行。
 
 写路径上共享的另外两样也在这里：本地副本要会的那几件事（:class:`WriteTarget`），以及
 「这条写没有底稿、推不出去」的那个错误（:class:`UnknownTaskError`）——三片写路径
 （:mod:`dida.sync.push` / :mod:`dida.sync.schedule` / :mod:`dida.sync.subtasks` …）都要它们，
 放在这里才不会让它们互相 import。
 
-加一种写类型：在 :class:`WriteKind` 里加一个成员、在 :data:`_BEHAVIOUR` 里加一行，就完了——
-两层枚举、换算、分派都读这一处。只有「这条写要打一个**新形状**的端点」（例如 v2 的
-``task/move`` 搬运、``task/batch`` 取消完成）才另外要在 :class:`WireCall` 里加一种调用形状：
-那是新的外部行为，不是要同步的词汇。
+加一种写类型：在 :class:`~dida.vocabulary.WriteKind` 里加一个成员、在那张表里加一行，就完了
+——两层枚举、换算、分派都读那一处。只有「这条写要打一个**新形状**的端点」（例如 v2 的
+``task/move`` 搬运、``task/batch`` 取消完成）才另外要在
+:class:`~dida.vocabulary.WireCall` 里加一种调用形状：那是新的外部行为，不是要同步的词汇。
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
-from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import DidaError
 from dida.sync.view import ViewSource
-
-if TYPE_CHECKING:  # 只为了标注：storage 反过来 import dida.sync.view，运行时不能在这里 import
-    from dida.storage.store import PendingChange
+from dida.vocabulary import (
+    LOCAL_ID_PREFIXES,
+    LOCAL_LIST_PREFIX,
+    LOCAL_TASK_PREFIX,
+    LocalEffect,
+    PendingChange,
+    WireCall,
+    WriteBehaviour,
+    WriteKind,
+    is_local_id,
+    is_local_list_id,
+    is_local_task_id,
+)
 
 __all__ = [
     "LOCAL_ID_PREFIXES",
@@ -63,217 +73,6 @@ __all__ = [
     "is_local_task_id",
     "project_in",
 ]
-
-LOCAL_LIST_PREFIX = "local-list-"
-"""本地临时**清单** id 的前缀（#42 / #54）：新建的清单在服务端给出真 id 之前先用它占位。
-
-它同时是**一条语义**（#54）：带这个前缀的 id 服务端**没见过**，所以任何「打到一个 id 上」
-的请求都不许发出去。存储层用它生成 id（:meth:`~dida.storage.store.Store.new_local_list_id`），
-写路径用它判断能不能发。
-
-**它住在这一层**（:mod:`dida.sync.writes`）：这是叶模块，谁先 import 都行；而
-:mod:`dida.sync.lists` 一 import 就跑 ``from dida.sync.push import backoff_delay``，
-``push`` 又 import ``writes``——反过来把判断放在 ``lists`` 里会成环（实测：四个入口
-全部 ``ImportError: cannot import name ... from partially initialized module``）。
-``lists`` 从这一层把它与判断一起取回去用，所以它们的**定义处**仍然只有这一处。
-"""
-
-LOCAL_TASK_PREFIX = "local-task-"
-"""本地临时**任务** id 的前缀（t15 / #39）：新建的任务在服务端给出真 id 之前先用它占位。
-
-它同时是一个**状态**：id 还挂着这个前缀，就说明那条任务的新建**还没有被认领**
-（:meth:`~dida.storage.store.Store.adopt_created` 才是认领那一步）；服务端从没见过这个
-id，所以任何带着它的改动都推不出去。
-
-**刻意不与清单前缀重叠**（#39）：原来这里是 ``local-``，而 ``local-`` 恰好是
-``local-list-`` 的**前缀**——一个 OR 起来判断两族的 :func:`is_local_id` 就必须先比长的，
-那是「今天对、加一个前缀就错」的顺序依赖（这个仓库已经为「一条判断两处实现」付过一次
-代价）。改成不重叠之后，判断与顺序无关，:func:`is_local_id` 也就没有歧义了。
-"""
-
-LOCAL_ID_PREFIXES: tuple[str, ...] = (LOCAL_LIST_PREFIX, LOCAL_TASK_PREFIX)
-"""本地临时 id 的**全部**前缀——「本地临时 id」这件事的登记处。
-
-存储层生成 id、写路径判断能不能发，读的都是这里。将来加一族本地 id（比如标签）只加一条；
-``tests/test_local_ids.py`` 有一道对象级守卫：**任何一条不许是另一条的前缀**（这正是
-``local-`` 那条老前缀踩过的坑），加错了它先红。
-"""
-
-
-def is_local_id(value: str) -> bool:
-    """这个 id 是本地临时占位的吗（服务端没见过它）——**形状判断只有这一处**。
-
-    两族前缀都不允许是彼此的前缀（见 :data:`LOCAL_TASK_PREFIX` 与
-    ``tests/test_local_ids.py`` 那道守卫），所以这里 ``any(...)`` 的顺序**没有语义**：
-    任何顺序给同一个答案。
-    """
-    return any(value.startswith(prefix) for prefix in LOCAL_ID_PREFIXES)
-
-
-def is_local_list_id(value: str) -> bool:
-    """这个 id 是不是本地临时**清单**占位的（服务端没见过它）。
-
-    它只是 :func:`is_local_id` 的**窄化读法**（「是不是我这一族的」）——窄化是有意义的：
-    清单与任务各有自己的 id 空间，而写路径要问的正是「我这一族的这个 id 服务端见过没有」。
-    """
-    return value.startswith(LOCAL_LIST_PREFIX)
-
-
-def is_local_task_id(value: str) -> bool:
-    """这个 id 是不是本地临时**任务**占位的（服务端没见过它）。同 :func:`is_local_list_id`。"""
-    return value.startswith(LOCAL_TASK_PREFIX)
-
-
-class LocalEffect(Enum):
-    """一次写在**本地快照**上的效果；存储层照着它改本地那一份。"""
-
-    MERGE = "merge"
-    """把 ``payload`` 的字段盖上去。本地没有这条任务时就是「凭空多出一条」——新建走这里。"""
-
-    REMOVE = "remove"
-    """本地摘掉这条任务（删除的本地效果不是「等推送成功再摘」）。"""
-
-
-class WireCall(Enum):
-    """推送时调客户端的哪一个方法；引擎照着它分派。
-
-    端点形状是 API 的事实，不是词汇的一部分，所以单独一个枚举——但**每一种写属于哪一种
-    形状**记在这一处的表里，不散在分派代码里。
-    """
-
-    CREATE_TASK = "create_task"
-    """``POST /open/v1/task``，请求体就是这份 payload。"""
-
-    UPDATE_TASK = "update_task"
-    """``POST /open/v1/task/{taskId}``，改动 + 本地那份完整底稿（未知字段靠它回写）。"""
-
-    COMPLETE_TASK = "complete_task"
-    """``POST .../task/{taskId}/complete``，没有请求体。"""
-
-    BATCH_UPDATE_TASK = "batch_update_task"
-    """``POST /open/v1/task/batch`` 的 ``update`` 数组，每一条只带 id / projectId / status。
-
-    取消完成走这一种（工单 #38）。它是一个**新形状**的端点（请求体是一个对象、里面装着
-    数组，而不是一条任务），所以在这里单独列一种调用形状——这是新的外部行为，不是要同步
-    的词汇。这条用法官方文档一字未提，是实测确认的（spec 的实测事实第 1 条）。
-    """
-
-    DELETE_TASK = "delete_task"
-    """``DELETE .../task/{taskId}``，没有请求体。"""
-
-    MOVE_TASK = "move_task"
-    """``POST /open/v1/task/move``：**数组**请求体、``{id, etag}`` 数组响应（工单 #45）。
-
-    本仓库里唯一一个「请求体是数组」的端点，所以它单独一种调用形状（``:504``、``:516``）。
-    """
-
-
-@dataclass(frozen=True)
-class WriteBehaviour:
-    """一种写的行为说明（见模块文档的 :data:`_BEHAVIOUR`）。"""
-
-    local: LocalEffect
-    wire: WireCall
-    marks_completed: bool = False
-    """本地还要顺手写下「已完成」的 ``status``（值从存储层取，同一份 API 事实只留一处）。"""
-
-    clears_completed: bool = False
-    """本地还要把 ``status`` 写回「未完成」那一档（取消完成是唯一的一种，工单 #38）。
-
-    值与 :attr:`marks_completed` 一样从存储层取，而且**只动 ``status``**：完成时间戳不动
-    ——实测取消完成不会清掉它，而「还算不算已完成」的判据只有 ``status``。
-    """
-
-    whole_row: bool = False
-    """冲突裁决时**整条任务**豁免于服务端权威（删除就是这一种）。"""
-
-
-class WriteKind(Enum):
-    """一次乐观写的种类。
-
-    值与存储层 ``pending_changes.kind`` 那一列直接对应（``ChangeKind`` 就是本枚举的别名）。
-    :meth:`~dida.sync.push.PushMixin.write` 只服务**已有任务**的改 / 完成 / 删；新建走
-    :meth:`~dida.sync.create.CreateMixin.create`，它的本地效果是「凭空多出一条任务」，
-    与那三条盖字段的路径不是一回事。
-    """
-
-    CREATE = "create"
-    """新建：本地先造一条（临时 id），推送走 ``POST /open/v1/task``（t15）。"""
-
-    UPDATE = "update"
-    """改字段：把 ``changes`` 推给 ``POST /open/v1/task/{taskId}``。"""
-
-    COMPLETE = "complete"
-    """完成：本地立刻标记完成，推送走 ``POST .../task/{taskId}/complete``（无请求体）。"""
-
-    UNCOMPLETE = "uncomplete"
-    """取消完成：本地把 ``status`` 写回 ``0``，推送走 ``task/batch`` 的 ``update``（工单 #38）。
-
-    与服务端权威的关系与别的写一样：本地先动，刷新时那条 ``status`` 由待推送改动豁免，
-    服务端真的照做了才由它说了算（``-1`` 已放弃也是服务端可能给的答案）。
-    """
-
-    DELETE = "delete"
-    """删除：本地立刻摘掉快照，推送走 ``DELETE .../task/{taskId}``。"""
-
-    MOVE = "move"
-    """搬运：本地把 ``projectId`` 换成目标清单，推送走 ``POST /open/v1/task/move``（#45）。
-
-    **本地效果是 ``MERGE`` 而不是 ``REMOVE``**：那条任务一条都不少，换的只是它在哪个清单。
-    推成功之后全量刷新带回来的原文里 ``projectId`` 已经是新的了，两边对得上。
-    """
-
-    @property
-    def behaviour(self) -> WriteBehaviour:
-        """这一种写在本地与推送两端分别怎么落地（:data:`_BEHAVIOUR` 那一行）。"""
-        return _BEHAVIOUR[self]
-
-    @property
-    def local(self) -> LocalEffect:
-        """本地快照怎么变（存储层读这个，不读成员名）。"""
-        return _BEHAVIOUR[self].local
-
-    @property
-    def wire(self) -> WireCall:
-        """推送调客户端的哪一个方法（推送分派读这个，不读成员名）。"""
-        return _BEHAVIOUR[self].wire
-
-    @property
-    def marks_completed(self) -> bool:
-        """本地要不要顺手写下 ``status``（完成是唯一的一种）。"""
-        return _BEHAVIOUR[self].marks_completed
-
-    @property
-    def clears_completed(self) -> bool:
-        """本地要不要把 ``status`` 写回「未完成」那一档（取消完成是唯一的一种）。"""
-        return _BEHAVIOUR[self].clears_completed
-
-    @property
-    def whole_row(self) -> bool:
-        """整条任务豁不豁免于服务端权威（删除是唯一的一种）。"""
-        return _BEHAVIOUR[self].whole_row
-
-
-_BEHAVIOUR: dict[WriteKind, WriteBehaviour] = {
-    WriteKind.CREATE: WriteBehaviour(local=LocalEffect.MERGE, wire=WireCall.CREATE_TASK),
-    WriteKind.UPDATE: WriteBehaviour(local=LocalEffect.MERGE, wire=WireCall.UPDATE_TASK),
-    WriteKind.COMPLETE: WriteBehaviour(
-        local=LocalEffect.MERGE, wire=WireCall.COMPLETE_TASK, marks_completed=True
-    ),
-    WriteKind.UNCOMPLETE: WriteBehaviour(
-        local=LocalEffect.MERGE,
-        wire=WireCall.BATCH_UPDATE_TASK,
-        clears_completed=True,
-    ),
-    WriteKind.DELETE: WriteBehaviour(
-        local=LocalEffect.REMOVE, wire=WireCall.DELETE_TASK, whole_row=True
-    ),
-    WriteKind.MOVE: WriteBehaviour(local=LocalEffect.MERGE, wire=WireCall.MOVE_TASK),
-}
-"""**一处**记全每种写的行为。加一种写只改这里（外加它要打的新端点形状）。
-
-每个成员一个不少：``tests/test_write_kind.py`` 会逐个访问这些属性，漏一行当场红。
-"""
 
 
 @runtime_checkable

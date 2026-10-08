@@ -73,16 +73,21 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from enum import Enum
-from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import DidaError
 from dida.sync.push import backoff_delay, can_attempt
 from dida.sync.view import ListSnapshot, ViewSource
-from dida.sync.writes import LOCAL_LIST_PREFIX, is_local_list_id
-
-if TYPE_CHECKING:  # storage 反过来 import 本模块（与 dida.sync.writes 同一条规矩）
-    from dida.storage.store import PendingListChange, RefreshReport
+from dida.vocabulary import (
+    LOCAL_LIST_PREFIX,
+    ListBehaviour,
+    ListLocalEffect,
+    ListWire,
+    ListWriteKind,
+    PendingListChange,
+    RefreshReport,
+    is_local_list_id,
+)
 
 __all__ = [
     "AmbiguousLocalListError",
@@ -101,117 +106,9 @@ __all__ = [
 ]
 
 # ``LOCAL_LIST_PREFIX`` 与 ``is_local_list_id`` 是**转发**，不是定义（#39 / #54 的裁定：
-# 「这个 id 服务端见过没有」这条形状判断全仓库只许有一处）。定义处是 :mod:`dida.sync.writes`
-# ——那是叶模块，谁先 import 都行；反过来把定义留在**这一层**会成环：本模块一 import 就跑
-# ``from dida.sync.push import backoff_delay``，而 ``push`` 要
-# ``from dida.sync.writes import ...``（实测：四个入口全部
-# ``ImportError: cannot import name ... from partially initialized module``）。
+# 「这个 id 服务端见过没有」这条形状判断全仓库只许有一处）。定义处是 :mod:`dida.vocabulary`
+# （#78 搬过去的：本地库与写路径两边共用，谁都不许 import 对方）。
 # 名字在这里转出来，是为了让 ``from dida.sync.lists import LOCAL_LIST_PREFIX`` 这一族读法照旧。
-
-
-class ListLocalEffect(Enum):
-    """一次清单写在**本地**的效果；存储层照着它改 ``lists`` 那一行。"""
-
-    SAVE = "save"
-    """写下这一行（新建与改名都是覆盖式地写）。"""
-
-    DROP = "drop"
-    """本地摘掉这一行（删除的本地效果不是「等推送成功再摘」）。"""
-
-
-class ListWire(Enum):
-    """推送时调客户端的哪一个方法；引擎照着它分派。"""
-
-    CREATE_PROJECT = "create_project"
-    UPDATE_PROJECT = "update_project"
-    DELETE_PROJECT = "delete_project"
-
-    NONE = "none"
-    """不发任何请求：这一种改动不是「要发出去的东西」，而是一份**记录**（见 ``AWAIT_ID``）。"""
-
-    @property
-    def addresses_an_id(self) -> bool:
-        """这一种调用是不是把主语写在 URL 里（那就要求那个 id 服务端认得，#57）。
-
-        默认**是**：加一种新端点时忘了想这件事，得到的是「先不发」（改动留在队列里、状态栏
-        那个数照旧算它），而不是「打到一个服务端没见过的 id 上」。只有两种是例外，而且都是
-        URL 里根本没有 id 的：新建与「不发」。
-        """
-        return self not in (ListWire.CREATE_PROJECT, ListWire.NONE)
-
-
-@dataclass(frozen=True)
-class ListBehaviour:
-    """一种清单写的行为说明（见 :data:`_BEHAVIOUR`）。
-
-    ``counts_as_pending`` 与 ``holds_its_row`` 是**两处会读它的地方**（#57 的检查 8）：
-    状态栏那个「待推送 N」数不算它（:meth:`~dida.storage.store.Store.pending_count`），
-    剪枝要不要为它留住那一行（:meth:`~dida.storage.store.Store._has_dirty_list_change`）。
-    两个默认值都取**保守**的那一侧（算改动、留住行）：加一种记录时忘了想这两件事，得到的是
-    「多算一个数、多留一行」，不是「用户的东西不声不响地被剪掉」。
-    """
-
-    local: ListLocalEffect
-    wire: ListWire
-    counts_as_pending: bool = True
-    """算不算「还没到服务端的改动」（状态栏那个数）。"""
-
-    holds_its_row: bool = True
-    """剪枝要不要为它留住本地那一行（以及：那一行是不是「用户还没上去的东西」）。"""
-
-
-class ListWriteKind(Enum):
-    """一次清单写的种类；值与队列表 ``pending_list_changes.kind`` 那一列一一对应。"""
-
-    CREATE = "list_create"
-    UPDATE = "list_update"
-    DELETE = "list_delete"
-
-    AWAIT_ID = "list_await_id"
-    """新建**成功了**，但服务端没回 id（``201 No Content``）：这一行还欠一个真 id（#54）。
-
-    这一种的 ``payload`` **不是**要发出去的请求体，而是一份**认领记录**：当时发出去的名字
-    （``sentName``）、当时那份颜色（``sentColor``）、以及建之前本地就认得的那些 id
-    （``knownIds``——按名字对的时候要把它们排除掉，不然「我本来就有一张同名清单」会被认成
-    刚建的那一条）。认领发生在下一次全量刷新（:meth:`ListMixin._identify_created_lists`）。
-
-    ``wire`` 是 :attr:`ListWire.NONE`：它从来不发请求，所以也**不算**进「待推送」那个数
-    （建都建好了，用户没有欠服务端什么；等他真改了名字，那一笔会换成普通的 ``UPDATE``）。
-    """
-
-    @property
-    def local(self) -> ListLocalEffect:
-        """本地那一行怎么变（存储层读这个，不读成员名）。"""
-        return _BEHAVIOUR[self].local
-
-    @property
-    def wire(self) -> ListWire:
-        """推送调客户端的哪一个方法（分派读这个）。"""
-        return _BEHAVIOUR[self].wire
-
-    @property
-    def counts_as_pending(self) -> bool:
-        """这一种算不算「还没到服务端的改动」（状态栏那个数读它，不读成员名）。"""
-        return _BEHAVIOUR[self].counts_as_pending
-
-    @property
-    def holds_its_row(self) -> bool:
-        """剪枝要不要为这一种留住本地那一行（读它，不读成员名）。"""
-        return _BEHAVIOUR[self].holds_its_row
-
-
-_BEHAVIOUR: dict[ListWriteKind, ListBehaviour] = {
-    ListWriteKind.CREATE: ListBehaviour(local=ListLocalEffect.SAVE, wire=ListWire.CREATE_PROJECT),
-    ListWriteKind.UPDATE: ListBehaviour(local=ListLocalEffect.SAVE, wire=ListWire.UPDATE_PROJECT),
-    ListWriteKind.DELETE: ListBehaviour(local=ListLocalEffect.DROP, wire=ListWire.DELETE_PROJECT),
-    ListWriteKind.AWAIT_ID: ListBehaviour(
-        local=ListLocalEffect.SAVE,
-        wire=ListWire.NONE,
-        counts_as_pending=False,  # 建都建好了：用户没有欠服务端什么
-        holds_its_row=False,  # 服务端索引里找不到它就是影子，剪掉才对（号仍然被这条记录占着）
-    ),
-}
-"""**一处**记全每种清单写的行为（与 :mod:`dida.sync.writes` 的 ``_BEHAVIOUR`` 同一条规矩）。"""
 
 
 @dataclass(frozen=True)

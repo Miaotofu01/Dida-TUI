@@ -61,37 +61,40 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from dida.sync.lists import (
+from dida.vocabulary import (
+    COMPLETED_STATUS,
+    INBOX_ID,
     LOCAL_LIST_PREFIX,
+    LOCAL_TASK_PREFIX,
+    UNCOMPLETED_STATUS,
+    FieldOverride,
     ListLocalEffect,
+    ListSnapshot,
     ListWriteKind,
+    LocalEffect,
+    PendingChange,
+    PendingListChange,
+    RefreshReport,
+    StoredSyncState,
+    SyncState,
+    TaskSnapshot,
+    ViewDefinition,
+    WriteKind,
     is_local_list_id,
+    view_from_payload,
+    view_payload,
 )
-from dida.sync.view import INBOX_ID, ListSnapshot, SyncState, TaskSnapshot
-from dida.sync.views import ViewDefinition, view_from_payload, view_payload
-from dida.sync.writes import LOCAL_TASK_PREFIX, LocalEffect, WriteKind
 
 ChangeKind = WriteKind
 """改动种类：对应 API 的四个写操作（新建 / 更新 / 完成 / 删除）。
 
-**别名，不是第二份定义**（t32）：词表住在 :mod:`dida.sync.writes`，引擎的 ``WriteKind`` 与
-这里的 ``ChangeKind`` 是同一个枚举。以前这里另写了一份成员一字不差的枚举，于是新增一种写
-要在两处各改一次——两层现在只剩一个来源。``ChangeKind`` 这个名字留着是因为「待推送改动的
-种类」在存储层读起来顺，指的还是同一个对象。每种写的**本地效果**（``kind.local``）与
-**冲突豁免**（``kind.whole_row``）也读这张词表，这一层不再按成员名分派。"""
+**别名，不是第二份定义**（t32）：词表住在 :mod:`dida.vocabulary`（#78 从 ``sync`` 与这一层
+共用的那批词汇里搬过去的），引擎的 ``WriteKind`` 与这里的 ``ChangeKind`` 是同一个枚举。
+以前这里另写了一份成员一字不差的枚举，于是新增一种写要在两处各改一次——两层现在只剩一个
+来源。``ChangeKind`` 这个名字留着是因为「待推送改动的种类」在存储层读起来顺，指的还是同一
+个对象。每种写的**本地效果**（``kind.local``）与**冲突豁免**（``kind.whole_row``）也读这
+张词表，这一层不再按成员名分派。"""
 
-COMPLETED_STATUS = 2
-"""任务「已完成」的 ``status`` 值（api-contracts.md：Completed 是 2，不是 1）。"""
-
-UNCOMPLETED_STATUS = 0
-"""任务「未完成」的 ``status`` 值（``0`` 是正常、``-1`` 是已放弃；spec 的「本地判定已完成
-一律看 ``status``」）。
-
-取消完成写回的就是这一档（工单 #38）。**它旁边的完成时间戳不会被清掉**——实测
-（spec 的实测事实第 1 条）取消完成只改 ``status``，所以「还算不算已完成」只认这一个值，
-不认有没有 ``completedTime``。与 :data:`COMPLETED_STATUS` 并排放在这里：同一个 API 事实
-（状态码表）只写一处，调用点一个字面量都不写。
-"""
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS lists (
@@ -184,108 +187,6 @@ class ListRecord:
     is_inbox: bool = False
     kind: str | None = None
     permission: str | None = None
-
-
-@dataclass(frozen=True)
-class PendingChange:
-    """一条还没推到服务端的本地改动（spec 的待推送改动 schema）。"""
-
-    id: int
-    """本地行号；推送成功时用它 :meth:`Store.resolve`。"""
-
-    task_id: str
-    list_id: str
-    """改动发生时任务所在的清单；推送要拿它拼 URL。"""
-
-    kind: ChangeKind
-    payload: dict[str, Any]
-    """改动涉及的字段（本地已生效的那一份）。"""
-
-    created_at: datetime
-    attempts: int = 0
-    next_retry_at: datetime | None = None
-    last_error: str | None = None
-
-
-@dataclass(frozen=True)
-class PendingListChange:
-    """一条还没推到服务端的**清单**改动（工单 #42）。
-
-    与 :class:`PendingChange` 长得像但不共用：清单改动没有任务 id，也不是作用在任务快照
-    上的字段合并。``payload`` 对建 / 改是要发出去的请求体（只有真的要写的字段），对删除是
-    空的——推送要 echo 回去的东西（``sortOrder``）不在队列里，而在 ``lists`` 那一行的
-    原文里（:meth:`Store.list_payload`），因为那才是用户看到的那一份。
-    """
-
-    id: int
-    """本地行号；推送成功时用它 :meth:`Store.resolve_list`。"""
-
-    list_id: str
-    """这一笔改的是哪个清单（新建时是本地那个临时 id）。"""
-
-    kind: ListWriteKind
-    payload: dict[str, Any]
-    """要发出去的请求体（删除是空的）。"""
-
-    created_at: datetime
-    attempts: int = 0
-    next_retry_at: datetime | None = None
-    last_error: str | None = None
-
-
-@dataclass(frozen=True)
-class StoredSyncState:
-    """缓存里的同步状态（spec 的同步状态 schema）。
-
-    比 ``sync.view.SyncState`` 宽：那个是引擎给 TUI 的视图模型，只有上次刷新时间与
-    待推送数量；游标和逻辑日只在这一层与引擎之间流动，所以单独一个类型，
-    不去改 t05 已经定稿的协议。
-    """
-
-    completed_cursor: str | None = None
-    """已完成流拉到哪了（t09 的窗口从这里续）。"""
-
-    last_refresh_at: datetime | None = None
-    logical_day: date | None = None
-    """上次算出来的逻辑日；缓存里那些「今天」的读法就是按它写的。"""
-
-
-@dataclass(frozen=True)
-class FieldOverride:
-    """一次全量刷新对某条任务某个字段的处置。
-
-    ``field`` 是 ``"*"`` 时表示**整条任务**：本地有一条还没推成功的删除，服务端那份
-    整个不许写回来，否则用户删掉的任务会在下一次刷新时复活。
-
-    ``task_id`` 在清单那一行上装的是**清单 id**（#42）：清单的整行豁免（本地有一笔还没推
-    成功的建 / 改 / 删）与任务是同一条规矩，报告的读者要的就是那个 id 加「整行」这个事实。
-    沿用 ``task_id`` 这个名字是因为这一处是清单侧唯一用到它的地方，为它另起一个类型不值当。
-    """
-
-    task_id: str
-    field: str
-    local: Any
-    server: Any
-
-
-@dataclass(frozen=True)
-class RefreshReport:
-    """一次全量刷新的结果。
-
-    ``written_*`` 是这次真正写进去的行数：同一份数据拉第二次全是 0，界面因此不闪、光标
-    因此不丢。``pruned_*`` 是这次**从本地库里删掉**的行数——服务端已经没有它们了（#41）。
-
-    ``overwritten`` 是服务端权威真的把本地值盖掉的字段（ADR-0002 要求这种覆盖能被
-    用户看见）；``suppressed`` 是被待推送改动挡回去的那些——两者都不含没变化的东西，
-    所以重复拉同一份数据的报告是空的。
-    """
-
-    written_lists: int = 0
-    written_tasks: int = 0
-    pruned_lists: int = 0
-    pruned_tasks: int = 0
-    overwritten: tuple[FieldOverride, ...] = ()
-    suppressed: tuple[FieldOverride, ...] = ()
 
 
 def _decode_payload(text: str) -> Mapping[str, Any]:
