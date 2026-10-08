@@ -793,6 +793,200 @@ def test_the_inlined_comparison_guard_catches_a_second_copy():
 
 
 # ---------------------------------------------------------------------------
+# 写链只有一个家：接住 DidaError 与「叫一次写」不许长在同一个函数里（工单 #83）
+#
+# 在 #83 之前，十一个处理函数各自走完那十二行——接住失败 → 挑一句话 → 推一轮 → 重画，
+# 其中三处逐字相同。收进 dida/tui/write_flow.py 之后这条守卫盯着它不会被搬回来：处理函数
+# 只声明「写了什么」（叫一次写），失败怎么说、落在哪只有 WriteFlow.finish_write 一处。
+#
+# 别把这条读成「不许接 DidaError」：拉标签（on_detail_page_pick_requested）、同步收尾
+# （_pull_completed / _sync）接它是正当的——它们没有写。所以规矩是**两件事同时出现**才算。
+# ---------------------------------------------------------------------------
+
+ENGINE_WRITES = frozenset(
+    {
+        "write",
+        "move_task",
+        "reschedule",
+        "defer",
+        "create",
+        "delete",
+        "complete",
+        "uncomplete",
+        "create_list",
+        "update_list",
+        "delete_list",
+        "create_view",
+        "update_view",
+        "delete_view",
+    }
+)
+"""引擎那几条**写**路径（``self.engine.write(...)`` 那一族）。接住 ``DidaError`` 又调它们，
+就是在那一处手写了一遍「写的后半段」。"""
+
+DECLARED_WRITE = "perform"
+"""``Write.perform``——那个唯一的家把「写了什么」执行掉的那一下（``<那次写>.perform()``）。
+
+``perform`` 也算「叫了一次写」，为的是让 :data:`WRITE_CHAIN_HOME` **真的**撞上这条规矩：
+豁免是活的（今天它正是靠 perform 走到引擎的），不是一句摆设。
+"""
+
+WRITE_CHAIN_HOME = "WriteFlow.finish_write"
+"""那个唯一的家：唯一允许同时「接住 ``DidaError``」与「叫一次写」的函数。"""
+
+
+def _qualified_names(tree: ast.AST, prefix: str = "") -> dict[int, str]:
+    """每个函数/方法的名字：模块级就是函数名，类里写成 ``类.方法``（这条守卫要指名那个家）。"""
+    names: dict[int, str] = {}
+    for child in ast.iter_child_nodes(tree):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = f"{prefix}{child.name}"
+            names[id(child)] = name
+            names.update(_qualified_names(child, f"{name}."))
+        elif isinstance(child, ast.ClassDef):
+            names.update(_qualified_names(child, f"{prefix}{child.name}."))
+    return names
+
+
+def _own_parts(node: ast.AST) -> Iterator[ast.AST]:
+    """这个函数**自己**的那几段（不进嵌套函数——闭包算它自己的那一份）。"""
+    stack = list(ast.iter_child_nodes(node))
+    while stack:
+        item = stack.pop()
+        yield item
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        stack.extend(ast.iter_child_nodes(item))
+
+
+def _catches_dida_error(node: ast.Try) -> bool:
+    """这个 ``try`` 接住 ``DidaError`` 吗（``except DidaError`` / ``except (A, DidaError)``）。"""
+    for handler in node.handlers:
+        caught = handler.type
+        if isinstance(caught, ast.Name) and caught.id == "DidaError":
+            return True
+        if isinstance(caught, ast.Tuple) and any(
+            isinstance(item, ast.Name) and item.id == "DidaError" for item in caught.elts
+        ):
+            return True
+    return False
+
+
+def _calls_a_write(node: ast.AST) -> str | None:
+    """这个调用是不是「一次写」：``self.engine.write(...)`` 那一族，或者 ``<那次写>.perform()``。"""
+    if not isinstance(node, ast.Call):
+        return None
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return None
+    if func.attr == DECLARED_WRITE:
+        return func.attr
+    if func.attr not in ENGINE_WRITES:
+        return None
+    receiver = func.value
+    grounded = (isinstance(receiver, ast.Attribute) and receiver.attr == "engine") or (
+        isinstance(receiver, ast.Name) and receiver.id == "engine"
+    )
+    return func.attr if grounded else None
+
+
+def _write_chain_offenders(source: str) -> list[str]:
+    """这份源码里「自己写了一遍一次写的后半段」的函数，写成 ``函数: 接住…写…``（空 = 干净）。
+
+    唯一的例外是 :data:`WRITE_CHAIN_HOME` 本人——它是那个家。
+    """
+    tree = ast.parse(source)
+    names = _qualified_names(tree)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        where = names.get(id(node), node.name)
+        if where == WRITE_CHAIN_HOME:
+            continue
+        parts = list(_own_parts(node))
+        catches = [
+            item.lineno for item in parts if isinstance(item, ast.Try) and _catches_dida_error(item)
+        ]
+        writes = [
+            f"{item.lineno}: {called}"
+            for item in parts
+            if (called := _calls_a_write(item)) is not None
+        ]
+        if catches and writes:
+            offenders.append(f"{where}: 接住 DidaError @{catches}，又写 @[{', '.join(writes)}]")
+    return offenders
+
+
+def test_the_write_chain_has_exactly_one_home():
+    """一次写的后半段**只有一个家**：``dida/tui/write_flow.py`` 的 ``WriteFlow.finish_write``（#83）。
+
+    十一个处理函数只声明「写了什么」（叫一次引擎写）与「成功那句说什么」；接住失败、挑话、
+    推一轮、重画都在那个家里。所以 ``tui/`` 里**任何函数**都不许同时出现「接住 ``DidaError``」
+    与「叫一次写」——那种组合就是一份手写的后半段。
+
+    这条守的是**搬家之后不会搬回来**（#83 之前它正是十一个地方各写一遍的样子），不是
+    「不许接 ``DidaError``」：那两处正当的（拉标签、同步收尾）都没有写。
+    """
+    offenders = [
+        f"{path.relative_to(ROOT)}:{where}"
+        for path in sorted((ROOT / "src" / "dida" / "tui").rglob("*.py"))
+        for where in _write_chain_offenders(path.read_text(encoding="utf-8"))
+    ]
+
+    assert offenders == [], (
+        "这一处在自己写一遍「写的后半段」（接住失败 → 挑话 → 推 → 重画）——它归 "
+        f"dida/tui/write_flow.py 的 {WRITE_CHAIN_HOME}，处理函数只声明「写了什么」：\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_the_write_chain_guard_catches_a_second_copy():
+    """上一条守卫自己也要有人守（仓库惯例）：抄一份当场红，那个家与两种「只有一半」都不算。"""
+    second_copy = (
+        "class TasksPage:\n"
+        "    async def save_the_title(self, task_id, title):\n"
+        "        try:\n"
+        "            self.engine.write(task_id, changes={'title': title})\n"
+        "        except DidaError as exc:\n"
+        "            self._write_status(str(exc))\n"
+    )
+    assert _write_chain_offenders(second_copy) != [], "别处再写一遍后半段要红"
+
+    home = (
+        "class WriteFlow:\n"
+        "    async def finish_write(self, write):\n"
+        "        try:\n"
+        "            write.perform()\n"
+        "        except DidaError as error:\n"
+        "            self._fail(error)\n"
+    )
+    assert _write_chain_offenders(home) == [], "那个唯一的家是允许的（豁免的对象正是它）"
+    assert _write_chain_offenders(home.replace("finish_write", "finish_write_again")) != [], (
+        "换个名字把它抄一份就不是那个家了"
+    )
+    assert _write_chain_offenders(
+        "async def load():\n    try:\n        await self.engine.load_tags()\n    except DidaError:\n        return\n"
+    ) == [], "接住 DidaError 但没写的不算（拉标签、同步收尾那几处正是这样）"
+    assert _write_chain_offenders(
+        "async def save():\n    await self.engine.write('t1', changes={})\n"
+    ) == [], "只声明「写了什么」、不接错的不算"
+    assert _write_chain_offenders(
+        "async def pump():\n    try:\n        await self.engine.push_pending()\n    except DidaError:\n        return\n"
+    ) == [], "推不是写（推送有多个正当调用点）"
+    assert _write_chain_offenders(
+        "class Inner:\n"
+        "    async def close(self):\n"
+        "        try:\n"
+        "            self.engine.delete('t1')\n"
+        "        except DidaError:\n"
+        "            return\n"
+        "    def outer(self):\n"
+        "        pass\n"
+    ) != [], "藏在类里的那一份，别指望它溜过去"
+
+
+# ---------------------------------------------------------------------------
 # 依赖方向：sync 与 storage 都只指向 dida.vocabulary（工单 #78）
 #
 # 在共用词汇独立成模块之前，sync 为了用本地库那几个类型，撑了 9 处补丁：6 处只在
