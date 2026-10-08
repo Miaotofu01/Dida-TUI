@@ -25,15 +25,22 @@ v2 的键位一直是「`enter` 向下、`esc` 向上」（[ADR-0004](0004-termi
   > `e` → `esc`，一个字段都没动）：`updated_lists == [("work", "工作", None)]`——一次真的入队
   > 加一轮推送；视图那一半则是本地库上的一次重写（实测 `updated_views` 记下一笔）。**#66 给这两张表单补上了这一层
   > 判断**：判据只有一份（`sync/lists.py` 的 `is_list_edit` 与 `sync/views.py` 的 `is_view_edit`），
-  > 引擎与界面两个时刻各问一次（与 `is_a_move` 同一个形状）；上面最后那半句因此对**这两张表单**
+  > 引擎与界面两个时刻各问一次（与 `is_a_move` 同一个形状；**界面那一问在 #79 之后删掉了**，
+  > 见下面那条更正）；上面最后那半句因此对**这两张表单**
   > 作废——没动过的表单现在落地的不是「一次空写」，而是**什么都不落**。
   >
-  > **这句缓解话到今天仍然不是普遍成立的**，别把它读成「全程序都没有空写」：详细页的**截止
-  > 编辑器**什么都没改就提交，照样产生一笔写（`DetailPage._submit_due` → `_commit_due` →
-  > `engine.reschedule`，`reschedule` 与 `write` 都不做同值收敛；实测：在详细页把光标走到
-  > 「截止」上，连按三次 `enter`（进编辑器 → 日期步 → 时刻步提交），`rescheduled == ["t1"]`）。
-  > 它属于哪张票要另定，不在 #66 的射程里。当时就是真的只有两处：详细页**自由文本框**那条
-  > （`DetailPage._finish_edit` 里的同值收敛）与三个挑选器（`app._apply_pick`）。
+  > **事后更正（#79 落地后）：下面那一段作废，而且是整条作废。** #79 让**写的那一次自己回话**
+  > 「改了 / 没改」：判据收成一个本体（`dida.sync.writes.is_a_change`，拿这次要盖上去的字段与
+  > **本地那一份原文**逐位比，归一化口径与本地库读那一份一致），六条写路径（改字段 / 搬运 /
+  > 改期 / 顺延 / 改清单 / 改视图）各自**回报布尔**，「没改」在引擎那一侧就不入队、不排推送、
+  > 不动本地那一份；界面上那六处自问（挑选器三条比较、两张表单前的判据调用、详细页自由文本框
+  > 的同值收敛）**全部删掉**，界面只按回报值决定推不推、说不说「已保存」。于是那段话里的
+  > 「详细页截止编辑器什么都没改就提交照样产生一笔写」不再成立：`_submit_due` → `_commit_due`
+  > → `engine.reschedule` 这一条现在回报 `False`，一个字节都不上网（`tests/test_detail_page.py`
+  > 的 `test_submitting_the_due_editor_without_changing_anything_writes_nothing` 钉住「传输层
+  > 一笔都没有 + 状态栏不亮」，`tests/test_write_converges.py` 钉住六条路径的回报）。
+  > 上面那句缓解话（「误按 `esc` 落地的大多是一次空写而不是一次坏写」）到 #79 之后才在**全程序**
+  > 上成立——「空写」这一档已经不存在了。
 - **会红的测试有六条**，名字全是「escape cancels … without writing anything」：`tests/test_list_overlay.py:134`、`tests/test_create_task.py:183`、`tests/test_picker_fields.py:395` 与 `:642`、`tests/test_view_overlay.py:151` 与 `:309`。
 - 文本框里 `enter` **保留**为同一个结果（`Input` 原生把它绑给 `submit`，`FormOverlay.on_input_submitted` 收的正是它）：两个键同一个结果，不去改输入框。
 

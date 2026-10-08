@@ -11,9 +11,9 @@
 |---|---|---|---|---|
 | 1 | 配置与凭据 | `dida/config.py` | `Config`（`token` / `day_end` / `refresh_on_start` / `push_on_change` / `completed_window_hours`）、`config_path()`、`load_config()`、`save_config()`、`needs_token()`、`Credentials(transport=, path=).verify_and_store(token)`、`DayEndReader(path=).current()`（日界跟着配置文件走，#46）；失败是 `ConfigError` / `CredentialsError` | t03 已实现 |
 | 2 | 滴答 API 客户端 | `dida/api/` | `DidaApiClient(token=, transport=, base_url=)`：`list_projects(offset=, limit=)`、`get_project_data(project_id)`、`get_task(project_id, task_id)`、`list_tags()`、`list_completed(project_ids=, start_date=, end_date=)`、`create_task(body)`、`update_task(project_id, task_id, changes, snapshot=)`、`complete_task(project_id, task_id)`、`delete_task(project_id, task_id)`、**清单的建 / 改 / 删**（#42）：`create_project(body)`、`update_project(project_id, changes, snapshot=)`、`delete_project(project_id)`——三条都有 `200 → Project` 与 `201 No Content` 两种成功形状，所以后两者返回「那一份清单，或者 `None`」；失败一律是 `dida.api.errors.DidaError` 的子类（`NetworkError` / `AuthError` / `ServerRejectionError` / `FieldIgnoredError`，守卫另有 `InvalidDateError` / `DatelessRepeatError` / `MalformedResponseError`） | t07 已实现 |
-| 3 | 共用词汇 | `dida/vocabulary.py` | 本地副本与引擎**都要用**的那点类型与常量，**谁都不依赖**（#78）：任务 / 清单快照与同步状态（`TaskSnapshot` / `ListSnapshot` / `SyncState` / `INBOX_ID`）、待推送改动（`PendingChange` / `PendingListChange`）、刷新报告（`RefreshReport` / `FieldOverride`）、存储侧同步状态（`StoredSyncState`）、完成 / 未完成两个状态码（`COMPLETED_STATUS` / `UNCOMPLETED_STATUS`）、写入种类与线路调用形状（`WriteKind` / `WireCall` / `LocalEffect` / `ListWriteKind` / `ListWire` / `ListLocalEffect` 及两张行为表）、本地 id 前缀（`LOCAL_TASK_PREFIX` / `LOCAL_LIST_PREFIX` 与 `is_local_id` 一族）、视图定义与它落库的原文（`ViewDefinition` / `DueWindow` / `Completion` / `view_payload` / `view_from_payload`） | #78 已实现 |
+| 3 | 共用词汇 | `dida/vocabulary.py` | 本地副本与引擎**都要用**的那点类型与常量，**谁都不依赖**（#78）：任务 / 清单快照与同步状态（`TaskSnapshot` / `ListSnapshot` / `SyncState` / `INBOX_ID`）、待推送改动（`PendingChange` / `PendingListChange`）、刷新报告（`RefreshReport` / `FieldOverride`）、存储侧同步状态（`StoredSyncState`）、完成 / 未完成两个状态码（`COMPLETED_STATUS` / `UNCOMPLETED_STATUS`）、写入种类与线路调用形状（`WriteKind` / `WireCall` / `LocalEffect` / `ListWriteKind` / `ListWire` / `ListLocalEffect` 及两张行为表，表上还有一位 `converges`）、本地 id 前缀（`LOCAL_TASK_PREFIX` / `LOCAL_LIST_PREFIX` 与 `is_local_id` 一族）、**读本地那一份原文的口径**（#79：`read_text` / `read_time` / `read_priority` / `read_tags`——本地库怎么读、写路径的判据就怎么比，两个口径是**同一份代码**）、视图定义与它落库的原文（`ViewDefinition` / `DueWindow` / `Completion` / `view_payload` / `view_from_payload`） | #78 已实现；读口径 #79 |
 | 4 | 本地存储 | `dida/storage/store.py` | `Store`：清单、任务快照、待推送改动、同步状态；它 import 的共用词汇全部从 `dida.vocabulary` 来，**不再 import 任何 `dida.sync.*`**（#78） | t08 已实现 |
-| 5 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` + `dida/sync/read.py` + `dida/sync/views.py` + `dida/sync/lists.py` | `SyncEngine(clock=, day_end=, source=, client=)`、`status() -> SyncStatus`、`logical_day() -> date`、**三种读形状**（#33）：`list_index() -> tuple[ListRow, ...]`、`tasks_in(container_id) -> TaskList`、`task_detail(task_id) -> TaskDetail \| None`、`refresh() -> RefreshReport`（**async**）、`complete(task_id)`、`defer(task_id)`、`push_pending()`、`set_day_end(day_end) -> bool`（换日界，#46）、**清单的建 / 改 / 删**（#42）：`create_list(name, color=)`、`update_list(list_id, name=, color=)`、`delete_list(list_id)`；行的字段与纯读法（截止时间读法、优先级标记、排序、逾期判定）在 `dida/sync/view.py`，读模型在 `dida/sync/read.py`，视图求值在 `dida/sync/views.py`（#35），清单的写路径与颜色档在 `dida/sync/lists.py`（#42；#54 加了「建好但服务端没回 id」时的认领：认领记录、按名字唯一对上、认领前不改 / 删那个临时 id）；**判据只有一个家、出口只有一道门**（#58）：优先级四档的用户语言 `PRIORITY_NAMES`（家在 `dida/sync/view.py`，与 `PRIORITY_CYCLE` 同一片词汇）与「搬到它已经在的那个清单不算一次改动」`is_a_move`（家在 `dida/sync/writes.py`）都经这里转出——界面只许 import 引擎，所以判据本体住在 sync 那一侧，两个时刻各问一次（与 `is_addressable_task` 同一个形状）；**v1 的 `view() -> TodayView` 已由 #58 删除**，三种读形状是唯一的读面 | t05 / t09 / t10 已实现；读形状 #33；视图求值 #35；清单写 #42；日界重读 #46；单一出处 #58；共用词汇 #78 |
+| 5 | 同步引擎 | `dida/sync/engine.py` + `dida/sync/view.py` + `dida/sync/read.py` + `dida/sync/views.py` + `dida/sync/lists.py` | `SyncEngine(clock=, day_end=, source=, client=)`、`status() -> SyncStatus`、`logical_day() -> date`、**三种读形状**（#33）：`list_index() -> tuple[ListRow, ...]`、`tasks_in(container_id) -> TaskList`、`task_detail(task_id) -> TaskDetail \| None`、`refresh() -> RefreshReport`（**async**）、`complete(task_id)`、`defer(task_id, days=) -> bool`、`push_pending()`、`set_day_end(day_end) -> bool`（换日界，#46）、**清单的建 / 改 / 删**（#42）：`create_list(name, color=)`、`update_list(list_id, name=, color=) -> bool`、`delete_list(list_id)`；行的字段与纯读法（截止时间读法、优先级标记、排序、逾期判定）在 `dida/sync/view.py`，读模型在 `dida/sync/read.py`，视图求值在 `dida/sync/views.py`（#35），清单的写路径与颜色档在 `dida/sync/lists.py`（#42；#54 加了「建好但服务端没回 id」时的认领：认领记录、按名字唯一对上、认领前不改 / 删那个临时 id）；**判据只有一个家、出口只有一道门**（#58）：优先级四档的用户语言 `PRIORITY_NAMES`（家在 `dida/sync/view.py`，与 `PRIORITY_CYCLE` 同一片词汇）与「搬到它已经在的那个清单不算一次改动」`is_a_move`（家在 `dida/sync/writes.py`）都经这里转出；**写的那一次自己回话「改了 / 没改」**（#79）：判据本体 `is_a_change`（`dida/sync/writes.py`，拿这次要盖上去的字段与**本地那一份原文**逐位比，归一化口径由 `dida/vocabulary.py` 的 `read_text` 一族与本地库共用）——改字段 `write(...) -> bool`、搬运 `move_task(...) -> bool`、改期 `reschedule(...) -> bool`、顺延 `defer(...) -> bool`、改清单 `update_list(...) -> bool`、改视图 `update_view(...) -> bool`；**删除 / 完成 / 取消完成不做同值收敛**（它们没有「什么都没改」这一档），签名不动。**v1 的 `view() -> TodayView` 已由 #58 删除**，三种读形状是唯一的读面 | t05 / t09 / t10 已实现；读形状 #33；视图求值 #35；清单写 #42；日界重读 #46；单一出处 #58；共用词汇 #78；改了没改 #79 |
 | 6 | 逻辑日 | `dida/logical_day.py` | `parse_day_end(text) -> timedelta`、`logical_day(now, day_end) -> LogicalDay`（`label` / `start` / `end`，半开区间） | t04 已实现 |
 | 7 | TUI | `dida/tui/` | `DidaApp(engine)`；三层页面 `dida/tui/pages/`（`index` / `tasks` / `detail`）、按层的键位表 `dida/tui/keys.py`、浮层 `dida/tui/overlays.py`、**视觉常量唯一出处 `dida/tui/theme.py`**（颜色 / 字形 / 间距 / 动效）、顶栏 `#top-bar`（`top_line()`，词标 + 导航路径）、状态栏 `#status-bar`（`status_line()` / `format_status()`） | v1 t05 / t18；一栏三层 #34；视觉地基 #51 |
 
@@ -207,6 +207,26 @@ app = DidaApp(backend)
 它是 **async** 的：网络等待不能阻塞界面，而 t08 的 `Store` 用的是普通 sqlite 连接（线程亲和），
 写必须发生在创建连接的那个线程上。异步协程跑在事件循环同一个线程里，两条同时满足——**不许**
 把刷新丢进 `threading.Thread` 工人（t08 故意没开 `check_same_thread=False`，也没加锁）。
+
+## 写路径：这一次到底改了没有（#79）
+
+**写的那一次自己回话**：一个判据本体 `dida.sync.writes.is_a_change(current, changes)`——拿
+「这次要盖上去的字段」与**本地那一份原文**逐位比，任何一位不同才算一次真改动。归一化口径
+与本地库读那一份时**是同一份代码**（`dida/vocabulary.py` 的 `read_text` / `read_time` /
+`read_priority` / `read_tags`）：文本缺省是空串、优先级缺省是 `0`、标签比**集合**、`isAllDay`
+看真假、`dueDate` 的「缺省」与「显式 `null`」是同一件事、认不出的字段原样比。
+
+六条写路径**回报布尔**（真的写了 / 什么都没写）：改字段 `write(...)`、搬运 `move_task(...)`、
+改期 `reschedule(...)`、顺延 `defer(...)`、改清单 `update_list(...)`、改视图 `update_view(...)`。
+**删除 / 完成 / 取消完成不做同值收敛**——它们没有「什么都没改」这一档（一个已经完成的任务再按
+一次完成就是再来一次不可逆的对外动作），签名与行为都不动。哪几条有这一档写在行为表的
+`converges` 那一位上，写路径读表，不逐个成员写 `if`。
+
+「没改」在**引擎那一侧**就成立：不入队、不排推送、不动本地那一份，然后如实回报。所以任何
+调用方（不只是界面）都不会为一次空操作入队。界面那半边是**纯删除**：挑选器里那三条比较、
+两张表单前的判据调用、详细页自由文本框的同值收敛都删掉了，界面只按回报值决定推不推、
+说不说「已保存」；什么都没改时它**不出声**（不新增「没有改动」这类提示）。
+`tests/test_architecture.py` 用 AST 守着「`tui/` 里一处都不许出现那几个判据的名字」。
 
 ## 屏幕文本怎么断言
 
