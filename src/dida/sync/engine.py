@@ -71,6 +71,7 @@ from dida.api.errors import AuthError, DidaError
 from dida.api.guards import all_day_date
 from dida.clock import Clock
 from dida.logical_day import logical_day
+from dida.sync.capabilities import Capabilities, MissingCapability
 from dida.sync.completed import (
     DEFAULT_COMPLETED_WINDOW_HOURS,
     CompletedReader,
@@ -219,6 +220,7 @@ __all__ = [
     "ListWriteKind",
     "ListWriteTarget",
     "LocalEffect",
+    "MissingCapability",
     "PayloadReader",
     "ProjectReader",
     "ReadModel",

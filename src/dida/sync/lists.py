@@ -263,10 +263,47 @@ class ProjectWriter(Protocol):
 
 @runtime_checkable
 class ListWriteTarget(ViewSource, Protocol):
-    """本地副本在清单写路径上要会的那几件事；t08 的 ``Store`` 满足它。"""
+    """本地副本在清单写路径上要会的那几件事；t08 的 ``Store`` 满足它。
+
+    **声明就是全部**：写路径只许调这里声明过的方法。从前这里少声明了 4 件
+    （``identify_list`` / ``amend_list_change`` / ``save_list`` / ``drop_list``）——代码实际会调
+    11 件，协议只说 7 件，而 ``isinstance`` 只查声明过的那几件。后果是第二个实现能通过入场检查、
+    然后在三层调用深处炸掉（工单 #85）。``tests/test_local_copy_interface.py`` 拿一个「只实现声明过
+    的那几件」的替身跑完整条清单写路径，把这件事钉成行为。
+    """
 
     def list_payload(self, list_id: str) -> dict[str, Any] | None:
         """一条清单的原文（改名时要 echo 回去的那些字段在里面）；本地没有就是 ``None``。"""
+        ...
+
+    def save_list(self, payload: Mapping[str, Any]) -> None:
+        """按一行清单的**原文**写进本地（#42 的乐观写、推送成功后把刚发出去的那一份盖回去）。
+
+        与 :meth:`enqueue_list` 的 ``local=`` 是同一件事的两种入口：那一处是「入队时顺手写」，
+        这一处是「不入队、只写本地那一行」。
+        """
+        ...
+
+    def drop_list(self, list_id: str) -> None:
+        """本地摘掉一行清单（#42 删除的本地效果；认领之后删掉临时 id 那一行也是它）。
+
+        **只动清单这一行**，它里面的任务一条都不碰（领域决定，见模块文档）。
+        """
+        ...
+
+    def identify_list(
+        self,
+        *,
+        local_id: str,
+        real_id: str,
+        row: Mapping[str, Any] | None = None,
+        remove: bool = False,
+    ) -> None:
+        """认领一条「服务端已经建好、但没回 id」的清单（#54）：队列记录挪到真 id 上、本地那一行换名。
+
+        ``row`` 给出来就把它写成真 id 那一行；``remove=True`` 是另一头——用户已经删了这条清单，
+        要把刷新刚写进来的那一行摘掉。
+        """
         ...
 
     def new_local_list_id(self) -> str:
@@ -283,6 +320,24 @@ class ListWriteTarget(ViewSource, Protocol):
         local: Mapping[str, Any] | None = None,
     ) -> PendingListChange:
         """入队一条待推送的清单改动，并让它在本地立刻生效。"""
+        ...
+
+    def amend_list_change(
+        self,
+        change_id: int,
+        *,
+        kind: ListWriteKind | None = None,
+        payload: Mapping[str, Any] | None = None,
+        list_id: str | None = None,
+        local: Mapping[str, Any] | None = None,
+    ) -> None:
+        """改写一条**还没推成功**的清单改动（#54）：后来的改名并进这一条，认领时也改这一条。
+
+        一条还没被认领的清单只许有**一条**队列记录——排在它后面的第二条永远发不出去
+        （``list_id`` 是服务端没见过的那个）。所以这里不是「再入一条」，是「把这一条说的事换成
+        现在这个」。``local`` 给出来就顺手把本地那一行写成它（与入队同一条规矩：屏幕上那一行与
+        队列里那一份必须是同一个意思）。
+        """
         ...
 
     def pending_lists(self) -> Sequence[PendingListChange]:
