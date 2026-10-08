@@ -89,6 +89,7 @@ from dida.sync.lists import (
     is_list_edit,
 )
 from dida.sync.priority import PriorityMixin
+from dida.sync.pump import PumpMixin
 from dida.sync.push import PushMixin, TaskWriter, backoff_delay
 from dida.sync.read import (
     ListKind,
@@ -537,6 +538,7 @@ class Engine(Protocol):
 
 
 class SyncEngine(
+    PumpMixin,
     ListMixin,
     ViewMixin,
     RefreshMixin,
@@ -550,10 +552,13 @@ class SyncEngine(
 ):
     """通用客户端的数据与写入入口（组装各片；读路径在本模块）。
 
-    :class:`~dida.sync.lists.ListMixin` 排在第一位，所以引擎的 ``push_pending()`` 是它那一份
-    （先推清单改动，再把任务那一份交给 :class:`~dida.sync.push.PushMixin`）；其余方法照旧
-    按名字解析，各自的 ``self._…`` 都落在同一个实例上。:class:`~dida.sync.views.ViewMixin`
-    在它们后面：自定义视图的建 / 改 / 删**只在本地落库**，与推送那几片没有交集。
+    ``push_pending()`` 是 :class:`~dida.sync.pump.PumpMixin` 那**一台**泵（它按 :class:`~dida.sync.pump.PushQueue`
+    把清单与任务两本账各抽一遍），``refresh()`` 是 :class:`~dida.sync.refresh.RefreshMixin`
+    那**一个**实现（取数落库之后顺手认领新建的清单）——这两个方法各自只有一个家，所以「谁先生效」
+    **不再由这里的基类排列顺序决定**（#84 之前是两个实现靠 ``super()`` 串起来，顺序一换清单改动
+    就悄悄不再推送）。其余方法照旧按名字解析，各自的 ``self._…`` 都落在同一个实例上。
+    :class:`~dida.sync.views.ViewMixin` 在中间：自定义视图的建 / 改 / 删**只在本地落库**，与推送
+    那几片没有交集。
     """
 
     def __init__(

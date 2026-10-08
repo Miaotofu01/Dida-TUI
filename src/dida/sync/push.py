@@ -9,15 +9,21 @@
 ``self._clock`` / ``self._source`` / ``self._write_target()``，单独一个 mixin 不完整。
 
 **这里不列写类型的成员**（t32）：打哪个端点读 ``kind.wire``，本地要不要补 ``status`` 读
-``kind.marks_completed``——两者都写在 :mod:`dida.sync.writes` 那张表里。只有「这条写要打一个
-新形状的端点」才在这里加一个分支（那是新的外部行为，不是要同步的词汇）。
+``kind.marks_completed``——两者都写在 :mod:`dida.sync.writes` 那张表里。**打哪个端点这件事
+也是一张表**（#84）：:data:`_TASK_WIRE` 把每一种线路调用形状接到一个小函数上，加一种**新形状**
+的端点只在那里加一行（那是新的外部行为，不是要同步的词汇）；加一种复用既有形状的写，只改
+:mod:`dida.vocabulary` 的 ``_WRITE_BEHAVIOUR`` 一行。
+
+**推这一轮的那台泵不在这里**：重试循环只有一台，住在 :mod:`dida.sync.pump`；这一片交给它的
+是清单那本账的邻居——:class:`TaskQueue`（「读队列、可寻址吗、记一次失败、出队、发出去」五件
+事接在任务这一族的动词上）。#84 之前任务是各写一台泵，清单又各写一台，靠 ``super()`` 串起来。
 """
 
 from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Awaitable, Callable, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import DidaError
 from dida.sync.writes import (
@@ -90,10 +96,9 @@ def _is_due(change: PendingChange, now: datetime) -> bool:
 def is_given_up(attempts: int) -> bool:
     """自动重试是不是已经放弃这条改动（工单 #71）：失败次数够到 :data:`MAX_PUSH_ATTEMPTS`。
 
-    「还要不要自动重试」只有这一处判据——任务的推送循环（本模块的 :meth:`PushMixin.push_pending`）
-    与清单的推送循环（:meth:`~dida.sync.lists.ListMixin._push_lists`）问的是同一个函数，不是
-    各写一遍。放弃**不删任何东西**：改动留在队列里、状态栏照旧数它，只有手动同步（``r``）
-    能再问它一次。
+    「还要不要自动重试」只有这一处判据——一台重试泵（:mod:`dida.sync.pump`）对任务与清单
+    两本账问的都是它，不是各写一遍。放弃**不删任何东西**：改动留在队列里、状态栏照旧数它，
+    只有手动同步（``r``）能再问它一次。
     """
     return attempts >= MAX_PUSH_ATTEMPTS
 
@@ -182,6 +187,136 @@ class TaskWriter(Protocol):
         请求体是**数组**、响应是 ``{id, etag}`` 的**数组**——本仓库唯一一个这样的端点。
         """
         ...
+
+
+class TaskQueue:
+    """任务那本账接给一台泵的适配器（#84）。
+
+    泵（:class:`~dida.sync.pump.PumpMixin`）不认任务词汇：它只问这五件事，这个类把它们接到
+    任务这一族的动词与 :data:`_TASK_WIRE` 上。清单那一本是另一个适配器
+    （:class:`~dida.sync.lists.ListQueue`）——两份词汇表照旧分开，共用的是**机器**。
+    """
+
+    def __init__(self, target: WriteTarget, writer: TaskWriter) -> None:
+        self._target = target
+        self._writer = writer
+
+    def pending(self) -> Sequence[PendingChange]:
+        """还没推成功的任务改动，按发生顺序（泵每一笔都重新取一次）。"""
+        return self._target.pending()
+
+    def addressable(self, change: PendingChange) -> bool:
+        """这一笔要说的每个 id 服务端都见过吗——判据本体在
+        :func:`~dida.sync.writes.is_addressable_task`（一处）。"""
+        return is_addressable(change)
+
+    def record_attempt(
+        self,
+        change_id: int,
+        *,
+        error: str | None = None,
+        next_retry_at: datetime | None = None,
+    ) -> None:
+        self._target.record_attempt(change_id, error=error, next_retry_at=next_retry_at)
+
+    def resolve(self, change_id: int) -> None:
+        self._target.resolve(change_id)
+
+    async def send(self, change: PendingChange) -> bool:
+        """按线路调用形状查表把这一笔发出去。失败照旧往外抛（由泵退避）。"""
+        handler = _TASK_WIRE.get(change.kind.wire)
+        if handler is None:
+            raise NotImplementedError(f"推送还没有实现「{change.kind.value}」这一种改动")
+        await handler(self, change)
+        return True
+
+    async def create_task(self, change: PendingChange) -> None:
+        """新建：才知道服务端给的 id，所以推成功之后顺手认领它（t15）。"""
+        _adopt_created(self._target, change, await self._writer.create_task(change.payload))
+
+    async def update_task(self, change: PendingChange) -> None:
+        """改字段：请求体是这份改动，外加本地那份完整底稿（不认识的字段靠它回写）。"""
+        await self._writer.update_task(
+            change.list_id,
+            change.task_id,
+            change.payload,
+            snapshot=self._target.task_payload(change.task_id),
+        )
+
+    async def complete_task(self, change: PendingChange) -> None:
+        """完成：没有请求体的端点。"""
+        await self._writer.complete_task(change.list_id, change.task_id)
+
+    async def batch_update_task(self, change: PendingChange) -> None:
+        """批量更新：请求体是 ``{update: [...]}``，每一条只带 id / projectId / status。
+
+        取消完成是唯一走这条路的一种写（``_WRITE_BEHAVIOUR`` 说的一种写一种端点形状）；那条
+        改动在本地要写下的 ``status`` 就是这条请求要发的值——两者同一个来源，不会出现
+        「本地改成未完成、服务端收到的是别的」。
+        """
+        await self._writer.batch_update(
+            [{"id": change.task_id, "projectId": change.list_id, **change.payload}]
+        )
+
+    async def delete_task(self, change: PendingChange) -> None:
+        """删除：``DELETE``，没有请求体。"""
+        await self._writer.delete_task(change.list_id, change.task_id)
+
+    async def move_task(self, change: PendingChange) -> None:
+        """搬运：``fromProjectId`` 是**入队那一刻**那条任务所在的清单（改动行上记着），
+        ``toProjectId`` 是这次改动盖上去的 ``projectId``。请求体那一层再翻成文档的数组形状
+        ——这里给的是「从哪到哪」，端点形状是客户端的事。"""
+        await self._writer.move_task(
+            change.list_id,
+            str(change.payload.get("projectId") or ""),
+            change.task_id,
+        )
+
+
+def _adopt_created(target: WriteTarget, change: PendingChange, created: Any) -> None:
+    """新建推成功：把本地那条临时 id 的任务挪到服务端给的 id 上（t15）。
+
+    不挪的后果不是「多一条看不见的行」：真 id 那条会被下一次全量刷新拉回来，临时 id
+    这条要等那一次刷新的剪枝才消失（#41）——中间这段时间同一条任务在屏幕上出现两遍。
+
+    是**合并**而不是替换：服务端给的字段盖上去，它没提的字段（用户刚写下的日期、
+    ``projectId``）留在本地。响应按文档就是那条建好的任务，但不拿这个赌——真正的
+    服务端权威裁决在全量刷新那条路上，那里每一笔覆盖都会如实记进报告（t08/t09），
+    而不是在这里悄悄少掉用户写的一个日期。
+
+    服务端没回一个带 id 的原文时**什么都不做**：这条改动已经推成功了，不能当失败重试
+    （新建不是幂等的，重试就是建两条）。宁可留着一条临时 id 的本地任务，也不建两条。
+    """
+    if not isinstance(created, Mapping) or not created.get("id"):
+        return
+    local = target.task_payload(change.task_id) or {}
+    target.adopt_created(
+        change.task_id,
+        {
+            **local,
+            **created,
+            "projectId": created.get("projectId") or change.list_id,
+        },
+    )
+
+
+_TASK_WIRE: dict[WireCall, Callable[[TaskQueue, PendingChange], Awaitable[None]]] = {
+    WireCall.CREATE_TASK: TaskQueue.create_task,
+    WireCall.UPDATE_TASK: TaskQueue.update_task,
+    WireCall.COMPLETE_TASK: TaskQueue.complete_task,
+    WireCall.BATCH_UPDATE_TASK: TaskQueue.batch_update_task,
+    WireCall.DELETE_TASK: TaskQueue.delete_task,
+    WireCall.MOVE_TASK: TaskQueue.move_task,
+}
+"""**一处**记全每种线路调用形状怎么打（#84）：加一种端点形状，在这里加一行。
+
+键是 ``change.kind.wire``（「写入种类 → 线路调用形状」那张表已经在 :mod:`dida.vocabulary`
+里是数据了），值是这一形状怎么把改动交给客户端。分派因此是查表，不是一串按成员名排的
+``elif``；复用既有形状的写连这里都不用碰，只在 ``_WRITE_BEHAVIOUR`` 加一行。
+
+表在 :class:`TaskQueue` 定义之后填：值要的是那几个函数对象，而它们住在那个类里（方法本体
+要 ``self`` 上的本地副本与客户端）。
+"""
 
 
 class PushMixin:
@@ -339,60 +474,6 @@ class PushMixin:
         # 交给 ``write`` 去解析（它那一处是唯一的判据），这里只把「搬不搬」问清楚。
         return self.write(task_id, changes={"projectId": to_list_id}, kind=WriteKind.MOVE)
 
-    async def push_pending(self, *, manual: bool = False) -> int:
-        """推一轮：把**该试**的待推送改动依次推给服务端，返回推成功的条数。
-
-        这是重试队列唯一的泵。「什么时候该重试」由注入的钟判定：没排过重试的立刻推，
-        排过的要等到 ``next_retry_at``。**没有 ``time.sleep``、没有真时钟、没有后台线程**
-        ——等待发生在调用方（t14 那种定时器或下一次写），引擎只负责算清楚什么时候能推。
-
-        ``manual=True`` 是用户按了 ``r``：已经放弃（失败够 :data:`MAX_PUSH_ATTEMPTS` 次）的
-        改动再试一次，放弃之前的那几种改动照旧按到点判定。默认 ``False``——写完之后立刻那次
-        推送与周期泵（``push_tick``）都是自动路径，放弃的改动它们一律不发。
-
-        一条失败不影响后面那些：队列按发生顺序走完，失败的留在队列里等下一次。
-
-        **每一笔都重新取一次队列**（不是先取一份快照再遍历，#53）：新建推成功会把这一条任务
-        排在后面的改动挪到服务端给的 id 上（``Store.adopt_created``），同一轮里紧接着的那一笔
-        必须看见新的 id——拿开头读进来的快照，它仍然会带着 ``local-…`` 去推。形状与清单版的
-        :meth:`~dida.sync.lists.ListMixin._push_lists` 同一份（#42 两件都做了）。循环一定会停：
-        每一轮要么删掉一行、要么把它的 ``next_retry_at`` 推到将来、要么把它记进
-        ``attempted``——``manual`` 对已放弃的改动不看 ``next_retry_at``（#71），少了这本账
-        同一笔会在这一轮里被反复重试。
-        """
-        target = self._write_target()
-        writer = self._writer()
-        pushed = 0
-        attempted: set[int] = set()
-        async with self._push_lock:
-            while True:
-                now = self._clock.now()
-                change = next(
-                    (
-                        item
-                        for item in target.pending()
-                        if item.id not in attempted and can_attempt(item, now, manual=manual)
-                    ),
-                    None,
-                )
-                if change is None:
-                    return pushed
-                attempted.add(change.id)
-                try:
-                    await self._send(writer, target, change)
-                except DidaError as exc:
-                    # 推不动就留在队列里，记下这次失败与下一次的时刻。本地那份改动照旧
-                    # 生效——ADR-0002 的豁免看的就是这个队列，用户的操作不会因为一次
-                    # 网络抖动被撤销。
-                    target.record_attempt(
-                        change.id,
-                        error=str(exc),
-                        next_retry_at=now + backoff_delay(change.attempts),
-                    )
-                    continue
-                target.resolve(change.id)
-                pushed += 1
-
     async def wait_for_pushes(self) -> None:
         """等 :meth:`write` 排下的那几轮推送跑完。
 
@@ -431,92 +512,15 @@ class PushMixin:
         self._inflight.add(task)
         task.add_done_callback(self._inflight.discard)
 
-    async def _send(self, writer: TaskWriter, target: WriteTarget, change: PendingChange) -> None:
-        """把一条待推送改动交给客户端。失败是结构化错误，照旧往外抛（由调用方退避）。
+    def _task_queue(self) -> TaskQueue:
+        """任务那本账（#84）：交给那一台泵的就是它。
 
-        ``kind`` 是引擎与存储共用的那一套词汇（:mod:`dida.sync.writes`），所以这里不需要
-        再 import 存储层：判断用哪一个端点，与「改动存在哪里」无关。
+        泵不认任务词汇——它只认 :class:`~dida.sync.pump.PushQueue` 那五件事，这个适配器把
+        它们接到任务这一族的动词上（``Store.pending`` / ``record_attempt`` / ``resolve``）与
+        分派表 :data:`_TASK_WIRE` 上。清单那一本由 :class:`~dida.sync.lists.ListQueue` 给。
         """
-        wire = change.kind.wire  # 打哪一个端点由词表说（dida.sync.writes），不在这里再列一遍成员
-        if not is_addressable(change):
-            # 两种「名字服务端没见过」都在这里落地（#53）：排在一条还没被认领的新建后面的改动
-            # （任务 id 是临时的——新建**自己**不在此列，它的 URL 里没有 id），以及落在一条还没
-            # 推出去的清单里的改动（projectId 是 ``local-list-…``）。写入那一侧也挡了一道
-            # （``write``），这是第二道，防的是别处再长出一条入队路径——两道都不许把这种改动
-            # **安静地**推到一个 404 上、然后永远退避下去。
-            raise _unaddressable(
-                change.task_id,
-                project=change.list_id,
-                target_project=project_in(change.payload),
-            )
-        if wire is WireCall.UPDATE_TASK:
-            await writer.update_task(
-                change.list_id,
-                change.task_id,
-                change.payload,
-                # 底稿是本地那份完整原文：不认识的字段靠它才能一个不丢地回写。
-                snapshot=target.task_payload(change.task_id),
-            )
-        elif wire is WireCall.COMPLETE_TASK:
-            await writer.complete_task(change.list_id, change.task_id)
-        elif wire is WireCall.BATCH_UPDATE_TASK:
-            # 批量更新：请求体是 {update: [...]}，每一条只带 id / projectId / status。
-            # 取消完成是唯一走这条路的一种写（`_WRITE_BEHAVIOUR` 说的一种写一种端点形状）；
-            # 那条改动在本地要写下的 ``status`` 就是这条请求要发的值——两者同一个来源，
-            # 不会出现「本地改成未完成、服务端收到的是别的」。
-            await writer.batch_update(
-                [
-                    {
-                        "id": change.task_id,
-                        "projectId": change.list_id,
-                        **change.payload,
-                    }
-                ]
-            )
-        elif wire is WireCall.DELETE_TASK:
-            await writer.delete_task(change.list_id, change.task_id)
-        elif wire is WireCall.MOVE_TASK:
-            # 搬运：``fromProjectId`` 是**入队那一刻**那条任务所在的清单（改动行上记着），
-            # ``toProjectId`` 是这次改动盖上去的 ``projectId``。请求体那一层再翻成文档的
-            # 数组形状——这里给的是「从哪到哪」，端点形状是客户端的事。
-            await writer.move_task(
-                change.list_id,
-                str(change.payload.get("projectId") or ""),
-                change.task_id,
-            )
-        elif wire is WireCall.CREATE_TASK:
-            # 新建才知道服务端给的 id，所以这一条推成功之后要顺手认领它（t15）。
-            self._adopt_created(target, change, await writer.create_task(change.payload))
-        else:
-            raise NotImplementedError(f"推送还没有实现「{change.kind.value}」这一种改动")
+        return TaskQueue(self._write_target(), self._writer())
 
-    def _adopt_created(
-        self, target: WriteTarget, change: PendingChange, created: Any
-    ) -> None:
-        """新建推成功：把本地那条临时 id 的任务挪到服务端给的 id 上（t15）。
-
-        不挪的后果不是「多一条看不见的行」：真 id 那条会被下一次全量刷新拉回来，临时 id
-        这条要等那一次刷新的剪枝才消失（#41）——中间这段时间同一条任务在屏幕上出现两遍。
-
-        是**合并**而不是替换：服务端给的字段盖上去，它没提的字段（用户刚写下的日期、
-        ``projectId``）留在本地。响应按文档就是那条建好的任务，但不拿这个赌——真正的
-        服务端权威裁决在全量刷新那条路上，那里每一笔覆盖都会如实记进报告（t08/t09），
-        而不是在这里悄悄少掉用户写的一个日期。
-
-        服务端没回一个带 id 的原文时**什么都不做**：这条改动已经推成功了，不能当失败重试
-        （新建不是幂等的，重试就是建两条）。宁可留着一条临时 id 的本地任务，也不建两条。
-        """
-        if not isinstance(created, Mapping) or not created.get("id"):
-            return
-        local = target.task_payload(change.task_id) or {}
-        target.adopt_created(
-            change.task_id,
-            {
-                **local,
-                **created,
-                "projectId": created.get("projectId") or change.list_id,
-            },
-        )
 
     def _writer(self) -> TaskWriter:
         """推送要的那个客户端。没接上就大声报错——绝不假装推过了。"""
