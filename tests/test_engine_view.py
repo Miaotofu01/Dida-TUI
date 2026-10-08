@@ -29,7 +29,7 @@ def make_source() -> InMemorySource:
     source.add_task("写周报", list_name="工作", due=at(14, 18, 0))
     source.add_task("买牛奶", list_name="生活")
     source.add_task("交季度报告", list_name="工作", due=at(11, 9, 0), priority=5)
-    source.state = SyncState(last_refresh_at=at(14, 12, 0), pending_count=2)
+    source.set_sync_state(last_refresh_at=at(14, 12, 0))
     return source
 
 
@@ -57,7 +57,12 @@ def test_reading_without_a_cache_is_empty_not_an_error():
     assert engine.task_detail("t1") is None
 
 
-def test_status_carries_the_logical_day_the_refresh_time_and_the_pending_count():
+def test_status_carries_the_logical_day_and_the_refresh_time():
+    """状态栏快照把注入的那几样原样搬出来：时刻、逻辑日、上次刷新时刻。
+
+    它只证**搬运**（``SyncState`` → ``SyncStatus``）——待推送那个数是本地副本自己算的，
+    只读替身没有队列，所以是 0（#86 之前这里摆过一个 2，那是替身声明的数）。
+    """
     engine = SyncEngine(clock=ManualClock(at(14, 12, 3)), day_end="24:00", source=make_source())
 
     status = engine.status()
@@ -65,7 +70,29 @@ def test_status_carries_the_logical_day_the_refresh_time_and_the_pending_count()
     assert status.checked_at == at(14, 12, 3)
     assert status.logical_day == date(2026, 3, 14)
     assert status.last_refresh_at == at(14, 12, 0)
-    assert status.pending_count == 2
+    assert status.pending_count == 0, "只读替身没有队列：这个 0 是算出来的"
+
+
+def test_a_read_only_source_offers_no_way_to_plant_a_pending_count():
+    """只读替身的公开面上**没有摆待推送数的地方**（#86）。
+
+    它挡的是「摆法在公开面上不存在」：没有可写的 ``state``，``set_sync_state`` 也不收
+    ``pending_count``（把这两样加回来，这一条当场红）。**它挡不住「把 0 写成声明的常量」**
+    ——只读替身没有队列，「算出来的 0」与「声明的 0」在这条接缝上**不可区分**；原缺陷要有
+    人摆一个非零数才可观测，所以真正的守卫是上面那两条「没地方摆」。
+    """
+    source = InMemorySource()
+
+    assert source.sync_state().pending_count == 0
+    assert not hasattr(source, "state"), "公开面上不该有可摆布的 state"
+    with pytest.raises(TypeError):
+        source.set_sync_state(pending_count=2)  # type: ignore[call-arg]
+
+    source.set_sync_state(last_refresh_at=at(14, 12, 0))
+
+    assert source.sync_state() == SyncState(last_refresh_at=at(14, 12, 0), pending_count=0), (
+        "摆得进去的只有「上次刷新时刻」，而且它真的落地了；那个数照旧是 0"
+    )
 
 
 def test_status_logical_day_follows_the_injected_day_end():

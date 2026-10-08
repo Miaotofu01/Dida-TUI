@@ -41,7 +41,7 @@ def a_colour_terminal(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("NO_COLOR", raising=False)
 
 
-def backend(*, pending: int = 0, slow: float = 0.0, broken: bool = False) -> FakeBackend:
+def backend(*, slow: float = 0.0, broken: bool = False) -> FakeBackend:
     """一份够用的缓存；``slow`` / ``broken`` 用来演「同步慢」与「同步失败」。"""
     fake = FakeBackend(clock=ManualClock(T0))
     fake.add_list("工作", id="work", group_id="g1")
@@ -49,7 +49,7 @@ def backend(*, pending: int = 0, slow: float = 0.0, broken: bool = False) -> Fak
     fake.add_task("交水费", list_name="work", id="t2")
     fake.add_list("生活", id="life", group_id="g1")
     fake.add_list("笔记本", id="note", kind="NOTE")
-    fake.set_sync_state(last_refresh_at=T0, pending_count=pending)
+    fake.set_sync_state(last_refresh_at=T0)
     if slow or broken:
         real_refresh = fake.refresh
 
@@ -981,7 +981,7 @@ async def test_the_cursor_row_is_the_same_whether_animations_are_on_or_off(monke
 
 async def test_a_fast_sync_never_shows_a_spinner():
     """快同步什么都不显示——本地缓存那一屏不该有个东西一直在转。"""
-    app = DidaApp(backend(pending=1))
+    app = DidaApp(backend())
 
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
@@ -1022,7 +1022,7 @@ async def test_a_slow_sync_shows_a_spinner_only_after_the_threshold():
 
 async def test_a_manual_sync_that_works_says_so_with_a_native_toast():
     """完成 = 原生 toast（``App.notify()``），不是改状态栏那一行字符串。"""
-    app = DidaApp(backend(pending=1))
+    app = DidaApp(backend())
 
     async with app.run_test(size=WIDE, notifications=True) as pilot:
         await pilot.pause()
