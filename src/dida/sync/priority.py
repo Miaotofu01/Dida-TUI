@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Mapping
 
 from dida.sync.view import next_priority
+from dida.vocabulary import read_priority
 
 
 class PriorityMixin:
@@ -39,10 +40,7 @@ class PriorityMixin:
 def _priority_of(payload: Mapping[str, Any]) -> int:
     """快照里的 ``priority`` → 线上编码的整数。
 
-    与存储层读快照的口径一致（``int(... or 0)``）：脏值当作「无」，不替服务端猜档位，
-    也不让一个字符串把 ``p`` 卡住。
+    口径只有一处（:func:`dida.vocabulary.read_priority`，本地库与写路径的判据都读它）：
+    缺省与脏值当作「无」（``0``），不替服务端猜档位，也不让一个字符串把 ``p`` 卡住。
     """
-    try:
-        return int(payload.get("priority") or 0)
-    except (TypeError, ValueError):
-        return 0
+    return read_priority(payload.get("priority"))

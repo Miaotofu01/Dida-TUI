@@ -974,11 +974,16 @@ class DetailPage(CursorPage):
         没有「取消」这条路——所以这里只有两种结局：写得出去（发消息给 app，交给引擎乐观写 +
         立刻推送），或者**根本没改**（原样收起）。标题被清空是唯一一种「不能写」的输入：
         空标题不被接受，旧标题原样留着，下面那一行说清是哪一条规矩（不是一个「保存失败」）。
+
+        **「没改」不在这里判**（工单 #79）：这一页退出编辑时比的是编辑器里那段文字与
+        ``field.value``（屏幕上那一份），而「改了没有」该比的是**本地那一份原文**——那个
+        判断住在引擎里（``dida.sync.writes.is_a_change``），写的那一次自己回报布尔，app 按
+        回报值决定推不推、说不说。所以这里只把值交出去，一个字都不比。
         """
         field = self._editing
         value = self._editor_value()
         self._end_edit()
-        if field is None or self._task_id is None or value == field.value:
+        if field is None or self._task_id is None:
             return
         if field.key == "title" and not value.strip():
             self.show_save(messages.NO_TITLE_EDIT_MESSAGE)

@@ -382,6 +382,10 @@ async def test_esc_on_an_untouched_view_form_writes_nothing():
     视图只在本地（ADR-0005：API 没有「保存一组过滤条件」这个接口），所以这一次「写」不是
     一次 API 调用，而是本地库那一行的覆盖式重写——它仍然是一次写，不该为一次没发生的改动
     发生（与清单那条同一条规矩，判据同样只有一份）。
+
+    **界面不判这一句**（工单 #79）：写的那一次自己回报「改了 / 没改」（判据本体
+    ``dida.sync.writes.is_a_change``，两份定义各读成落库那份原文再逐位比），界面只按回报值
+    走下一步。引擎那一侧的回报由 ``tests/test_write_converges.py`` 钉着。
     """
     fake = backend()
     app = DidaApp(fake)

@@ -26,6 +26,7 @@ from dida.sync.writes import (
     UnknownTaskError,
     WireCall,
     WriteKind,
+    is_a_change,
     is_a_move,
     is_addressable,
     is_addressable_task,
@@ -200,8 +201,18 @@ class PushMixin:
         *,
         changes: Mapping[str, Any] | None = None,
         kind: WriteKind = WriteKind.UPDATE,
-    ) -> None:
+    ) -> bool:
         """乐观写：本地当场生效并入队，然后**立即返回**；网络结果不是它的前置条件。
+
+        **这一次到底改了没有由它自己回答**（工单 #79）：拿这次要盖上去的字段与本地那一份
+        原文逐位比（判据本体 :func:`~dida.sync.writes.is_a_change`，一处），有一位不同就写、
+        并回 ``True``；一位都相同就**什么都不做**——不入队、不排推送、不动本地那一份，
+        回 ``False``。调用方（界面或别的谁都一样）按这个值决定还要不要往下走，不必把同一个
+        判断再问一遍（ADR-0008 第二节记的那一次空写就是漏了这一句）。
+
+        哪些写有「什么都没改」这一档由词表说：:attr:`~dida.vocabulary.WriteKind.converges`。
+        改字段有；完成 / 取消完成 / 删除**没有**（它们是不可逆的对外动作，再来一次就是再来
+        一次），所以那三条即使回 ``True`` 也不代表服务端上真的多了一个字段。
 
         ADR-0002 的口径：一次按键的手感比可撤销性值钱，所以本地先动，服务端随后到。
         改动进 :class:`~dida.vocabulary.PendingChange` 队列后，会立刻在事件循环上
@@ -240,13 +251,18 @@ class PushMixin:
             task_id, kind, project_id=project, target_project_id=target_project
         ):
             raise _unaddressable(task_id, project=project, target_project=target_project)
+        local = self._local_effect(kind, changes)
+        if kind.converges and not is_a_change(snapshot, local):
+            # 什么都没改：不入队、不排推送、不动本地那一份，如实回一句「没写」（工单 #79）。
+            return False
         target.enqueue(
             task_id=task_id,
             kind=kind,
-            payload=self._local_effect(kind, changes),
+            payload=local,
             now=self._clock.now(),
         )
         self._push_now()
+        return True
 
     def complete(self, task_id: str) -> None:
         """写：完成任务并立即推送（ADR 0002 的乐观写：本地先动，服务端随后到）。
@@ -286,8 +302,13 @@ class PushMixin:
         """
         self.write(task_id, kind=WriteKind.DELETE)
 
-    def move_task(self, task_id: str, *, to_list_id: str) -> None:
+    def move_task(self, task_id: str, *, to_list_id: str) -> bool:
         """写：把这条任务搬到另一个清单（``POST /open/v1/task/move``，工单 #45）。
+
+        **回报这次到底搬了没有**（工单 #79）：搬到它**已经在**的那个清单（或者目标为空）时
+        什么都不写，回 ``False``——不入队、不排推送、不动本地那一份；真搬了回 ``True``。
+        调用方按这个值决定还要不要推一轮，不必自己比一遍（#58 落地时界面确实问过同一个判据，
+        #79 之后它不再问）。
 
         **不是一次普通字段更新**：搬运有自己的端点、自己的数组请求体，所以它是
         :class:`~dida.sync.writes.WriteKind` 里的一个成员，而不是 ``write(changes={"projectId": …})``
@@ -298,8 +319,8 @@ class PushMixin:
 
         ``to_list_id`` 与当前清单相同时**什么都不写**：那不是一次改动，凭空入队只会让状态栏
         多出一个永远没有意义的数。这条判断的**本体在** :func:`~dida.sync.writes.is_a_move`
-        （「目标为空」与「就是它现在待的那个清单」两种都算没改）——界面那一侧问的是同一个
-        函数（工单 #58 的 T6：它以前在这里与 ``app._apply_pick`` 各写了一遍同一个比较）。
+        （「目标为空」与「就是它现在待的那个清单」两种都算没改），而它比的又是那**一个**判据
+        本体 :func:`~dida.sync.writes.is_a_change`（#79：这一层是唯一的比较处）。
         本地没有这条任务的底稿时与 :meth:`write` 一样当场抛
         :class:`~dida.sync.writes.UnknownTaskError`——``fromProjectId`` 只存在于那份底稿里，
         拼不出请求的改动永远推不出去（工单 #25）。
@@ -313,10 +334,10 @@ class PushMixin:
         if not current:
             raise UnknownTaskError(task_id)
         if not is_a_move(current, to_list_id):
-            return
+            return False
         # ``task_id`` 可能是认领换名之前的那个（光标停在一行刚建出来的任务上，工单 #75）：
         # 交给 ``write`` 去解析（它那一处是唯一的判据），这里只把「搬不搬」问清楚。
-        self.write(task_id, changes={"projectId": to_list_id}, kind=WriteKind.MOVE)
+        return self.write(task_id, changes={"projectId": to_list_id}, kind=WriteKind.MOVE)
 
     async def push_pending(self, *, manual: bool = False) -> int:
         """推一轮：把**该试**的待推送改动依次推给服务端，返回推成功的条数。

@@ -141,6 +141,7 @@ from dida.sync.writes import (
     WireCall,
     WriteKind,
     WriteTarget,
+    is_a_change,
     is_a_move,
     is_local_id,
     is_local_list_id,
@@ -258,6 +259,7 @@ __all__ = [
     "evaluate_view",
     "format_due",
     "implied_due_for",
+    "is_a_change",
     "is_a_move",
     "is_inbox_id",
     "is_list_edit",
@@ -410,8 +412,12 @@ class Engine(Protocol):
         *,
         changes: Mapping[str, Any] | None = None,
         kind: WriteKind = WriteKind.UPDATE,
-    ) -> None:
+    ) -> bool:
         """写：把 ``changes`` 里那几个字段盖上去（本地当场生效 + 立刻推送）。
+
+        **回报这次到底改了没有**（工单 #79）：改了回 ``True``；一位都没变时什么都不写（不入队、
+        不排推送、不动本地那一份）回 ``False``。完成 / 删除那几条预置写没有这一档，照旧回
+        ``True``（它们的对外动作是不可逆的，再来一次就是再来一次）。
 
         改一个字段（详细页 #43 的标题 / 描述 / 备注）与完成、删除走的是同一条乐观写路径；
         本地没有这条任务的底稿时当场抛 :class:`~dida.sync.writes.UnknownTaskError`——界面
@@ -431,23 +437,32 @@ class Engine(Protocol):
         """
         ...
 
-    def defer(self, task_id: str, *, days: int = 1) -> None:
-        """写：顺延 ``days`` 个逻辑日（``g`` 是 1 天、``G`` 是 7 天）。"""
+    def defer(self, task_id: str, *, days: int = 1) -> bool:
+        """写：顺延 ``days`` 个逻辑日（``g`` 是 1 天、``G`` 是 7 天）。
+
+        回报这次到底挪了没有（#79）：落点与本地那一份相同时回 ``False``（什么都不写）。
+        """
         ...
 
     def delete(self, task_id: str) -> None:
         """写：删除一条任务（服务端没有撤销，t16）。"""
         ...
 
-    def move_task(self, task_id: str, *, to_list_id: str) -> None:
-        """写：把这条任务搬到另一个清单——走**搬运端点**，不是普通字段更新（#45）。"""
+    def move_task(self, task_id: str, *, to_list_id: str) -> bool:
+        """写：把这条任务搬到另一个清单——走**搬运端点**，不是普通字段更新（#45）。
+
+        回报这次到底搬了没有（#79）：搬到它已经在的那个清单回 ``False``（什么都不写）。
+        """
         ...
 
-    def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> None:
+    def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> bool:
         """写：改期——把截止时间换成 ``due``，只动 ``dueDate`` 与 ``isAllDay``。
 
         ``due=None`` 是**清除**（详细页 #44 的「把任务变回没有日期」）：写显式的
         ``dueDate: null``，让服务端知道这一格空了，而不是「别动它」。
+
+        回报这次到底改了没有（#79）：那一刻与本地那一份相同（同一个时刻的两种写法也算相同）
+        回 ``False``——详细页「一个字都没改就提交」那一次空写走的就是这里。
         """
         ...
 
@@ -473,8 +488,11 @@ class Engine(Protocol):
 
     def update_list(
         self, list_id: str, *, name: str | None = None, color: str | None = None
-    ) -> None:
-        """写：改清单的名字与颜色（``e``）——没给的字段不动（#42）。"""
+    ) -> bool:
+        """写：改清单的名字与颜色（``e``）——没给的字段不动（#42）。
+
+        回报这次到底改了没有（#79）：给的字段都与本地那一行相同时回 ``False``。
+        """
         ...
 
     def delete_list(self, list_id: str) -> None:
@@ -489,9 +507,12 @@ class Engine(Protocol):
         """
         ...
 
-    def update_view(self, definition: ViewDefinition) -> None:
+    def update_view(self, definition: ViewDefinition) -> bool:
         """写：改一个自定义视图的条件与名字（``e``）；本地没有这一行时抛
-        :class:`~dida.sync.views.UnknownViewError`（#36）。"""
+        :class:`~dida.sync.views.UnknownViewError`（#36）。
+
+        回报这次到底改了没有（#79）：交回来的那份与本地那一行一样时回 ``False``。
+        """
         ...
 
     def delete_view(self, view_id: str) -> None:

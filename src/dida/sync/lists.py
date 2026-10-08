@@ -78,6 +78,7 @@ from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 from dida.api.errors import DidaError
 from dida.sync.push import backoff_delay, can_attempt
 from dida.sync.view import ListSnapshot, ViewSource
+from dida.sync.writes import is_a_change
 from dida.vocabulary import (
     LOCAL_LIST_PREFIX,
     ListBehaviour,
@@ -172,23 +173,26 @@ def is_list_edit(
     （``color=None`` 是「别动颜色」，不是「清空颜色」）。给了的字段与当前值相同也不算——
     一次「保存」把原样交回来的那份写下去，与它根本不该发生是同一条。
 
-    **两个时刻各问一次**，与 :func:`dida.sync.writes.is_a_move` 同一个形状：
+    比较本身交给 :func:`dida.sync.writes.is_a_change`（工单 #79 立的**那一个**判据本体）：
+    这一处只把两个当前值摆成它的形状（没给的字段干脆不出现在 ``changes`` 里），不自己再比
+    一遍。所以「改字段」与「改清单」用的是同一条口径。
 
-    - 引擎在 :meth:`ListMixin.update_list` 里问它，决定**写不写**（不入队、不排推送）。这条
-      判断长在引擎这一层，是因为 ``update_list`` 是公开的写入口——谁都可能调它。
-    - 界面在 :meth:`~dida.tui.app.DidaApp._finish_list_form` 里问它，决定**叫不叫**引擎写。
-      那一问不是多余：接缝一上的假后端自己实现写路径（与 ``FakeBackend.move_task`` 同一条），
-      界面不问就会为一次没发生的改动记下一笔（``tests/test_list_overlay.py`` 钉着那句
-      「一笔都没有」）。
+    引擎在 :meth:`ListMixin.update_list` 里问它，决定**写不写**，并把答案回报给调用方
+    （#79：这条路径的签名从 ``-> None`` 变成 ``-> bool``）。界面**不再**问第二遍——它已经按
+    回报值决定说不说「已保存」了。
 
-    参数是**两个当前值**而不是一份本地原文：两个调用方手里各是一份形状不同的底稿（引擎是
-    ``list_payload`` 那份词典、界面是清单索引里那一行 ``ListRow``），而这条判据只该认值。
+    参数是**两个当前值**而不是一份本地原文：调用方手里是 ``list_payload`` 那份词典里的两位，
+    而这条判据只该认值。
     """
-    if name is not None and name != current_name:
-        return True
-    if color is not None and color != current_color:
-        return True
-    return False
+    changes: dict[str, Any] = {}
+    if name is not None:
+        changes["name"] = name
+    if color is not None:
+        changes["color"] = color
+    return is_a_change(
+        {"name": current_name, "color": current_color},
+        changes,
+    )
 
 
 class AmbiguousLocalListError(DidaError):
@@ -324,8 +328,12 @@ class ListMixin:
 
     def update_list(
         self, list_id: str, *, name: str | None = None, color: str | None = None
-    ) -> None:
+    ) -> bool:
         """改清单的名字与颜色：本地当场生效并入队，然后立即排一轮推送。
+
+        **回报这次到底改了没有**（工单 #79）：一位都不变时什么都不写——不入队、不排推送，
+        回 ``False``；真改了回 ``True``。调用方按这个值决定说不说「已保存」，不必自己再比
+        一遍（#66 落地时界面确实问过同一个判据，#79 之后它不再问）。
 
         没给的字段**不动**（``color=None`` 是「别动颜色」，不是「清空颜色」）：请求体里
         只有这次真的要改的那些，其余的由客户端在推送时从本地原文里 echo 回去
@@ -350,7 +358,7 @@ class ListMixin:
             name=name,
             color=color,
         ):
-            return
+            return False
         changes: dict[str, Any] = {}
         if name is not None:
             changes["name"] = name
@@ -358,7 +366,7 @@ class ListMixin:
             changes["color"] = color
         if is_local_list_id(list_id):
             self._fold_into_unclaimed(target, list_id, current=current, changes=changes)
-            return
+            return True
         target.enqueue_list(
             list_id=list_id,
             kind=ListWriteKind.UPDATE,
@@ -367,6 +375,7 @@ class ListMixin:
             local={**current, **changes},
         )
         self._push_now()
+        return True
 
     def _fold_into_unclaimed(
         self,

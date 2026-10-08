@@ -59,6 +59,7 @@ from dida.api.guards import all_day_date
 from dida.logical_day import logical_day
 from dida.sync.rows import row_order_tail
 from dida.sync.view import PRIORITY_CYCLE, PRIORITY_NAMES, TaskSnapshot, due_day, is_overdue
+from dida.sync.writes import is_a_change
 from dida.vocabulary import (
     ANY_VALUE,
     Completion,
@@ -608,18 +609,18 @@ def is_view_edit(current: ViewDefinition, definition: ViewDefinition) -> bool:
     维度一维都不用在这里重数一遍。在界面那一侧逐格重比一份是不行的——加一维（#36 就是这么
     加的）就会漏掉一处，而漏掉的那一处正是「改了那一维却不写」。
 
-    **两个时刻各问一次**，与 :func:`dida.sync.lists.is_list_edit` / ``is_a_move`` 同一个形状：
+    比较本身交给 :func:`dida.sync.writes.is_a_change`（工单 #79 立的**那一个**判据本体）：
+    两份定义各自读成落库的那份原文（:func:`view_payload`），逐位比。这一处只做「值 → 原文」
+    的翻译，不自己再比一遍——所以「改视图」与「改字段」「改清单」用的是同一条口径。
 
-    - 引擎在 :meth:`ViewMixin.update_view` 里问它，决定**写不写**（本地那一行不重写）。
-    - 界面在 :meth:`~dida.tui.app.DidaApp._finish_view_form` 里问**同一个**函数，决定**叫不叫**
-      引擎写。那一问不是多余：接缝一上的假后端自己实现视图写路径（``FakeBackend.update_view``
-      记一笔再交给真引擎），界面不问就会为一次没发生的改动记下一笔
-      （``tests/test_view_overlay.py`` 钉着那句「一笔都没有」）。
+    引擎在 :meth:`ViewMixin.update_view` 里问它，决定**写不写**，并把答案回报给调用方
+    （#79：签名从 ``-> None`` 变成 ``-> bool``）。界面**不再**问第二遍——它已经按回报值走
+    下一步了。
 
     本地没有那一行时**不归它管**：那是 :meth:`ViewMixin.update_view` 的 ``UnknownViewError``
     ——「不存在」与「没改」是两件事，混成一个判断会让前者静默变成后者。
     """
-    return current != definition
+    return is_a_change(view_payload(current), view_payload(definition))
 
 
 class ViewMixin:
@@ -645,21 +646,22 @@ class ViewMixin:
         target.save_view(replace(definition, id=view_id))
         return view_id
 
-    def update_view(self, definition: ViewDefinition) -> None:
+    def update_view(self, definition: ViewDefinition) -> bool:
         """改一个视图的条件与名字：那一行原地换掉（位置不动，建完再改不会跳到末尾）。
 
-        交回来的那份与本地那一行**逐字段相同**时什么都不写（#66 的验收标准 3 / 用户故事 134）
-        ——判据在 :func:`is_view_edit`，这里不另写一遍。``esc`` 从 #66 起是「保存并退出」，
-        所以「开了表单又没改」这条路真的会走到；为一次没发生的改动重写本地那一行，就是
-        「一次写」发生了。
+        **回报这次到底改了没有**（工单 #79）：交回来的那份与本地那一行**逐字段相同**时什么都
+        不写、回 ``False``（#66 的验收标准 3 / 用户故事 134）——判据在 :func:`is_view_edit`，
+        这里不另写一遍。``esc`` 从 #66 起是「保存并退出」，所以「开了表单又没改」这条路真的
+        会走到；为一次没发生的改动重写本地那一行，就是「一次写」发生了。真改了回 ``True``。
         """
         target = self._view_target()
         current = target.view_definition(definition.id)
         if current is None:
             raise UnknownViewError(definition.id)
         if not is_view_edit(current, definition):
-            return
+            return False
         target.save_view(definition)
+        return True
 
     def delete_view(self, view_id: str) -> None:
         """删一个视图：**只摘掉这一行**。

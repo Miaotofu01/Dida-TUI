@@ -29,8 +29,12 @@ class ScheduleMixin:
 
 
 
-    def defer(self, task_id: str, *, days: int = 1) -> None:
+    def defer(self, task_id: str, *, days: int = 1) -> bool:
         """写：顺延到下一个逻辑日（``g``）；``days=7`` 是下周同一天（``G``）。t13 实现。
+
+        **回报这次到底挪了没有**（工单 #79）：落点与原来的截止时间相同时什么都不写，回
+        ``False``；本地没有这条任务、或者它没有截止时间可以挪，同样是 ``False``（那不是一次
+        改动，凭空补一个日期只会改到用户没碰过的东西）；真挪了回 ``True``。
 
         落点由 :func:`dida.logical_day.logical_day` 决定，TUI 不重算任何日界：先找出目标
         逻辑日（``[start, end)`` 的 ``end`` 就是下一个逻辑日），再把这条任务**原来的墙钟
@@ -38,7 +42,8 @@ class ScheduleMixin:
         明天，而不是机器日历日 +1——顺延过的任务醒来时仍然读作「今日」，不会被判成逾期。
 
         只改 ``dueDate`` 一个字段（GLOSSARY 的「顺延」），而且走 :meth:`write` 那条写路径：
-        本地当场生效、立即推送、推不动就留在队列里按注入的钟退避重试。
+        本地当场生效、立即推送、推不动就留在队列里按注入的钟退避重试。**收敛也发生在那里**
+        ——同一个判据本体比的是本地那一份原文，这一层不自己再比一遍。
 
         **全天任务**的落点也是逻辑日，但形状归 UTC（#73）：写的是目标日那一天的 UTC 午夜，
         这条任务原来那一份的时刻与偏移都不参与。带时刻的任务照旧把原来的墙钟时刻放进目标
@@ -47,17 +52,22 @@ class ScheduleMixin:
         target = self._write_target()
         payload = target.task_payload(task_id)
         if payload is None:  # 本地没有这条任务，就没有「当前的截止时间」可挪
-            return
+            return False
         changes = _defer_changes(payload, now=self._clock.now(), day_end=self._day_end, days=days)
         if changes is None:  # 没有截止时间可挪：无日期的任务不凭空长出一个日期来
-            return
-        self.write(task_id, changes=changes)
+            return False
+        return self.write(task_id, changes=changes)
 
-    def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> None:
+    def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> bool:
         """写：改期——把截止时间换成给定那一刻，只动 ``dueDate`` 与 ``isAllDay``。
 
+        **回报这次到底改了没有**（工单 #79）：那一刻与本地那一份是同一个时刻（同一个逻辑日、
+        同一个 offset 的两种写法都算）、``isAllDay`` 也一样时什么都不写，回 ``False``——详细页
+        「一个字都没改就提交」那一次空写（ADR-0008 第二节）走的就是这里；真改了回 ``True``。
+
         「改成哪一天」由调用方（#44 的结构化选择器）定；这里只把结果交给 :meth:`write`：
-        本地当场生效、立即推送、推不动留在队列里按注入的钟退避重试。
+        本地当场生效、立即推送、推不动留在队列里按注入的钟退避重试。收敛本身在 ``write``
+        那一边（判据只有一个本体），这一层不另写一遍。
 
         **截止时间原样写回，不做任何逻辑日加减。** ``all_day=True`` 时 ``due`` 是那一天的
         00:00，是个**日期标记**：按 ``[start, end)`` 去把它挪进「当前逻辑日」，会让一个
@@ -74,7 +84,7 @@ class ScheduleMixin:
         UTC 午夜，它携带的时刻与偏移都不写出去（#73）。所以这条路上调用方的时区在「全天」
         那一档上不再被需要——带时刻那一档照旧用它（``api_date`` 不换时区）。
         """
-        self.write(task_id, changes=_date_changes(due=due, all_day=all_day))
+        return self.write(task_id, changes=_date_changes(due=due, all_day=all_day))
 
 
 def _date_changes(*, due: datetime | None, all_day: bool) -> dict[str, Any]:

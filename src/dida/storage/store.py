@@ -81,6 +81,10 @@ from dida.vocabulary import (
     ViewDefinition,
     WriteKind,
     is_local_list_id,
+    read_priority,
+    read_tags,
+    read_text,
+    read_time,
     view_from_payload,
     view_payload,
 )
@@ -1186,23 +1190,27 @@ def _snapshot(payload: Mapping[str, Any]) -> TaskSnapshot:
 
     只翻译，不判断：``status`` 是不是「已完成」由 API 决定（Completed 是 ``2``），
     这条属于今日还是逾期则完全不是这里的事。
+
+    每一格怎么读（文本缺省空串 / 优先级缺省 ``0`` / 标签只留字符串 / 日期吃不下就当没有）
+    归 :func:`dida.vocabulary.read_text` 一族：写路径的「这次到底改了没有」（#79）读同一份
+    口径，两边才不会一个说改了、一个说没改。
     """
     due = payload.get("dueDate")
     completed_at = payload.get("completedTime")
     return TaskSnapshot(
         id=str(payload["id"]),
-        title=str(payload.get("title") or ""),
+        title=read_text(payload.get("title")),
         list_id=_list_id_of(payload),
-        due=_parse_time(due) if isinstance(due, str) else None,
+        due=read_time(due),
         all_day=bool(payload.get("isAllDay")),
-        priority=int(payload.get("priority") or 0),
+        priority=read_priority(payload.get("priority")),
         completed=payload.get("status") == COMPLETED_STATUS,
-        completed_at=_parse_time(completed_at) if isinstance(completed_at, str) else None,
-        desc=_text(payload.get("desc")),
-        content=_text(payload.get("content")),
-        tags=_tag_names(payload.get("tags")),
+        completed_at=read_time(completed_at),
+        desc=read_text(payload.get("desc")),
+        content=read_text(payload.get("content")),
+        tags=read_tags(payload.get("tags")),
         # 重复规则与提醒只读（v2 不改它们），行里要的只是「有没有」；原文照旧整份留在 raw 里。
-        repeat_flag=_text(payload.get("repeatFlag")),
+        repeat_flag=read_text(payload.get("repeatFlag")),
         reminders=_texts(payload.get("reminders")),
     )
 
@@ -1224,46 +1232,13 @@ def _change(row: sqlite3.Row) -> PendingChange:
     )
 
 
-def _parse_time(value: str) -> datetime | None:
-    """解析服务端日期。
-
-    文档的形状是 ``yyyy-MM-dd'T'HH:mm:ssZ``，实测里偏移既可能是 ``+0800`` 也可能是
-    ``+08:00``，还可能带毫秒。``fromisoformat``（3.11+）这几种都吃得下；吃不下就当作
-    没有截止时间，绝不让一条脏日期把整个刷新带崩。
-    """
-    try:
-        return datetime.fromisoformat(value)
-    except ValueError:
-        return None
-
-
 def _texts(value: Any) -> tuple[str, ...]:
     """服务端的一段**字符串数组**（``reminders``）→ 元组；不是数组就当没有。
 
-    与 :func:`_text` 同一条口径：脏字段不该把整次刷新带崩。元素逐条转成字符串——触发器
-    原文长什么样不由这一层解释（那是只读展示的事）。
+    与 :func:`dida.vocabulary.read_text` 同一条口径：脏字段不该把整次刷新带崩。元素逐条转成
+    字符串——触发器原文长什么样不由这一层解释（那是只读展示的事）。
     """
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         return ()
     return tuple(str(item) for item in value)
 
-
-def _text(value: Any) -> str:
-    """服务端的一段文字（``desc`` / ``content``）→ 快照上的字符串。
-
-    不是字符串就当没有（与 :func:`_parse_time` 同一条口径）：一条脏字段不该把整次刷新带崩，
-    右栏少一行远好过一屏都读不出来。
-    """
-    return value if isinstance(value, str) else ""
-
-
-def _tag_names(value: Any) -> tuple[str, ...]:
-    """任务上的 ``tags`` → 标签名。
-
-    服务端给的是一串名字（``probe-update-semantics.py`` 实测写进去的是 ``["probe-tag"]``）。
-    不是数组、或者数组里混了不是字符串的东西，就跳过那一个：标签是展示用的，不值得为它
-    丢掉一整次刷新。顺序照服务端给的来——排序是服务端的事。
-    """
-    if not isinstance(value, (list, tuple)):
-        return ()
-    return tuple(item for item in value if isinstance(item, str) and item)
