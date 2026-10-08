@@ -510,7 +510,8 @@ async def test_the_tag_field_picks_from_existing_tags_and_says_new_ones_come_fro
         await pilot.pause()
         after = screen_text(app)
 
-    assert fake.tag_loads == 1, "打开挑标签那一格时才拉一次标签列表"
+    fetched = [r for r in fake.transport.requests if r.url.path == "/open/v1/tag"]
+    assert len(fetched) == 1, "打开挑标签那一格时才拉一次标签列表"
     assert tag_marked(picker, "工作") and tag_marked(picker, "季度"), f"任务上已有的标签没打上：\n{picker}"
     assert not tag_marked(picker, "紧急"), f"没打过的标签不该是打上的：\n{picker}"
     assert tag_marked(walked, "季度") and not tag_marked(walked, "紧急"), f"↓ 没有换到下一个：\n{walked}"
@@ -527,9 +528,12 @@ async def test_a_tag_list_that_cannot_be_fetched_is_said_out_loud_and_local_tags
 
     悄悄换成空列表就是「你没有标签」，那是对用户说假话；而任务上已经打着的标签必须留在
     可挑的那一份里，否则断网时「取消一个标签」无路可走。
+
+    失败摆在**传输层**（``GET /open/v1/tag`` 连不上）：那才是这个错误真正的来源，
+    替身的方法上摆一个异常测不到「请求发出去了、回来的路断了」这一段。
     """
     fake = backend()
-    fake.tag_error = DidaError("连不上服务器")
+    fake.transport.enqueue(httpx.ConnectError("连不上服务器"))
     app = DidaApp(fake)
 
     async with app.run_test(size=WIDE) as pilot:

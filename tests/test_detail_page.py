@@ -20,7 +20,7 @@ from textual._xterm_parser import XTermParser
 
 from dida.api.client import DidaApiClient
 from dida.storage.store import Store
-from dida.sync.engine import NO_DUE_TEXT, DidaError, UnknownTaskError
+from dida.sync.engine import NO_DUE_TEXT, UnknownTaskError
 from dida.sync.engine import SyncEngine
 
 from rich.cells import cell_len
@@ -954,24 +954,30 @@ async def test_a_refused_save_says_which_refusal_it_was():
 
 
 async def test_a_save_failure_that_is_not_the_known_one_still_names_the_reason():
-    """别的写失败也带上具体那一句（验收标准 9）：前缀之后是原因，不是一个句号。"""
-    fake = backend()
-    fake.write_error = DidaError("服务端说这个字段不行")
+    """别的写失败也带上具体那一句（验收标准 9）：前缀之后是原因，不是一个句号。
+
+    这一格用**真货**的那一句来试：任务还在等认领（本地 id，服务端还没给它 id）时引擎当场
+    拒绝（``UnclaimedTaskError``，工单 #53）。它不属于「本地没有这一条」那一类（本地明明
+    有），所以走的是**带上原因**的那一支——原来这里靠替身摆一个 ``write_error``，那不是这个
+    错误真正的来源。
+    """
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_task("还没同步完的", list_name="work", id="local-task-1")
     app = DidaApp(fake)
 
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
         await enter_detail(pilot, app)
         await pilot.press("enter")
-        await pilot.press(*clear(len(TITLE)))
+        await pilot.press(*clear(len("还没同步完的")))
         await pilot.press(*"新标题")
         await pilot.press("escape")
         await pilot.pause()
         text = screen_text(app)
 
-    assert messages.field_save_failed_message("服务端说这个字段不行") in text, (
-        f"保存失败没有带上具体原因：\n{text}"
-    )
+    assert "这条任务还在等同步" in text, f"保存失败没有带上具体原因：\n{text}"
+    assert "local-task-1" in text, f"原因里没说清是哪一条：\n{text}"
 
 
 # ------------------------------------------------------------------ 截止时间（#44）

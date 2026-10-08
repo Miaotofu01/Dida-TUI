@@ -449,14 +449,25 @@ class _FakeBackendServer(FakeTransport):
     带上服务端给的 id（认领因此真的发生）。
 
     它只做两件事：**记请求**、**回一个说得过去的响应**——没有任何业务判断。
+
+    要试「某一次请求失败了」，就在这上面 :meth:`~dida.testing.FakeTransport.enqueue` 一个异常
+    或一条 4xx/5xx 响应：失败摆在**传输层**，那才是错误真正的来源。摆进来的那一份照旧
+    先于按端点拼的响应出队。
     """
 
     def __init__(self) -> None:
         super().__init__()
         self._created = 0
+        self.tags: list[dict[str, Any]] = []
+        """摆进来的那一份「服务端有的标签」（``GET /open/v1/tag`` 的响应体）。"""
 
     async def send(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
+        if self._responses:
+            response = self._responses.popleft()
+            if isinstance(response, Exception):
+                raise response
+            return response
         return self._respond(request)
 
     def _respond(self, request: httpx.Request) -> httpx.Response:
@@ -484,7 +495,7 @@ class _FakeBackendServer(FakeTransport):
         if method == "GET" and path == "/open/v1/project":
             return httpx.Response(200, json=[])
         if method == "GET" and path == "/open/v1/tag":
-            return httpx.Response(200, json=[])
+            return httpx.Response(200, json=self.tags)
         if method == "GET" and path.endswith("/data"):
             return httpx.Response(200, json={"project": None, "tasks": []})
         return httpx.Response(200, json={})
@@ -549,9 +560,6 @@ class FakeBackend:
         self.rescheduled_all_day: list[bool] = []
         """每次改期是不是全天，与 ``rescheduled`` 一一对应。"""
 
-        self.reschedule_error: Exception | None = None
-        """摆一个异常进去，``reschedule`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。"""
-
         self.created: list[str] = []
         """``create(title, ...)`` 收到的标题，按调用顺序（t15 的新建）。"""
 
@@ -578,15 +586,6 @@ class FakeBackend:
         （#45 的搬运）。与 ``writes`` 分开记：搬运**不是**一次普通字段更新，混在一起就看不出
         它到底走了哪条路。"""
 
-        self.tag_loads = 0
-        """``load_tags()`` 被调用的次数（#45：打开挑标签那一格才拉一次）。"""
-
-        self.tag_error: Exception | None = None
-        """摆一个异常进去，``load_tags`` 就抛它（试界面拉不到标签列表时的反应）。"""
-
-        self._tags: tuple[str, ...] = ()
-        """摆进来的那一份「服务端有的标签」（:meth:`set_tags`）。"""
-
         self.writes: list[tuple[str, dict[str, Any]]] = []
         """``write(task_id, changes=)`` 收到的每一笔（任务 id + 改动的字段），按调用顺序。
 
@@ -595,14 +594,21 @@ class FakeBackend:
         """
 
         self.write_error: Exception | None = None
-        """摆一个异常进去，``write`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。
+        """摆一个异常进去，``write`` / ``move_task`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。
 
-        与 ``reschedule_error`` / ``delete_error`` 同一形状：引擎当场拒绝（#25 的
-        ``UnknownTaskError``）时界面要说出**具体**原因。
+        **这一格是方法级的，故意的**：它模拟的是引擎**同步拒绝**（#25 的
+        ``UnknownTaskError``——本地没有这条任务的底稿），不是网络或服务端拒绝。挪到传输层
+        复现不出来：那样乐观写会先落地（屏幕上新标题已经变了），而后端才失败——那正是
+        ``tests/test_detail_page.py::test_a_refused_save_says_which_refusal_it_was`` 要断的
+        反面。真正的网络 / 服务端失败（标签列表、推送）一律摆在传输层。
         """
 
         self.delete_error: Exception | None = None
-        """摆一个异常进去，``delete`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。"""
+        """摆一个异常进去，``delete`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。
+
+        与 :attr:`write_error` 同一格：模拟的是引擎**同步拒绝**（本地没有这条任务的底稿），
+        不是网络失败——传输层复现不出「当场拒绝」，删除那一笔会先乐观落地。
+        """
 
         self.created_lists: list[tuple[str, str | None]] = []
         """``create_list(name, color=)`` 收到的每一笔，按顺序（#42）。"""
@@ -613,9 +619,6 @@ class FakeBackend:
         self.deleted_lists: list[str] = []
         """``delete_list(list_id)`` 收到的清单 id，按顺序（#42）。"""
 
-        self.list_error: Exception | None = None
-        """摆一个异常进去，清单的三种写就抛它（试 TUI 拿到结构化错误时的反应）。"""
-
         self.created_views: list[ViewDefinition] = []
         """``create_view(definition)`` 收到的每一笔，按顺序（#36）。"""
 
@@ -624,9 +627,6 @@ class FakeBackend:
 
         self.deleted_views: list[str] = []
         """``delete_view(view_id)`` 收到的视图 id，按顺序（#36）。"""
-
-        self.view_error: Exception | None = None
-        """摆一个异常进去，视图的三种写就抛它（与 ``list_error`` 同一条口径）。"""
 
         self._seq = 0
         """``add_task`` 不给 id 时的计数器（``t1``、``t2``……）。"""
@@ -811,27 +811,21 @@ class FakeBackend:
         return self._engine.move_targets()
 
     def set_tags(self, *names: str) -> None:
-        """摆一份「服务端有的标签」（#45）：下一次 :meth:`load_tags` 就交回这一份。
+        """摆一份「服务端有的标签」（#45）：那一个端点下一次就回这一份。
 
-        替身不自己编标签——编出来的东西会让「挑得到哪些标签」这句话变成空话（与
-        :meth:`add_view` 只摆定义、不求值同一条口径）。
+        摆的是**假服务端的响应体**（``GET /open/v1/tag``），不是替身内存里另存一份：
+        :meth:`load_tags` 走真引擎、真客户端、真传输层，标签从哪儿来只剩服务端这一处；
+        要试「拉不到」，就往传输层摆一个网络错或 4xx/5xx（``self.transport.enqueue(...)``）。
         """
-        self._tags = tuple(names)
+        self.transport.tags = [{"name": name} for name in names]
 
     async def load_tags(self) -> tuple[str, ...]:
-        """读：把摆进来的那一份交回去（#45），并记下拉过几次。
-
-        摆了 ``tag_error`` 就抛它：模拟拉不到标签列表（断网、服务端拒绝），好试界面
-        「说出来 + 照旧让用户挑本地已知的」那两半。
-        """
-        self.tag_loads += 1
-        if self.tag_error is not None:
-            raise self.tag_error
-        return self._tags
+        """读：委托给真引擎（发出 ``GET /open/v1/tag``，拉一次、记在引擎内存里）。"""
+        return await self._engine.load_tags()
 
     def tags(self) -> tuple[str, ...]:
-        """读：摆进来的那一份 ∪ 本地任务上出现过的那些（与真引擎同一条口径）。"""
-        return tuple(dict.fromkeys((*self._tags, *self._engine.tags())))
+        """读：委托给真引擎（服务端那一份 ∪ 本地任务上出现过的那些）。"""
+        return self._engine.tags()
 
     def task_detail(self, task_id: str) -> TaskDetail | None:
         """读：委托给真引擎（详情页的字段，含原文里我们不认识的那些）。"""
@@ -901,16 +895,8 @@ class FakeBackend:
         没改的提交因此看起来也不像一次写（#39 的教训：替身编一份自己的判断，测试就会静默
         断言成别的东西）。
 
-        摆了 ``reschedule_error`` 就记完这一笔再抛：模拟引擎当场拒绝（#25 的
-        ``UnknownTaskError``），好试 TUI 拿到结构化错误时的反应——抛在交给引擎**之前**，
-        「当场拒绝」的意思就是这一笔没写成。本地没有这条任务的底稿时与 :meth:`write`
-        一样不当场拒绝，只回 ``False``。
+        本地没有这条任务的底稿时与 :meth:`write` 一样不当场拒绝，只回 ``False``。
         """
-        if self.reschedule_error is not None:
-            self.rescheduled.append(task_id)
-            self.rescheduled_due.append(due)
-            self.rescheduled_all_day.append(all_day)
-            raise self.reschedule_error
         if self.source.task_payload(task_id) is None:
             return False
         changed = self._engine.reschedule(task_id, due=due, all_day=all_day)
@@ -1028,7 +1014,6 @@ class FakeBackend:
         本地临时 id 由真库的发号器给（服务端建好之后才给真 id）。
         """
         self.created_lists.append((name, color))
-        self._raise_list_error()
         return self._engine.create_list(name, color=color)
 
     def update_list(
@@ -1038,13 +1023,9 @@ class FakeBackend:
 
         **同值收敛**（#79）：交回来的两位与本地那一行相同时引擎什么都不写、回 ``False``——
         判据是生产那一份（:func:`~dida.sync.lists.is_list_edit`，本体在 ``writes``），替身
-        不再自己比一遍；空操作**不记账**（``updated_lists`` 里不留这一笔）。
-        摆了 ``list_error`` 就记完这一笔再抛（引擎当场拒绝那条路）；本地没有这一行的原文时
-        与旧替身一样不当场拒绝，只回 ``False``。
+        不再自己比一遍；空操作**不记账**（``updated_lists`` 里不留这一笔）。本地没有这一行的
+        原文时与旧替身一样不当场拒绝，只回 ``False``。
         """
-        if self.list_error is not None:
-            self.updated_lists.append((list_id, name, color))
-            raise self.list_error
         if self.source.list_payload(list_id) is None:
             return False
         changed = self._engine.update_list(list_id, name=name, color=color)
@@ -1055,20 +1036,13 @@ class FakeBackend:
     def delete_list(self, list_id: str) -> None:
         """写：记下这一笔，并交给真引擎删那一行（只动清单那一行）。"""
         self.deleted_lists.append(list_id)
-        self._raise_list_error()
         if self.source.list_payload(list_id) is None:
             return
         self._engine.delete_list(list_id)
 
-    def _raise_list_error(self) -> None:
-        """摆了 ``list_error`` 就在记完这一笔之后抛它（引擎当场拒绝的那条路）。"""
-        if self.list_error is not None:
-            raise self.list_error
-
     def create_view(self, definition: ViewDefinition) -> str:
         """写：记下这一笔，并交给真引擎落库（**只在本地**，视图不推服务端）。"""
         self.created_views.append(definition)
-        self._raise_view_error()
         return self._engine.create_view(definition)
 
     def update_view(self, definition: ViewDefinition) -> bool:
@@ -1077,11 +1051,7 @@ class FakeBackend:
         **同值收敛**（#79）：交回来的那份与本地那一行一样时引擎什么都不做、回 ``False``——
         判据是生产那一份（:func:`~dida.sync.views.is_view_edit`，本体在 ``writes``），替身不
         自己再比一遍；空操作**不记账**（``updated_views`` 里不留这一笔）。
-        摆了 ``view_error`` 就记完这一笔再抛（引擎当场拒绝那条路）。
         """
-        if self.view_error is not None:
-            self.updated_views.append(definition)
-            raise self.view_error
         changed = self._engine.update_view(definition)
         if changed:
             self.updated_views.append(definition)
@@ -1090,14 +1060,8 @@ class FakeBackend:
     def delete_view(self, view_id: str) -> None:
         """写：记下这一笔，并交给真引擎摘掉那一行（**一条任务都不碰**）。"""
         self.deleted_views.append(view_id)
-        self._raise_view_error()
         self._engine.delete_view(view_id)
 
     def view_definition(self, view_id: str) -> ViewDefinition | None:
         """读：委托给真引擎（本地库里那一行定义；没建过就是 ``None``）。"""
         return self._engine.view_definition(view_id)
-
-    def _raise_view_error(self) -> None:
-        """摆了 ``view_error`` 就在记完这一笔之后抛它（引擎当场拒绝的那条路）。"""
-        if self.view_error is not None:
-            raise self.view_error
