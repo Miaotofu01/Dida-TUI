@@ -88,11 +88,21 @@ class Reply:
     refused: Callable[[DidaError], str] | None = None
     landing: Landing = Landing.STATUS
 
-    def sentence(self, error: DidaError) -> str | None:
-        """这次失败该说的那一句；``None`` = 这一种写没有失败这一档。"""
-        if self.refused is not None and isinstance(error, LOCAL_MISSING):
-            return self.refused(error)
-        return None if self.failed is None else self.failed(error)
+    def when_missing(self, error: DidaError) -> str | None:
+        """第一类失败（**本地没有这一条**）该说的那一句话。
+
+        这一类没有专门说法的几种（清单 / 视图 / 完成 / 删除 / 新建）由 ``failed`` 那一支自己
+        分——``messages`` 里那几句本来就认得出两种，所以不必各写一遍。
+        """
+        return self._sentence(self.refused if self.refused is not None else self.failed, error)
+
+    def when_rejected(self, error: DidaError) -> str | None:
+        """第二类失败（服务端与网络）该说的那一句话。"""
+        return self._sentence(self.failed, error)
+
+    @staticmethod
+    def _sentence(word: Callable[[DidaError], str] | None, error: DidaError) -> str | None:
+        return None if word is None else word(error)
 
 
 # --------------------------------------------------------------------------- 措辞与落点那张表
@@ -162,11 +172,13 @@ class WriteFlow:
         try:
             wrote = write.perform()
         except LOCAL_MISSING as error:
-            # 第一类：本地没有这一条。与第二类分开接，因为用户该做的下一步不一样。
-            self._fail(write.reply, error)
+            # 第一类：**本地没有这一条**（用户该做的是刷新一下再看）。它与第二类分开接，
+            # 因为下一步完全不同，说的话也是两句。
+            self._fail(write.reply, error, sentence=write.reply.when_missing(error))
             return
         except DidaError as error:
-            self._fail(write.reply, error)
+            # 第二类：服务端与网络（断网、凭据失效、服务端拒绝）。
+            self._fail(write.reply, error, sentence=write.reply.when_rejected(error))
             return
         if wrote is False:
             # 「什么都没改」（工单 #79）：不入队、不推、不重画、不出声——空操作在屏幕上
@@ -174,7 +186,8 @@ class WriteFlow:
             return
         if write.reply.landing is Landing.DETAIL:
             # 落在详细页底部的那几笔：等这一轮推送落地，那一行才知道写「已保存」还是
-            # 「待推送（N）」。**次序的唯一出处就是这三行**（先推再刷）。
+            # 「待推送（N）」。**次序的唯一出处就是这三行**（先推再刷）。落在状态栏的那几笔
+            # 不等它：引擎按配置自己排推送（默认立刻，ADR-0002），这一层不替它等网络。
             await self.engine.push_pending()
             if not self.is_running:
                 return
@@ -184,9 +197,12 @@ class WriteFlow:
             # （ADR-0007 四），不该被一次按键挤掉。
             self._notify_step(write.said)
 
-    def _fail(self, reply: Reply, error: DidaError) -> None:
-        """把这次失败说到它的落点上；声明了「没有失败这一档」的那种照旧往外抛（不吞）。"""
-        sentence = reply.sentence(error)
+    def _fail(self, reply: Reply, error: DidaError, sentence: str | None) -> None:
+        """把这次失败说到它的落点上；声明了「没有失败这一档」的那种照旧往外抛（不吞）。
+
+        那句话由调用方按**失败的种类**从 :class:`Reply` 上取好递进来（``when_missing`` /
+        ``when_rejected``），这里只管它落在哪、以及先说还是先重画。
+        """
         if sentence is None:
             raise error
         if reply.landing is Landing.DETAIL:
