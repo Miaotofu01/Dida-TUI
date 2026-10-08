@@ -1551,6 +1551,73 @@ async def test_the_due_editor_writes_out_an_explicit_null_shape(tmp_path):
     assert body["focusSummaries"] == [{"pomoCount": 1}], "服务端给的陌生字段一起回去（验收标准 8）"
 
 
+def repaint_answer(text: str, header: str, draft: str) -> tuple[bool, bool, bool]:
+    """重画之后屏幕上的答案：编辑器开着、草稿还在、字段列表没有回来（工单 #87）。
+
+    第三件按「优先级」那一行认，不按「标题」：编辑标题时屏幕上本来就有「编辑标题」这几个
+    字，拿「标题」当凭据会把编辑器那一行标题误当成字段列表回来了。
+    """
+    return (header in text, draft in text, "优先级" not in text)
+
+
+async def test_a_repaint_answers_the_same_for_the_text_editor_and_the_due_editor():
+    """重画对两种编辑器给出**同一个答案**（工单 #87）。
+
+    这一页「有没有编辑器开着」以前是两个开关、三种拼法，其中重画那一处只问了文本框那一个：
+    开着自由文本框时重画不动，开着截止编辑器时照样按字段列表去滚一遍光标。收成一个值之后
+    两种编辑器问的是同一句——用户手里那段文字（或者他正在改的那个日期）是他的，后台刷新与
+    窗口变化都不许把它换掉、也不许把字段列表翻上来。
+
+    断的是屏幕：两种编辑器各做一遍「进编辑 → 敲点东西 → 后台刷新 → 窗口变小」，重画之后
+    屏幕上那三件事必须一样——编辑器那一行标题还在、敲进去的草稿还在、字段列表没有回来。
+    （当初那两种答案在屏幕上并没有差别：编辑那一块是 ``1fr``，重画时这一页没有可滚的东西。
+    这一条守的是「两种编辑器从此问同一句」——编辑器被重画收掉、草稿被换掉这一类改动它当场红。）
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        refreshed = False
+
+        async def repaint() -> str:
+            """重画的两条路都走一遍：后台刷新送回来的那一趟，以及窗口变小那一下。"""
+            nonlocal refreshed
+            if not refreshed:
+                fake.add_task("刷新带回来的", list_name="work", id="t9", due=T0.replace(hour=9))
+                refreshed = True
+            app.refresh_view()
+            await pilot.pause()
+            await pilot.resize_terminal(WIDE[0] - 1, WIDE[1] - 1)
+            await pilot.pause()
+            return screen_text(app)
+
+        await pilot.press("enter")  # 标题：自由文本框
+        await pilot.press(*clear(len(TITLE)))
+        await pilot.press(*"还没交的标题")
+        await pilot.pause()
+        text_screen = await repaint()
+        text_answer = repaint_answer(text_screen, "编辑标题", "还没交的标题")
+        await pilot.press("escape")
+        await pilot.pause()
+
+        await walk_to_the_due_field(pilot, app)
+        await pilot.press("enter")  # 截止：结构化编辑器（先日期、再时刻）
+        await pilot.press(*clear(10))
+        await pilot.press(*"2026-04-01")
+        await pilot.pause()
+        due_screen = await repaint()
+        due_answer = repaint_answer(due_screen, "改截止", "2026-04-01")
+
+    assert text_answer == (True, True, True), f"重画把文本框换掉了：\n{text_screen}"
+    assert due_answer == (True, True, True), f"重画把截止编辑器换掉了：\n{due_screen}"
+    assert text_answer == due_answer, (
+        "重画对两种编辑器给了不同的答案——「有没有东西开着」只该有一个值：\n"
+        f"自由文本框：{text_answer}\n截止时间：{due_answer}"
+    )
+
+
 async def test_the_due_editor_emits_no_truecolor():
     """截止时间编辑器里**一格真彩色都没有**（工单 #44；ADR-0007 的第一条决定）。
 
