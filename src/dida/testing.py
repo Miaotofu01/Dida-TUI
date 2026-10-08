@@ -779,7 +779,8 @@ class FakeBackend:
 
         摆的是**假服务端的响应体**（``GET /open/v1/tag``），不是替身内存里另存一份：
         :meth:`load_tags` 走真引擎、真客户端、真传输层，标签从哪儿来只剩服务端这一处；
-        要试「拉不到」，就往传输层摆一个网络错或 4xx/5xx（``self.transport.enqueue(...)``）。
+        要试「拉不到」，用 :meth:`_FakeBackendServer.enqueue_for` 把网络错或 4xx/5xx
+        **钉在这个端点**上（按顺序摆会被更早的请求吃掉）。
         """
         self.transport.tags = [{"name": name} for name in names]
 
