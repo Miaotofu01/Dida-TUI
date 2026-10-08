@@ -145,6 +145,31 @@ async def test_a_refresh_adopts_a_newly_created_list(engine_class, store):
     assert local_id not in ids, "本地临时那一行让位给真 id"
 
 
+@pytest.mark.parametrize(
+    "engine_class", [SyncEngine, REORDERED], ids=["正常拼装", "倒过来拼"]
+)
+async def test_a_write_schedules_its_own_push_without_the_caller_asking(engine_class, store):
+    """写完之后**引擎自己**按配置排一轮推送——#83 那几笔不 await 的界面写靠的就是这条契约。
+
+    引擎内部的「写完立刻推」入口是 ``_push_now``（配置默认开着），而合成一台泵只动了泵的
+    内部形状、没有动它排的那一轮推谁：两种改动写完之后各自都会自己出去。这台引擎用默认配置
+    （``push_on_change=True``），测试不自己发起任何一轮推送，只等已经排下的那几轮跑完。
+    """
+    transport = FakeTransport(json={"id": "x"})
+    engine = engine_class(
+        clock=ManualClock(T0),
+        source=store,
+        client=DidaApiClient(token="tok", transport=transport),
+    )
+    store.apply_refresh(lists=[inbox(), project()], tasks=[task()])
+
+    assert engine.write("t1", changes={"title": "写周报（改）"}) is True
+    assert engine.update_list("work", name="工作（改）") is True
+    await engine.wait_for_pushes()
+
+    assert "https://api.dida365.com/open/v1/task/t1" in urls(transport), "任务那一笔自己出去了"
+    assert "https://api.dida365.com/open/v1/project/work" in urls(transport), "清单那一笔也是"
+
 def test_push_pending_and_refresh_have_exactly_one_implementation_each():
     """``push_pending`` 与 ``refresh`` 各自**只有一个实现**（#84 的验收标准）。
 
