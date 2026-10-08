@@ -46,7 +46,6 @@ from dida.sync.engine import (
     ListRow,
     SyncStatus,
     TaskDetail,
-    UnknownTaskError,
     ViewDefinition,
     ViewFormProblem,
     parse_view_form,
@@ -62,9 +61,9 @@ from dida.tui.keys import (
     bindings_for,
     help_body,
 )
-from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay, multi_values
+from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay
 from dida.tui.pages import DetailPage, IndexPage, TasksPage
-from dida.tui.pages.detail import LIST_FIELD, PRIORITY_FIELD, TAGS_FIELD, picker_spec
+from dida.tui.pages.detail import TAGS_FIELD, picker_spec
 from dida.tui.pages.index import (
     KIND_VIEW,
     LIST_COLOR_FIELD,
@@ -79,6 +78,17 @@ from dida.tui.pages.index import (
     view_write_refusal,
 )
 from dida.tui.pages.tasks import NEW_TASK_TITLE_FIELD, new_task_form_fields
+from dida.tui.write_flow import (
+    LIST_WRITE,
+    TASK_COMPLETE,
+    TASK_CREATE,
+    TASK_DEFER,
+    TASK_DELETE,
+    TASK_FIELD,
+    VIEW_WRITE,
+    Write,
+    WriteFlow,
+)
 
 if TYPE_CHECKING:  # 只为了标注周期泵那个句柄，运行时用不到
     from textual.timer import Timer
@@ -241,7 +251,7 @@ def save_line(status: SyncStatus) -> str:
     return messages.saved_message()
 
 
-class DidaApp(App[None]):
+class DidaApp(WriteFlow, App[None]):
     """一栏 + 三层页面 + 状态栏。"""
 
     ENABLE_COMMAND_PALETTE = False  # 命令面板会抢键；键位帮助是 h
@@ -622,38 +632,40 @@ class DidaApp(App[None]):
         """任务列表页上按了 ``←``：回清单列表页。"""
         self.back_to_index()
 
-    def on_tasks_page_toggle_complete(self, event: TasksPage.ToggleComplete) -> None:
+    async def on_tasks_page_toggle_complete(self, event: TasksPage.ToggleComplete) -> None:
         """任务列表页上按了 ``space``：完成 / 取消完成（工单 #38）。
 
         两个方向都是**乐观写**（ADR-0002）：本地当场生效、立即推送，界面不等网络。
         ``event.completed`` 是按下那一刻读模型里的状态，所以「取消完成」这条路的判据是
         服务端的 ``status``，不是这一层记的什么东西。
 
+        **后半段在 :mod:`dida.tui.write_flow`**：这里只声明「写了什么」与成功那句回声。
         引擎当场拒绝（本地已经没有这条任务的底稿，工单 #25）时如实说一句——按下去什么都
-        不发生，用户会以为它成了。**这一条路没有 ``await``**：``complete`` / ``uncomplete``
-        都是同步的（推送排在事件循环上，写的人当场返回），所以写完之后碰 DOM 不需要
-        「先问 ``is_running``」那道守卫；重画与 toast 各自还有一道，见它们的说明。
+        不发生，用户会以为它成了；说那一句、先推还是先刷、落在状态栏还是详细页底部，都不在
+        这一层。``complete`` / ``uncomplete`` 是同步的（推送排在事件循环上，写的人当场返回），
+        所以这条路没有要等的东西——它是协程只是因为它走的是那**一条**链。
 
         **完成这一下顺手排一次已完成流**（:meth:`pull_completed`，工单 #74）：本地刚完成的任务
         还没有 ``completedTime``（服务端要等推送落地才写），而周期泵只管推、不拉——不去拉它，
         那个时间戳永远回不来。取消完成不用拉：本地的 ``status`` 当场说了算（#38）。
         """
-        try:
-            if event.completed:
-                self.engine.uncomplete(event.task_id)
-            else:
-                self.engine.complete(event.task_id)
-        except DidaError as exc:
-            self._write_status(messages.toggle_complete_failed_message(exc))
-            return
-        self.refresh_view()
+        await self.finish_write(
+            Write(
+                perform=lambda: (
+                    self.engine.uncomplete(event.task_id)
+                    if event.completed
+                    else self.engine.complete(event.task_id)
+                ),
+                reply=TASK_COMPLETE,
+                said=(
+                    messages.uncompleted_message(event.title)
+                    if event.completed
+                    else messages.completed_message(event.title)
+                ),
+            )
+        )
         if not event.completed:
             self.pull_completed()
-        self._notify_step(
-            messages.uncompleted_message(event.title)
-            if event.completed
-            else messages.completed_message(event.title)
-        )
 
     def on_detail_page_back(self, event: DetailPage.Back) -> None:
         """详细页上按了 ``←``：回任务列表页。"""
@@ -668,7 +680,7 @@ class DidaApp(App[None]):
             self._finish_new_task,
         )
 
-    def _finish_new_task(self, values: dict[str, str] | None) -> None:
+    async def _finish_new_task(self, values: dict[str, str] | None) -> None:
         """表单关掉了：按填的标题建一条（空标题不建，如实说一句）。
 
         ``None`` 那条分支从 #66 起走不到了（表单没有「取消」，``Esc`` 就是保存），留着只是
@@ -682,6 +694,9 @@ class DidaApp(App[None]):
 
         「这个容器是不是视图」只在一处判（``TaskList.shows_list_name``），这一层不自己认识
         视图——两处各判一次就是两处会漂。
+
+        写成之后那一段（失败怎么说、推不推、重画）在 :mod:`dida.tui.write_flow`——这一层
+        只声明「写了什么」。
         """
         if values is None:
             return
@@ -694,19 +709,19 @@ class DidaApp(App[None]):
             return
         task_list = self.engine.tasks_in(container)
         destination = INBOX_ID if task_list.shows_list_name else container
-        try:
-            self.engine.create(
-                title,
-                destination,
-                due=task_list.implied_due,
-                # 隐含日期写成**全天**任务的日期标记：「今天」的意思是「今天要做」，
-                # 不是某个时刻（那个逻辑日自己怎么算由引擎给，这一层不算日期）。
-                all_day=task_list.implied_due is not None,
+        await self.finish_write(
+            Write(
+                perform=lambda: self.engine.create(
+                    title,
+                    destination,
+                    due=task_list.implied_due,
+                    # 隐含日期写成**全天**任务的日期标记：「今天」的意思是「今天要做」，
+                    # 不是某个时刻（那个逻辑日自己怎么算由引擎给，这一层不算日期）。
+                    all_day=task_list.implied_due is not None,
+                ),
+                reply=TASK_CREATE,
             )
-        except DidaError as exc:
-            self._write_status(messages.create_failed_message(exc))
-            return
-        self.refresh_view()
+        )
 
     async def on_detail_page_due_changed(self, event: DetailPage.DueChanged) -> None:
         """详细页上提交了截止时间：**改期 / 清除**立刻写出去（工单 #44）。
@@ -716,70 +731,44 @@ class DidaApp(App[None]):
         底稿照旧回写（重复规则、时区、陌生字段一个不丢）。
 
         ``event.due is None`` 是**清除**：写显式的 ``dueDate: null``，任务变回「没有日期」。
-        写失败与逐字段编辑那一侧同一套说法（用户故事 81）：本地没有底稿的拒绝用现成那句，
-        其余带上引擎/服务端说的具体原因。
 
-        ``reschedule`` **回报这次到底改了没有**（工单 #79）：回 ``False`` 时一个字都没写——
-        那一刻与本地那一份相同（用户把光标走到「截止」上、一个字都没改就按 ``enter``），
-        于是**不推、不重画、也不出声**，状态栏的「待推送」不为一个空操作亮起。这正是
-        ADR-0008 第二节记的那一次实测（连按三次 ``enter`` → 一笔空写）要消灭的东西。
+        **后半段（失败怎么说、先推再刷、结果落在哪）在 :mod:`dida.tui.write_flow`**：这里
+        只声明「写了什么」。``reschedule`` 回报这次到底改了没有（工单 #79）：回 ``False``
+        时一个字都没写——用户把光标走到「截止」上、一个字都没改就按 ``enter`` 走的就是
+        那一条（ADR-0008 第二节记的那次实测），于是不推、不重画、也不出声。
         """
-        try:
-            wrote = self.engine.reschedule(event.task_id, due=event.due, all_day=event.all_day)
-        except UnknownTaskError:
-            self.refresh_view()
-            if self.is_running:
-                self.detail_page().show_save(messages.UNKNOWN_TASK_MESSAGE)
-            return
-        except DidaError as exc:
-            self.refresh_view()
-            if not self.is_running:
-                return
-            self.detail_page().show_save(messages.field_save_failed_message(exc))
-            return
-        if not wrote:
-            return
-        await self.engine.push_pending()
-        if not self.is_running:
-            return
-        self.refresh_view()
+        await self.finish_write(
+            Write(
+                perform=lambda: self.engine.reschedule(
+                    event.task_id, due=event.due, all_day=event.all_day
+                ),
+                reply=TASK_FIELD,
+            )
+        )
 
     async def on_detail_page_field_edited(self, event: DetailPage.FieldEdited) -> None:
         """详细页上改完一个字段：**立刻写出去**，并把结果留在那一页底部（工单 #43）。
 
         乐观写（``write``）：本地当场生效、推送排到事件循环上立刻跑——用户按完 ``esc`` 不等
-        网络。后面那一次 ``push_pending`` 是**等这一笔落地**的确定性那一次（队列只有一条，
-        两次推送不会重复发），它回来之后底部那一行才知道该写「已保存」还是「待推送（N）」。
+        网络。
 
-        ``write`` **回报这次到底改了没有**（工单 #79）：回 ``False`` 时一个字都没写——用户
-        原样交回那一格，于是不推、不重画、也不出声（不新增「没有改动」这类提示）。界面不再
-        自己比一遍（#43 落地时这里比的是屏幕上那一行的值，与引擎手里的原文差着归一化）。
+        **后半段在 :mod:`dida.tui.write_flow`**：这里只声明「写了什么」。``write`` 回报这次
+        到底改了没有（工单 #79）：回 ``False`` 时一个字都没写——用户原样交回那一格——于是
+        不推、不重画、也不出声（不新增「没有改动」这类提示）。界面不再自己比一遍（#43 落地
+        时这里比的是屏幕上那一行的值，与引擎手里的原文差着归一化）。
 
         写失败分两种，两种都说出**具体**原因（用户故事 81）：引擎当场拒绝（本地没有这条任务
-        的底稿）在这里接住，用 ``messages`` 里那一句现成的话；推不出去（断网、服务端拒绝）
-        由引擎记在队列上，下一次 :meth:`update_status` 会把它读出来。
+        的底稿）是一句说得出名字的话；推不出去（断网、服务端拒绝）由引擎记在队列上，那一次
+        重画会把底部那一行写成它说的话。
         """
-        try:
-            wrote = self.engine.write(event.task_id, changes={event.field: event.value})
-        except UnknownTaskError:
-            # 「这条任务已经不在本地缓存里了，刷新之后再试一次」——本地没有底稿是一种**说得出
-            # 名字**的拒绝，不该混进「保存失败」那一类里（那条留给服务端与网络说的话）。
-            self.refresh_view()
-            if self.is_running:
-                self.detail_page().show_save(messages.UNKNOWN_TASK_MESSAGE)
-            return
-        except DidaError as exc:
-            self.refresh_view()
-            if not self.is_running:
-                return
-            self.detail_page().show_save(messages.field_save_failed_message(exc))
-            return
-        if not wrote:
-            return
-        await self.engine.push_pending()
-        if not self.is_running:
-            return
-        self.refresh_view()
+        await self.finish_write(
+            Write(
+                perform=lambda: self.engine.write(
+                    event.task_id, changes={event.field: event.value}
+                ),
+                reply=TASK_FIELD,
+            )
+        )
 
     # ---------------------------------------------------------------- 挑选型字段（#45）
 
@@ -815,77 +804,12 @@ class DidaApp(App[None]):
         )
         if spec is None:
             return
+        # 表单关掉之后只把**值**交回去：它是哪一格、值怎么读（线上编码）、失败怎么说、
+        # 结果落在哪，全在 :meth:`~dida.tui.write_flow.WriteFlow.pick_write` 那一处。
         self.push_screen(
             FormOverlay(title=spec.title, fields=spec.fields, hint=spec.hint),
-            partial(self._finish_pick, event.task_id, event.field),
+            partial(self.pick_write, event.task_id, event.field),
         )
-
-    async def _finish_pick(
-        self, task_id: str, field: str, values: dict[str, str] | None
-    ) -> None:
-        """挑选浮层关掉了：按挑的那一份写出去（``None`` 从 #66 起走不到，表单没有「取消」）。
-
-        三条路各自走该走的端点——**搬运不是一次普通字段更新**（``move_task``），优先级与
-        标签是普通更新（整份底稿带回去那件事由 ``update_task`` 的 ``snapshot=`` 管，
-        ``merge_snapshot`` 的既有策略）。写完照旧立刻推一轮、重画、把结果留在底部那一行：
-        与逐字段编辑（``on_detail_page_field_edited``）同一条规矩（验收标准 7）。
-        """
-        if values is None:
-            return
-        try:
-            wrote = self._apply_pick(task_id, field, values)
-        except UnknownTaskError:
-            self.refresh_view()
-            if self.is_running:
-                self.detail_page().show_save(messages.UNKNOWN_TASK_MESSAGE)
-            return
-        except DidaError as exc:
-            self.refresh_view()
-            if not self.is_running:
-                return
-            self.detail_page().show_save(messages.field_save_failed_message(exc))
-            return
-        if not wrote:
-            # 挑回原来那一档：没有改动就没有「立刻推送」这回事（队列里本来也不该多出一笔）。
-            return
-        await self.engine.push_pending()
-        if not self.is_running:
-            return
-        self.refresh_view()
-
-    def _apply_pick(self, task_id: str, field: str, values: dict[str, str]) -> bool:
-        """挑完的那一份怎么变成一次写（三条路各自的形状只在这一个地方）。
-
-        **回报「真的写了一笔吗」——而那个判断整个归引擎**（工单 #79）：挑回原来那一档时
-        写的那一次自己收敛掉（不写、不回推），回一个 ``False``；这一层不再自己比一遍。
-        在 #79 之前，这里比过三样东西，每样比的还是不同的底稿（清单比详情页里那一行、
-        优先级比 ``detail.priority``、标签比 ``detail.tags``）——同一个判断在六个地方各写
-        一遍，而第七处（详细页改截止）漏掉了，于是「一个字都没改就提交」真的入队、推一轮、
-        点亮状态栏（ADR-0008 第二节的实测）。
-
-        优先级与标签只是普通更新（整份底稿带回去那件事由 ``update_task`` 的 ``snapshot=``
-        管，``merge_snapshot`` 的既有策略）；清单那一路走 ``move_task``——搬运不是一次普通
-        字段更新。
-
-        ``int(...)`` 那一下是**线上编码**：选项的值是 ``0/1/3/5``、标签是用户语言
-        （``PRIORITY_NAMES``，唯一一张表——本体的家在 ``dida.sync.view``，经引擎的公开面
-        转出成 ``messages.PRIORITY_NAMES``，工单 #58）。表外的值不该出现（选项就是从那张表
-        生成的），认不出来就当没挑——不替服务端猜一个档位；这**不是**「改了没有」的判断，
-        所以它留在这里。
-        """
-        if field == LIST_FIELD:
-            return self.engine.move_task(task_id, to_list_id=values[LIST_FIELD])
-        if field == PRIORITY_FIELD:
-            picked = values[PRIORITY_FIELD]
-            if not picked.isdigit():
-                return False
-            return self.engine.write(task_id, changes={"priority": int(picked)})
-        if field == TAGS_FIELD:
-            # 多选那一格交回来的是一串值；顺序不是改动的一部分，而这件事由引擎那一份判据
-            # （按集合比）说了算，这里只把值递过去。
-            picked = multi_values(values[TAGS_FIELD])
-            return self.engine.write(task_id, changes={"tags": list(picked)})
-        return False
 
     # ---------------------------------------------------------------- 任务的删除与顺延（#40）
 
@@ -904,26 +828,32 @@ class DidaApp(App[None]):
             partial(self._finish_delete_task, event.task_id),
         )
 
-    def _finish_delete_task(self, task_id: str, confirmed: bool | None) -> None:
-        """删除确认关掉了：只有 ``True`` 才真的删（``n`` / ``Esc`` 与 ``None`` 都不动）。"""
+    async def _finish_delete_task(self, task_id: str, confirmed: bool | None) -> None:
+        """删除确认关掉了：只有 ``True`` 才真的删（``n`` / ``Esc`` 与 ``None`` 都不动）。
+
+        删失败（引擎当场拒绝、断网、服务端拒绝）那句话怎么说在
+        :mod:`dida.tui.write_flow`——删除在服务端不可逆，所以那一句说的是「**没**删成」。
+        """
         if not confirmed:
             return
-        try:
-            self.engine.delete(task_id)
-        except DidaError as exc:
-            self._write_status(messages.delete_failed_message(exc))
-            return
-        self.refresh_view()
+        await self.finish_write(
+            Write(perform=lambda: self.engine.delete(task_id), reply=TASK_DELETE)
+        )
 
-    def on_tasks_page_defer(self, event: TasksPage.Defer) -> None:
+    async def on_tasks_page_defer(self, event: TasksPage.Defer) -> None:
         """``g`` / ``G``：顺延 ``days`` 个逻辑日，**截止时间以外的字段一个都不动**（验收标准 4–7）。
 
         落点由引擎按注入的日界算（``sync/schedule.py``），这一层不重算日期、也不经过任何日期
-        解析。没有截止时间的任务引擎不动它——顺延不凭空给一条任务长出一个日期来，所以这里
-        没有「当场失败」要报的那种情况（引擎那一支没有可抛的结构化错误）。
+        解析。没有截止时间的任务引擎不动它——顺延不凭空给一条任务长出一个日期来，所以这一种
+        写在 :mod:`dida.tui.write_flow` 那张表上是**没有失败这一档**的（引擎那一支没有可抛的
+        结构化错误）。
         """
-        self.engine.defer(event.task_id, days=event.days)
-        self.refresh_view()
+        await self.finish_write(
+            Write(
+                perform=lambda: self.engine.defer(event.task_id, days=event.days),
+                reply=TASK_DEFER,
+            )
+        )
 
     # ---------------------------------------------------------------- 清单 / 视图的建 / 改 / 删（#42 / #36）
 
@@ -1050,7 +980,7 @@ class DidaApp(App[None]):
             self._finish_view_form,
         )
 
-    def _finish_list_form(self, values: dict[str, str] | None) -> None:
+    async def _finish_list_form(self, values: dict[str, str] | None) -> None:
         """清单表单关掉了：按填的那一份建 / 改（``None`` 从 #66 起走不到，表单没有「取消」）。
 
         颜色是空串就**不发** ``color`` 字段（那是「默认」，不是「清空」）；名字空着则
@@ -1059,7 +989,8 @@ class DidaApp(App[None]):
         改的那一路直接把这一份交给引擎：**「和本地那一行一样 = 没改」由它自己判**（工单 #79：
         ``update_list`` 回报布尔，判据只有一个本体 ``dida.sync.writes.is_a_change``）。界面不
         再自己比一遍——#66 落地时这里问过 ``is_list_edit``，比的是清单索引里那一行（屏幕上
-        那一份），而引擎比的是本地原文那一份；现在两边不会各说一句话了。
+        那一份），而引擎比的是本地原文那一份；现在两边不会各说一句话了。回报回来的那一步
+        （不推、不重画、不出声）由 :mod:`dida.tui.write_flow` 消费。
         """
         if values is None:
             return
@@ -1070,17 +1001,18 @@ class DidaApp(App[None]):
         color = values.get(LIST_COLOR_FIELD) or None
         editing = self._editing_list
         self._editing_list = None
-        try:
-            if editing is None:
-                self.engine.create_list(name, color=color)
-            else:
-                self.engine.update_list(editing, name=name, color=color)
-        except DidaError as exc:
-            self._write_status(messages.list_write_failed_message(exc))
-            return
-        self.refresh_view()
+        await self.finish_write(
+            Write(
+                perform=lambda: (
+                    self.engine.create_list(name, color=color)
+                    if editing is None
+                    else self.engine.update_list(editing, name=name, color=color)
+                ),
+                reply=LIST_WRITE,
+            )
+        )
 
-    def _finish_view_form(self, values: dict[str, str] | None) -> None:
+    async def _finish_view_form(self, values: dict[str, str] | None) -> None:
         """视图表单关掉了：把那一份值读成定义再落本地库（``None`` 从 #66 起走不到）。
 
         读不成定义时（认不出的清单名、永远筛不出任务的组合）**不保存**，把理由写进状态栏
@@ -1104,28 +1036,26 @@ class DidaApp(App[None]):
             return
         assert isinstance(parsed, ViewDefinition)
         self._editing_view = None
-        try:
-            if editing is None:
-                self.engine.create_view(parsed)
-            else:
-                self.engine.update_view(parsed)
-        except DidaError as exc:
-            self._write_status(messages.view_write_failed_message(exc))
-            return
-        self.refresh_view()
+        await self.finish_write(
+            Write(
+                perform=lambda: (
+                    self.engine.create_view(parsed)
+                    if editing is None
+                    else self.engine.update_view(parsed)
+                ),
+                reply=VIEW_WRITE,
+            )
+        )
 
-    def _finish_delete_list(self, list_id: str, confirmed: bool | None) -> None:
+    async def _finish_delete_list(self, list_id: str, confirmed: bool | None) -> None:
         """删除确认关掉了：只有 ``True`` 才真的删（``n`` / ``Esc`` 与 ``None`` 都不动）。"""
         if not confirmed:
             return
-        try:
-            self.engine.delete_list(list_id)
-        except DidaError as exc:
-            self._write_status(messages.list_write_failed_message(exc))
-            return
-        self.refresh_view()
+        await self.finish_write(
+            Write(perform=lambda: self.engine.delete_list(list_id), reply=LIST_WRITE)
+        )
 
-    def _finish_delete_view(self, view_id: str, confirmed: bool | None) -> None:
+    async def _finish_delete_view(self, view_id: str, confirmed: bool | None) -> None:
         """删视图那一次确认：只有 ``True`` 才真的删，而删的**只是那一行**（#36）。
 
         视图是一组过滤条件，不是容器：它「里面」的任务本来就在各自的清单里，所以这里一条
@@ -1133,12 +1063,9 @@ class DidaApp(App[None]):
         """
         if not confirmed:
             return
-        try:
-            self.engine.delete_view(view_id)
-        except DidaError as exc:
-            self._write_status(messages.view_write_failed_message(exc))
-            return
-        self.refresh_view()
+        await self.finish_write(
+            Write(perform=lambda: self.engine.delete_view(view_id), reply=VIEW_WRITE)
+        )
 
     # ---------------------------------------------------------------- 当前任务 / 浏览器（工单 #19）
 

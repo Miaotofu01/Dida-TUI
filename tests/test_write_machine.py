@@ -176,6 +176,7 @@ async def test_a_write_schedules_its_own_push_without_the_caller_asking(engine_c
     assert "https://api.dida365.com/open/v1/task/t1" in urls(transport), "任务那一笔自己出去了"
     assert "https://api.dida365.com/open/v1/project/work" in urls(transport), "清单那一笔也是"
 
+
 async def test_an_unaddressable_change_in_the_task_queue_is_not_a_failed_attempt(store):
     """任务队列里一笔**打在一个服务端没见过的 id 上**的改动：泵跳过它，不算一次失败。
 
