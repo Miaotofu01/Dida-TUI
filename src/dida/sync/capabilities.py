@@ -69,7 +69,8 @@ class Capabilities:
     """读自定义视图的**定义**；没有就是「没有自定义视图」，不是错误。"""
 
     writes: WriteTarget | None = None
-    """任务的写路径 + 那本队列（``pending()`` 也读它，状态栏的 ``last_error`` 从这来）。"""
+    """任务的写路径 + 那本队列（``pending()`` 也读它；状态栏的 ``last_error`` 从**这一格**来，
+    由 :func:`dida.sync.engine.pending_error` 读出来）。"""
 
     list_writes: ListWriteTarget | None = None
     """清单的写路径 + 那本队列（``pending_lists()`` 也读它，未认领的清单从这来）。"""
@@ -197,14 +198,6 @@ class Capabilities:
         """自定义视图的定义；没有这件能力就是「一个都没有」，不是错误。"""
         reader = self.views
         return () if reader is None else tuple(reader.view_definitions())
-
-    def last_error(self) -> str | None:
-        """队列里最后一条推不出去的改动报的错；这份副本没有队列时就是 ``None``。"""
-        queue = self.writes
-        if queue is None:
-            return None
-        errors = [str(change.last_error) for change in queue.pending() if change.last_error]
-        return errors[-1] if errors else None
 
     def unseen_list_ids(self) -> frozenset[str]:
         """服务端还没见过的清单 id；这份副本没有清单队列时就是空集。"""
