@@ -814,7 +814,7 @@ class FakeBackend:
         """摆一份「服务端有的标签」（#45）：下一次 :meth:`load_tags` 就交回这一份。
 
         替身不自己编标签——编出来的东西会让「挑得到哪些标签」这句话变成空话（与
-        ``set_subtasks`` 收成品行同一条口径）。
+        :meth:`add_view` 只摆定义、不求值同一条口径）。
         """
         self._tags = tuple(names)
 
