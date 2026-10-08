@@ -20,9 +20,12 @@ TUI 读写一切只能走本模块；排序、逾期判定、视图求值、冲�
 - ``create(title, ...)`` —— 写：新建，落在收集箱（:mod:`dida.sync.create`）。
 - ``create_list(name, color=)`` / ``update_list(id, name=, color=)`` / ``delete_list(id)`` ——
   写：清单的建 / 改 / 删，乐观写 + 立即推送 + 失败进重试队列（:mod:`dida.sync.lists`，#42）。
-- ``cycle_priority(task_id)`` —— 写：优先级推进一档（:mod:`dida.sync.priority`）。
-- ``subtasks(task_id)`` —— 读：子任务那几行（只读，:mod:`dida.sync.subtasks`；spec 的
-  「子任务只看不勾」）。
+
+**#85 退场的那两个没有调用者的成员**：``cycle_priority(task_id)``（``p`` 推进一档）与
+``subtasks(task_id)``（引擎那一层的子任务读）。优先级从 #45 起走详细页的挑选器
+（``write(changes={"priority": …})``，线上编码那套词汇留在 :mod:`dida.sync.view`），子任务行由
+``task_detail().subtasks`` 给——两条路都还在，只是「引擎上多挂一个入口」这一层没人用了。
+接口只留有人用的部分（工单 #85 的验收标准 4）。
 
 **v1 那条读路径在 #58 里删掉了**：``view() -> TodayView`` 与它硬编码的三个分区、左栏的
 ``ListSummary`` 徽标、``/`` 的模糊过滤、以及子任务的勾选写路径（``toggle_subtask``）都只
@@ -41,8 +44,7 @@ v2 的全部读面。
 :mod:`dida.sync.completed`      已完成流的窗口与游标（t12）
 :mod:`dida.sync.schedule`       顺延与改期：截止时间怎么挪（t13 / t14 / #40 / #44）
 :mod:`dida.sync.create`         新建一条任务要发什么（t15 / #39）
-:mod:`dida.sync.priority`       优先级推进一档（t17 / #45）
-:mod:`dida.sync.subtasks`       子任务的先读后写（t20）
+:mod:`dida.sync.capabilities`   构造那一处问清「谁会做什么」（#85）
 ============================  ==========================================
 
 各片的方法挂在同一个 ``SyncEngine`` 上（它们用 ``self._clock`` / ``self._source`` / 彼此的
@@ -65,7 +67,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import AuthError, DidaError
 from dida.api.guards import all_day_date
@@ -89,7 +91,6 @@ from dida.sync.lists import (
     UnknownListError,
     is_list_edit,
 )
-from dida.sync.priority import PriorityMixin
 from dida.sync.pump import PumpMixin
 from dida.sync.push import PushMixin, TaskWriter, backoff_delay
 from dida.sync.read import (
@@ -112,7 +113,6 @@ from dida.sync.read import (
 )
 from dida.sync.refresh import ProjectReader, RefreshMixin, RefreshTarget
 from dida.sync.schedule import ScheduleMixin
-from dida.sync.subtasks import SubtaskMixin
 from dida.sync.tags import TagMixin, TagReader
 from dida.sync.view import (
     INBOX_ID,
@@ -527,18 +527,6 @@ class Engine(Protocol):
         """读：一个自定义视图的定义；本地没有就是 ``None``（``e`` 的表单要拿它填当前值）。"""
         ...
 
-    def cycle_priority(self, task_id: str) -> None:
-        """写：优先级推进一档（``p``）——无 → 低 → 中 → 高 → 无。"""
-        ...
-
-    def subtasks(self, task_id: str) -> tuple[SubtaskItem, ...]:
-        """读：这条任务的子任务行（详情页的只读那一段），标题与完成状态都已经是可以直接画的成品。
-
-        **只读**：spec 的「子任务只看不勾（也不能增删改）」，所以没有对应的写入口（#58 把
-        v1 的 ``toggle_subtask`` 删掉了）。
-        """
-        ...
-
 
 class SyncEngine(
     PumpMixin,
@@ -549,8 +537,6 @@ class SyncEngine(
     CompletedStreamMixin,
     ScheduleMixin,
     CreateMixin,
-    PriorityMixin,
-    SubtaskMixin,
     TagMixin,
 ):
     """通用客户端的数据与写入入口（组装各片；读路径在本模块）。
@@ -753,3 +739,13 @@ class SyncEngine(
     def _write_target(self) -> WriteTarget:
         """写路径要写的那个本地副本。没接上就大声报错——绝不假装写成功了。"""
         return self._caps.write_target()
+
+    def _payload_of(self, task_id: str) -> Mapping[str, Any] | None:
+        """本地那份任务原文；源读不出原文时当作「没有这条任务」。
+
+        要的是**读**的能力（``PayloadReader``），不是写的能力：详情形状（含只读的子任务行）
+        只读它，只读的替身存得下原文就该读得到。这一格在构造那一处就定了（工单 #85 的
+        :attr:`Capabilities.payload`）。#85 之前它挂在 ``SubtaskMixin`` 上——那个 mixin 的
+        另一个成员（``subtasks()``）没有调用者，退场了，这一件留下（有人用）。
+        """
+        return self._caps.payload_of(task_id)

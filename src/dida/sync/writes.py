@@ -24,7 +24,7 @@
 
 写路径上共享的另外两样也在这里：本地副本要会的那几件事（:class:`WriteTarget`），以及
 「这条写没有底稿、推不出去」的那个错误（:class:`UnknownTaskError`）——三片写路径
-（:mod:`dida.sync.push` / :mod:`dida.sync.schedule` / :mod:`dida.sync.subtasks` …）都要它们，
+（:mod:`dida.sync.push` / :mod:`dida.sync.schedule` / :mod:`dida.sync.create` …）都要它们，
 放在这里才不会让它们互相 import。
 
 加一种写类型：在 :class:`~dida.vocabulary.WriteKind` 里加一个成员、在那张表里加一行，就完了

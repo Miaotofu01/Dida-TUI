@@ -7,7 +7,6 @@
 from dida.storage.store import (
     ChangeKind,
     FieldOverride,
-    ListRecord,
     PendingChange,
     RefreshReport,
     Store,
@@ -17,7 +16,6 @@ from dida.storage.store import (
 __all__ = [
     "ChangeKind",
     "FieldOverride",
-    "ListRecord",
     "PendingChange",
     "RefreshReport",
     "Store",

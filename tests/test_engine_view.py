@@ -55,7 +55,6 @@ def test_reading_without_a_cache_is_empty_not_an_error():
     assert engine.list_index() == ()
     assert engine.tasks_in("work").items == ()
     assert engine.task_detail("t1") is None
-    assert engine.subtasks("t1") == ()
 
 
 def test_status_carries_the_logical_day_the_refresh_time_and_the_pending_count():
@@ -115,11 +114,14 @@ def seed(store: Store, *tasks: dict) -> None:
 
 
 def test_subtasks_show_title_and_completion_state_even_without_a_due_date(store):
-    """``subtasks()`` 每一行都有标题与完成状态，**没有日期的照样在**（工单 #32 搬出来的）。
+    """子任务行每一行都有标题与完成状态，**没有日期的照样在**（工单 #32 搬出来的）。
 
     v2 的子任务是只读显示（spec 用户故事 76），所以这一条比 v1 更要紧：行是右栏唯一能给的
     东西，缺了日期就不显示的话，大多数子任务会整行消失。没有日期读作 ``NO_DUE_TEXT``，
     不是「不该出现」。
+
+    #85 之后读法是 ``task_detail().subtasks``（引擎上那个单独的 ``subtasks()`` 入口没有
+    调用者，退场了）；行的内容来自同一条 :func:`dida.sync.view.subtask_items`。
     """
     seed(
         store,
@@ -137,7 +139,9 @@ def test_subtasks_show_title_and_completion_state_even_without_a_due_date(store)
     )
     engine = SyncEngine(clock=ManualClock(at(14, 12, 3)), day_end="24:00", source=store)
 
-    subtasks = engine.subtasks("t1")
+    detail = engine.task_detail("t1")
+    assert detail is not None
+    subtasks = detail.subtasks
 
     assert [(row.title, row.completed) for row in subtasks] == [
         ("收集数据", True),
@@ -154,4 +158,6 @@ def test_a_task_without_subtasks_reads_as_no_rows(store):
     seed(store, {"id": "t1", "projectId": "work", "title": "交季度报告", "status": 0})
     engine = SyncEngine(clock=ManualClock(at(14, 12, 3)), day_end="24:00", source=store)
 
-    assert engine.subtasks("t1") == ()
+    detail = engine.task_detail("t1")
+    assert detail is not None
+    assert detail.subtasks == ()
