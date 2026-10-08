@@ -31,6 +31,7 @@ from dida.storage.store import (
 from dida.sync.engine import (
     CompletedReport,
     ListRow,
+    ReadModel,
     SyncEngine,
     SyncStatus,
     TaskDetail,
@@ -574,6 +575,13 @@ class FakeBackend:
 
     def set_sync_state(self, *, last_refresh_at: datetime | None = None, pending_count: int = 0) -> None:
         self.source.state = SyncState(last_refresh_at=last_refresh_at, pending_count=pending_count)
+
+    def read_model(self) -> ReadModel | None:
+        """读：委托给真引擎——整份读模型与它的三个投影都是生产那一份（#81）。
+
+        替身不自己拼一份：一次界面重画只装配一遍这件事，在接缝一上也看得见。
+        """
+        return self._engine.read_model()
 
     def list_index(self) -> tuple[ListRow, ...]:
         """读：委托给真引擎——三种行怎么组装、收集箱那一行是谁、条数怎么数，都是生产那一份。"""

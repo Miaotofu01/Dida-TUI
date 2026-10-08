@@ -510,9 +510,16 @@ class DidaApp(App[None]):
         # 一个比行更新的日子，那一屏就永远没人认领了（心跳以为它是最新的，见
         # :meth:`reload_day_boundary`）。记早了最多多画一次，记晚了就是一屏昨天的东西。
         self._view_day = self.engine.logical_day()
-        rows = self.engine.list_index()
+        # 一次重画只装配**一遍**读模型（#81）：三种读形状都是它的投影，所以进一个视图不再
+        # 为了找那一行把索引重建一遍，行上的条数与进去看到的成员也来自同一次求值。
+        model = self.engine.read_model()
+        rows = () if model is None else model.list_index()
         self.index_page().show_lists(rows)
-        task_list = None if self._container_id is None else self.engine.tasks_in(self._container_id)
+        task_list = (
+            None
+            if model is None or self._container_id is None
+            else model.tasks_in(self._container_id)
+        )
         if task_list is not None:
             # 读模型说这个容器**现在**叫什么（认领换过名的话就是新的那个，工单 #75 / ADR-0009），
             # 认回来。不认的话这一层会拿着旧 id 干三件事：抬头把 `local-list-1` 原样画出来
@@ -526,7 +533,7 @@ class DidaApp(App[None]):
         if task_list is not None:
             self.tasks_page().show_tasks(task_list, name=self._container_title or "")
         if self._detail_task_id is not None:
-            detail = self.engine.task_detail(self._detail_task_id)
+            detail = None if model is None else model.task_detail(self._detail_task_id)
             self._detail_title = None if detail is None else detail.title
             # 时区提示走**注入的钟**：``status().checked_at`` 就是那只钟给的时刻，它的
             # ``tzinfo`` 是用户墙钟当前的时区。详细页要把用户敲的日期与时刻理解成一个时刻，

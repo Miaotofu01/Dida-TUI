@@ -2,15 +2,19 @@
 
 v1 的读入口只有一个为「今日」硬编码的 ``view() -> TodayView``（未来的任务整条丢掉、没有日期的
 任务不分清单地汇成一区、也表达不了「现在打开的是哪个清单」），#58 把它连同那个类型一起删掉了。
-v2 的三层页面要的是三种形状，这里是它们的类型与组装纯函数（TUI 只画，判断都在这一层）：
+v2 的三层页面要的是三种形状，这里是它们的类型与组装纯函数（TUI 只画，判断都在这一层）。
+**一次装配产出整份读模型**（:class:`ReadModel`，#81），三种形状是它的三个投影：
 
-- :func:`list_index` —— **清单索引**：内置视图、自定义视图、真实清单三种行（:class:`ListKind`），
-  每行带未完成条数；真实清单还带颜色、项目组、``kind``、``permission``。
-- :func:`container_tasks` —— **某个容器的任务列表**：这个清单的**全部**未完成任务（未来的也在），
-  外加这个容器里该显示的那部分已完成任务；视图那个容器的成员与顺序由**视图求值**给
-  （:mod:`dida.sync.views`，#35），它不是一个容器。
-- :func:`task_detail` —— **单条任务的详情**：标题、描述、备注、清单、截止、优先级、标签，
-  以及只读的重复规则、提醒、子任务与原文里我们不认识的字段。
+- :meth:`ReadModel.list_index` —— **清单索引**：内置视图、自定义视图、真实清单三种行
+  （:class:`ListKind`），每行带未完成条数；真实清单还带颜色、项目组、``kind``、``permission``。
+- :meth:`ReadModel.tasks_in` —— **某个容器的任务列表**：这个清单的**全部**未完成任务
+  （未来的也在），外加这个容器里该显示的那部分已完成任务；视图那个容器的成员与顺序由
+  **视图求值**给（:mod:`dida.sync.views`，#35），它不是一个容器。
+- :meth:`ReadModel.task_detail` —— **单条任务的详情**：标题、描述、备注、清单、截止、优先级、
+  标签，以及只读的重复规则、提醒、子任务与原文里我们不认识的字段。
+
+「这个容器是哪一行」由 :func:`list_rows` 与 :meth:`ReadModel.list_index` 一处回答；容器查找
+复用同一次装配，不再为了找一行把索引连同所有视图重算一遍。
 
 **收集箱的身份是这一层的核心**（spec 的已实测 API 事实 #2）：服务端的清单索引里没有收集箱，
 它的 ``projectId`` 是**每账户不同的一串**（形如 ``inbox`` 加数字），``"inbox"`` 只是请求侧
@@ -26,7 +30,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field, replace
 from datetime import datetime
 from enum import Enum
-from typing import Any, Collection, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Callable, Collection, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.sync.view import (
     INBOX_ID,
@@ -58,15 +62,17 @@ __all__ = [
     "ListKind",
     "ListRow",
     "PayloadReader",
+    "ReadModel",
     "TaskDetail",
     "TaskList",
     "ViewReader",
     "ViewRow",
+    "assemble_read_model",
     "builtin_view_rows",
-    "container_tasks",
     "custom_view_rows",
+    "detail_of",
     "is_inbox_id",
-    "list_index",
+    "list_rows",
     "resolve_lists",
     "task_detail",
 ]
@@ -383,93 +389,200 @@ def _inbox_rank(value: str) -> int:
     return 0 if is_inbox_id(value) else 2
 
 
-def list_index(
+PayloadOf = Callable[[str], Mapping[str, Any] | None]
+"""单行原文的读取口（详情形状要它）：本地没有这条任务就是 ``None``。"""
+
+ResolveId = Callable[[str], str]
+"""「这个名字**现在是**哪个 id」的读取口（认领换名，工单 #75）。"""
+
+
+def _same_id(task_id: str) -> str:
+    """认不出别名时给原样（只读替身没有认领这件事，见 ``ViewSource.resolve_id``）。"""
+    return task_id
+
+
+def _no_payload(_task_id: str) -> Mapping[str, Any] | None:
+    """没有原文可读时（空缓存 / 只读替身没有原文）当作「这条任务没有原文」。"""
+    return None
+
+
+def assemble_read_model(
     lists: Sequence[ListSnapshot],
     tasks: Sequence[TaskSnapshot],
-    *,
-    now: datetime,
-    day_end: str,
-    views: Sequence[ViewRow] = (),
-) -> tuple[ListRow, ...]:
-    """清单索引：收集箱置顶 → 内置视图 → 自定义视图 → 真实清单（照缓存给的顺序）。
-
-    ``views`` 是本地库里那些自定义视图行（#36）；内置视图这一层自己算
-    （:func:`builtin_view_rows`）。三种行的条数都从同一份缓存里数，所以索引里的数字与
-    进去看到的列表不可能对不上。
-    """
-    resolved = resolve_lists(lists, tasks)
-    unfinished = _unfinished_counts(tasks)
-    unfinished_ids = {snapshot.id for snapshot in tasks if not snapshot.completed}
-    rows = [_list_row(resolved[0], unfinished)]
-    rows += [
-        _view_row(view, unfinished_ids)
-        for view in builtin_view_rows(tasks, now=now, day_end=day_end) + tuple(views)
-    ]
-    rows += [_list_row(row, unfinished) for row in resolved[1:]]
-    return tuple(rows)
-
-
-def container_tasks(
-    container_id: str,
-    lists: Sequence[ListSnapshot],
-    tasks: Sequence[TaskSnapshot],
+    definitions: Sequence[ViewDefinition] = (),
     *,
     now: datetime,
     day_end: str,
     window_hours: int,
-    views: Sequence[ViewRow] = (),
-) -> TaskList:
-    """某个容器的任务列表：全部未完成任务（未来的也在）+ 该显示的那部分已完成任务。
+    resolve_id: ResolveId = _same_id,
+    payload_of: PayloadOf = _no_payload,
+) -> ReadModel:
+    """把**当下这一份**本地副本装配成整份读模型：视图行在这里各求值一次（#81）。
 
-    认不出来的容器（清单被删了、光标停在一条已经不在的行上）给空列表，不是错误：
-    读路径上没有可读的东西就是没有（与空缓存给空视图同一条口径）。
+    ``definitions`` 是本地库里那些自定义视图的定义（#36）；内置三个定义写死在
+    :func:`builtin_view_rows` 里。两边走的是**同一条** ``evaluate_view``，所以它们各求值
+    一次、一共就是「这一屏要用的每个视图各一遍」。收集箱那一行在 :func:`resolve_lists`
+    里补齐并好，之后的归类、分组、计数一律用它的 id。
     """
-    resolved = resolve_lists(lists, tasks)
-    names = list_names(resolved)
-    row = next(
-        (
-            item
-            for item in list_index(lists, tasks, now=now, day_end=day_end, views=views)
-            if item.id == container_id
-        ),
-        None,
+    snapshots = tuple(tasks)
+    return ReadModel(
+        lists=resolve_lists(lists, snapshots),
+        tasks=snapshots,
+        views=builtin_view_rows(snapshots, now=now, day_end=day_end)
+        + custom_view_rows(definitions, snapshots, now=now, day_end=day_end),
+        now=now,
+        day_end=day_end,
+        window_hours=window_hours,
+        resolve_id=resolve_id,
+        payload_of=payload_of,
     )
-    if row is None:
-        return TaskList(container_id=container_id)
 
-    if row.kind is ListKind.LIST:
-        members = [
-            snapshot
-            for snapshot in tasks
-            if not snapshot.completed and snapshot.list_id == container_id
-        ]
-        completed = completed_section(
-            [snapshot for snapshot in tasks if snapshot.list_id == container_id],
-            resolved,
-            now=now,
-            day_end=day_end,
-            window_hours=window_hours,
-        )
-        shows_list_name = False
-        implied_due = None
-        items = tuple(
-            by_due([task_item(snapshot, names, now=now, day_end=day_end) for snapshot in members])
-        )
-    else:
-        # 视图不是容器：成员与顺序都由视图求值给（#35 的内置视图 / #36 的自定义视图）。
-        view_row = _view_row_for(container_id, tasks, now=now, day_end=day_end, views=views)
-        members = _members_of(view_row, tasks)
-        completed = CompletedSection()
-        shows_list_name = True
-        implied_due = _implied_due(view_row, now=now, day_end=day_end)
-        items = tuple(task_item(snapshot, names, now=now, day_end=day_end) for snapshot in members)
-    return TaskList(
-        container_id=container_id,
-        items=items,
-        completed=completed,
-        shows_list_name=shows_list_name,
-        implied_due=implied_due,
+
+def list_rows(
+    resolved: Sequence[ListSnapshot], tasks: Sequence[TaskSnapshot]
+) -> tuple[ListRow, ...]:
+    """收集箱置顶 + 真实清单那些行（**不含视图行**）；``resolved`` 是 ``resolve_lists`` 之后那一份。
+
+    真实清单行的**唯一**出处：清单索引与 ``move_targets()`` 都从这里取，所以「哪个容器是
+    哪一行」只有一份答案。视图行不在这里——它们要一次视图求值，而挑搬运目标用不到
+    （#81：挑选器不该为挑清单付视图求值的钱）。
+    """
+    unfinished = _unfinished_counts(tasks)
+    return tuple(_list_row(snapshot, unfinished) for snapshot in resolved)
+
+
+def detail_of(
+    resolved: Sequence[ListSnapshot],
+    tasks: Sequence[TaskSnapshot],
+    task_id: str,
+    *,
+    now: datetime,
+    day_end: str,
+    resolve_id: ResolveId = _same_id,
+    payload_of: PayloadOf = _no_payload,
+) -> TaskDetail | None:
+    """单条任务的详情：先认领换名（#75），本地没有这条任务就是 ``None``。
+
+    ``resolved`` 是 ``resolve_lists`` 之后那一份（收集箱那一行的名字靠它）。这是详情形状
+    **唯一**的组装处：读模型的投影与引擎那条窄读法都走它。
+    """
+    task_id = resolve_id(task_id)
+    snapshot = next((item for item in tasks if item.id == task_id), None)
+    if snapshot is None:
+        return None
+    return task_detail(
+        snapshot,
+        payload_of(task_id),
+        list_names(resolved),
+        now=now,
+        day_end=day_end,
     )
+
+
+@dataclass(frozen=True)
+class ReadModel:
+    """从当下这一份本地副本**一次装配**出来的整份读模型（#81）。
+
+    装配发生一次：``lists`` 是补齐 / 并好收集箱那一行之后的清单，``tasks`` 是全部任务快照，
+    ``views`` 是内置三个加自定义若干个**各求值一次**的结果。三个读形状都只是它的投影：
+
+    - :meth:`list_index` —— 清单索引（收集箱 / 内置视图 / 自定义视图 / 真实清单）；
+    - :meth:`tasks_in` —— 某个容器的任务列表（「这个容器是哪一行」也在这里回答）；
+    - :meth:`task_detail` —— 单条任务的详情。
+
+    所以行上的条数与进去看到的成员来自同一次求值，容器查找也不必为了找一行把索引重建一遍。
+    **它不是缓存**：这个值活不过一次重画，下一次重画从当下那一份本地副本重新装配，所以没有
+    增量、没有过期问题，变的只是算的遍数。
+
+    ``resolve_id`` / ``payload_of`` 是两个**单行**读取口（认领换名、原文），读的仍是当下这一
+    份本地副本：一条任务的名字可能在装配之后被认领换掉（#75），而详情要的那份原文只有在知道
+    是哪一条任务之后才读得出来——它们烘不进快照里。
+    """
+
+    lists: tuple[ListSnapshot, ...]
+    tasks: tuple[TaskSnapshot, ...]
+    views: tuple[ViewRow, ...]
+    now: datetime
+    day_end: str
+    window_hours: int
+    resolve_id: ResolveId = _same_id
+    payload_of: PayloadOf = _no_payload
+
+    def list_index(self) -> tuple[ListRow, ...]:
+        """清单索引：收集箱置顶 → 内置视图 → 自定义视图 → 真实清单（照缓存给的顺序）。
+
+        ``views`` 已经是求值结果，这里只把它们摆到位置上——不再为了一行把视图再算一遍。
+        """
+        unfinished_ids = {snapshot.id for snapshot in self.tasks if not snapshot.completed}
+        rows = list_rows(self.lists, self.tasks)
+        return (
+            (rows[0],)
+            + tuple(_view_row(view, unfinished_ids) for view in self.views)
+            + rows[1:]
+        )
+
+    def tasks_in(self, container_id: str) -> TaskList:
+        """某个容器的任务列表：全部未完成任务（未来的也在）+ 该显示的那部分已完成任务。
+
+        「这个容器是哪一行」在这里回答一次：清单行走 :func:`list_rows` 那一份，视图行在
+        ``self.views`` 里找（它带着定义与求值结果）。认不出来的容器（清单被删了、光标停在
+        一条已经不在的行上）给空列表，不是错误——与空缓存给空视图同一条口径。
+        """
+        container_id = self.resolve_id(container_id)
+        row = next((item for item in self.list_index() if item.id == container_id), None)
+        if row is None:
+            return TaskList(container_id=container_id)
+
+        names = list_names(self.lists)
+        if row.kind is ListKind.LIST:
+            members = [
+                snapshot
+                for snapshot in self.tasks
+                if not snapshot.completed and snapshot.list_id == container_id
+            ]
+            completed = completed_section(
+                [snapshot for snapshot in self.tasks if snapshot.list_id == container_id],
+                self.lists,
+                now=self.now,
+                day_end=self.day_end,
+                window_hours=self.window_hours,
+            )
+            return TaskList(
+                container_id=container_id,
+                items=tuple(
+                    by_due(
+                        [
+                            task_item(snapshot, names, now=self.now, day_end=self.day_end)
+                            for snapshot in members
+                        ]
+                    )
+                ),
+                completed=completed,
+            )
+
+        # 视图不是容器：成员与顺序都由视图求值给（#35 的内置视图 / #36 的自定义视图）。
+        view_row = next((item for item in self.views if item.id == container_id), None)
+        return TaskList(
+            container_id=container_id,
+            items=tuple(
+                task_item(snapshot, names, now=self.now, day_end=self.day_end)
+                for snapshot in _members_of(view_row, self.tasks)
+            ),
+            shows_list_name=True,
+            implied_due=_implied_due(view_row, now=self.now, day_end=self.day_end),
+        )
+
+    def task_detail(self, task_id: str) -> TaskDetail | None:
+        """单条任务的详情；本地没有这条任务就是 ``None``。"""
+        return detail_of(
+            self.lists,
+            self.tasks,
+            task_id,
+            now=self.now,
+            day_end=self.day_end,
+            resolve_id=self.resolve_id,
+            payload_of=self.payload_of,
+        )
 
 
 def _implied_due(row: ViewRow | None, *, now: datetime, day_end: str) -> datetime | None:
@@ -582,23 +695,6 @@ def _unfinished_counts(tasks: Sequence[TaskSnapshot]) -> dict[str, int]:
         if not snapshot.completed:
             counts[snapshot.list_id] = counts.get(snapshot.list_id, 0) + 1
     return counts
-
-
-def _view_row_for(
-    view_id: str,
-    tasks: Sequence[TaskSnapshot],
-    *,
-    now: datetime,
-    day_end: str,
-    views: Sequence[ViewRow],
-) -> ViewRow | None:
-    """这个容器是哪一个视图行（内置那三行 + 本地库那几行里找）；认不出来就是 ``None``。
-
-    行上带着它的**定义**（:attr:`ViewRow.definition`），所以调用方读到的成员与隐含日期都
-    出自同一份条件——成员走 :func:`_members_of`，隐含日期走 :func:`_implied_due`。
-    """
-    rows = builtin_view_rows(tasks, now=now, day_end=day_end) + tuple(views)
-    return next((item for item in rows if item.id == view_id), None)
 
 
 def _members_of(row: ViewRow | None, tasks: Sequence[TaskSnapshot]) -> list[TaskSnapshot]:
