@@ -20,7 +20,9 @@
 读的人第一步就错。状态栏那个「待推送 N」两张一起数（``pending_count()``）。
 
 **记这本账的做法只有一份**（#82）：两张表的账面（还没试过、没有下次重试、没有错误）、
-尝试次数 +1 与最后一次错误 / 下次重试时刻、出队、认领换名都在 :mod:`dida.storage.queue`。
+尝试次数 +1 与最后一次错误 / 下次重试时刻、出队、认领换名、#54 的并单改写，都在
+:mod:`dida.storage.queue`——这一层对两张队列表的**写语句一条都没有**，只有发号与冲突豁免
+那几处按各自的谓词读它（``tests/test_queue_bookkeeping.py`` 按 AST 守着）。
 这一层只递进去各自的表名、id 列与数据形状，并把行译回各自的词汇——任务 id 与清单 id 照旧
 是两件事，两张表、两套词汇一个都没合并。
 
@@ -712,23 +714,19 @@ class Store:
 
         ``local`` 给出来就顺手把本地那一行写成它：与入队时「本地生效与入队同一个事务」同一条
         规矩——并进去的改名，屏幕上那一行与队列里那一份必须是同一个意思。
+
+        这几格怎么落到那一行上是记账那一层的事（#82，:meth:`~dida.storage.queue.PendingQueue.amend`）：
+        这里只给列名（``kind`` / ``payload`` / ``list_id``，清单这一族的词汇）。
         """
         with self._db:
-            if kind is not None:
-                self._db.execute(
-                    "UPDATE pending_list_changes SET kind = ? WHERE id = ?",
-                    (kind.value, change_id),
-                )
-            if payload is not None:
-                self._db.execute(
-                    "UPDATE pending_list_changes SET payload = ? WHERE id = ?",
-                    (_dumps(payload), change_id),
-                )
-            if list_id is not None:
-                self._db.execute(
-                    "UPDATE pending_list_changes SET list_id = ? WHERE id = ?",
-                    (list_id, change_id),
-                )
+            self._list_queue.amend(
+                change_id,
+                {
+                    **({"kind": kind.value} if kind is not None else {}),
+                    **({"payload": _dumps(payload)} if payload is not None else {}),
+                    **({"list_id": list_id} if list_id is not None else {}),
+                },
+            )
             if local is not None:
                 self._write_list(dict(local))
 

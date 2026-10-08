@@ -7,19 +7,22 @@
 - 新入队那一行的账面：还没试过（``attempts = 0``）、没有下次重试、没有错误；
 - 失败一次：尝试次数 +1、写下最后一次错误与下次重试时刻；
 - 出队：推成功了就从队列里删掉；
-- 认领：这一笔（以及后面排着的几笔）改的是服务端刚给的那个 id 了。
+- 认领：这一笔（以及后面排着的几笔）改的是服务端刚给的那个 id 了；
+- 并单（#54）：一条还没被认领的改动只许有一条记录，后来的改动并进这一行的几格。
 
-这四件事原来在 :mod:`dida.storage.store` 里成对写了两遍（``record_attempt`` /
+这几件事原来在 :mod:`dida.storage.store` 里成对写了两遍（``record_attempt`` /
 ``record_list_attempt``、``resolve`` / ``resolve_list``、``adopt_created`` /
 ``adopt_created_list``），于是加一条队列级的规则（比如「试满几次」怎么记）要改两处。它们
-现在只住在这里一份。
+现在只住在这里一份——**两张队列表的写语句在别处一条都没有**，``tests/test_queue_bookkeeping.py``
+按 AST 守着这一条。
 
 **这一层不知道任务与清单是什么**：表名与「谁的 id」那一列由调用方以 :class:`QueueShape`
 递进来，其余字段（``kind`` / ``payload`` / 任务行上那个 ``list_id``）也由调用方给。
 所以新队列、或者队列级的一条新事实，改的是这一个类，而不是每一张表各一遍。
 
 SQL 里的表名与列名来自 :class:`QueueShape`——那是模块里写死的两张形状（``Store`` 构造时
-给出），不是外面递进来的字符串，所以这里拼 SQL 没有注入口。
+给出），不是外面递进来的字符串，所以这里拼 SQL 没有注入口。:meth:`PendingQueue.amend`
+的列名由调用方给，同理是存储层内部的词汇（``kind`` / ``payload`` / ``list_id``），不是用户输入。
 """
 
 from __future__ import annotations
@@ -120,4 +123,18 @@ class PendingQueue:
             f"UPDATE {self._shape.table} SET {self._shape.owner_column} = ?"
             f" WHERE {self._shape.owner_column} = ?",
             (new_owner, old_owner),
+        )
+
+    def amend(self, change_id: int, values: Mapping[str, Any]) -> None:
+        """改写**这一行**的几格（#54 的并单：一条还没被认领的改动只许有一条记录）。
+
+        列名由调用方给——它是那一族的词汇（``kind`` / ``payload`` / ``list_id``），机制只
+        负责把这几格写下去。空映射什么都不写（与「这一处没有要改的」同一个意思）。
+        """
+        if not values:
+            return
+        assignments = ", ".join(f"{column} = ?" for column in values)
+        self._db.execute(
+            f"UPDATE {self._shape.table} SET {assignments} WHERE id = ?",
+            (*values.values(), change_id),
         )
