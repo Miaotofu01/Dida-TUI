@@ -77,6 +77,7 @@ MODULE_WHITELIST = [
     "dida.api.client",  # 滴答 API 客户端
     "dida.vocabulary",  # 共用词汇（同步与本地副本的共同下界）
     "dida.storage.store",  # 本地存储
+    "dida.storage.queue",  # 队列表的记账机制（#82；本地存储那一支里的账本，只依赖 stdlib）
     "dida.sync.engine",  # 同步引擎
     "dida.logical_day",  # 逻辑日
     "dida.tui.app",  # TUI

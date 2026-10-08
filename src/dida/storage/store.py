@@ -19,6 +19,11 @@
 根本不是同一种东西——把 ``list_id`` 塞进 ``task_id`` 那一列，一个字段两个意思，
 读的人第一步就错。状态栏那个「待推送 N」两张一起数（``pending_count()``）。
 
+**记这本账的做法只有一份**（#82）：两张表的账面（还没试过、没有下次重试、没有错误）、
+尝试次数 +1 与最后一次错误 / 下次重试时刻、出队、认领换名都在 :mod:`dida.storage.queue`。
+这一层只递进去各自的表名、id 列与数据形状，并把行译回各自的词汇——任务 id 与清单 id 照旧
+是两件事，两张表、两套词汇一个都没合并。
+
 「增量」是这一层的概念：全量拉回来的数据在这里比对，只写变化（ADR 0001）。服务端已经没有
 的东西也在这里删掉（剪枝，#41）：清单与未完成任务只在「这一路这次取全了」的断言下才剪，
 断言就是 ``apply_refresh`` 的 ``prune_*`` 参数。冲突裁决也在这里：服务端权威胜出，但待推送
@@ -44,6 +49,8 @@
 - 写（清单，#42）：``save_list(...)`` / ``drop_list(list_id)`` / ``list_payload(list_id)`` /
   ``new_local_list_id()`` / ``enqueue_list(...)`` / ``pending_lists()`` /
   ``record_list_attempt(...)`` / ``resolve_list(change_id)`` / ``adopt_created_list(...)``；
+  两族队列动词只管各自的数据形状，记账一律转发给 :class:`~dida.storage.queue.PendingQueue`
+  （#82）；
 - 读 / 写（自定义视图，#36）：``view_definitions()`` / ``view_definition(view_id)`` /
   ``save_view(definition)`` / ``drop_view(view_id)`` / ``new_view_id()``——**没有队列**，
   视图只在本地（:class:`~dida.sync.views.ViewStore` 就是这五个方法）。
