@@ -137,37 +137,50 @@ def test_a_new_queue_gets_the_same_bookkeeping_without_a_second_implementation()
     assert queue.rows() == [], "出队就是没了，没有第二本账要一起清"
 
 
-def test_store_never_writes_the_queue_tables():
-    """写语句（INSERT / UPDATE / DELETE）一条都不许留在 ``store.py``。
+def _storage_queue_statements() -> list[tuple[str, str | None, str]]:
+    """整个存储层里点名两张队列表的 SQL 语句：``(文件名, 落在哪个函数, 原文)``。"""
+    return [
+        (path.name, owner, text)
+        for path in sorted(STORAGE.glob("*.py"))
+        for owner, text in _queue_statements(path.read_text(encoding="utf-8"))
+    ]
 
-    按**结构**断，不按字面串：认领重指（``UPDATE pending_changes SET task_id = ?``）与失败
-    一次（``attempts = attempts + 1``）只要被内联回来，不管空格怎么摆都会红。
+
+def test_the_storage_layer_has_no_literal_write_against_the_queue_tables():
+    """整个存储层里，**写死表名**的写语句一条都没有。
+
+    机制那份 SQL 的表名来自 ``QueueShape``（``{self._shape.table}``），所以连它自己也不含
+    字面表名——于是任何文件里出现一句写死 ``pending_changes`` / ``pending_list_changes`` 的
+    INSERT / UPDATE / DELETE，就是第二本账。按 AST 取「像一句 SQL 的字面量」的**开头关键字**，
+    不按整串匹配：认领重指与失败一次内联回来、空格怎么摆，都会红。
     """
     writes = [
-        " ".join(text.split())[:80]
-        for _, text in _queue_statements((STORAGE / "store.py").read_text(encoding="utf-8"))
+        f"{name}: {' '.join(text.split())[:70]}"
+        for name, _, text in _storage_queue_statements()
         if WRITE_STATEMENT.match(text)
     ]
 
-    assert writes == [], "两张队列表的写语句只许住在 queue.py，store.py 里又出现了：\n" + "\n".join(
-        writes
+    assert writes == [], (
+        "两张队列表的写语句只许由 queue.py 按 QueueShape 拼出来，实际出现：\n" + "\n".join(writes)
     )
 
 
-def test_store_reads_the_queue_tables_only_where_the_policy_lives():
-    """读语句只许出现在发号与豁免那几处；表结构只许是模块级的 ``_SCHEMA``。"""
-    readers: set[str | None] = set()
-    for owner, text in _queue_statements((STORAGE / "store.py").read_text(encoding="utf-8")):
+def test_the_queue_tables_are_read_only_where_the_policy_lives():
+    """读语句只许出现在发号与豁免那几处；表结构只许是 ``store.py`` 模块级的 ``_SCHEMA``。"""
+    readers: set[tuple[str, str | None]] = set()
+    for name, owner, text in _storage_queue_statements():
         if SCHEMA_STATEMENT.match(text):
-            assert owner is None, "表结构只许是模块级那个 _SCHEMA"
+            assert (name, owner) == ("store.py", None), "表结构只许是 store.py 模块级那个 _SCHEMA"
             continue
         assert READ_STATEMENT.match(text), (
-            f"认不出这段点名队列表的 SQL：{' '.join(text.split())[:60]}"
+            f"认不出这段点名队列表的 SQL：{name}: {' '.join(text.split())[:60]}"
         )
-        readers.add(owner)
+        readers.add((name, owner))
 
-    assert readers == QUEUE_READERS, (
-        "读两张队列表的应当是且只是那几处豁免 / 发号，实际：" + repr(sorted(map(str, readers)))
+    expected = {("store.py", name) for name in QUEUE_READERS}
+    assert readers == expected, (
+        "读两张队列表的应当是且只是 store.py 里那几处豁免 / 发号，实际："
+        + repr(sorted(map(str, readers)))
     )
 
 

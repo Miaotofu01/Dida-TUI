@@ -45,10 +45,12 @@ dataclass 照旧各写各的），重复的是记这本账的**做法**：
 `tests/test_queue_bookkeeping.py` 把这件事钉成**结构**（不是字面串，空格怎么摆都一样）：
 
 - 一条当场造**第三本队列账**走一遍这些事，证明机制不挑表；
-- 按 AST 断 `store.py` 里对两张队列表的**写语句一条都没有**（认领重指与失败一次内联回去就红）；
-- 按 AST 断读语句只出现在**发号**（`_held_local_list_ids`）与**冲突豁免**（`_exempt_fields` /
-  `_has_pending_change` / `_has_dirty_list_change` / `_has_pending_list_change`）那几处，表结构
-  只许是模块级的 `_SCHEMA`；
+- 按 AST 断**整个存储层**里写死两张队列表名的**写语句一条都没有**——机制那份 SQL 的表名来自
+  `QueueShape`，所以连它自己也不含字面表名（认领重指与失败一次内联回去、或另起一个文件抄一份，
+  都会红）；
+- 按 AST 断读语句只出现在 `store.py` 的**发号**（`_held_local_list_ids`）与**冲突豁免**
+  （`_exempt_fields` / `_has_pending_change` / `_has_dirty_list_change` /
+  `_has_pending_list_change`）那几处，表结构只许是模块级的 `_SCHEMA`；
 - 断 `queue.py` 自己一句写死表名的 SQL 都没有（表名只能从 `QueueShape` 来），以及
   `attempts = attempts + 1` 全存储层只出现一次。
 
