@@ -10,7 +10,7 @@
 |---|---|
 | 接一张票、跑一轮编排 | [`brief.md`](brief.md)——交付决定、**按后果分流**的路由规则、**测试预算**、各轮实测出来的地雷 |
 | 看已经落地了什么 | [`progress.md`](progress.md)——append-only 的进度日志 |
-| 派活给 subagent | [`implementer-template.md`](implementer-template.md) / [`merger-template.md`](merger-template.md) |
+| 派活给 subagent | [`implementer-template.md`](implementer-template.md) / [`merger-template.md`](merger-template.md) / [`reviewer-template.md`](reviewer-template.md)（独立复核 + 变异验证） |
 | 找某个文件在哪、某个形状长什么样 | [`codebase-map.md`](codebase-map.md) |
 | 终端的键到底送不送得上来 | [`terminal-input-evidence.md`](terminal-input-evidence.md)（ADR-0006 / ADR-0008 的实测依据） |
 | 官方 API 的形状 | [`openapi-dida365.md`](openapi-dida365.md)（原文）、[`api-shapes.md`](api-shapes.md)（按端点提取） |
