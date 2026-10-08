@@ -344,6 +344,10 @@ async def test_esc_on_an_untouched_list_form_writes_nothing_but_a_real_rename_wr
     带颜色的清单也走一遍：表单把当前颜色**原样**填回来，而「原样交回去」同样不是一次改动。
 
     真的改了名字就照旧正好一笔——这一条同时钉住那条收敛没有把真改动一起挡掉。
+
+    **界面不判这一句**（工单 #79）：写的那一次自己回报「改了 / 没改」（判据本体
+    ``dida.sync.writes.is_a_change``），界面只按回报值走下一步。引擎那一侧的回报与「传输层
+    一笔都没有」由 ``tests/test_write_converges.py`` 钉着。
     """
     fake = backend()
     fake.add_list("海外", id="abroad", color="#123456")

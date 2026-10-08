@@ -9,8 +9,11 @@
 
 ``FakeBackend`` 记下的那些字段（``writes`` / ``completed`` / ``moved``……）是**对外的账本**：
 #80 的第一步只换内部实现，账本照旧（第二步 #86 才收拾抄来的判断与没人读的数组）。
-写方法一律先把调用记进账本，再交给真引擎走真写路径——乐观落库、入队、推送、认领、出队
-全在引擎与本地库里发生，替身不再自己抄一份。
+写方法一律交给真引擎走真写路径——乐观落库、入队、推送、认领、出队全在引擎与本地库里发生，
+替身不再自己抄一份。**「这一次到底改了没有」也由引擎回答**（#79：判据本体
+:func:`~dida.sync.writes.is_a_change`，比的是本地那一份原文），替身照它的回报记账：回
+``False``（空操作）时账本里**不留这一笔**——一次没发生的写不该看起来像发生过（#79 之前旧
+替身自己抄了一份判断，两个时刻各问一次；#80 之后判断只有引擎那一处）。
 """
 
 from __future__ import annotations
@@ -394,7 +397,7 @@ class InMemorySource:
         （``due`` / ``all_day``）不是同一个拼法，而 ``Store._snapshot`` 就是在这两个名字之间
         翻译的。替身不翻译的话，「改完截止时间屏幕上就变了」这句话在接缝一根本测不到
         （#44：详细页那一格读的是快照上的 ``due``）。**显式的 ``None`` 是清除**——与 ``Store``
-        把 ``dueDate: null`` 读成「没有日期」同一个口径（``_parse_time`` 只认字符串）。
+        把 ``dueDate: null`` 读成「没有日期」同一个口径（``dida.vocabulary.read_time`` 只认字符串）。
 
         **``projectId`` 那一条是搬运**（#45）：快照上「在哪个清单」那一位叫 ``list_id``，
         与 ``Store._write_task`` 同一条口径（它也是从 ``projectId`` 算出 ``list_id`` 那一列）。
@@ -883,26 +886,45 @@ class FakeBackend:
             return
         self._engine.uncomplete(task_id)
 
-    def defer(self, task_id: str, *, days: int = 1) -> None:
-        """写：记下这一笔，并交给真引擎按逻辑日顺延（没有截止时间的任务不凭空长出一个）。"""
+    def defer(self, task_id: str, *, days: int = 1) -> bool:
+        """写：记下这一笔，并交给真引擎按逻辑日顺延，把引擎的回报原样交回。
+
+        **回报这次到底挪了没有**（#79）：顺延的判据与真写路径都在引擎那一份里（落点是不是
+        同一个逻辑日、有没有截止时间可挪），替身不再自己抄一遍。回 ``False`` 时这一笔
+        **照样记在账本上**：账本说的是「调用收到过没有」，一条本地不存在的任务也一样记
+        （``tests/test_fake_backend.py`` 钉着它）。
+        """
         self.deferred.append(task_id)
         self.deferred_days.append(days)
-        self._engine.defer(task_id, days=days)
+        return self._engine.defer(task_id, days=days)
 
-    def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> None:
-        """写：记下这一笔，并交给真引擎改期（只动 ``dueDate`` 与 ``isAllDay``）。
+    def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> bool:
+        """写：交给真引擎改期（只动 ``dueDate`` 与 ``isAllDay``），把它的回报原样交回。
+
+        **同值收敛**（#79）：那一刻与本地那一份相同时引擎什么都不写、回 ``False``——判据是
+        生产那**一个**本体 :func:`~dida.sync.writes.is_a_change`（在本地那份原文上比），替身
+        不再自己写第二份比较；空操作**不记账**（``rescheduled`` 里不留这一笔），一次什么都
+        没改的提交因此看起来也不像一次写（#39 的教训：替身编一份自己的判断，测试就会静默
+        断言成别的东西）。
 
         摆了 ``reschedule_error`` 就记完这一笔再抛：模拟引擎当场拒绝（#25 的
-        ``UnknownTaskError``），好试 TUI 拿到结构化错误时的反应。
+        ``UnknownTaskError``），好试 TUI 拿到结构化错误时的反应——抛在交给引擎**之前**，
+        「当场拒绝」的意思就是这一笔没写成。本地没有这条任务的底稿时与 :meth:`write`
+        一样不当场拒绝，只回 ``False``。
         """
-        self.rescheduled.append(task_id)
-        self.rescheduled_due.append(due)
-        self.rescheduled_all_day.append(all_day)
         if self.reschedule_error is not None:
+            self.rescheduled.append(task_id)
+            self.rescheduled_due.append(due)
+            self.rescheduled_all_day.append(all_day)
             raise self.reschedule_error
         if self.source.task_payload(task_id) is None:
-            return
-        self._engine.reschedule(task_id, due=due, all_day=all_day)
+            return False
+        changed = self._engine.reschedule(task_id, due=due, all_day=all_day)
+        if changed:
+            self.rescheduled.append(task_id)
+            self.rescheduled_due.append(due)
+            self.rescheduled_all_day.append(all_day)
+        return changed
 
     def create(
         self,
@@ -956,23 +978,25 @@ class FakeBackend:
             return
         self._engine.delete(task_id)
 
-    def move_task(self, task_id: str, *, to_list_id: str) -> None:
-        """写：记下这一笔，并交给真引擎搬运（``POST /open/v1/task/move``，#45）。
+    def move_task(self, task_id: str, *, to_list_id: str) -> bool:
+        """写：交给真引擎搬运（``POST /open/v1/task/move``，#45），把它的回报原样交回。
 
-        已经在那个清单里 = 什么都不写（判据是引擎的 :func:`~dida.sync.writes.is_a_move`，
-        与旧替身同一条口径）：不照做的话，替身会记下一笔「搬了」而生产那一条根本没写。
-        摆了 ``write_error`` 就记完这一笔再抛（与 ``write`` 同一个口子）。
+        搬到它**已经在**的那个清单（或者目标为空）= 引擎什么都不写、回 ``False``——判据是
+        引擎的 :func:`~dida.sync.writes.is_a_move`，替身不再自己比一遍；空操作**不记账**
+        （``moved`` 里不留这一笔），否则替身会记下一笔「搬了」而生产那一条根本没写——接缝一
+        断的就是这句话。摆了 ``write_error`` 就记完这一笔再抛（与 ``write`` 同一个口子：
+        引擎当场拒绝时界面要说得出具体原因）——抛在交给引擎**之前**，「当场拒绝」的意思就是
+        这一笔没写成。本地没有这条任务的底稿时与 :meth:`write` 一样不当场拒绝，只回 ``False``。
         """
-        payload = self.source.task_payload(task_id)
-        current = None if payload is None else str(payload.get("projectId") or "")
-        if current is not None and current == to_list_id:
-            return
-        self.moved.append((task_id, to_list_id))
         if self.write_error is not None:
+            self.moved.append((task_id, to_list_id))
             raise self.write_error
-        if payload is None:
-            return
-        self._engine.move_task(task_id, to_list_id=to_list_id)
+        if self.source.task_payload(task_id) is None:
+            return False
+        changed = self._engine.move_task(task_id, to_list_id=to_list_id)
+        if changed:
+            self.moved.append((task_id, to_list_id))
+        return changed
 
     def write(
         self,
@@ -980,17 +1004,29 @@ class FakeBackend:
         *,
         changes: Mapping[str, Any] | None = None,
         kind: WriteKind = WriteKind.UPDATE,
-    ) -> None:
-        """写：记下这一笔，并交给真引擎走真写路径（乐观落库 + 入队 + 立即推送）。
+    ) -> bool:
+        """写：交给真引擎走真写路径（乐观落库 + 入队 + 立即推送），把它的回报原样交回。
 
-        摆了 ``write_error`` 就记完这一笔再抛，试 TUI 拿到结构化错误时说不说得清。
+        **同值收敛**（#79）：盖上去的字段与本地那一份原文逐位相同时引擎什么都不做、回
+        ``False``——判据是生产那**一个**本体 :func:`~dida.sync.writes.is_a_change`，替身不再
+        自己写第二份比较；空操作**不记账**（``writes`` 里不留这一笔），一次没发生的写因此
+        看起来也不像发生过（#39 的教训：替身编一份自己的判断，接缝一上就会静默断言成别的
+        东西）。
+
+        摆了 ``write_error`` 就记完这一笔再抛，试 TUI 拿到结构化错误时说不说得清——抛在交给
+        引擎**之前**，「引擎当场拒绝」的意思就是这一笔没写成。本地没有这条任务的底稿时与旧
+        替身一样不当场拒绝，只回 ``False``。
         """
-        self.writes.append((task_id, dict(changes or {})))
+        local = dict(changes or {})
         if self.write_error is not None:
+            self.writes.append((task_id, local))
             raise self.write_error
         if self.source.task_payload(task_id) is None:
-            return
-        self._engine.write(task_id, changes=changes, kind=kind)
+            return False
+        changed = self._engine.write(task_id, changes=changes, kind=kind)
+        if changed:
+            self.writes.append((task_id, local))
+        return changed
 
     def cycle_priority(self, task_id: str) -> None:
         """写：记下这一笔，并交给真引擎推进一档（``0 → 1 → 3 → 5``）。
@@ -1014,13 +1050,24 @@ class FakeBackend:
 
     def update_list(
         self, list_id: str, *, name: str | None = None, color: str | None = None
-    ) -> None:
-        """写：记下这一笔，并交给真引擎改那一行（没给的字段照旧不动）。"""
-        self.updated_lists.append((list_id, name, color))
-        self._raise_list_error()
+    ) -> bool:
+        """写：交给真引擎改那一行（没给的字段照旧不动），把它的回报原样交回。
+
+        **同值收敛**（#79）：交回来的两位与本地那一行相同时引擎什么都不写、回 ``False``——
+        判据是生产那一份（:func:`~dida.sync.lists.is_list_edit`，本体在 ``writes``），替身
+        不再自己比一遍；空操作**不记账**（``updated_lists`` 里不留这一笔）。
+        摆了 ``list_error`` 就记完这一笔再抛（引擎当场拒绝那条路）；本地没有这一行的原文时
+        与旧替身一样不当场拒绝，只回 ``False``。
+        """
+        if self.list_error is not None:
+            self.updated_lists.append((list_id, name, color))
+            raise self.list_error
         if self.source.list_payload(list_id) is None:
-            return
-        self._engine.update_list(list_id, name=name, color=color)
+            return False
+        changed = self._engine.update_list(list_id, name=name, color=color)
+        if changed:
+            self.updated_lists.append((list_id, name, color))
+        return changed
 
     def delete_list(self, list_id: str) -> None:
         """写：记下这一笔，并交给真引擎删那一行（只动清单那一行）。"""
@@ -1041,11 +1088,21 @@ class FakeBackend:
         self._raise_view_error()
         return self._engine.create_view(definition)
 
-    def update_view(self, definition: ViewDefinition) -> None:
-        """写：记下这一笔，并交给真引擎改那一行（位置照旧不动）。"""
-        self.updated_views.append(definition)
-        self._raise_view_error()
-        self._engine.update_view(definition)
+    def update_view(self, definition: ViewDefinition) -> bool:
+        """写：交给真引擎改那一行（位置照旧不动），把它的回报原样交回。
+
+        **同值收敛**（#79）：交回来的那份与本地那一行一样时引擎什么都不做、回 ``False``——
+        判据是生产那一份（:func:`~dida.sync.views.is_view_edit`，本体在 ``writes``），替身不
+        自己再比一遍；空操作**不记账**（``updated_views`` 里不留这一笔）。
+        摆了 ``view_error`` 就记完这一笔再抛（引擎当场拒绝那条路）。
+        """
+        if self.view_error is not None:
+            self.updated_views.append(definition)
+            raise self.view_error
+        changed = self._engine.update_view(definition)
+        if changed:
+            self.updated_views.append(definition)
+        return changed
 
     def delete_view(self, view_id: str) -> None:
         """写：记下这一笔，并交给真引擎摘掉那一行（**一条任务都不碰**）。"""
