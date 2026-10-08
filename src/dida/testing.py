@@ -2,13 +2,15 @@
 
 - :class:`ManualClock` —— 时钟接缝（``dida.clock.Clock``）。
 - :class:`FakeTransport` —— HTTP 传输接缝（``dida.api.transport.Transport``）。
-- :class:`InMemorySource` —— 本地缓存的内存替身（``dida.sync.view.ViewSource``）。
-- :class:`FakeBackend` —— **接缝一的假后端**：给它内存数据，它用真引擎的读路径，
-  写操作只记录。TUI 测试一律 ``DidaApp(FakeBackend(clock=...))`` 这样搭。
+- :class:`InMemorySource` —— 只读的内存替身（``dida.sync.view.ViewSource``）；写路径够不着它。
+- :class:`FakeBackend` —— **接缝一的假后端**：#80 第一步之后它内部装的是**真货**：真
+  :class:`~dida.sync.engine.SyncEngine` + 真本地库（``Store(":memory:")``）+ 假传输层，
+  对外仍是「摆数据 + 记下调用」那套字段，所以用它的测试文件一行都不用改。
 
-这里只放「记录 + 回放」的哑替身，不含任何业务判断：三种读形状委托给真引擎，
-行的读法（排序、逾期判定、截止时间读法）调用 ``dida.sync.view`` 的纯函数——
-和真引擎同一份实现，替身不会跟真货说不一样的话。
+``FakeBackend`` 记下的那些字段（``writes`` / ``completed`` / ``moved``……）是**对外的账本**：
+#80 的第一步只换内部实现，账本照旧（第二步 #86 才收拾抄来的判断与没人读的数组）。
+写方法一律先把调用记进账本，再交给真引擎走真写路径——乐观落库、入队、推送、认领、出队
+全在引擎与本地库里发生，替身不再自己抄一份。
 """
 
 from __future__ import annotations
@@ -21,12 +23,14 @@ from typing import Any, Mapping, Sequence
 
 import httpx
 
+from dida.api.client import DidaApiClient
 from dida.clock import Clock
 from dida.storage.store import (
     COMPLETED_STATUS,
     UNCOMPLETED_STATUS,
     VIEW_ID_PREFIX,
     RefreshReport,
+    Store,
 )
 from dida.sync.engine import (
     CompletedReport,
@@ -39,8 +43,6 @@ from dida.sync.engine import (
     ViewDefinition,
     WriteKind,
 )
-from dida.sync.lists import LOCAL_LIST_PREFIX
-from dida.sync.writes import UnclaimedListError, is_local_id
 from dida.sync.view import (
     INBOX_ID,
     ListSnapshot,
@@ -128,6 +130,65 @@ class FakeTransport:
         if isinstance(response, Exception):
             raise response
         return response
+
+
+def _server_payload(snapshot: TaskSnapshot) -> dict[str, Any]:
+    """快照 → 服务端原文那样的字典（只拼 ``Store._snapshot`` 会读的那几个字段）。
+
+    摆数据那一侧唯一的「快照 → 原文」翻译，:class:`InMemorySource` 与 :class:`FakeBackend`
+    共用同一份——少一处抄，就少一处漂。
+    """
+    payload: dict[str, Any] = {
+        "id": snapshot.id,
+        "projectId": snapshot.list_id,
+        "title": snapshot.title,
+        "priority": snapshot.priority,
+        "status": COMPLETED_STATUS if snapshot.completed else 0,
+    }
+    if snapshot.due is not None:
+        payload["dueDate"] = snapshot.due.isoformat()
+        payload["isAllDay"] = snapshot.all_day
+    if snapshot.completed_at is not None:
+        payload["completedTime"] = snapshot.completed_at.isoformat()
+    if snapshot.desc:
+        payload["desc"] = snapshot.desc
+    if snapshot.content:
+        payload["content"] = snapshot.content
+    if snapshot.tags:
+        payload["tags"] = list(snapshot.tags)
+    if snapshot.repeat_flag:
+        payload["repeatFlag"] = snapshot.repeat_flag
+    if snapshot.reminders:
+        payload["reminders"] = list(snapshot.reminders)
+    return payload
+
+
+def _list_payload(
+    list_id: str,
+    name: str,
+    *,
+    color: str | None = None,
+    group_id: str | None = None,
+    kind: str | None = None,
+    permission: str | None = None,
+    is_inbox: bool = False,
+    sort_order: int | None = None,
+) -> dict[str, Any]:
+    """一行清单 → 服务端 ``Project`` 那样的字典（``Store._write_list`` 认的那几个字段）。
+
+    ``sortOrder`` 由摆数据的人给：真库按它排序，替身给的序号让「怎么加的就怎么排」这件事
+    在接缝一上照旧成立（``InMemorySource`` 的字典顺序就是它的旧行为）。
+    """
+    return {
+        "id": list_id,
+        "name": name,
+        "color": color,
+        "groupId": group_id,
+        "kind": kind,
+        "permission": permission,
+        "isInbox": is_inbox,
+        "sortOrder": sort_order,
+    }
 
 
 class InMemorySource:
@@ -288,30 +349,8 @@ class InMemorySource:
         return self._raw.get(task_id)
 
     def _payload_of(self, snapshot: TaskSnapshot) -> dict[str, Any]:
-        """快照 → 服务端原文那样的字典（只拼 ``Store._snapshot`` 会读的那几个字段）。"""
-        payload: dict[str, Any] = {
-            "id": snapshot.id,
-            "projectId": snapshot.list_id,
-            "title": snapshot.title,
-            "priority": snapshot.priority,
-            "status": COMPLETED_STATUS if snapshot.completed else 0,
-        }
-        if snapshot.due is not None:
-            payload["dueDate"] = snapshot.due.isoformat()
-            payload["isAllDay"] = snapshot.all_day
-        if snapshot.completed_at is not None:
-            payload["completedTime"] = snapshot.completed_at.isoformat()
-        if snapshot.desc:
-            payload["desc"] = snapshot.desc
-        if snapshot.content:
-            payload["content"] = snapshot.content
-        if snapshot.tags:
-            payload["tags"] = list(snapshot.tags)
-        if snapshot.repeat_flag:
-            payload["repeatFlag"] = snapshot.repeat_flag
-        if snapshot.reminders:
-            payload["reminders"] = list(snapshot.reminders)
-        return payload
+        """快照 → 服务端原文那样的字典（与 :func:`_server_payload` 同一份实现）。"""
+        return _server_payload(snapshot)
 
     def view_definitions(self) -> tuple[ViewDefinition, ...]:
         """自定义视图的**定义**（#36），按加进来的顺序。
@@ -398,12 +437,68 @@ class InMemorySource:
         return self.state
 
 
-class FakeBackend:
-    """接缝一的假后端：内存缓存 + 真引擎的读路径，写操作只记录。
+class _FakeBackendServer(FakeTransport):
+    """假后端用的假服务端：记下每个请求，并按端点回一个让**真写路径**走得通的响应。
 
-    读（``view()`` / ``status()``）委托给真 :class:`~dida.sync.engine.SyncEngine`，
-    所以渲染测试跑的是真的读路径、排序与逻辑日判定；写（``refresh`` / ``complete`` /
-    ``defer``）只把调用记下来，等对应工单落地后由它们决定要不要真的走一遍。
+    与基类 :class:`FakeTransport` 的差别只有一处：默认响应不是「空 body」，而是**按端点
+    给形状**。真写路径上的每一次推送都要有回应才能出队——空 body 会让更新那一笔被读成
+    「响应体不是 JSON」、按失败退避，队列永远不空，于是「推完之后待推送回到 0」这件事在
+    接缝一上变成假的。所以这里按文档给形状：更新与批量更新是对象、搬运是数组、新建
+    带上服务端给的 id（认领因此真的发生）。
+
+    它只做两件事：**记请求**、**回一个说得过去的响应**——没有任何业务判断。
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self._created = 0
+
+    async def send(self, request: httpx.Request) -> httpx.Response:
+        self.requests.append(request)
+        return self._respond(request)
+
+    def _respond(self, request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        method = request.method
+        body: Any = {}
+        if request.content:
+            try:
+                body = json.loads(request.content)
+            except ValueError:
+                body = {}
+        if method == "POST" and path == "/open/v1/task":
+            self._created += 1
+            return httpx.Response(200, json={**body, "id": f"srv-task-{self._created}"})
+        if method == "POST" and path == "/open/v1/project":
+            self._created += 1
+            return httpx.Response(200, json={**body, "id": f"srv-list-{self._created}"})
+        if method == "POST" and path == "/open/v1/task/batch":
+            return httpx.Response(200, json={"id2etag": {}, "id2error": {}})
+        if method == "POST" and path == "/open/v1/task/move":
+            moved = body[0] if isinstance(body, list) and body else {}
+            return httpx.Response(200, json=[{"id": moved.get("taskId", ""), "etag": "etag"}])
+        if method == "POST" and path == "/open/v1/task/completed":
+            return httpx.Response(200, json=[])
+        if method == "GET" and path == "/open/v1/project":
+            return httpx.Response(200, json=[])
+        if method == "GET" and path == "/open/v1/tag":
+            return httpx.Response(200, json=[])
+        if method == "GET" and path.endswith("/data"):
+            return httpx.Response(200, json={"project": None, "tasks": []})
+        return httpx.Response(200, json={})
+
+
+class FakeBackend:
+    """接缝一的假后端：内部装的是**真货**，对外照旧（#80 的第一步）。
+
+    内部：真 :class:`~dida.storage.store.Store`（``:memory:``）+ 真
+    :class:`~dida.sync.engine.SyncEngine` + 真 :class:`~dida.api.client.DidaApiClient`，
+    网络走 :class:`_FakeBackendServer`。读（``list_index`` / ``tasks_in`` / ``task_detail``
+    / ``status``……）委托给真引擎；**写走真写路径**：真引擎解析 id、真库乐观落库并入队、
+    真客户端把请求发到假传输层，推成功之后认领与出队也都在真库上发生。
+
+    对外那套记录字段与旧版一字不差——测试读的就是它们（``writes`` / ``completed`` /
+    ``created_tasks`` / ``moved``……）。替身里抄来的判断与没人读的数组留给第二步（#86）。
 
     用法::
 
@@ -414,7 +509,11 @@ class FakeBackend:
 
     def __init__(self, *, clock: Clock, day_end: str = "24:00") -> None:
         self.clock = clock
-        self.source = InMemorySource()
+        self.source = Store(":memory:")
+        """真本地库（内存 SQLite）；替身不再自己实现一份。"""
+        self.transport = _FakeBackendServer()
+        """假传输层：发出去的请求在这里看得见（方法、路径、请求体）。"""
+        self.client = DidaApiClient(token="tok", transport=self.transport)
         self.refreshes = 0
         """``refresh()`` 被调用的次数。"""
 
@@ -532,49 +631,165 @@ class FakeBackend:
         self._subtasks: dict[str, tuple[SubtaskItem, ...]] = {}
         """摆进来的子任务，按任务 id 索引（t20）；:meth:`set_subtasks` 摆，读路径照给。"""
 
-        self._engine = SyncEngine(clock=clock, day_end=day_end, source=self.source)
+        self._seq = 0
+        """``add_task`` 不给 id 时的计数器（``t1``、``t2``……）。"""
+        self._list_order = 0
+        """摆进来的清单的 ``sortOrder``：让「怎么加的就怎么排」照旧成立。"""
+        self._planted_pending: int | None = None
+        """``set_sync_state(pending_count=)`` 摆进来的数（真库的待推送是算出来的，见 :meth:`status`）。"""
+
+        self._engine = SyncEngine(
+            clock=clock,
+            day_end=day_end,
+            source=self.source,
+            client=self.client,
+        )
+
+    # ---------------------------------------------------------------- 引擎的三件事（网络）
 
     async def refresh(self) -> RefreshReport:
         """真引擎的 ``refresh()`` 是 async 的（网络等待不阻塞界面），假后端跟着它。
 
-        什么都不写：假后端没有网络也没有库，返回一份空报告就是实话。
+        **不委托给真引擎**：真 ``refresh()`` 会按「服务端这次取全了」的断言剪枝，而替身
+        摆进来的数据不是服务端事实——委托它就会把整份缓存删空。这一层只记下「刷过几次」。
         """
         self.refreshes += 1
         return RefreshReport()
 
     async def push_pending(self, *, manual: bool = False) -> int:
-        """推一轮待推送改动（t21 的周期泵会调它）。
+        """推一轮待推送改动：**交给真引擎的真推送循环**（t21 的周期泵会调它）。
 
-        假后端没有队列，也没有网络，所以推出去 0 条——但调用本身要记下来，好让「泵真的在泵」
-        这件事在接缝一上看得见。``manual`` 也记下来（工单 #71）：「按 ``r`` 时传的是
-        ``manual=True``、启动刷新与周期泵传 ``False``」这条接线在这一层看得最清楚。
+        ``manual`` 照原样转给引擎（工单 #71：「按 ``r`` 时传的是 ``manual=True``、启动刷新与
+        周期泵传 ``False``」这条接线在这一层看得最清楚）。返回值是真引擎推成功的条数。
         """
         self.pushes += 1
         self.manual_pushes.append(manual)
-        return 0
+        return await self._engine.push_pending(manual=manual)
 
     async def refresh_completed(self) -> CompletedReport:
         """拉一次已完成流（``r`` 的第三件事）。
 
-        同样什么都不写：已完成区的内容由 :meth:`set_sync_state` 与内存缓存摆布，
-        这里只记下「拉过几次」。
+        与 :meth:`refresh` 同一个理由：真引擎那一次会按服务端的窗口写库，而替身没有服务端
+        数据。这里只记下「拉过几次」，已完成区由 :meth:`set_sync_state` 与缓存摆布。
         """
         self.completed_pulls += 1
         now = self.clock.now()
         return CompletedReport(start=now, end=now)
 
-    def add_list(self, name: str, **kwargs: Any) -> ListSnapshot:
-        return self.source.add_list(name, **kwargs)
+    # ---------------------------------------------------------------- 摆数据（进真库）
 
-    def add_view(self, name: str, **conditions: Any) -> ViewDefinition:
-        """摆一个自定义视图（#36）：``conditions`` 就是 :class:`ViewDefinition` 的那几维。"""
-        return self.source.add_view(name, **conditions)
+    def add_list(
+        self,
+        name: str,
+        *,
+        id: str | None = None,
+        color: str | None = None,
+        group_id: str | None = None,
+        kind: str | None = None,
+        permission: str | None = None,
+        is_inbox: bool = False,
+    ) -> ListSnapshot:
+        """加一条清单；``id`` 默认就是名字。
 
-    def add_task(self, title: str, **kwargs: Any) -> TaskSnapshot:
-        return self.source.add_task(title, **kwargs)
+        ``is_inbox`` 摆 ``True`` 就是客户端补出来的收集箱那一行（服务端的清单索引里没有它）。
+        ``kind`` / ``permission`` 是服务端 ``Project`` 上那两个字段（``TASK``/``NOTE``、
+        ``write``/``read``/``comment``），清单索引页靠它们标出进不去的行（用户故事 23 / 24）。
+        """
+        list_id = id if id is not None else name
+        self._list_order += 1
+        self.source.save_list(
+            _list_payload(
+                list_id,
+                name,
+                color=color,
+                group_id=group_id,
+                kind=kind,
+                permission=permission,
+                is_inbox=is_inbox,
+                sort_order=self._list_order,
+            )
+        )
+        return next(row for row in self.source.lists() if row.id == list_id)
 
-    def set_sync_state(self, *, last_refresh_at: datetime | None = None, pending_count: int = 0) -> None:
-        self.source.state = SyncState(last_refresh_at=last_refresh_at, pending_count=pending_count)
+    def add_view(self, name: str, *, id: str | None = None, **conditions: Any) -> ViewDefinition:
+        """摆一个自定义视图（#36）：``conditions`` 就是 :class:`ViewDefinition` 的那几维。
+
+        替身**不自己求值**——成员怎么算出来是视图求值那一层的判断（``evaluate_view``），
+        真引擎的读路径从这里读定义、当场求值。所以「这个视图选中了谁」在接缝一上与生产
+        走的是同一份实现（#39 的教训：替身自己编一份，测试就会静默断言成别的东西）。
+        """
+        definition = ViewDefinition(
+            id=id if id is not None else name, name=name, **conditions
+        )
+        self.source.save_view(definition)
+        return definition
+
+    def add_task(
+        self,
+        title: str,
+        *,
+        list_name: str = "收集箱",
+        list_id: str | None = None,
+        due: datetime | None = None,
+        all_day: bool = False,
+        priority: int = 0,
+        completed: bool = False,
+        id: str | None = None,
+        completed_at: datetime | None = None,
+        desc: str = "",
+        content: str = "",
+        tags: tuple[str, ...] = (),
+        repeat_flag: str = "",
+        reminders: tuple[str, ...] = (),
+        raw: Mapping[str, Any] | None = None,
+    ) -> TaskSnapshot:
+        """加一条任务快照；``id`` 默认 ``t1``、``t2``……（按加入顺序）。
+
+        ``completed_at`` 是服务端的完成时刻：已完成区（t12）按它决定谁在窗口里。
+        ``desc`` / ``content`` / ``tags`` 是右栏常驻显示的那三样（工单 #20）。``raw`` 是
+        **服务端原文里多出来的那些字段**（重复规则、提醒、子任务、我们不认识的字段）。
+
+        过的是真库（``Store.apply_refresh``）与同一份「快照 → 原文」翻译
+        （:func:`_server_payload`）——替身不自己拼第二份，也就不会跟真货说不一样的话。
+        清单行不存在时顺手补一条（与旧行为同一条：测试里加任务不必先建清单）。
+        """
+        self._seq += 1
+        snapshot = TaskSnapshot(
+            id=id if id is not None else f"t{self._seq}",
+            title=title,
+            list_id=list_id if list_id is not None else list_name,
+            due=due,
+            all_day=all_day,
+            priority=priority,
+            completed=completed,
+            completed_at=completed_at,
+            desc=desc,
+            content=content,
+            tags=tags,
+            repeat_flag=repeat_flag,
+            reminders=reminders,
+        )
+        if not any(row.id == snapshot.list_id for row in self.source.lists()):
+            self._list_order += 1
+            self.source.save_list(
+                _list_payload(snapshot.list_id, list_name, sort_order=self._list_order)
+            )
+        self.source.apply_refresh(tasks=[{**_server_payload(snapshot), **(raw or {})}])
+        return snapshot
+
+    def set_sync_state(
+        self, *, last_refresh_at: datetime | None = None, pending_count: int = 0
+    ) -> None:
+        """摆同步状态：``last_refresh_at`` 写进真库，``pending_count`` 记成覆盖值。
+
+        真库里「待推送几条」是**算出来的**（``Store.pending_count`` 数两张队列表），摆不进
+        去。而既有测试用它摆出「离线、还有 N 笔没推」那一屏，所以这里记下这个数，在
+        :meth:`status` 里盖上去——对外行为与旧替身一字不差。
+        """
+        self._planted_pending = pending_count
+        self.source.set_sync_state(last_refresh_at=last_refresh_at)
+
+    # ---------------------------------------------------------------- 读（委托真引擎）
 
     def read_model(self) -> ReadModel | None:
         """读：委托给真引擎——整份读模型与它的三个投影都是生产那一份（#81）。
@@ -594,9 +809,7 @@ class FakeBackend:
     def move_targets(self) -> tuple[ListRow, ...]:
         """读：委托给真引擎（真实清单、进得去、服务端已经见过的那些，#45）。
 
-        「服务端见过没有」的判据在真引擎里读的是**队列**（``pending_lists``），而内存替身
-        没有队列，所以它这一路不过滤——接缝一测的是「挑选器给的正好是引擎说的那一份」，
-        过滤本身归接缝二（真库那一条）。
+        真引擎读的是**真队列**（``pending_lists``）：还没被认领的清单从这一份里滤掉。
         """
         return self._engine.move_targets()
 
@@ -636,46 +849,48 @@ class FakeBackend:
         return self._engine.set_day_end(day_end)
 
     def status(self) -> SyncStatus:
-        return self._engine.status()
+        """读：真引擎的状态，``pending_count`` 有摆过的值就盖上去。
+
+        与 ``set_sync_state`` 同一个理由：真库那个数是算出来的，而既有测试用它摆
+        「离线、还有 N 笔」那一屏。没摆过（``None``）就是真库算出来的那个数。
+        """
+        status = self._engine.status()
+        if self._planted_pending is None:
+            return status
+        return replace(status, pending_count=self._planted_pending)
 
     def logical_day(self) -> date:
         """读：现在是哪个逻辑日（工单 #46 的心跳）——同样委托真引擎，替身不自己算一份。"""
         return self._engine.logical_day()
 
+    # ---------------------------------------------------------------- 写（真写路径）
+
     def complete(self, task_id: str) -> None:
-        """写：记下这一笔，**并且真的把它标成完成**（工单 #38）。
+        """写：记下这一笔，并交给真引擎完成它（乐观落库 + 立即推送）。
 
-        与 :meth:`create` 同一条口径（清单那三种写也是）：本地效果是真引擎当场做的事
-        （``Store`` 的乐观写把 ``status`` 写成 2），只记录的话接缝一看不到「按下去这一行
-        就变了」——而完成 / 取消完成正是要按键才看得见的那一类。
-
-        ``completedTime`` 照真引擎的样子**不动**：服务端还没认过这一笔，屏幕上那一条的完成
-        时刻先用「现在」占位（#74 的 ``completed_section``），要等已完成流把服务端那个时间戳
-        带回来才换成权威的那一份——而「拉一次已完成流」是 app 的事（``completed_pulls`` 数它），
-        替身只把状态改掉。
+        本地没有这条任务时**只记录**（旧替身的对外契约：``complete`` 从不当场拒绝；
+        引擎那一条会抛 ``UnknownTaskError``，而这是替身与真实调用方不重叠的一格）。
         """
         self.completed.append(task_id)
-        self.source.set_completed(task_id, completed=True)
+        if self.source.task_payload(task_id) is None:
+            return
+        self._engine.complete(task_id)
 
     def uncomplete(self, task_id: str) -> None:
-        """写：记下这一笔，并把它改回未完成（工单 #38 的第二个方向）。
-
-        与 :meth:`complete` 同一条口径，只是 ``status`` 写回 0；完成时间戳同样不动。
-        """
+        """写：记下这一笔，并交给真引擎取消完成（本地 ``status`` 写回 0，完成时间戳不动）。"""
         self.uncompleted.append(task_id)
-        self.source.set_completed(task_id, completed=False)
+        if self.source.task_payload(task_id) is None:
+            return
+        self._engine.uncomplete(task_id)
 
     def defer(self, task_id: str, *, days: int = 1) -> None:
+        """写：记下这一笔，并交给真引擎按逻辑日顺延（没有截止时间的任务不凭空长出一个）。"""
         self.deferred.append(task_id)
         self.deferred_days.append(days)
+        self._engine.defer(task_id, days=days)
 
     def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> None:
-        """写：记下这一笔，**并且真的把新的截止时间摆进内存缓存**（#44 的改期 / 清除）。
-
-        与 ``write`` / ``create`` 同一条口径（那两个也是「真的摆进缓存」）：只记录的话，
-        「改完截止时间那一格就变了」「清除之后读作没有日期」这两句话在接缝一根本测不到——
-        而它们正是 #44 的验收标准。摆的是**服务端字段名**那一份（``dueDate`` / ``isAllDay``），
-        翻译交给 :meth:`InMemorySource.apply_changes`，与 ``Store._snapshot`` 同一个口径。
+        """写：记下这一笔，并交给真引擎改期（只动 ``dueDate`` 与 ``isAllDay``）。
 
         摆了 ``reschedule_error`` 就记完这一笔再抛：模拟引擎当场拒绝（#25 的
         ``UnknownTaskError``），好试 TUI 拿到结构化错误时的反应。
@@ -685,13 +900,9 @@ class FakeBackend:
         self.rescheduled_all_day.append(all_day)
         if self.reschedule_error is not None:
             raise self.reschedule_error
-        self.source.apply_changes(
-            task_id,
-            {
-                "dueDate": None if due is None else due.isoformat(),
-                "isAllDay": all_day,
-            },
-        )
+        if self.source.task_payload(task_id) is None:
+            return
+        self._engine.reschedule(task_id, due=due, all_day=all_day)
 
     def create(
         self,
@@ -703,40 +914,23 @@ class FakeBackend:
         priority: int | None = None,
         tags: Sequence[str] = (),
     ) -> str:
-        """写：记下这一笔（含落点），**并且真的把它摆进内存缓存**（t15 / #39 的新建）。
+        """写：交给真引擎新建（本地临时 id、乐观落库、立即推送、推成功后认领真 id）。
 
-        与 ``complete`` / ``defer`` 那种「只记录」不一样：新建是凭空多出一条任务，而
-        「新建的任务立刻出现在对应分区里」正是验收标准之一——只记录的话，接缝一根本测不到
-        这句话。
+        **落点由 ``list_id`` 给**（#39 的验收标准 8）：默认收集箱只是给「落点不是这条测试的
+        重点」的那些调用留的方便（与引擎那一侧「在视图里建传 ``INBOX_ID``」是同一个值）。
 
-        **落点由 ``list_id`` 给**（#39 的验收标准 8）：原来这里把 ``list_name=收集箱`` 写死，
-        于是「在 工作 里新建，落在 工作」会静默断言成收集箱——假替身说了假话，测试全绿。
-        默认收集箱只是给「落点不是这条测试的重点」的那些调用留的方便（与引擎那一侧
-        「在视图里建传 ``INBOX_ID``」是同一个值）。
-
-        ``priority or 0``：API 的「无」是 ``0``（快照那一侧的编码），而 ``None`` 是「调用方
-        没写这个字段」——两者在快照里是同一个意思。
-
-        落点那条清单**还没被认领**（id 是 ``local-list-…``）时照引擎的样子抛
-        :class:`~dida.sync.writes.UnclaimedListError`（#39 / #53）：替身说了假话（收下一条
-        请求体里 ``projectId`` 服务端没见过的任务）就会让「在没推出去的清单里建」看起来
-        通了，而真引擎是拒绝的。判据读同一处（``is_local_id``）。
+        落点那条清单**还没被认领**（id 是 ``local-list-…``）时真引擎抛
+        :class:`~dida.sync.writes.UnclaimedListError`（#39 / #53），这里**一条都不记**——
+        拒绝就是拒绝。
         """
-        if is_local_id(list_id):
-            raise UnclaimedListError(list_id)
+        task_id = self._engine.create(
+            title, list_id, due=due, all_day=all_day, priority=priority, tags=tags
+        )
         self.created.append(title)
         self.created_due.append(due)
         self.created_all_day.append(all_day)
         self.created_priority.append(priority)
         self.created_tags.append(tuple(tags))
-        task_id = self.source.add_task(
-            title,
-            list_id=list_id,
-            due=due,
-            all_day=all_day,
-            priority=priority or 0,
-            tags=tuple(tags),
-        ).id
         self.created_tasks.append(
             CreatedTask(
                 id=task_id,
@@ -750,7 +944,7 @@ class FakeBackend:
         return task_id
 
     def delete(self, task_id: str) -> None:
-        """写：只记录（t16 的 ``d``；替身不动缓存，与 ``complete`` / ``defer`` 一样）。
+        """写：记下这一笔，并交给真引擎删除（本地当场摘掉快照、推送走 ``DELETE``）。
 
         摆了 ``delete_error`` 就记完这一笔再抛：模拟引擎当场拒绝（#25 的
         ``UnknownTaskError``），好试 TUI 拿到结构化错误时的反应。
@@ -758,24 +952,27 @@ class FakeBackend:
         self.deleted.append(task_id)
         if self.delete_error is not None:
             raise self.delete_error
+        if self.source.task_payload(task_id) is None:
+            return
+        self._engine.delete(task_id)
 
     def move_task(self, task_id: str, *, to_list_id: str) -> None:
-        """写：记下这一笔，**并且真的把任务挪进目标清单**（#45 的搬运）。
+        """写：记下这一笔，并交给真引擎搬运（``POST /open/v1/task/move``，#45）。
 
-        与 ``write`` / ``create`` 同一条口径（那两处也是「真的摆进缓存」）：只记录的话，
-        「搬完那条任务出现在新清单里、原清单里没有了」这句话在接缝一根本测不到——而它正是
-        这一票的验收标准。摆了 ``write_error`` 就记完这一笔再抛（与 ``write`` 同一个口子：
-        引擎当场拒绝时界面要说得出具体原因）。
+        已经在那个清单里 = 什么都不写（判据是引擎的 :func:`~dida.sync.writes.is_a_move`，
+        与旧替身同一条口径）：不照做的话，替身会记下一笔「搬了」而生产那一条根本没写。
+        摆了 ``write_error`` 就记完这一笔再抛（与 ``write`` 同一个口子）。
         """
-        current = next((task.list_id for task in self.source.tasks() if task.id == task_id), None)
-        if current == to_list_id:
-            # 与真引擎同一条口径（``PushMixin.move_task``）：已经在那个清单里 = 什么都不写。
-            # 不照做的话，替身会记下一笔「搬了」而生产那一条根本没写——接缝一断的就是这句话。
+        payload = self.source.task_payload(task_id)
+        current = None if payload is None else str(payload.get("projectId") or "")
+        if current is not None and current == to_list_id:
             return
         self.moved.append((task_id, to_list_id))
         if self.write_error is not None:
             raise self.write_error
-        self.source.apply_changes(task_id, {"projectId": to_list_id})
+        if payload is None:
+            return
+        self._engine.move_task(task_id, to_list_id=to_list_id)
 
     def write(
         self,
@@ -784,64 +981,54 @@ class FakeBackend:
         changes: Mapping[str, Any] | None = None,
         kind: WriteKind = WriteKind.UPDATE,
     ) -> None:
-        """写：记下这一笔，**并且真的把改动落进内存缓存**（#43 的逐字段编辑）。
+        """写：记下这一笔，并交给真引擎走真写路径（乐观落库 + 入队 + 立即推送）。
 
-        与 ``create`` 同一条口径（那里也是「真的摆进缓存」）：只记录的话，「改完一个字段屏幕
-        上就变了」这句话在接缝一根本测不到——而逐个字段改、两个字段互不覆盖正是这一票要断的
-        事。摆了 ``write_error`` 就记完这一笔再抛，试 TUI 拿到结构化错误时说不说得清。
+        摆了 ``write_error`` 就记完这一笔再抛，试 TUI 拿到结构化错误时说不说得清。
         """
         self.writes.append((task_id, dict(changes or {})))
         if self.write_error is not None:
             raise self.write_error
-        self.source.apply_changes(task_id, dict(changes or {}))
-    def cycle_priority(self, task_id: str) -> None:
-        """写：只记录（与 ``complete`` / ``defer`` 一样，替身不动缓存）。
+        if self.source.task_payload(task_id) is None:
+            return
+        self._engine.write(task_id, changes=changes, kind=kind)
 
-        「下一档是哪个线上编码」是引擎的判断（``dida.sync.view.next_priority``，0/1/3/5），
-        替身不自己再抄一份——抄了就会跟真货说不一样的话。
+    def cycle_priority(self, task_id: str) -> None:
+        """写：记下这一笔，并交给真引擎推进一档（``0 → 1 → 3 → 5``）。
+
+        「下一档是哪个线上编码」是引擎的判断（``dida.sync.view.next_priority``），替身不自己
+        再抄一份——抄了就会跟真货说不一样的话。
         """
         self.cycled.append(task_id)
+        if self.source.task_payload(task_id) is None:
+            return
+        self._engine.cycle_priority(task_id)
 
     def create_list(self, name: str, *, color: str | None = None) -> str:
-        """写：记下这一笔，**并且真的把它摆进内存缓存**（#42 的新建）。
+        """写：记下这一笔，并交给真引擎新建清单（本地临时 id + 乐观落库 + 立即推送）。
 
-        与 :meth:`create` 同一条口径：清单列表页上「建完立刻多出一行」正是这张工单的验收
-        标准，只记录的话接缝一根本测不到那句话。本地临时 id 也照真引擎的样子给
-        （服务端建好之后才给真 id），界面因此不必认识「哪条还没推上去」；前缀用
-        :data:`~dida.sync.lists.LOCAL_LIST_PREFIX`，不在这里另抄一份字面量（#57 的检查 10）。
+        本地临时 id 由真库的发号器给（服务端建好之后才给真 id）。
         """
         self.created_lists.append((name, color))
         self._raise_list_error()
-        return self.source.add_list(
-            name, id=f"{LOCAL_LIST_PREFIX}{len(self.created_lists)}", color=color
-        ).id
+        return self._engine.create_list(name, color=color)
 
     def update_list(
         self, list_id: str, *, name: str | None = None, color: str | None = None
     ) -> None:
-        """写：记下这一笔，并改内存缓存里那一行（没给的字段照旧不动）。"""
+        """写：记下这一笔，并交给真引擎改那一行（没给的字段照旧不动）。"""
         self.updated_lists.append((list_id, name, color))
         self._raise_list_error()
-        current = next((row for row in self.source.lists() if row.id == list_id), None)
-        if current is None:
+        if self.source.list_payload(list_id) is None:
             return
-        self.source.save_list(
-            {
-                "id": list_id,
-                "name": current.name if name is None else name,
-                "color": current.color if color is None else color,
-                "groupId": current.group_id,
-                "kind": current.kind,
-                "permission": current.permission,
-                "isInbox": current.is_inbox,
-            }
-        )
+        self._engine.update_list(list_id, name=name, color=color)
 
     def delete_list(self, list_id: str) -> None:
-        """写：记下这一笔，并从内存缓存里摘掉那一行（#42 的删除）。"""
+        """写：记下这一笔，并交给真引擎删那一行（只动清单那一行）。"""
         self.deleted_lists.append(list_id)
         self._raise_list_error()
-        self.source.drop_list(list_id)
+        if self.source.list_payload(list_id) is None:
+            return
+        self._engine.delete_list(list_id)
 
     def _raise_list_error(self) -> None:
         """摆了 ``list_error`` 就在记完这一笔之后抛它（引擎当场拒绝的那条路）。"""
@@ -849,26 +1036,19 @@ class FakeBackend:
             raise self.list_error
 
     def create_view(self, definition: ViewDefinition) -> str:
-        """写：记下这一笔，**并且真的把它摆进内存缓存**（#36）。
-
-        与 :meth:`create_list` 同一条口径：清单列表页上「建完立刻多出一行」正是这张工单的
-        验收标准，只记录的话接缝一根本测不到那句话。
-
-        实际落库**委托给真引擎**（``self._engine``）：视图那条写路径不需要网络也不需要
-        客户端，替身没有理由再抄一遍「分配 id + 覆盖式写一行」——抄一遍就会与生产漂移。
-        """
+        """写：记下这一笔，并交给真引擎落库（**只在本地**，视图不推服务端）。"""
         self.created_views.append(definition)
         self._raise_view_error()
         return self._engine.create_view(definition)
 
     def update_view(self, definition: ViewDefinition) -> None:
-        """写：记下这一笔，并改内存缓存里那一行（位置照旧不动）。"""
+        """写：记下这一笔，并交给真引擎改那一行（位置照旧不动）。"""
         self.updated_views.append(definition)
         self._raise_view_error()
         self._engine.update_view(definition)
 
     def delete_view(self, view_id: str) -> None:
-        """写：记下这一笔，并从内存缓存里摘掉那一行（**一条任务都不碰**）。"""
+        """写：记下这一笔，并交给真引擎摘掉那一行（**一条任务都不碰**）。"""
         self.deleted_views.append(view_id)
         self._raise_view_error()
         self._engine.delete_view(view_id)
