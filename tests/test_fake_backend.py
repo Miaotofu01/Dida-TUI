@@ -69,3 +69,34 @@ def test_a_create_through_the_fake_records_the_tags_on_the_task():
     assert detail is not None
     assert detail.tags == ("周报", "工作"), "标签要落在那条任务上（不是只记在账本里）"
     assert backend.created_tags == [("周报", "工作")], "记下来的那一份也照旧"
+
+
+def test_a_planted_pending_count_is_a_real_queue_not_an_overlay():
+    """摆出来的「待推送 N」是**真队列里的 N 笔真改动**（#86）。
+
+    原来 ``status()`` 上盖了一个摆进来的数——替身说得出真库说不出的状态。现在这个参数改成
+    真的入队，所以「状态栏那个数」与「本地库算出来的那个数」永远是同一份账。
+    """
+    backend = FakeBackend(clock=ManualClock(T0))
+    backend.add_list("工作", id="work")
+    backend.add_task("写周报", list_name="work", id="t1")
+
+    backend.set_sync_state(pending_count=2)
+
+    assert backend.status().pending_count == 2
+    assert backend.source.pending_count() == 2, "真账目算出来也是 2，不是只有 status() 这么说"
+    assert len(backend.source.pending()) == 2
+
+
+def test_status_reports_the_count_the_real_queue_derives():
+    """没摆过的时候，那个数就是真库从队列表里算出来的那一个——没有东西在暗中顶替它。"""
+    backend = FakeBackend(clock=ManualClock(T0))
+    backend.add_list("工作", id="work")
+    backend.add_task("写周报", list_name="work", id="t1")
+    assert backend.status().pending_count == 0
+
+    backend.write("t1", changes={"title": "写周报（改）"})  # 真写 → 真入队
+
+    assert backend.source.pending_count() == 1
+    assert backend.status().pending_count == 1, "status() 说的就是真队列里那一笔"
+

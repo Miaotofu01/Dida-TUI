@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import json
 from collections import deque
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from typing import Any, Mapping, Sequence
 
@@ -36,8 +36,10 @@ from dida.storage.store import (
     Store,
 )
 from dida.sync.engine import (
+    LIST_COLORS,
     CompletedReport,
     ListRow,
+    ListWriteKind,
     ReadModel,
     SyncEngine,
     SyncStatus,
@@ -529,8 +531,6 @@ class FakeBackend:
         """``add_task`` 不给 id 时的计数器（``t1``、``t2``……）。"""
         self._list_order = 0
         """摆进来的清单的 ``sortOrder``：让「怎么加的就怎么排」照旧成立。"""
-        self._planted_pending: int | None = None
-        """``set_sync_state(pending_count=)`` 摆进来的数（真库的待推送是算出来的，见 :meth:`status`）。"""
 
         self._engine = SyncEngine(
             clock=clock,
@@ -674,14 +674,51 @@ class FakeBackend:
     def set_sync_state(
         self, *, last_refresh_at: datetime | None = None, pending_count: int = 0
     ) -> None:
-        """摆同步状态：``last_refresh_at`` 写进真库，``pending_count`` 记成覆盖值。
+        """摆同步状态：``last_refresh_at`` 写进真库；``pending_count`` **真的入队那么多笔改动**。
 
-        真库里「待推送几条」是**算出来的**（``Store.pending_count`` 数两张队列表），摆不进
-        去。而既有测试用它摆出「离线、还有 N 笔没推」那一屏，所以这里记下这个数，在
-        :meth:`status` 里盖上去——对外行为与旧替身一字不差。
+        「待推送几条」在真库里是**算出来的**（``Store.pending_count`` 数两张队列表），摆不进
+        去。所以这个参数不是盖在 :meth:`status` 上的一个数，而是让替身走**真队列**
+        （``Store.enqueue`` / ``Store.enqueue_list``——引擎自己入队走的就是这两条）入队那么多笔
+        **真改动**：状态栏那个数因此永远与队列里的事实是同一份账，替身说不出真库说不出的
+        状态（#86 之前这里是一个覆盖值）。
+
+        入队改的是界面上**不画**的那一位——有任务时是任务的 ``etag``（引擎的
+        ``write(changes={"etag": …})`` 会为它入队），只有清单时是清单的 ``color``（清单行画的是
+        「前缀 + 名字 + 条数」，颜色不画；引擎的 ``update_list(color=…)`` 会为它入队）。挑一位
+        看得见的不改屏幕，是因为这个参数的语义就是「摆出有待推送 N 笔**而屏幕照旧**」。
+        两样都没有时无从入队，直接报错（不静默摆一个假数）。
         """
-        self._planted_pending = pending_count
         self.source.set_sync_state(last_refresh_at=last_refresh_at)
+        for index in range(pending_count):
+            self._enqueue_planted_change(index)
+
+    def _enqueue_planted_change(self, index: int) -> None:
+        """入队一笔真改动，只动界面上不画的那一位（见 :meth:`set_sync_state`）。"""
+        pending_task = next(iter(self.source.tasks()), None)
+        if pending_task is not None:
+            self.source.enqueue(
+                task_id=pending_task.id,
+                kind=WriteKind.UPDATE,
+                payload={"etag": f"pending-{index + 1}"},
+                now=self.clock.now(),
+                list_id=pending_task.list_id,
+            )
+            return
+        pending_list = next(iter(self.source.lists()), None)
+        if pending_list is None:
+            raise AssertionError(
+                "没有任务也没有清单可挂待推送改动：先 add_task / add_list 再 "
+                "set_sync_state(pending_count=…)"
+            )
+        raw = dict(self.source.list_payload(pending_list.id) or {})
+        color = next(color.value for color in LIST_COLORS if color.value != raw.get("color"))
+        self.source.enqueue_list(
+            list_id=pending_list.id,
+            kind=ListWriteKind.UPDATE,
+            payload={"name": raw.get("name"), "color": color},
+            now=self.clock.now(),
+            local={**raw, "color": color},
+        )
 
     # ---------------------------------------------------------------- 读（委托真引擎）
 
@@ -737,15 +774,8 @@ class FakeBackend:
         return self._engine.set_day_end(day_end)
 
     def status(self) -> SyncStatus:
-        """读：真引擎的状态，``pending_count`` 有摆过的值就盖上去。
-
-        与 ``set_sync_state`` 同一个理由：真库那个数是算出来的，而既有测试用它摆
-        「离线、还有 N 笔」那一屏。没摆过（``None``）就是真库算出来的那个数。
-        """
-        status = self._engine.status()
-        if self._planted_pending is None:
-            return status
-        return replace(status, pending_count=self._planted_pending)
+        """读：委托给真引擎——待推送那个数是真库从两张队列表里算出来的，替身不盖任何值。"""
+        return self._engine.status()
 
     def logical_day(self) -> date:
         """读：现在是哪个逻辑日（工单 #46 的心跳）——同样委托真引擎，替身不自己算一份。"""
