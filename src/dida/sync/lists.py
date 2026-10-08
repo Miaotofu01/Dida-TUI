@@ -692,8 +692,8 @@ class ListMixin:
 
         分不清就一条都不动、等下一次全量刷新（宁可不动，也不许认错）。
         """
-        target = self._source
-        if not isinstance(target, ListWriteTarget):
+        target = self._caps.list_writes
+        if target is None:
             return 0
         records = tuple(target.pending_lists())
         parked = [item for item in records if not is_addressable(item)]
@@ -777,18 +777,11 @@ class ListMixin:
 
     def _list_target(self) -> ListWriteTarget:
         """清单写路径要写的那个本地副本。没接上就大声报错——绝不假装写成功了。"""
-        if not isinstance(self._source, ListWriteTarget):
-            raise RuntimeError(
-                "清单的写路径需要本地存储：SyncEngine(source=Store(...))；"
-                "只读的 ViewSource 存不下待推送改动"
-            )
-        return self._source
+        return self._caps.list_write_target()
 
     def _list_writer(self) -> ProjectWriter:
         """推送清单改动要的那个客户端。没接上就大声报错——绝不假装推过了。"""
-        if not isinstance(self._client, ProjectWriter):
-            raise RuntimeError("清单的写路径需要 API 客户端：SyncEngine(client=DidaApiClient(...))")
-        return self._client
+        return self._caps.project_writer()
 
 
 def _records_are_one_list(records: Sequence[PendingListChange]) -> bool:

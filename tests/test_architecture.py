@@ -79,6 +79,7 @@ MODULE_WHITELIST = [
     "dida.storage.store",  # 本地存储
     "dida.storage.queue",  # 队列表的记账机制（#82；本地存储那一支里的账本，只依赖 stdlib）
     "dida.sync.engine",  # 同步引擎
+    "dida.sync.capabilities",  # 构造那一处问清「谁会做什么」（#85）
     "dida.logical_day",  # 逻辑日
     "dida.tui.app",  # TUI
 ]
@@ -1094,3 +1095,100 @@ def test_the_storage_backdoor_guard_lets_the_shared_vocabulary_through():
     )
 
     assert _storage_imports(source, package=SYNC_PACKAGE) == ()
+
+
+# ---------------------------------------------------------------------------
+# 能力在构造那一处定下来：业务路径一处运行时探测都不许有（工单 #85）
+#
+# 在 #85 之前，「这份副本会不会做某件事」被拆成 13 处运行时探测散在业务路径上
+# （``isinstance(…, 某个 Protocol)`` / ``getattr`` + ``callable``），而「做不到」有四种说法。
+# 现在只有一个地方问：``Capabilities.of``（引擎构造那一处）。这条守卫盯着它不会被写回来——
+# 形状是「谁再临场探一次就当场红」，而不是「现在这几处对不对」。
+# ---------------------------------------------------------------------------
+
+CAPABILITY_PROTOCOLS = frozenset(
+    {
+        "ViewSource",
+        "WriteTarget",
+        "ListWriteTarget",
+        "RefreshTarget",
+        "ViewStore",
+        "ViewReader",
+        "PayloadReader",
+        "ProjectReader",
+        "TaskWriter",
+        "ProjectWriter",
+        "TagReader",
+        "CompletedReader",
+        "PushQueue",
+    }
+)
+"""「这份副本 / 这个客户端会不会做某件事」那几个能力协议（工单 #85）。
+
+``isinstance(…, 这里的一个名字)`` 就是一次临场探测。``isinstance(payload, Mapping)`` 那种
+**形状**检查不算——它问的不是「谁会做什么」，是「这份数据长什么样」。
+"""
+
+CAPABILITY_HOME = "src/dida/sync/capabilities.py"
+"""唯一允许问「谁会做什么」的地方（工单 #85）：构造那一处的那一张表。"""
+
+
+def _is_a_capability(node: ast.AST) -> bool:
+    """``isinstance`` 的第二个参数是不是一个能力协议（裸名字，或者元组里的一个）。"""
+    if isinstance(node, ast.Name):
+        return node.id in CAPABILITY_PROTOCOLS
+    if isinstance(node, ast.Tuple):
+        return any(_is_a_capability(item) for item in node.elts)
+    return False
+
+
+def _capability_probes(source: str) -> list[str]:
+    """这份源码里的临场能力探测，写成 ``行号: 形状``（空 = 干净）。"""
+    found: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None)
+        if name == "isinstance" and len(node.args) >= 2 and _is_a_capability(node.args[1]):
+            found.append(f"{node.lineno}: isinstance")
+        elif name == "callable":
+            found.append(f"{node.lineno}: callable")
+    return found
+
+
+def test_the_capability_is_decided_in_exactly_one_place():
+    """业务路径上**一处**运行时能力探测都没有——只有构造那一处问一次（工单 #85）。
+
+    两种形状都拦：``isinstance(source, ListWriteTarget)`` 与 ``getattr`` + ``callable``
+    （``pending_error`` 原来那种「装作没这回事」的写法）。业务路径读
+    :attr:`~dida.sync.engine.SyncEngine._caps` 里已经定下来的那一格。
+    """
+    offenders = [
+        f"{path.relative_to(ROOT)}:{where}"
+        for path in sorted((ROOT / "src" / "dida" / "sync").rglob("*.py"))
+        if str(path.relative_to(ROOT)) != CAPABILITY_HOME
+        for where in _capability_probes(path.read_text(encoding="utf-8"))
+    ]
+
+    assert offenders == [], (
+        "「谁会做什么」只许在构造那一处问一次（dida/sync/capabilities.py）：\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_the_capability_probe_guard_catches_a_second_copy():
+    """上一条守卫自己也要有人守（仓库惯例）：两种形状逐条钉住，形状检查不算。"""
+    assert _capability_probes("if isinstance(source, ListWriteTarget):\n    return ()\n") == [
+        "1: isinstance"
+    ]
+    assert _capability_probes(
+        "pending = getattr(source, 'pending', None)\nif not callable(pending):\n    return None\n"
+    ) == ["2: callable"], "``getattr`` + ``callable`` 那种写法也要拦得住"
+    assert _capability_probes(
+        "if isinstance(source, (WriteTarget, ListWriteTarget)):\n    pass\n"
+    ) == ["1: isinstance"], "元组里的一个也算"
+    assert _capability_probes("if isinstance(payload, Mapping):\n    pass\n") == [], (
+        "形状检查不是「谁会做什么」"
+    )
+    assert _capability_probes("if isinstance(created, Mapping) or not created.get('id'):\n    pass\n") == []
+

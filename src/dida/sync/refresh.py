@@ -32,10 +32,14 @@ PROJECT_PAGE_SIZE = 200
 """
 
 
+@runtime_checkable
 class ProjectReader(Protocol):
     """全量刷新要的那两次网络调用；t07 的 ``DidaApiClient`` 满足它。
 
     故意只有两个方法：刷新路径不需要客户端的写操作，也不需要它认识领域概念。
+
+    ``runtime_checkable`` 是**承重**的（工单 #85）：能力在构造那一处问一次
+    （:meth:`~dida.sync.capabilities.Capabilities.of`），业务路径不再探测。
     """
 
     async def list_projects(
@@ -175,18 +179,11 @@ class RefreshMixin:
 
     def _refresh_target(self) -> RefreshTarget:
         """刷新要写的那个本地副本。没接上就大声报错——绝不假装刷过了。"""
-        if not isinstance(self._source, RefreshTarget):
-            raise RuntimeError(
-                "全量刷新需要本地存储：SyncEngine(source=Store(...))；"
-                "只读的 ViewSource 写不进去"
-            )
-        return self._source
+        return self._caps.refresh_target()
 
     def _reader(self) -> ProjectReader:
-        """取数要的那个客户端。"""
-        if self._client is None:
-            raise RuntimeError("全量刷新需要 API 客户端：SyncEngine(client=DidaApiClient(...))")
-        return self._client
+        """取数要的那个客户端。没接上就大声报错——绝不假装刷过了。"""
+        return self._caps.project_reader()
 
 
 async def _project_index(reader: ProjectReader) -> list[Mapping[str, Any]]:

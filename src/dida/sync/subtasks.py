@@ -39,7 +39,7 @@ class SubtaskMixin:
         """本地那份任务原文；源读不出原文时当作「没有这条任务」。
 
         要的是**读**的能力（``PayloadReader``），不是写的能力：详情页与子任务行都只读它
-        （#33 的详情读形状也从这里过），只读的替身存得下原文就该读得到。
+        （#33 的详情读形状也从这里过），只读的替身存得下原文就该读得到。这一格在构造那一处
+        就定了（工单 #85 的 :attr:`Capabilities.payload`）。
         """
-        source = self._source
-        return source.task_payload(task_id) if isinstance(source, PayloadReader) else None
+        return self._caps.payload_of(task_id)

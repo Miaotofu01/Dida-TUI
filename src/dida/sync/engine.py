@@ -287,20 +287,21 @@ DEFAULT_DAY_END = "00:00"
 """配置注入之前的默认日界：零偏移，逻辑日等于自然日（规范形式见 ADR 0003）。"""
 
 
-def pending_error(source: object) -> str | None:
-    """本地队列里最后一条推不出去的改动报的错（源上没有队列就是 ``None``）。
+def pending_error(queue: WriteTarget | None) -> str | None:
+    """本地队列里最后一条推不出去的改动报的错（这份副本没有队列就是 ``None``）。
 
     读的是一条**已经记下来的事实**：``Store.record_attempt`` 把失败原因写在那一行上
     （``last_error``），这里只是把它带到 :class:`SyncStatus` 上，让它到得了界面（用户故事
     81：保存失败要说具体原因）。
 
-    只读替身（``InMemorySource`` 那种）没有队列，于是没有这个信息——与写路径上那几个
-    ``isinstance`` 门同一条口径：不知道就说不知道，不猜一个。
+    参数是**构造时定下来的那一格**（工单 #85 的 :attr:`Capabilities.writes`），不是一个还没
+    问过的源：只读替身（``InMemorySource`` 那种）没有队列，于是没有这个信息——「不知道就说
+    不知道」这件事在构造那一处就定了，业务路径不再临场探一次。真的 ``Store`` 本身就满足
+    ``WriteTarget``，所以照旧可以直接把它递进来。
     """
-    pending = getattr(source, "pending", None)
-    if not callable(pending):
+    if queue is None:
         return None
-    errors = [str(change.last_error) for change in pending() if getattr(change, "last_error", None)]
+    errors = [str(change.last_error) for change in queue.pending() if change.last_error]
     return errors[-1] if errors else None
 
 
@@ -577,6 +578,10 @@ class SyncEngine(
         self._day_end = day_end
         self._source = source
         self._client = client
+        # 「这份本地副本 / 这个客户端会不会做某件事」**在构造这一处问清**（工单 #85）：
+        # 从前它被拆成 13 处运行时探测散在业务路径上，而「做不到」有四种说法。答案存在这张
+        # 表里，业务路径只读它；缺哪一件由 Capabilities 那一个地方说（MissingCapability）。
+        self._caps = Capabilities.of(source, client)
         self._completed_window_hours = completed_window_hours
         # 标签列表：用户打开挑标签那一格时拉一次，只活在内存里（见 dida.sync.tags 的模块文档）。
         self._tags: tuple[str, ...] = ()
@@ -613,7 +618,7 @@ class SyncEngine(
             pending_count=state.pending_count,
             last_refresh_at=state.last_refresh_at,
             logical_day=logical_day(now, self._day_end).label,
-            last_error=pending_error(self._source),
+            last_error=pending_error(self._caps.writes),
         )
 
     def logical_day(self) -> date:
@@ -730,36 +735,21 @@ class SyncEngine(
         """服务端还没见过的清单 id（本地还有一笔没推成功的 ``CREATE``）。
 
         读的是一条**已经记下来的事实**（``Store.pending_lists`` 那张队列表），不是 id 的
-        形状。只读替身没有队列，于是没有这个信息——与写路径上那几个 ``isinstance`` 门
-        同一条口径：不知道就说不知道，不猜一个。
+        形状。只读替身没有队列，于是没有这个信息——「不知道就说不知道」在构造那一处就定了
+        （工单 #85 的 :attr:`Capabilities.list_writes`），这里只是照它答。
         """
-        source = self._source
-        if not isinstance(source, ListWriteTarget):
-            return frozenset()
-        return frozenset(
-            change.list_id
-            for change in source.pending_lists()
-            if change.kind is ListWriteKind.CREATE
-        )
+        return self._caps.unseen_list_ids()
 
     def _view_definitions(self) -> tuple[ViewDefinition, ...]:
         """本地库里那些自定义视图的**定义**（#36）；装配读模型时交给那一层去求值。
 
         本地副本只给**定义**（它手上没有逻辑日，不读时钟），求值走
         :func:`~dida.sync.read.custom_view_rows`——与内置视图那三个是同一个
-        ``evaluate_view``。源上没有这个能力就是「没有自定义视图」，不是错误——与写路径上
-        那几个 ``isinstance`` 门同一条口径。
+        ``evaluate_view``。源上没有这个能力就是「没有自定义视图」，不是错误——这一格在构造
+        那一处就定了（工单 #85 的 :attr:`Capabilities.views`）。
         """
-        source = self._source
-        if not isinstance(source, ViewReader):
-            return ()
-        return tuple(source.view_definitions())
+        return self._caps.view_definitions()
 
     def _write_target(self) -> WriteTarget:
         """写路径要写的那个本地副本。没接上就大声报错——绝不假装写成功了。"""
-        if not isinstance(self._source, WriteTarget):
-            raise RuntimeError(
-                "写路径需要本地存储：SyncEngine(source=Store(...))；"
-                "只读的 ViewSource 存不下待推送改动"
-            )
-        return self._source
+        return self._caps.write_target()
