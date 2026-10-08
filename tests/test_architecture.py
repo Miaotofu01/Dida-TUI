@@ -75,6 +75,7 @@ CSS 里 ``cyan`` 是 ``#00FFFF``（真彩色）。同一个词两个意思——
 MODULE_WHITELIST = [
     "dida.config",  # 配置与凭据
     "dida.api.client",  # 滴答 API 客户端
+    "dida.vocabulary",  # 共用词汇（同步与本地副本的共同下界）
     "dida.storage.store",  # 本地存储
     "dida.sync.engine",  # 同步引擎
     "dida.logical_day",  # 逻辑日
@@ -628,3 +629,113 @@ def test_the_same_list_guard_catches_an_inlined_comparison():
         "把 id 当参数传出去不是「自己判」"
     )
     assert _equality_with_attribute("if other.list_id == mine.list_id:\n    pass\n", "list_id") == [1]
+
+
+# ---------------------------------------------------------------------------
+# 依赖方向：sync 与 storage 都只指向 dida.vocabulary（工单 #78）
+#
+# 在共用词汇独立成模块之前，sync 为了用本地库那几个类型，撑了 9 处补丁：6 处只在
+# ``if TYPE_CHECKING:`` 里 import、3 处把 import 写进函数体。三种形状都得拦——它们都能让
+# 「新加一个共用类型得先猜放哪边」这件事回来。零容忍：sync 里一处都不许出现。
+# ---------------------------------------------------------------------------
+
+SYNC_PACKAGE = "dida.sync"
+
+
+def _is_storage(name: str) -> bool:
+    """这是不是本地存储那一支（``dida.storage`` 或它的子模块）。"""
+    return name == "dida.storage" or name.startswith("dida.storage.")
+
+
+def _names_type_checking(test: ast.expr) -> bool:
+    """这个 ``if`` 的条件里出现了 ``TYPE_CHECKING`` 吗。"""
+    return any(isinstance(node, ast.Name) and node.id == "TYPE_CHECKING" for node in ast.walk(test))
+
+
+def _import_place(node: ast.AST, parents: dict[int, ast.AST]) -> str:
+    """这处 import 在哪儿：模块顶层 / 只在类型检查时 / 函数体内（可叠加）。"""
+    places: list[str] = []
+    parent = parents.get(id(node))
+    while parent is not None:
+        if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            places.append("函数体内")
+        elif isinstance(parent, ast.If) and _names_type_checking(parent.test):
+            places.append("只在类型检查时")
+        parent = parents.get(id(parent))
+    return " + ".join(reversed(places)) or "模块顶层"
+
+
+def _storage_imports(source: str, *, package: str) -> tuple[str, ...]:
+    """这份源码里每一处 import 本地库的位置，写成 ``行号: 在哪``（空元组 = 干净）。"""
+    tree = ast.parse(source)
+    parents: dict[int, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        names: set[str] = set()
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        else:
+            base = _absolute_module(node, package=package)
+            if base:
+                names.add(base)
+                names.update(f"{base}.{alias.name}" for alias in node.names)
+        if any(_is_storage(name) for name in names):
+            found.append(f"{node.lineno}: {_import_place(node, parents)}")
+    return tuple(found)
+
+
+def test_sync_never_reaches_back_into_the_local_store():
+    """``sync`` 只许依赖 :mod:`dida.vocabulary`，一处本地库 import 都不许有（工单 #78）。
+
+    这条守的是**方向**，不是「现在这几处对不对」：顶层、``if TYPE_CHECKING:``、函数体内
+    三种形状一视同仁——补丁当初正是靠后两种绕开那个环的。
+    """
+    offenders = [
+        f"{path.relative_to(ROOT)}:{where}"
+        for path in sorted((ROOT / "src" / "dida" / "sync").rglob("*.py"))
+        for where in _storage_imports(path.read_text(encoding="utf-8"), package=_package_of(path))
+    ]
+
+    assert offenders == [], (
+        "sync 只许依赖 dida.vocabulary（工单 #78）：本地库那一支一处都不许 import，"
+        "函数内 import 与 TYPE_CHECKING 后门同样不行：\n" + "\n".join(offenders)
+    )
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        ("from dida.storage.store import Store\n", ("1: 模块顶层",)),
+        ("import dida.storage\n", ("1: 模块顶层",)),
+        ("from ..storage import store\n", ("1: 模块顶层",)),
+        (
+            "if TYPE_CHECKING:\n    from dida.storage.store import RefreshReport\n",
+            ("2: 只在类型检查时",),
+        ),
+        (
+            "def f():\n    from dida.storage.store import COMPLETED_STATUS\n"
+            "    return COMPLETED_STATUS\n",
+            ("2: 函数体内",),
+        ),
+    ],
+)
+def test_the_storage_backdoor_guard_catches_every_shape(source, expected):
+    """这条守卫自己也要有人守（工单 #78）：补丁的三种形状逐条钉住（不然它只是好看）。"""
+    assert _storage_imports(source, package=SYNC_PACKAGE) == expected
+
+
+def test_the_storage_backdoor_guard_lets_the_shared_vocabulary_through():
+    """共用词汇与自己的兄弟模块照旧放行——守卫拦的是**本地库那一支**。"""
+    source = (
+        "from dida.vocabulary import PendingChange, WriteKind\n"
+        "from dida.sync.view import ListSnapshot\n"
+        "from dida.sync.engine import SyncEngine\n"
+    )
+
+    assert _storage_imports(source, package=SYNC_PACKAGE) == ()

@@ -17,7 +17,7 @@ from __future__ import annotations
 
 import asyncio
 from datetime import datetime, timedelta
-from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import DidaError
 from dida.sync.writes import (
@@ -33,9 +33,7 @@ from dida.sync.writes import (
     is_local_task_id,
     project_in,
 )
-
-if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能在这里 import
-    from dida.storage.store import PendingChange
+from dida.vocabulary import COMPLETED_STATUS, PendingChange, UNCOMPLETED_STATUS
 
 
 RETRY_SCHEDULE: tuple[timedelta, ...] = (
@@ -137,26 +135,6 @@ def _unaddressable(
     return UnclaimedTaskError(task_id)
 
 
-def _completed_status() -> int:
-    """任务「已完成」的 ``status`` 值（``2``，api-contracts.md 第 2 条）。
-
-    从存储层取而不是在这里再写一个字面量：同一份 API 事实只留一处。
-    """
-    from dida.storage.store import COMPLETED_STATUS
-
-    return COMPLETED_STATUS
-
-
-def _uncompleted_status() -> int:
-    """任务「未完成」的 ``status`` 值（``0``，取消完成写回的那一档，工单 #38）。
-
-    与 :func:`_completed_status` 并排：这两个值是**同一张码表**的两档，分开写两处就会漂。
-    """
-    from dida.storage.store import UNCOMPLETED_STATUS
-
-    return UNCOMPLETED_STATUS
-
-
 @runtime_checkable
 class TaskWriter(Protocol):
     """推送要的那几个写操作；t07 的 ``DidaApiClient`` 满足它。
@@ -226,7 +204,7 @@ class PushMixin:
         """乐观写：本地当场生效并入队，然后**立即返回**；网络结果不是它的前置条件。
 
         ADR-0002 的口径：一次按键的手感比可撤销性值钱，所以本地先动，服务端随后到。
-        改动进 :class:`~dida.storage.store.PendingChange` 队列后，会立刻在事件循环上
+        改动进 :class:`~dida.vocabulary.PendingChange` 队列后，会立刻在事件循环上
         推一次（``push_on_change=False`` 时不排这一轮，改动留在队列里等下一次
         :meth:`push_pending`：手动同步 ``r``，或 t21 那个周期泵）；推不动就留在队列里按
         注入的钟退避重试，绝不让这一屏等网络。
@@ -462,7 +440,7 @@ class PushMixin:
             await writer.complete_task(change.list_id, change.task_id)
         elif wire is WireCall.BATCH_UPDATE_TASK:
             # 批量更新：请求体是 {update: [...]}，每一条只带 id / projectId / status。
-            # 取消完成是唯一走这条路的一种写（`_BEHAVIOUR` 说的一种写一种端点形状）；
+            # 取消完成是唯一走这条路的一种写（`_WRITE_BEHAVIOUR` 说的一种写一种端点形状）；
             # 那条改动在本地要写下的 ``status`` 就是这条请求要发的值——两者同一个来源，
             # 不会出现「本地改成未完成、服务端收到的是别的」。
             await writer.batch_update(
@@ -538,9 +516,9 @@ class PushMixin:
         ``task/batch`` 的 ``update`` 要发的东西（实测确认，spec 的实测事实第 1 条）。
         """
         merged = dict(changes or {})
-        # 「本地立刻完成 / 立刻不再完成」这两件事都由词表说（dida.sync.writes 的 _BEHAVIOUR）
+        # 「本地立刻完成 / 立刻不再完成」这两件事都由词表说（dida.vocabulary 的 _WRITE_BEHAVIOUR）
         if kind.marks_completed:
-            merged.setdefault("status", _completed_status())
+            merged.setdefault("status", COMPLETED_STATUS)
         elif kind.clears_completed:
-            merged.setdefault("status", _uncompleted_status())
+            merged.setdefault("status", UNCOMPLETED_STATUS)
         return merged

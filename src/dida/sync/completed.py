@@ -12,14 +12,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import MalformedResponseError
 from dida.api.guards import api_date
 from dida.sync.rows import completed_window_start, task_is_completed
-
-if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能在这里 import
-    from dida.storage.store import StoredSyncState
+from dida.vocabulary import StoredSyncState
 
 
 DEFAULT_COMPLETED_WINDOW_HOURS = 168

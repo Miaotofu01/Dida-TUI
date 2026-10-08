@@ -63,7 +63,7 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import TYPE_CHECKING, Protocol, Sequence, runtime_checkable
+from typing import Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import AuthError, DidaError
 from dida.api.guards import all_day_date
@@ -176,9 +176,7 @@ from dida.sync.views import (
     view_from_payload,
     view_payload,
 )
-
-if TYPE_CHECKING:  # 只为了标注：storage 反过来 import dida.sync.view，运行时不能在这里 import
-    from dida.storage.store import RefreshReport
+from dida.vocabulary import RefreshReport
 
 __all__ = [
     "ANY_VALUE",

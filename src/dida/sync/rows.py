@@ -24,6 +24,8 @@ from __future__ import annotations
 from datetime import datetime, timedelta
 from typing import Protocol
 
+from dida.vocabulary import COMPLETED_STATUS
+
 __all__ = [
     "RowFacts",
     "completed_window_start",
@@ -112,12 +114,9 @@ def task_is_completed(status: object) -> bool:
     取消完成**不会清空** ``completedTime``（实测），所以「有没有完成时间」判不出完成与否
     ——那正是这条规矩存在的原因（spec 的「已完成」两处必须写清之一）。
 
-    ``COMPLETED_STATUS`` 从存储层取（函数内 import，与 :func:`dida.sync.push._completed_status`
-    同一条路）：同一份 API 事实只留一处，而 storage 反过来 import :mod:`dida.sync.view`，
-    模块级 import 会绕成环。
+    ``COMPLETED_STATUS`` 从共用词汇取：同一份 API 事实只留一处（#78 之前它是函数内
+    import——storage 反过来 import :mod:`dida.sync.view`，模块级 import 会绕成环）。
     """
-    from dida.storage.store import COMPLETED_STATUS
-
     try:
         return int(status) == COMPLETED_STATUS  # type: ignore[arg-type]
     except (TypeError, ValueError):

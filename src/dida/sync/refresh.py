@@ -11,14 +11,12 @@
 from __future__ import annotations
 
 from datetime import date, datetime
-from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import MalformedResponseError
 from dida.logical_day import logical_day
 from dida.sync.view import INBOX_ID, INBOX_NAME, ViewSource
-
-if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能在这里 import
-    from dida.storage.store import RefreshReport, StoredSyncState
+from dida.vocabulary import RefreshReport, StoredSyncState
 
 
 PROJECT_PAGE_SIZE = 200
@@ -102,7 +100,7 @@ class RefreshMixin:
     async def refresh(self) -> RefreshReport:
         """全量刷新（ADR 0001）：逐清单取回未完成 → 与本地快照 diff → 只写变化 + 剪枝。
 
-        返回 :class:`~dida.storage.store.RefreshReport`：这次到底写了什么、**删了什么**
+        返回 :class:`~dida.vocabulary.RefreshReport`：这次到底写了什么、**删了什么**
         （远端已经没有的清单与任务，#41）、服务端盖掉了哪些本地值、哪些被待推送改动挡回去了
         （ADR-0002 要求覆盖能被看见）。
 
