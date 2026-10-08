@@ -601,6 +601,29 @@ def _equality_with_attribute(source: str, attribute: str) -> list[int]:
     return found
 
 
+def _equality_against_a_bare_name(source: str, attribute: str) -> list[int]:
+    """源码里 ``<某个裸名字> == … .attribute``（或反过来）这种比较的行号。
+
+    与 :func:`_equality_with_attribute` 的差别在**另一边**：这里要求另一边是一个**裸名字**
+    （界面自己手里那份值），所以只抓「拿我这边那份值与引擎给的那一份比」这种形状；
+    ``option.value == field.value``（两边都是属性，挑选项回填那种正当比较）不算。
+    """
+    found: list[int] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Compare):
+            continue
+        if not any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
+            continue
+        operands = [node.left, *node.comparators]
+        named = any(isinstance(item, ast.Name) for item in operands)
+        valued = any(
+            isinstance(item, ast.Attribute) and item.attr == attribute for item in operands
+        )
+        if named and valued:
+            found.append(node.lineno)
+    return found
+
+
 JUDGEMENT_NAMES = frozenset({"is_a_change", "is_a_move", "is_list_edit", "is_view_edit"})
 """「这一次到底改了没有」那几个判据的名字（**本体只有一个**，其余是同一族的适配）。
 
@@ -656,17 +679,25 @@ def test_the_interface_never_judges_whether_something_changed():
 def test_the_interface_does_not_inline_the_comparisons_it_used_to_make():
     """界面也不许把那个比较**手写**回来（工单 #79）：import 与内联两种形状都要拦。
 
-    拦的是写路径上那几格（清单 / 优先级 / 标签）的比较——它们在 #79 之前逐处写在
-    ``app._apply_pick`` 里，比的是屏幕上那一份，而不是引擎手里的本地原文。
+    拦的是两组，#79 之前它们逐处写在界面里、比的是屏幕上那一份（而不是引擎手里的本地原文）：
+
+    - ``app._apply_pick`` 里那几格（清单 / 优先级 / 标签）的属性比较；
+    - ``pages/detail.py`` 自由文本框退出时「编辑器里那段文字与 ``Field.value`` 相等」那一下
+      （形状是**裸名字 vs 属性**：``value == field.value``）。
     """
-    source = (ROOT / "src" / "dida" / "tui" / "app.py").read_text(encoding="utf-8")
+    app = (ROOT / "src" / "dida" / "tui" / "app.py").read_text(encoding="utf-8")
+    detail = (ROOT / "src" / "dida" / "tui" / "pages" / "detail.py").read_text(encoding="utf-8")
 
     inlined = {
-        attribute: _equality_with_attribute(source, attribute)
+        attribute: _equality_with_attribute(app, attribute)
         for attribute in ("list_id", "priority", "tags")
     }
     assert inlined == {"list_id": [], "priority": [], "tags": []}, (
         "界面又自己比了一遍「改了没有」（比的是屏幕上那一份）：这条判断归引擎\n" + repr(inlined)
+    )
+    assert _equality_against_a_bare_name(detail, "value") == [], (
+        "详细页又自己比了一遍「编辑器里那段文字与字段当前值相等」——这条判断归引擎"
+        "（dida.sync.writes.is_a_change），写的那一次回报布尔"
     )
 
 
@@ -695,6 +726,15 @@ def test_the_inlined_comparison_guard_catches_a_second_copy():
     )
     assert _equality_with_attribute("if other.list_id == mine.list_id:\n    pass\n", "list_id") == [1]
     assert _equality_with_attribute("if int(picked) == detail.priority:\n    pass\n", "priority") == [1]
+
+    free_text = "value = self._editor_value()\nif value == field.value:\n    return\n"
+    assert _equality_against_a_bare_name(free_text, "value") == [2]
+    assert _equality_against_a_bare_name("if option.value == field.value:\n    pass\n", "value") == [], (
+        "两边都是属性的正当比较（挑选项回填）不算「自己判」"
+    )
+    assert _equality_against_a_bare_name(
+        'if event.input.id == "due-date" and event.value != self._due_prefill:\n    pass\n', "value"
+    ) == [], "「这一格被用户动过没有」不是「改了没有」"
 
 
 # ---------------------------------------------------------------------------
