@@ -37,9 +37,10 @@ from dida.sync.engine import (
     TaskList,
     ViewDefinition,
     WriteKind,
+    is_view_edit,
 )
-from dida.sync.lists import LOCAL_LIST_PREFIX
-from dida.sync.writes import UnclaimedListError, is_local_id
+from dida.sync.lists import LOCAL_LIST_PREFIX, is_list_edit
+from dida.sync.writes import UnclaimedListError, is_a_change, is_a_move, is_local_id
 from dida.sync.view import (
     INBOX_ID,
     ListSnapshot,
@@ -657,11 +658,12 @@ class FakeBackend:
         self.uncompleted.append(task_id)
         self.source.set_completed(task_id, completed=False)
 
-    def defer(self, task_id: str, *, days: int = 1) -> None:
+    def defer(self, task_id: str, *, days: int = 1) -> bool:
         self.deferred.append(task_id)
         self.deferred_days.append(days)
+        return True
 
-    def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> None:
+    def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> bool:
         """写：记下这一笔，**并且真的把新的截止时间摆进内存缓存**（#44 的改期 / 清除）。
 
         与 ``write`` / ``create`` 同一条口径（那两个也是「真的摆进缓存」）：只记录的话，
@@ -669,21 +671,28 @@ class FakeBackend:
         而它们正是 #44 的验收标准。摆的是**服务端字段名**那一份（``dueDate`` / ``isAllDay``），
         翻译交给 :meth:`InMemorySource.apply_changes`，与 ``Store._snapshot`` 同一个口径。
 
+        **同值收敛**（#79）：那一刻与本地那一份相同时什么都不写、回 ``False``——判据用的是
+        生产那**一个**本体 :func:`~dida.sync.writes.is_a_change`（在本地那份原文上比），不是
+        替身自己再写一遍比较。替身在这一层说实话，接缝一上「一个字都没改就提交」才看得见
+        （#39 的教训：替身编一份自己的判断，测试就会静默断言成别的东西）。
+
         摆了 ``reschedule_error`` 就记完这一笔再抛：模拟引擎当场拒绝（#25 的
         ``UnknownTaskError``），好试 TUI 拿到结构化错误时的反应。
         """
+        changes: dict[str, Any] = {
+            "dueDate": None if due is None else due.isoformat(),
+            "isAllDay": all_day,
+        }
+        payload = self.source.task_payload(task_id)
+        if payload is not None and not is_a_change(payload, changes):
+            return False
         self.rescheduled.append(task_id)
         self.rescheduled_due.append(due)
         self.rescheduled_all_day.append(all_day)
         if self.reschedule_error is not None:
             raise self.reschedule_error
-        self.source.apply_changes(
-            task_id,
-            {
-                "dueDate": None if due is None else due.isoformat(),
-                "isAllDay": all_day,
-            },
-        )
+        self.source.apply_changes(task_id, changes)
+        return True
 
     def create(
         self,
@@ -751,23 +760,26 @@ class FakeBackend:
         if self.delete_error is not None:
             raise self.delete_error
 
-    def move_task(self, task_id: str, *, to_list_id: str) -> None:
+    def move_task(self, task_id: str, *, to_list_id: str) -> bool:
         """写：记下这一笔，**并且真的把任务挪进目标清单**（#45 的搬运）。
 
         与 ``write`` / ``create`` 同一条口径（那两处也是「真的摆进缓存」）：只记录的话，
         「搬完那条任务出现在新清单里、原清单里没有了」这句话在接缝一根本测不到——而它正是
         这一票的验收标准。摆了 ``write_error`` 就记完这一笔再抛（与 ``write`` 同一个口子：
         引擎当场拒绝时界面要说得出具体原因）。
+
+        回报这次到底搬了没有（#79）：已经在那个清单里（或者目标为空）时回 ``False``——与真
+        引擎同一条口径（``PushMixin.move_task`` 读的是同一个判据 :func:`is_a_move`）。不照做
+        的话，替身会记下一笔「搬了」而生产那一条根本没写：接缝一断的就是这句话。
         """
         current = next((task.list_id for task in self.source.tasks() if task.id == task_id), None)
-        if current == to_list_id:
-            # 与真引擎同一条口径（``PushMixin.move_task``）：已经在那个清单里 = 什么都不写。
-            # 不照做的话，替身会记下一笔「搬了」而生产那一条根本没写——接缝一断的就是这句话。
-            return
+        if not is_a_move(current, to_list_id):
+            return False
         self.moved.append((task_id, to_list_id))
         if self.write_error is not None:
             raise self.write_error
         self.source.apply_changes(task_id, {"projectId": to_list_id})
+        return True
 
     def write(
         self,
@@ -775,17 +787,27 @@ class FakeBackend:
         *,
         changes: Mapping[str, Any] | None = None,
         kind: WriteKind = WriteKind.UPDATE,
-    ) -> None:
+    ) -> bool:
         """写：记下这一笔，**并且真的把改动落进内存缓存**（#43 的逐字段编辑）。
 
         与 ``create`` 同一条口径（那里也是「真的摆进缓存」）：只记录的话，「改完一个字段屏幕
         上就变了」这句话在接缝一根本测不到——而逐个字段改、两个字段互不覆盖正是这一票要断的
         事。摆了 ``write_error`` 就记完这一笔再抛，试 TUI 拿到结构化错误时说不说得清。
+
+        **同值收敛**（#79）：盖上去的字段与本地那一份原文逐位相同时什么都不做、回 ``False``
+        ——判据是生产那**一个**本体 :func:`~dida.sync.writes.is_a_change`，替身不再自己写
+        第二份比较。#39 的教训：替身编一份自己的判断，接缝一上就会静默断言成别的东西。
         """
-        self.writes.append((task_id, dict(changes or {})))
+        local = dict(changes or {})
+        payload = self.source.task_payload(task_id)
+        if payload is not None and kind.converges and not is_a_change(payload, local):
+            return False
+        self.writes.append((task_id, local))
         if self.write_error is not None:
             raise self.write_error
-        self.source.apply_changes(task_id, dict(changes or {}))
+        self.source.apply_changes(task_id, local)
+        return True
+
     def cycle_priority(self, task_id: str) -> None:
         """写：只记录（与 ``complete`` / ``defer`` 一样，替身不动缓存）。
 
@@ -810,13 +832,25 @@ class FakeBackend:
 
     def update_list(
         self, list_id: str, *, name: str | None = None, color: str | None = None
-    ) -> None:
-        """写：记下这一笔，并改内存缓存里那一行（没给的字段照旧不动）。"""
+    ) -> bool:
+        """写：记下这一笔，并改内存缓存里那一行（没给的字段照旧不动）。
+
+        **同值收敛**（#79）：交回来的两位与本地那一行相同时什么都不做、回 ``False``——判据是
+        生产那一份（:func:`~dida.sync.lists.is_list_edit`，本体在 ``writes``），替身不自己
+        再比一遍。
+        """
+        current = next((row for row in self.source.lists() if row.id == list_id), None)
+        if current is not None and not is_list_edit(
+            current_name=current.name,
+            current_color=current.color,
+            name=name,
+            color=color,
+        ):
+            return False
         self.updated_lists.append((list_id, name, color))
         self._raise_list_error()
-        current = next((row for row in self.source.lists() if row.id == list_id), None)
         if current is None:
-            return
+            return True
         self.source.save_list(
             {
                 "id": list_id,
@@ -828,6 +862,7 @@ class FakeBackend:
                 "isInbox": current.is_inbox,
             }
         )
+        return True
 
     def delete_list(self, list_id: str) -> None:
         """写：记下这一笔，并从内存缓存里摘掉那一行（#42 的删除）。"""
@@ -853,11 +888,20 @@ class FakeBackend:
         self._raise_view_error()
         return self._engine.create_view(definition)
 
-    def update_view(self, definition: ViewDefinition) -> None:
-        """写：记下这一笔，并改内存缓存里那一行（位置照旧不动）。"""
+    def update_view(self, definition: ViewDefinition) -> bool:
+        """写：记下这一笔，并改内存缓存里那一行（位置照旧不动）。
+
+        **同值收敛**（#79）：交回来的那份与本地那一行一样时什么都不做、回 ``False``——判据
+        是生产那一份（:func:`~dida.sync.views.is_view_edit`，本体在 ``writes``），替身不自己
+        再比一遍。
+        """
+        current = self._engine.view_definition(definition.id)
+        if current is not None and not is_view_edit(current, definition):
+            return False
         self.updated_views.append(definition)
         self._raise_view_error()
         self._engine.update_view(definition)
+        return True
 
     def delete_view(self, view_id: str) -> None:
         """写：记下这一笔，并从内存缓存里摘掉那一行（**一条任务都不碰**）。"""

@@ -1055,6 +1055,99 @@ async def test_typing_a_date_and_a_time_reschedules_the_task_to_that_moment():
     assert "明天 09:30" in field_row(text, "截止"), f"改完那一格没跟着变：\n{text}"
 
 
+SGR = re.compile(r"\x1b\[[0-9;]*m")
+"""ANSI 的 SGR 序列：屏幕文本里的样式就长这样。"""
+
+
+def status_style(screen: str, text: str) -> str:
+    """带样式的一屏里 ``text`` 那一段用的样式（原样，不去解读它是哪个颜色）。"""
+    for line in screen.splitlines():
+        if text not in SGR.sub("", line):
+            continue
+        runs: list[tuple[str, str]] = []
+        style, pos = "", 0
+        for match in SGR.finditer(line):
+            if line[pos : match.start()]:
+                runs.append((style, line[pos : match.start()]))
+            style = "" if match.group() == "\x1b[0m" else match.group()
+            pos = match.end()
+        if line[pos:]:
+            runs.append((style, line[pos:]))
+        for run_style, chunk in runs:
+            if text in chunk:
+                return run_style
+    raise AssertionError(f"屏幕上没有「{text}」这一段：\n{screen}")
+
+
+async def test_submitting_the_due_editor_without_changing_anything_writes_nothing(tmp_path):
+    """详细页把光标走到「截止」上、一个字都没改就提交：**空操作不入队、不推、不亮**（#79）。
+
+    ADR-0008 第二节记下的那次实测就是它的前身：在详细页把光标走到「截止」上连按三次
+    ``enter``（进编辑器 → 日期步 → 时刻步提交），引擎收到的是 ``rescheduled == ["t1"]``——
+    一笔什么都没改的写真的入队、真的推了一轮、状态栏的「待推送」就亮了一格。第七处漏掉是
+    因为写的那一次只回一个「什么都没有」；#79 让它自己回话，这一条就断在**传输层**上：
+    一个请求都没有（不是「替身没记账」，是网络上真的没东西出去）。
+
+    接缝二：真引擎 + 真库 + 打给假服务端的真客户端——与
+    ``test_a_change_that_cannot_be_pushed_says_why`` 同一套。什么都没改时界面也**不出声**：
+    不新增「没有改动」这类提示（措辞一个字不变）。
+    """
+    transport = Recording()
+    app = real_app(tmp_path, transport)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to_the_due_field(pilot, app)
+        await pilot.press("enter")  # 进截止编辑器（日期那一格，回填着当前那一刻）
+        await pilot.pause()
+        await pilot.press("enter")  # 日期这一格提交 → 轮到时刻
+        await pilot.pause()
+        await pilot.press("enter")  # 时刻这一格提交 → 「这一次改动」出去
+        await pilot.pause()
+        text = screen_text(app)
+        styled = screen_styled_text(app)
+        pending = app.engine.status().pending_count
+
+    assert transport.requests == [], (
+        "一个字都没改，却发了一个请求："
+        + repr([str(request.url) for request in transport.requests])
+    )
+    assert pending == 0, "空操作不许入队（状态栏那个数就是它）"
+    assert status_style(styled, "待推送 0") == status_style(styled, "已同步"), (
+        "空操作不许把状态栏那一段点亮：\n" + styled
+    )
+    assert "没有改动" not in text and "未改变" not in text, "什么都没改时界面不出声，不新增提示"
+    assert "今天" in field_row(text, "截止"), field_row(text, "截止")
+
+
+async def test_finishing_a_text_box_without_changing_anything_writes_nothing(tmp_path):
+    """详细页自由文本框原样退出：**一个请求都不发**（#79 删掉的那处界面自问的替补）。
+
+    这一格里界面以前自己比 ``value == field.value``（屏幕上那一份），#79 之后比的是引擎手里
+    的本地原文——写的那一次自己回话。这里走真引擎 + 假传输，所以「一笔都没有」在网络上看得见。
+    """
+    transport = Recording()
+    app = real_app(tmp_path, transport)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await pilot.press("enter")  # 改标题：编辑器开着，一个字都不敲
+        await pilot.pause()
+        await pilot.press("escape")  # 结束编辑 = 保存
+        await pilot.pause()
+        text = screen_text(app)
+        pending = app.engine.status().pending_count
+
+    assert transport.requests == [], (
+        "标题一个字都没改，却发了一个请求："
+        + repr([str(request.url) for request in transport.requests])
+    )
+    assert pending == 0, "空操作不许入队"
+    assert TITLE in field_row(text, "标题"), f"原来的标题照旧在：\n{text}"
+
+
 async def test_the_all_day_switch_flips_between_a_time_and_a_date_only():
     """「全天」开关在「有具体时刻」与「只有日期」之间切换（验收标准 2）。
 

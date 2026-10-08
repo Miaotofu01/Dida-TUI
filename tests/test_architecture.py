@@ -601,27 +601,92 @@ def _equality_with_attribute(source: str, attribute: str) -> list[int]:
     return found
 
 
-def test_the_same_list_judgement_is_asked_of_the_engine_not_written_twice():
-    """「搬到它已经在的那个清单 = 没改」只实现一次，界面**问引擎**（工单 #58 的 T6）。
+JUDGEMENT_NAMES = frozenset({"is_a_change", "is_a_move", "is_list_edit", "is_view_edit"})
+"""「这一次到底改了没有」那几个判据的名字（**本体只有一个**，其余是同一族的适配）。
 
-    判据本体是 :func:`dida.sync.writes.is_a_move`，两个时刻各问一次（与
-    ``is_addressable_task`` 同一个形状）：引擎在 ``move_task`` 里问它决定**写不写**，
-    界面在 ``_apply_pick`` 里问它决定**推不推**。
+从 #79 起写的那一次自己回话（回报布尔），所以界面一处都不许再问、也不许再自己比一遍。
+"""
 
-    界面那一问非有不可：``move_task`` 回不了话（它的签名是 ``-> None``），不问就会为一次
-    根本没发生的改动推一轮——``tests/test_picker_fields.py`` 钉着那句 ``pushes == 0``。
-    但**判据**只有一处，所以这里扫两件事：界面确实问了引擎，而且没有自己再比一遍。
+
+def _judgements_in(source: str) -> list[str]:
+    """这份源码里用到那几个判据的地方，写成 ``行号: 名字``（空元组 = 干净）。
+
+    两种形状都算：``from … import is_a_move`` 进来的那个名字（``ast.alias``），以及直接用它
+    （``ast.Name`` / ``ast.Attribute``，后者兜住 ``import dida.sync.writes as w; w.is_a_move``）。
     """
-    source = (ROOT / "src" / "dida" / "tui" / "app.py").read_text(encoding="utf-8")
+    found: set[tuple[int, str]] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Name) and node.id in JUDGEMENT_NAMES:
+            found.add((node.lineno, node.id))
+        elif isinstance(node, ast.Attribute) and node.attr in JUDGEMENT_NAMES:
+            found.add((node.lineno, node.attr))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name in JUDGEMENT_NAMES:
+                    found.add((node.lineno, alias.name))
+    return [f"{lineno}: {name}" for lineno, name in sorted(found)]
 
-    assert "is_a_move(" in source, "界面没有问引擎那条判据：它是不是又自己比了一遍？"
-    assert _equality_with_attribute(source, "list_id") == [], (
-        "界面自己判了「同一个清单」——这条判断归引擎（dida.sync.writes.is_a_move）"
+
+def test_the_interface_never_judges_whether_something_changed():
+    """界面里 **0 处**自己判「改了没有」（工单 #79）。
+
+    判据本体是 :func:`dida.sync.writes.is_a_change`（写词汇那一层，比的是本地那一份原文），
+    六条写路径各自回报布尔；界面只按回报值决定推不推、说不说。所以 ``tui/`` 里一处都不许
+    出现那几个判据的名字——包括「再 import 进来问一遍」这条退路。
+
+    在 #79 之前这里恰好相反：``#58`` 的守卫要求界面 import ``is_a_move``（那时写入口回不了
+    话，只能各问一遍），于是同一个判断在六个地方各写一遍、第七处漏掉（ADR-0008 第二节记的
+    那次空写）。这条守卫守的是**那个方向**：判据只有一个主语。
+    """
+    sources = {
+        str(path.relative_to(ROOT)): path.read_text(encoding="utf-8")
+        for path in sorted((ROOT / "src" / "dida" / "tui").rglob("*.py"))
+    }
+
+    offenders = [
+        f"{name}:{where}" for name, source in sources.items() for where in _judgements_in(source)
+    ]
+
+    assert offenders == [], (
+        "界面自己判了「改了没有」——这条判断归引擎（dida.sync.writes.is_a_change），"
+        "写的那一次回报布尔，界面只按回报值走：\n" + "\n".join(offenders)
     )
 
 
-def test_the_same_list_guard_catches_an_inlined_comparison():
-    """上一条守卫自己也要有人守（工单 #58 的 T6）：再写一遍那个比较当场红。"""
+def test_the_interface_does_not_inline_the_comparisons_it_used_to_make():
+    """界面也不许把那个比较**手写**回来（工单 #79）：import 与内联两种形状都要拦。
+
+    拦的是写路径上那几格（清单 / 优先级 / 标签）的比较——它们在 #79 之前逐处写在
+    ``app._apply_pick`` 里，比的是屏幕上那一份，而不是引擎手里的本地原文。
+    """
+    source = (ROOT / "src" / "dida" / "tui" / "app.py").read_text(encoding="utf-8")
+
+    inlined = {
+        attribute: _equality_with_attribute(source, attribute)
+        for attribute in ("list_id", "priority", "tags")
+    }
+    assert inlined == {"list_id": [], "priority": [], "tags": []}, (
+        "界面又自己比了一遍「改了没有」（比的是屏幕上那一份）：这条判断归引擎\n" + repr(inlined)
+    )
+
+
+def test_the_interface_judgement_guard_catches_both_shapes():
+    """上两条守卫自己也要有人守（工单 #79）：import 与内联两种写法逐条钉住。"""
+    assert _judgements_in("from dida.sync.engine import is_a_move\n") == ["1: is_a_move"]
+    assert _judgements_in("if not is_a_move(a, b):\n    return False\n") == ["1: is_a_move"]
+    assert _judgements_in("import dida.sync.writes as w\n\nw.is_a_change(a, b)\n") == [
+        "3: is_a_change"
+    ], "换个写法绕过去也要拦得住"
+    assert _judgements_in("from dida.sync.engine import WriteKind, move_targets\n") == [], (
+        "不是那几个名字的 import 不算"
+    )
+    assert _judgements_in("self.engine.move_task(task_id, to_list_id=x)\n") == [], (
+        "把 id 当参数交出去不是「自己判」"
+    )
+
+
+def test_the_inlined_comparison_guard_catches_a_second_copy():
+    """内联那一条的守卫自己也要有人守：再写一遍那个比较当场红。"""
     inlined = "if field == LIST_FIELD:\n    if values[LIST_FIELD] == detail.list_id:\n        return False\n"
 
     assert _equality_with_attribute(inlined, "list_id") == [2]
@@ -629,6 +694,7 @@ def test_the_same_list_guard_catches_an_inlined_comparison():
         "把 id 当参数传出去不是「自己判」"
     )
     assert _equality_with_attribute("if other.list_id == mine.list_id:\n    pass\n", "list_id") == [1]
+    assert _equality_with_attribute("if int(picked) == detail.priority:\n    pass\n", "priority") == [1]
 
 
 # ---------------------------------------------------------------------------

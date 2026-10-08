@@ -993,11 +993,16 @@ async def test_changing_the_due_date_sends_the_repeat_rule_byte_for_byte(store):
 
 
 async def test_a_task_without_a_date_never_carries_a_repeat_rule_out(store):
-    """没有日期的任务：清除截止时间的那一笔请求里**没有**重复规则（验收标准 5）。
+    """一条**从来没有日期**的任务：再清除一次截止时间不算改动，一个字都不写（#79）。
 
-    服务端对「没有日期却有重复规则」的处理是**静默清空**（spec :158；``guards`` 的
-    ``DatelessRepeatError`` 就是拦它的）。一条从来没有日期的任务不该有任何规则可带——这里
-    断的就是请求体里连那个 key 都不出现，而不是「带了一个空串」。
+    旧的形状是「本地一律入队、由写边界那两道守卫兜着」——于是同一个空操作真的写了一笔，
+    请求体里没有 ``repeatFlag`` 这句话只能在一次**没发生**的写里被检查（#79 之前的实测就是
+    这样：详细页连按三次 ``enter`` 会推一轮）。#79 之后这条设定自己先收敛掉了：``dueDate``
+    的「缺省」与「显式 ``null``」是同一件事，所以这里断的是**连请求都没有**，本地那一份照旧
+    没有日期、也没有凭空长出一条重复规则。
+
+    真正「清除一个**有日期**的任务」那一笔请求体里没有 ``repeatFlag``，由下面那条
+    （``test_clearing_a_due_date_does_not_touch_a_repeat_rule_that_is_not_there``）钉着。
     """
     seed(store, task(id="t1", title="写周报"))
     transport = FakeTransport(json={"id": "t1"})
@@ -1006,8 +1011,10 @@ async def test_a_task_without_a_date_never_carries_a_repeat_rule_out(store):
     engine.reschedule("t1", due=None, all_day=False)
     await engine.wait_for_pushes()
 
-    assert len(transport.requests) == 1
-    assert "repeatFlag" not in transport.last_json, transport.last_json
+    assert transport.requests == [], "本来就没有日期：这一笔不算改动，一个字节都不发"
+    payload = store.task_payload("t1")
+    assert payload is not None
+    assert "dueDate" not in payload and "repeatFlag" not in payload, "本地那一份也不许变样"
 
 
 async def test_clearing_a_repeating_tasks_due_date_is_refused_before_any_request(store):
