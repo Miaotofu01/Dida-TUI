@@ -55,7 +55,7 @@ D 清单  ：清单列表页行上 local-list-1 ／库里 ['srvlist1']（同一�
 ## Consequences
 
 - **新增一张表 + 一条解析**：`_SCHEMA` 里 `CREATE TABLE IF NOT EXISTS id_aliases`（老库不需要迁移脚本，建表是幂等的），开库时 `DELETE FROM id_aliases`。`ViewSource` 公开面加 `resolve_id`，`InMemorySource` 照做（替身不许说假话）。
-- **接缝一复现不了这个 bug**：`FakeBackend.create` 直接发 `t1` 这种真 id，认领在替身里不存在。所以回归测试落在**接缝二**上——真 `Store` + 真引擎 + 假传输 + Pilot，样式照 `tests/test_app_sync.py`。这也是这个 bug 在近千条测试里全绿的原因。
+- **接缝一复现不了这个 bug**（**2026-10-08 订正：这一句从 #80 起不再成立**）——当时 `FakeBackend.create` 直接发 `t1` 这种真 id，认领在替身里不存在。**#80 之后**假后端的写路径委托真引擎（真 `Store(":memory:")` + 假传输层）：`create` 返回 `local-task-…`、推成功后认领成 `srv-task-1`，所以接缝一现在**跑得到**认领这条路。回归测试仍留在**接缝二**（真 `Store` + 真引擎 + 假传输 + Pilot，样式照 `tests/test_app_sync.py`）——这也是这个 bug 当初在近千条测试里全绿的原因。
 - **别名不许写进任务原文**：那份 `raw` 会整份回写给服务端（`update_task(snapshot=...)`），塞一个私有字段就是把本机的事发给服务端。
 - **队列的重指（#53 / #54）不撤**：别名不是它的替代品——一个消费者在库里（那一笔改动要重指），一个在屏幕上（那个 id 要继续认得出），两件事。
 - **界面仍然不许知道认领**：谁要在 `tui/` 里加「认领了」的处理，先回来看第三节。顺带补上的一处：`on_tasks_page_delete` 在 `task_detail` 为 `None` 时静默 `return`（`tui/app.py:880-889`），那是 ADR-0002「失败不许静默」在这条路上的一个口子——修完之后那个 id 不会再是 `None`，但**那个 `return` 本身仍然该出声**，留给下一张票。

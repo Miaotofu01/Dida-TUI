@@ -180,8 +180,10 @@ TUI 只画字符串。截止时间读法的字形必须是**宽度无歧义**的
   会被算成昨天。写侧只有一种形状（`dida.api.guards.all_day_date`）——写成「本地午夜 + 本地
   偏移」会让读侧按 UTC 取到**前一天**。
 
-接缝一的假后端在 `dida.testing.FakeBackend`：读委托给真引擎（三种读形状跟生产同一份实现），
-写操作只记录（`refreshes` / `completed` / `deferred`）。TUI 测试一律这样搭：
+接缝一的假后端在 `dida.testing.FakeBackend`：**读与写都委托给真引擎**（真 `Store(":memory:")` +
+真 `SyncEngine` + 假传输层，工单 #80），所以字段翻译、守卫、发号、队列记账都只有一份；它另外记下
+`refreshes` / `completed` / `deferred` 这些观察量。`refresh()` 与 `refresh_completed()` 仍是记录桩
+——真 refresh 按服务端剪枝，会把测试摆好的数据清空。TUI 测试一律这样搭：
 
 ```python
 backend = FakeBackend(clock=ManualClock(T0), day_end="04:00")
