@@ -1,6 +1,6 @@
 """本地副本这条接缝的**接口本身**（工单 #85）。
 
-今天声明的是 7 件、代码实际会调 11 件：多出来的那 4 件（``identify_list`` /
+在这之前声明的是 7 件、代码实际会调 11 件：多出来的那 4 件（``identify_list`` /
 ``amend_list_change`` / ``save_list`` / ``drop_list``）在 ``sync/`` 里从没声明过，只有真的那个
 本地库实现过。后果不是「少写几行文档」，而是**第二个实现能通过入场检查**
 （``isinstance(…, ListWriteTarget)`` 只查声明过的那几件），然后在三层调用深处炸掉。
@@ -108,8 +108,8 @@ def only_declared(real, *protocols):
 async def test_a_second_implementation_that_only_declares_the_interface_runs_the_list_writes(store):
     """只按协议声明实现的那个替身，跑得完整条清单写路径（新建 / 推送 / 认领 / 改名 / 删除）。
 
-    ``identify_list`` / ``amend_list_change`` / ``save_list`` / ``drop_list`` 这四件今天在
-    ``sync/`` 里从没声明过——这个替身因此没有它们，整条路会在第一次调用时红。
+    修之前那 4 件（``identify_list`` / ``amend_list_change`` / ``save_list`` / ``drop_list``）
+    在 ``sync/`` 里从没声明过——这个替身因此没有它们，整条路会在第一次调用时红。
     """
     transport = FakeTransport(status_code=201)  # 建清单：201 Created，没有响应体（认领推迟到刷新）
     real = store
