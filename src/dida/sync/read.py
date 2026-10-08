@@ -13,8 +13,9 @@ v2 的三层页面要的是三种形状，这里是它们的类型与组装纯�
 - :meth:`ReadModel.task_detail` —— **单条任务的详情**：标题、描述、备注、清单、截止、优先级、
   标签，以及只读的重复规则、提醒、子任务与原文里我们不认识的字段。
 
-「这个容器是哪一行」由 :func:`list_rows` 与 :meth:`ReadModel.list_index` 一处回答；容器查找
-复用同一次装配，不再为了找一行把索引连同所有视图重算一遍。
+「这个容器是哪一行」由 :func:`list_rows` 与 :meth:`ReadModel.list_index` 一处回答；容器查找与
+清单索引读的是**同一次装配**的数据——``self.views`` 里已经是求值结果，所以找一行只会把索引行
+照着当下的缓存再摆一遍，**任何视图都不会被重新求值**。
 
 **收集箱的身份是这一层的核心**（spec 的已实测 API 事实 #2）：服务端的清单索引里没有收集箱，
 它的 ``projectId`` 是**每账户不同的一串**（形如 ``inbox`` 加数字），``"inbox"`` 只是请求侧
@@ -490,7 +491,8 @@ class ReadModel:
     - :meth:`tasks_in` —— 某个容器的任务列表（「这个容器是哪一行」也在这里回答）；
     - :meth:`task_detail` —— 单条任务的详情。
 
-    所以行上的条数与进去看到的成员来自同一次求值，容器查找也不必为了找一行把索引重建一遍。
+    所以行上的条数与进去看到的成员来自同一次求值；容器查找读的是这**同一份**装配数据，不必
+    为了找一行把任何视图重新求值一遍（索引行照旧照着当下那份缓存摆一遍）。
     **它不是缓存**：这个值活不过一次重画，下一次重画从当下那一份本地副本重新装配，所以没有
     增量、没有过期问题，变的只是算的遍数。
 
@@ -643,20 +645,11 @@ def builtin_view_rows(
 
     ``task_ids`` 是求值给的**顺序**（#35）：行上的条数与进去看到的列表来自同一次求值，
     逾期置顶这件事也因此在索引与列表里是同一个答案。
+
+    与 :func:`custom_view_rows` 只差「定义从哪来」（三个写死的 vs 本地库读出来的），求值那
+    一段是**同一份实现**（:func:`_view_rows`）——那句话在这一层是字面意思，不是口号。
     """
-    return tuple(
-        ViewRow(
-            id=definition.id,
-            name=definition.name,
-            task_ids=tuple(
-                item.snapshot.id
-                for item in evaluate_view(definition, tasks, now=now, day_end=day_end)
-            ),
-            builtin=True,
-            definition=definition,
-        )
-        for definition in builtin_view_definitions()
-    )
+    return _view_rows(builtin_view_definitions(), tasks, now=now, day_end=day_end, builtin=True)
 
 
 def custom_view_rows(
@@ -671,7 +664,23 @@ def custom_view_rows(
     与 :func:`builtin_view_rows` 是同一个形状、同一个 :func:`~dida.sync.views.evaluate_view`
     ——区别只有「定义从哪来」：那里是三个写死的，这里是本地库读出来的。所以「内置视图与
     自定义视图共用同一条求值路径」这句话在这一层就是字面意思，而视图的成员、顺序、条数
-    不可能与内置视图有任何算法上的分别（验收标准的最后一条）。
+    不可能与内置视图有任何算法上的分别（验收标准的最后一条）：两个名字落到**同一份实现**
+    （:func:`_view_rows`）上，求值那一段只写了一遍。
+    """
+    return _view_rows(definitions, tasks, now=now, day_end=day_end, builtin=False)
+
+
+def _view_rows(
+    definitions: Sequence[ViewDefinition],
+    tasks: Sequence[TaskSnapshot],
+    *,
+    now: datetime,
+    day_end: str,
+    builtin: bool,
+) -> tuple[ViewRow, ...]:
+    """两族视图行唯一的一份求值实现：一个定义 → 一行（#77 把两份逐字相同的函数体收成一份）。
+
+    ``builtin`` 只决定这一行算内置还是自定义（索引里的分组），成员、顺序、条数都不看它。
     """
     return tuple(
         ViewRow(
@@ -681,7 +690,7 @@ def custom_view_rows(
                 item.snapshot.id
                 for item in evaluate_view(definition, tasks, now=now, day_end=day_end)
             ),
-            builtin=False,
+            builtin=builtin,
             definition=definition,
         )
         for definition in definitions

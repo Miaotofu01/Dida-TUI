@@ -90,7 +90,7 @@ from typing import (
 
 from dida.api.errors import DidaError
 from dida.sync.view import ListSnapshot, ViewSource
-from dida.sync.writes import is_a_change
+from dida.sync.writes import is_a_change, wire_handler
 from dida.vocabulary import (
     LOCAL_LIST_PREFIX,
     ListLocalEffect,
@@ -401,9 +401,7 @@ class ListQueue:
         失败照旧是结构化错误，往外抛（由泵退避）。新建成功但服务端没回 id 时回 ``False``：
         那一笔已经发出去了，但这一行还欠一个真 id，记录得留着（#54）。
         """
-        handler = _LIST_WIRE.get(change.kind.wire)
-        if handler is None:
-            raise NotImplementedError(f"推送还没有实现「{change.kind.value}」这一种改动")
+        handler = wire_handler(_LIST_WIRE, change)
         return await handler(self, change)
 
     async def create_project(self, change: PendingListChange) -> bool:

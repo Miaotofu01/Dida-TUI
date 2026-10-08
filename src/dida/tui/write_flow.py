@@ -216,16 +216,12 @@ class WriteFlow:
 
     # ---------------------------------------------------------------- 浮层值 → 一次写
 
-    async def pick_write(
-        self, task_id: str, field: str, values: Mapping[str, str] | None
-    ) -> None:
+    async def pick_write(self, task_id: str, field: str, values: Mapping[str, str]) -> None:
         """挑选浮层关掉了：把交回来那一份值翻译成一次写，再走完整条链。
 
-        回调只把值递进来（**它是哪一格、值怎么读**都归这一层）。``None`` 从 #66 起走不到
-        ——表单没有「取消」——留着只是防御。
+        回调只把值递进来（**它是哪一格、值怎么读**都归这一层）。表单交出来的**一定**是一份
+        值：``FormOverlay`` 只有 ``dismiss(self.values())`` 一条路，没有「取消」那一档（#66）。
         """
-        if values is None:
-            return
         await self.finish_write(
             Write(
                 perform=lambda: self._apply_pick(task_id, field, values),

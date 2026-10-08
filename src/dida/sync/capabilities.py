@@ -41,14 +41,12 @@ P = TypeVar("P")
 class MissingCapability(RuntimeError):
     """这份引擎缺一件东西，做不了这件事（工单 #85）——「做不到」唯一的那一种说法。
 
-    ``what`` 说清是哪一件事缺哪一件，``how`` 说清该注入什么。八条写 / 网络路径从前各写一句
-    自己的 ``RuntimeError``（同一个病、八种说法），现在都从这里出去。
+    消息是两半拼起来的一句话：前一半说清是哪一件事缺哪一件，后一半说清该注入什么。八条
+    写 / 网络路径从前各写一句自己的 ``RuntimeError``（同一个病、八种说法），现在都从这里出去。
     """
 
     def __init__(self, what: str, how: str) -> None:
         super().__init__(f"{what}：{how}")
-        self.what = what
-        self.how = how
 
 
 def _capability(value: object | None, protocol: type[P]) -> P | None:
@@ -116,8 +114,12 @@ class Capabilities:
 
     # ---------------------------------------------------------------- 要用的那一件不在：一种说法
 
-    def write_target(self) -> WriteTarget:
-        """任务的写路径要的那一份本地副本。"""
+    def task_write_target(self) -> WriteTarget:
+        """任务的写路径要的那一份本地副本。
+
+        与 :meth:`list_write_target` 是**并列的两族**（任务的账与清单的账），不是「通用那一件
+        与它的特例」——名字照这一点写。
+        """
         return self._required(
             self.writes,
             "写路径需要本地存储",

@@ -36,7 +36,7 @@
 from __future__ import annotations
 
 from datetime import datetime
-from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, TypeVar, runtime_checkable
 
 from dida.api.errors import DidaError
 from dida.sync.view import ViewSource
@@ -46,6 +46,7 @@ from dida.vocabulary import (
     LOCAL_TASK_PREFIX,
     LocalEffect,
     PendingChange,
+    PendingListChange,
     TEXT_FIELDS,
     WireCall,
     WriteBehaviour,
@@ -237,6 +238,29 @@ def is_addressable_task(
     if kind.wire is WireCall.CREATE_TASK:
         return True
     return not is_local_id(task_id)
+
+
+HandlerT = TypeVar("HandlerT")
+
+
+def wire_handler(
+    table: Mapping[Any, HandlerT], change: PendingChange | PendingListChange
+) -> HandlerT:
+    """从这一族的线路调用表里挑出这一笔该怎么发；挑不到就是「这一种改动还没有推送实现」。
+
+    **两族共用的一句话**（#77）：任务与清单各有一张表（``push._TASK_WIRE`` /
+    ``lists._LIST_WIRE``，两份词汇照旧分开），而两边的 ``send`` 从前各写了一遍「查表 →
+    查不到就 ``raise NotImplementedError``」——逐字相同，只有表与返回值不同。表留各自那一片，
+    查表这一句收在这里。住这一层是因为两份写路径都已经 import 它（适配器互相 import 才是环）。
+
+    挑不到是**大声报错**，不是假装发过：走到这里的只可能是「这一种线路调用形状还没接上」，
+    例如清单的 :attr:`~dida.vocabulary.ListWire.NONE`（认领记录，它从来不发请求）——泵先用
+    各自的 ``is_addressable`` 把它滤掉，真到了这里说明有一条路漏了。
+    """
+    handler = table.get(change.kind.wire)
+    if handler is None:
+        raise NotImplementedError(f"推送还没有实现「{change.kind.value}」这一种改动")
+    return handler
 
 
 def is_a_move(current_list_id: str | None, target_list_id: str | None) -> bool:

@@ -517,8 +517,8 @@ class DidaApp(WriteFlow, App[None]):
         # 一个比行更新的日子，那一屏就永远没人认领了（心跳以为它是最新的，见
         # :meth:`reload_day_boundary`）。记早了最多多画一次，记晚了就是一屏昨天的东西。
         self._view_day = self.engine.logical_day()
-        # 一次重画只装配**一遍**读模型（#81）：三种读形状都是它的投影，所以进一个视图不再
-        # 为了找那一行把索引重建一遍，行上的条数与进去看到的成员也来自同一次求值。
+        # 一次重画只装配**一遍**读模型（#81）：三种读形状都是它的投影，所以找一个容器不再
+        # 把视图重新求值一遍，行上的条数与进去看到的成员也来自同一次求值。
         model = self.engine.read_model()
         rows = () if model is None else model.list_index()
         self.index_page().show_lists(rows)

@@ -39,6 +39,7 @@ from dida.sync.writes import (
     is_local_list_id,
     is_local_task_id,
     project_in,
+    wire_handler,
 )
 from dida.vocabulary import COMPLETED_STATUS, PendingChange, UNCOMPLETED_STATUS
 
@@ -224,9 +225,7 @@ class TaskQueue:
 
     async def send(self, change: PendingChange) -> bool:
         """按线路调用形状查表把这一笔发出去。失败照旧往外抛（由泵退避）。"""
-        handler = _TASK_WIRE.get(change.kind.wire)
-        if handler is None:
-            raise NotImplementedError(f"推送还没有实现「{change.kind.value}」这一种改动")
+        handler = wire_handler(_TASK_WIRE, change)
         await handler(self, change)
         return True
 

@@ -490,7 +490,7 @@ Dup default: `sync/engine.py:132` `DEFAULT_COMPLETED_WINDOW_HOURS = 24` (used as
 - `runtime_checkable` matters: `DidaApp(engine: Engine)` (`app.py:270`) is the single injection point, and **`isinstance`-style conformance is what keeps `FakeBackend` honest** — adding a protocol member without adding it to `FakeBackend` breaks `DidaApp(FakeBackend(...))` in every test file that injects the fake.
 
 - 能力协议**不在 engine.py**：`ProjectReader` `refresh.py:36`、`RefreshTarget` `refresh.py:61`、`TaskWriter` `push.py:145`、`WriteTarget` `writes.py:132`、`CompletedReader` `completed.py:38`（五个都 `@runtime_checkable`；`TaskReader` 已全仓库不存在）。engine.py 里只剩 `SyncStatus` `:309` / `Engine` `:333` / `SyncEngine` `:531`，**一处 `isinstance(` 都没有**。
-- 探测只有一处：`capabilities.py` 的 `_capability` `:54-56`，由 `Capabilities.of` `:101-116` 在引擎构造时问一遍；「缺这一件」怎么说是那几个访问器 `:119-180`（`write_target` `:119` … `completed_reader` `:175`）的事。
+- 探测只有一处：`capabilities.py` 的 `_capability` `:52-54`，由 `Capabilities.of` `:99-113` 在引擎构造时问一遍；「缺这一件」怎么说是那几个访问器 `:117-181`（`task_write_target` `:117` … `completed_reader` `:177`）的事。
 
 
 ### `tests/support.py::screen_text`
