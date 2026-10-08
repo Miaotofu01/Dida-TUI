@@ -23,7 +23,7 @@ import pytest
 
 from dida.api.client import DidaApiClient
 from dida.storage.store import Store
-from dida.sync.engine import ListKind, MissingCapability, SyncEngine
+from dida.sync.engine import ListKind, MissingCapability, SyncEngine, ViewDefinition
 from dida.sync.lists import ListWriteTarget
 from dida.sync.refresh import RefreshTarget
 from dida.sync.writes import WriteTarget
@@ -186,6 +186,8 @@ def test_a_read_only_double_constructs_and_reads():
     assert [item.title for item in engine.tasks_in("工作").items] == ["写周报"]
     assert engine.status().pending_count == 0
     assert engine.read_model() is not None
+    detail = engine.task_detail("t1")
+    assert detail is not None and detail.title == "写周报", "只读替身存得下原文就该读得到（#33 的详情形状）"
 
 
 # ---------------------------------------------------------------------------
@@ -202,7 +204,10 @@ def test_a_read_only_double_refuses_every_write_with_the_same_story():
         lambda: engine.create("写周报", list_id="inbox1"),
         lambda: engine.delete("t1"),
         lambda: engine.complete("t1"),
+        lambda: engine.uncomplete("t1"),
         lambda: engine.defer("t1"),
+        lambda: engine.move_task("t1", to_list_id="work"),
+        lambda: engine.reschedule("t1", due=None),
         lambda: engine.create_list("购物"),
         lambda: engine.update_list("work", name="工作"),
         lambda: engine.delete_list("work"),
@@ -214,10 +219,37 @@ def test_a_read_only_double_refuses_every_write_with_the_same_story():
         assert "本地存储" in str(caught.value), "说清缺的是哪一件"
 
 
+def test_a_copy_without_a_view_store_refuses_the_view_writes_with_the_same_story(store):
+    """一个会写清单、但不存视图的副本：视图那三条写路径也拒得一模一样。
+
+    只读替身（``InMemorySource``）**存得下视图**，所以视图这一格的拒绝要另一份副本才试得到：
+    这里用「只实现声明过的那几件」的那个替身（它没有 ``ViewStore`` 那五件）。
+    """
+    engine = SyncEngine(
+        clock=ManualClock(T0),
+        source=only_declared(store, ListWriteTarget, WriteTarget, RefreshTarget),
+    )
+
+    definition = ViewDefinition(id="", name="高优先级", priorities=(5,))
+
+    for refuse in (
+        lambda: engine.create_view(definition),
+        lambda: engine.update_view(definition),
+        lambda: engine.delete_view("v1"),
+    ):
+        with pytest.raises(MissingCapability) as caught:
+            refuse()
+        assert "本地存储" in str(caught.value), "说清缺的是哪一件"
+
+    assert engine.view_definition("v1") is None, "读不到视图是「没有这个视图」，不是错误"
+
+
 async def test_a_write_engine_without_a_client_refuses_with_the_same_story(store):
     """没有 API 客户端时，每一条要网络的路径也拒得一模一样：同一个类型、说清缺客户端。"""
     engine = SyncEngine(clock=ManualClock(T0), source=store)
 
+    with pytest.raises(MissingCapability) as refreshing:
+        await engine.refresh()
     with pytest.raises(MissingCapability) as pushing:
         await engine.push_pending()
     with pytest.raises(MissingCapability) as tags:
@@ -225,7 +257,7 @@ async def test_a_write_engine_without_a_client_refuses_with_the_same_story(store
     with pytest.raises(MissingCapability) as completed:
         await engine.refresh_completed()
 
-    for caught in (pushing, tags, completed):
+    for caught in (refreshing, pushing, tags, completed):
         assert "API 客户端" in str(caught.value), "说清缺的是哪一件"
 
 
