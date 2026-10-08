@@ -35,12 +35,12 @@ def at(day: int, hour: int = 0, minute: int = 0) -> datetime:
 T0 = at(14, 12, 3)
 
 
-def backend(*, pending: int = 0, refreshed_at: datetime | None = T0) -> FakeBackend:
+def backend(*, pending: int = 0) -> FakeBackend:
     fake = FakeBackend(clock=ManualClock(T0))
     fake.add_list("工作", id="work")
     fake.add_task("写周报", list_name="work", id="t1", due=at(14, 18, 0))
     fake.add_task("买牛奶", list_name="work", id="t2")
-    fake.set_sync_state(last_refresh_at=refreshed_at, pending_count=pending)
+    fake.set_sync_state(last_refresh_at=T0, pending_count=pending)
     return fake
 
 

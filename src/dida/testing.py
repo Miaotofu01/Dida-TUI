@@ -366,10 +366,10 @@ class _FakeBackendServer(FakeTransport):
     它只做两件事：**记请求**、**回一个说得过去的响应**——没有任何业务判断。
 
     要试「某一个端点失败了」，用 :meth:`enqueue_for` 把异常或 4xx/5xx 响应**钉在那个端点上**
-    （认 ``(method, path)``，与之前发过什么请求无关）。基类那个
-    :meth:`~dida.testing.FakeTransport.enqueue` 也照旧可用，但它是**按发出顺序**出队的：只要
-    在它之前 app 多发了任何一个请求，摆好的那一份就被别人吃掉——只在「下一个请求就是它」
-    说得清时才用它。
+    （认 ``(method, path)``，与之前发过什么请求无关）。**别用基类那个按发出顺序出队的
+    :meth:`~dida.testing.FakeTransport.enqueue`**：只要在它之前 app 多发了任何一个请求，
+    摆好的那一份就被别人吃掉（#86 真的被这个坑咬过一次）——所以这个子类把它覆盖成直接报错，
+    注入只有「钉在端点上」这一条路。（基类自己的 :class:`FakeTransport` 不受影响。）
     """
 
     def __init__(self) -> None:
@@ -378,6 +378,13 @@ class _FakeBackendServer(FakeTransport):
         self._failures: dict[tuple[str, str], deque[httpx.Response | Exception]] = {}
         self.tags: list[dict[str, Any]] = []
         """摆进来的那一份「服务端有的标签」（``GET /open/v1/tag`` 的响应体）。"""
+
+    def enqueue(self, response: httpx.Response | Exception) -> None:
+        """**别用**：按发出顺序出队会被更早的请求吃掉——用 :meth:`enqueue_for` 钉在端点上。"""
+        raise AssertionError(
+            "按发出顺序摆响应会被更早的请求吃掉："
+            "用 enqueue_for(method=…, path=…, response=…)"
+        )
 
     def enqueue_for(
         self, *, method: str, path: str, response: httpx.Response | Exception
@@ -391,13 +398,9 @@ class _FakeBackendServer(FakeTransport):
 
     async def send(self, request: httpx.Request) -> httpx.Response:
         self.requests.append(request)
-        for source in (
-            self._failures.get((request.method, request.url.path)),
-            self._responses,
-        ):
-            if not source:
-                continue
-            response = source.popleft()
+        keyed = self._failures.get((request.method, request.url.path))
+        if keyed:
+            response = keyed.popleft()
             if isinstance(response, Exception):
                 raise response
             return response

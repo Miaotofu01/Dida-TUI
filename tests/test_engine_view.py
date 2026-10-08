@@ -73,20 +73,25 @@ def test_status_carries_the_logical_day_and_the_refresh_time():
     assert status.pending_count == 0, "只读替身没有队列：这个 0 是算出来的"
 
 
-def test_a_read_only_sources_pending_count_is_derived_not_declared():
-    """只读替身的待推送数是**算**出来的，不是摆出来的（#86）。
+def test_a_read_only_source_offers_no_way_to_plant_a_pending_count():
+    """只读替身的公开面上**没有摆待推送数的地方**（#86）。
 
-    它手里那个真库没有队列，所以算出来是 0；把 ``sync_state()`` 改回返回一个可摆布的值、
-    或者把这个 0 写成声明的常量，这一条就红。
+    它挡的是「摆法在公开面上不存在」：没有可写的 ``state``，``set_sync_state`` 也不收
+    ``pending_count``（把这两样加回来，这一条当场红）。**它挡不住「把 0 写成声明的常量」**
+    ——只读替身没有队列，「算出来的 0」与「声明的 0」在这条接缝上**不可区分**；原缺陷要有
+    人摆一个非零数才可观测，所以真正的守卫是上面那两条「没地方摆」。
     """
     source = InMemorySource()
 
     assert source.sync_state().pending_count == 0
+    assert not hasattr(source, "state"), "公开面上不该有可摆布的 state"
+    with pytest.raises(TypeError):
+        source.set_sync_state(pending_count=2)  # type: ignore[call-arg]
 
     source.set_sync_state(last_refresh_at=at(14, 12, 0))
 
     assert source.sync_state() == SyncState(last_refresh_at=at(14, 12, 0), pending_count=0), (
-        "摆得进去的只有「上次刷新时刻」；那个数照旧是算出来的 0"
+        "摆得进去的只有「上次刷新时刻」，而且它真的落地了；那个数照旧是 0"
     )
 
 
