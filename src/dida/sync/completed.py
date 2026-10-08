@@ -158,11 +158,7 @@ class CompletedStreamMixin:
 
     def _completed_reader(self) -> CompletedReader:
         """已完成流要的那个客户端。没接上就大声报错——绝不假装拉过了。"""
-        if not isinstance(self._client, CompletedReader):
-            raise RuntimeError(
-                "已完成流需要 API 客户端：SyncEngine(client=DidaApiClient(...))"
-            )
-        return self._client
+        return self._caps.completed_reader()
 
 
 def _completed_tasks(payload: Any) -> list[Mapping[str, Any]]:

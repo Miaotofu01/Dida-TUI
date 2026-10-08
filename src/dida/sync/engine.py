@@ -20,9 +20,12 @@ TUI 读写一切只能走本模块；排序、逾期判定、视图求值、冲�
 - ``create(title, ...)`` —— 写：新建，落在收集箱（:mod:`dida.sync.create`）。
 - ``create_list(name, color=)`` / ``update_list(id, name=, color=)`` / ``delete_list(id)`` ——
   写：清单的建 / 改 / 删，乐观写 + 立即推送 + 失败进重试队列（:mod:`dida.sync.lists`，#42）。
-- ``cycle_priority(task_id)`` —— 写：优先级推进一档（:mod:`dida.sync.priority`）。
-- ``subtasks(task_id)`` —— 读：子任务那几行（只读，:mod:`dida.sync.subtasks`；spec 的
-  「子任务只看不勾」）。
+
+**#85 退场的那两个没有调用者的成员**：``cycle_priority(task_id)``（``p`` 推进一档）与
+``subtasks(task_id)``（引擎那一层的子任务读）。优先级从 #45 起走详细页的挑选器
+（``write(changes={"priority": …})``，线上编码那套词汇留在 :mod:`dida.sync.view`），子任务行由
+``task_detail().subtasks`` 给——两条路都还在，只是「引擎上多挂一个入口」这一层没人用了。
+接口只留有人用的部分（工单 #85 的验收标准 4）。
 
 **v1 那条读路径在 #58 里删掉了**：``view() -> TodayView`` 与它硬编码的三个分区、左栏的
 ``ListSummary`` 徽标、``/`` 的模糊过滤、以及子任务的勾选写路径（``toggle_subtask``）都只
@@ -41,8 +44,7 @@ v2 的全部读面。
 :mod:`dida.sync.completed`      已完成流的窗口与游标（t12）
 :mod:`dida.sync.schedule`       顺延与改期：截止时间怎么挪（t13 / t14 / #40 / #44）
 :mod:`dida.sync.create`         新建一条任务要发什么（t15 / #39）
-:mod:`dida.sync.priority`       优先级推进一档（t17 / #45）
-:mod:`dida.sync.subtasks`       子任务的先读后写（t20）
+:mod:`dida.sync.capabilities`   构造那一处问清「谁会做什么」（#85）
 ============================  ==========================================
 
 各片的方法挂在同一个 ``SyncEngine`` 上（它们用 ``self._clock`` / ``self._source`` / 彼此的
@@ -65,12 +67,13 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import AuthError, DidaError
 from dida.api.guards import all_day_date
 from dida.clock import Clock
 from dida.logical_day import logical_day
+from dida.sync.capabilities import Capabilities, MissingCapability
 from dida.sync.completed import (
     DEFAULT_COMPLETED_WINDOW_HOURS,
     CompletedReader,
@@ -88,7 +91,6 @@ from dida.sync.lists import (
     UnknownListError,
     is_list_edit,
 )
-from dida.sync.priority import PriorityMixin
 from dida.sync.pump import PumpMixin
 from dida.sync.push import PushMixin, TaskWriter, backoff_delay
 from dida.sync.read import (
@@ -111,7 +113,6 @@ from dida.sync.read import (
 )
 from dida.sync.refresh import ProjectReader, RefreshMixin, RefreshTarget
 from dida.sync.schedule import ScheduleMixin
-from dida.sync.subtasks import SubtaskMixin
 from dida.sync.tags import TagMixin, TagReader
 from dida.sync.view import (
     INBOX_ID,
@@ -219,6 +220,7 @@ __all__ = [
     "ListWriteKind",
     "ListWriteTarget",
     "LocalEffect",
+    "MissingCapability",
     "PayloadReader",
     "ProjectReader",
     "ReadModel",
@@ -285,20 +287,21 @@ DEFAULT_DAY_END = "00:00"
 """配置注入之前的默认日界：零偏移，逻辑日等于自然日（规范形式见 ADR 0003）。"""
 
 
-def pending_error(source: object) -> str | None:
-    """本地队列里最后一条推不出去的改动报的错（源上没有队列就是 ``None``）。
+def pending_error(queue: WriteTarget | None) -> str | None:
+    """本地队列里最后一条推不出去的改动报的错（这份副本没有队列就是 ``None``）。
 
     读的是一条**已经记下来的事实**：``Store.record_attempt`` 把失败原因写在那一行上
     （``last_error``），这里只是把它带到 :class:`SyncStatus` 上，让它到得了界面（用户故事
     81：保存失败要说具体原因）。
 
-    只读替身（``InMemorySource`` 那种）没有队列，于是没有这个信息——与写路径上那几个
-    ``isinstance`` 门同一条口径：不知道就说不知道，不猜一个。
+    参数是**构造时定下来的那一格**（工单 #85 的 :attr:`Capabilities.writes`），不是一个还没
+    问过的源：只读替身（``InMemorySource`` 那种）没有队列，于是没有这个信息——「不知道就说
+    不知道」这件事在构造那一处就定了，业务路径不再临场探一次。真的 ``Store`` 本身就满足
+    ``WriteTarget``，所以照旧可以直接把它递进来。
     """
-    pending = getattr(source, "pending", None)
-    if not callable(pending):
+    if queue is None:
         return None
-    errors = [str(change.last_error) for change in pending() if getattr(change, "last_error", None)]
+    errors = [str(change.last_error) for change in queue.pending() if change.last_error]
     return errors[-1] if errors else None
 
 
@@ -524,18 +527,6 @@ class Engine(Protocol):
         """读：一个自定义视图的定义；本地没有就是 ``None``（``e`` 的表单要拿它填当前值）。"""
         ...
 
-    def cycle_priority(self, task_id: str) -> None:
-        """写：优先级推进一档（``p``）——无 → 低 → 中 → 高 → 无。"""
-        ...
-
-    def subtasks(self, task_id: str) -> tuple[SubtaskItem, ...]:
-        """读：这条任务的子任务行（详情页的只读那一段），标题与完成状态都已经是可以直接画的成品。
-
-        **只读**：spec 的「子任务只看不勾（也不能增删改）」，所以没有对应的写入口（#58 把
-        v1 的 ``toggle_subtask`` 删掉了）。
-        """
-        ...
-
 
 class SyncEngine(
     PumpMixin,
@@ -546,8 +537,6 @@ class SyncEngine(
     CompletedStreamMixin,
     ScheduleMixin,
     CreateMixin,
-    PriorityMixin,
-    SubtaskMixin,
     TagMixin,
 ):
     """通用客户端的数据与写入入口（组装各片；读路径在本模块）。
@@ -575,6 +564,10 @@ class SyncEngine(
         self._day_end = day_end
         self._source = source
         self._client = client
+        # 「这份本地副本 / 这个客户端会不会做某件事」**在构造这一处问清**（工单 #85）：
+        # 从前它被拆成 13 处运行时探测散在业务路径上，而「做不到」有四种说法。答案存在这张
+        # 表里，业务路径只读它；缺哪一件由 Capabilities 那一个地方说（MissingCapability）。
+        self._caps = Capabilities.of(source, client)
         self._completed_window_hours = completed_window_hours
         # 标签列表：用户打开挑标签那一格时拉一次，只活在内存里（见 dida.sync.tags 的模块文档）。
         self._tags: tuple[str, ...] = ()
@@ -611,7 +604,7 @@ class SyncEngine(
             pending_count=state.pending_count,
             last_refresh_at=state.last_refresh_at,
             logical_day=logical_day(now, self._day_end).label,
-            last_error=pending_error(self._source),
+            last_error=pending_error(self._caps.writes),
         )
 
     def logical_day(self) -> date:
@@ -728,36 +721,31 @@ class SyncEngine(
         """服务端还没见过的清单 id（本地还有一笔没推成功的 ``CREATE``）。
 
         读的是一条**已经记下来的事实**（``Store.pending_lists`` 那张队列表），不是 id 的
-        形状。只读替身没有队列，于是没有这个信息——与写路径上那几个 ``isinstance`` 门
-        同一条口径：不知道就说不知道，不猜一个。
+        形状。只读替身没有队列，于是没有这个信息——「不知道就说不知道」在构造那一处就定了
+        （工单 #85 的 :attr:`Capabilities.list_writes`），这里只是照它答。
         """
-        source = self._source
-        if not isinstance(source, ListWriteTarget):
-            return frozenset()
-        return frozenset(
-            change.list_id
-            for change in source.pending_lists()
-            if change.kind is ListWriteKind.CREATE
-        )
+        return self._caps.unseen_list_ids()
 
     def _view_definitions(self) -> tuple[ViewDefinition, ...]:
         """本地库里那些自定义视图的**定义**（#36）；装配读模型时交给那一层去求值。
 
         本地副本只给**定义**（它手上没有逻辑日，不读时钟），求值走
         :func:`~dida.sync.read.custom_view_rows`——与内置视图那三个是同一个
-        ``evaluate_view``。源上没有这个能力就是「没有自定义视图」，不是错误——与写路径上
-        那几个 ``isinstance`` 门同一条口径。
+        ``evaluate_view``。源上没有这个能力就是「没有自定义视图」，不是错误——这一格在构造
+        那一处就定了（工单 #85 的 :attr:`Capabilities.views`）。
         """
-        source = self._source
-        if not isinstance(source, ViewReader):
-            return ()
-        return tuple(source.view_definitions())
+        return self._caps.view_definitions()
 
     def _write_target(self) -> WriteTarget:
         """写路径要写的那个本地副本。没接上就大声报错——绝不假装写成功了。"""
-        if not isinstance(self._source, WriteTarget):
-            raise RuntimeError(
-                "写路径需要本地存储：SyncEngine(source=Store(...))；"
-                "只读的 ViewSource 存不下待推送改动"
-            )
-        return self._source
+        return self._caps.write_target()
+
+    def _payload_of(self, task_id: str) -> Mapping[str, Any] | None:
+        """本地那份任务原文；源读不出原文时当作「没有这条任务」。
+
+        要的是**读**的能力（``PayloadReader``），不是写的能力：详情形状（含只读的子任务行）
+        只读它，只读的替身存得下原文就该读得到。这一格在构造那一处就定了（工单 #85 的
+        :attr:`Capabilities.payload`）。#85 之前它挂在 ``SubtaskMixin`` 上——那个 mixin 的
+        另一个成员（``subtasks()``）没有调用者，退场了，这一件留下（有人用）。
+        """
+        return self._caps.payload_of(task_id)

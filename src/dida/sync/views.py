@@ -677,19 +677,12 @@ class ViewMixin:
     def view_definition(self, view_id: str) -> ViewDefinition | None:
         """读：一个自定义视图的定义（``e`` 打开表单时要拿它填当前值）。
 
-        源上没有这个能力（只读替身、降级模式）就是「没有这个视图」，不是错误——与读路径上
-        那几个 ``isinstance`` 门同一条口径。
+        源上没有这个能力（只读替身、降级模式）就是「没有这个视图」，不是错误——这一格在
+        构造那一处就定了（工单 #85 的 :attr:`Capabilities.view_store`）。
         """
-        source = self._source
-        if not isinstance(source, ViewStore):
-            return None
-        return source.view_definition(view_id)
+        store = self._caps.view_store
+        return None if store is None else store.view_definition(view_id)
 
     def _view_target(self) -> ViewStore:
         """视图写路径要写的那个本地副本。没接上就大声报错——绝不假装写成功了。"""
-        if not isinstance(self._source, ViewStore):
-            raise RuntimeError(
-                "视图的写路径需要本地存储：SyncEngine(source=Store(...))；"
-                "视图只存在本地库里，没有服务端那一半"
-            )
-        return self._source
+        return self._caps.view_target()

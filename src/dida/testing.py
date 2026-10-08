@@ -49,7 +49,6 @@ from dida.sync.engine import (
 from dida.sync.view import (
     INBOX_ID,
     ListSnapshot,
-    SubtaskItem,
     SyncState,
     TaskSnapshot,
 )
@@ -604,8 +603,6 @@ class FakeBackend:
 
         self.delete_error: Exception | None = None
         """摆一个异常进去，``delete`` 就抛它（试 TUI 遇到引擎拒绝时的反应）。"""
-        self.cycled: list[str] = []
-        """``cycle_priority(task_id)`` 收到的任务 id，按调用顺序（t17 的 ``p``）。"""
 
         self.created_lists: list[tuple[str, str | None]] = []
         """``create_list(name, color=)`` 收到的每一笔，按顺序（#42）。"""
@@ -630,9 +627,6 @@ class FakeBackend:
 
         self.view_error: Exception | None = None
         """摆一个异常进去，视图的三种写就抛它（与 ``list_error`` 同一条口径）。"""
-
-        self._subtasks: dict[str, tuple[SubtaskItem, ...]] = {}
-        """摆进来的子任务，按任务 id 索引（t20）；:meth:`set_subtasks` 摆，读路径照给。"""
 
         self._seq = 0
         """``add_task`` 不给 id 时的计数器（``t1``、``t2``……）。"""
@@ -820,7 +814,7 @@ class FakeBackend:
         """摆一份「服务端有的标签」（#45）：下一次 :meth:`load_tags` 就交回这一份。
 
         替身不自己编标签——编出来的东西会让「挑得到哪些标签」这句话变成空话（与
-        ``set_subtasks`` 收成品行同一条口径）。
+        :meth:`add_view` 只摆定义、不求值同一条口径）。
         """
         self._tags = tuple(names)
 
@@ -1028,17 +1022,6 @@ class FakeBackend:
             self.writes.append((task_id, local))
         return changed
 
-    def cycle_priority(self, task_id: str) -> None:
-        """写：记下这一笔，并交给真引擎推进一档（``0 → 1 → 3 → 5``）。
-
-        「下一档是哪个线上编码」是引擎的判断（``dida.sync.view.next_priority``），替身不自己
-        再抄一份——抄了就会跟真货说不一样的话。
-        """
-        self.cycled.append(task_id)
-        if self.source.task_payload(task_id) is None:
-            return
-        self._engine.cycle_priority(task_id)
-
     def create_list(self, name: str, *, color: str | None = None) -> str:
         """写：记下这一笔，并交给真引擎新建清单（本地临时 id + 乐观落库 + 立即推送）。
 
@@ -1118,16 +1101,3 @@ class FakeBackend:
         """摆了 ``view_error`` 就在记完这一笔之后抛它（引擎当场拒绝的那条路）。"""
         if self.view_error is not None:
             raise self.view_error
-
-    def set_subtasks(self, task_id: str, *items: SubtaskItem) -> None:
-        """摆一条任务的子任务（t20）：详情页那一段只读行的输入。
-
-        ``SubtaskItem`` 是引擎给的成品行（标题、完成状态、截止读法），替身照收不误——
-        「怎么从 ``items`` 数组读出这一行」是引擎的判断（``dida.sync.view.subtask_items``），
-        替身不自己再抄一份。
-        """
-        self._subtasks[task_id] = tuple(items)
-
-    def subtasks(self, task_id: str) -> tuple[SubtaskItem, ...]:
-        """读：摆进去的那一份（t20）；没摆过就是没有子任务。"""
-        return self._subtasks.get(task_id, ())

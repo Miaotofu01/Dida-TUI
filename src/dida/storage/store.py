@@ -44,7 +44,7 @@
 
 - 开关：``close()``、``with Store(path) as store``；
 - 读（``ViewSource``）：``lists()`` / ``tasks()`` / ``sync_state()`` / ``resolve_id(id)``；
-- 读（完整记录）：``list_records()`` / ``task_payload(task_id)`` / ``stored_sync_state()``；
+- 读（原文）：``task_payload(task_id)`` / ``stored_sync_state()``；
 - 写：``apply_refresh(lists=, tasks=, prune_lists=, prune_unfinished_tasks=)``（只写变化、
   顺手剪枝，返回 ``RefreshReport``）、``enqueue(...)`` / ``pending()`` / ``pending_count()`` /
   ``record_attempt(...)`` / ``resolve(change_id)`` / ``set_sync_state(...)``；
@@ -183,24 +183,6 @@ VIEW_ID_PREFIX = "view-"
 之后认领」那一套——这个前缀是它从头到尾的身份，不是临时占位（与 ``local-list-`` 的分别
 正在这里：那个前缀的意思是「还没推上去」）。
 """
-
-
-@dataclass(frozen=True)
-class ListRecord:
-    """缓存里一条清单的完整记录（spec 的清单 schema）。
-
-    ``kind`` / ``permission`` 是服务端 ``Project`` 上那两个字段（``TASK``/``NOTE``、
-    ``write``/``read``/``comment``）：清单索引页靠它们标出进不去的行（用户故事 23 / 24）。
-    """
-
-    id: str
-    name: str
-    color: str | None = None
-    sort_order: int | None = None
-    group_id: str | None = None
-    is_inbox: bool = False
-    kind: str | None = None
-    permission: str | None = None
 
 
 def _decode_payload(text: str) -> Mapping[str, Any]:
@@ -404,22 +386,6 @@ class Store:
                 kind=row["kind"],
                 permission=row["permission"],
                 is_inbox=bool(row["is_inbox"]),
-            )
-            for row in self._list_rows()
-        )
-
-    def list_records(self) -> tuple[ListRecord, ...]:
-        """全部清单的完整记录。"""
-        return tuple(
-            ListRecord(
-                id=row["id"],
-                name=row["name"],
-                color=row["color"],
-                sort_order=row["sort_order"],
-                group_id=row["group_id"],
-                is_inbox=bool(row["is_inbox"]),
-                kind=row["kind"],
-                permission=row["permission"],
             )
             for row in self._list_rows()
         )

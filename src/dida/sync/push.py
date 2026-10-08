@@ -524,9 +524,7 @@ class PushMixin:
 
     def _writer(self) -> TaskWriter:
         """推送要的那个客户端。没接上就大声报错——绝不假装推过了。"""
-        if not isinstance(self._client, TaskWriter):
-            raise RuntimeError("推送需要 API 客户端：SyncEngine(client=DidaApiClient(...))")
-        return self._client
+        return self._caps.task_writer()
 
     def _local_effect(self, kind: WriteKind, changes: Mapping[str, Any] | None) -> dict[str, Any]:
         """这次改动在本地要盖上去的那一份字段。

@@ -3,9 +3,10 @@
 这个文件是**搬过来的**（工单 #32 的「先搬后删」）：这些结论原本钉在四个要按键开屏的测试
 文件里（``test_complete.py`` / ``test_delete.py`` / ``test_reschedule.py`` /
 ``test_quick_add.py``），界面重写会连文件一起删掉。搬过来的是**断言**，一个字都没放松：
-接缝仍然只有引擎的公开入口（``complete`` / ``delete`` / ``create`` / ``reschedule`` /
-``cycle_priority`` 与 ``push_pending``），接真的 ``Store`` 与真的 ``DidaApiClient``，网络
-钉在传输层（接缝二）上——不断言任何私有方法，也不需要起一个 Textual 应用。
+接缝仍然只有引擎的公开入口（``complete`` / ``delete`` / ``create`` / ``reschedule`` 与
+``push_pending``），接真的 ``Store`` 与真的 ``DidaApiClient``，网络钉在传输层（接缝二）上——
+不断言任何私有方法，也不需要起一个 Textual 应用。（``cycle_priority`` 在 #85 里退场了：
+TUI 从 #45 起走详细页的挑选器，直接 ``write(changes={"priority": …})``。）
 
 日期解析器（``plan()``）是 v2 整体作废的那一块，所以这里的期望值全部**由测试直接给出**
 （``due=at(14, 0, 0), all_day=True``），不再绕一圈 ``plan("今天")``。新建那一侧 v2 只填
@@ -651,28 +652,11 @@ async def test_a_create_into_an_unclaimed_list_is_refused_not_queued(store):
     assert [item.title for item in store.tasks()] == [], "本地也不许先造出一条推不出去的"
 
 
-# ---------------------------------------------------------------- 优先级（t17）
-
-
-async def test_priority_advances_the_wire_code_locally_and_pushes_it(store):
-    """``cycle_priority()`` 走的是 API 的线上编码 ``0 → 1 → 3 → 5``，本地当场生效。
-
-    「当场生效」与「推给服务端」是两件事：本地那份快照在 ``cycle_priority`` 返回时就已经
-    是新的（ADR-0002 的乐观写），请求体随后才发出去——两者都钉在这里。期望的四个取值来自
-    ``api-contracts.md`` 第 3 条，不是照 ``next_priority`` 再算一遍。
-    """
-    seed(store, task(id="t1", title="写周报", dueDate="2026-03-14T18:00:00+0800"))
-    transport = FakeTransport(json=task(id="t1"))
-    engine = make_engine(store, transport)
-
-    for wire in (1, 3, 5, 0):
-        engine.cycle_priority("t1")
-
-        assert store.task_payload("t1")["priority"] == wire, "本地当场生效，不等网络"
-
-        await engine.wait_for_pushes()
-        assert store.pending() == (), "推成功就该出队"
-        assert transport.last_json["priority"] == wire, "请求体里是线上编码"
+# ---------------------------------------------------------------- 优先级（t17 / #85）
+#
+# ``cycle_priority()`` 在 #85 里退场了（没有生产调用者：TUI 从 #45 起走详细页的挑选器，
+# 直接 ``write(changes={"priority": …})``）。留下来的这一条断的是**写路径**本身——
+# 「本地当场生效、推不动留在队列里、本地值不撤销」——优先级只是它顺手用的一个字段。
 
 
 async def test_a_failed_priority_push_stays_in_the_retry_queue(store):
@@ -682,7 +666,7 @@ async def test_a_failed_priority_push_stays_in_the_retry_queue(store):
     transport.enqueue(NetworkError("连不上"))
     engine = make_engine(store, transport)
 
-    engine.cycle_priority("t1")
+    engine.write("t1", changes={"priority": 1})
     await engine.wait_for_pushes()
 
     assert len(transport.requests) == 1
