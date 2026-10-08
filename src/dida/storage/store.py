@@ -61,6 +61,7 @@ from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
+from dida.storage.queue import PendingQueue, QueueShape
 from dida.vocabulary import (
     COMPLETED_STATUS,
     INBOX_ID,
@@ -211,6 +212,10 @@ class Store:
         self._db.execute("PRAGMA foreign_keys = ON")
         self._db.executescript(_SCHEMA)
         self._migrate()
+        # 两本队列账共用一份机制（#82）：机制只要「表名 + 谁的 id 那一列」，任务与清单各自的
+        # 数据形状由下面那些动词递进去。**分开的仍是表与词汇，合起来的只是做法**。
+        self._task_queue = PendingQueue(self._db, QueueShape("pending_changes", "task_id"))
+        self._list_queue = PendingQueue(self._db, QueueShape("pending_list_changes", "list_id"))
         # id 别名**只活这一次打开**（ADR-0009 二）：一个旧 id 只可能被这一次打开期间已经画出去的
         # 界面握着，重开之后没有任何界面还握着它。清在这里而不是剪在某处，是因为「有效期」这件事
         # 没有别的答案——按时间剪要一只这一层没有的钟，按条数剪是编一个数。
@@ -430,7 +435,8 @@ class Store:
         ``now`` 由调用方给：这一层没有时钟，「现在」永远是注入进来的（CONTEXT 的硬规矩）。
 
         本地效果**读词表**（``kind.local``，t32）：``REMOVE`` 直接摘掉快照，其余盖字段。
-        清单 id 记在改动行上，推送时仍然拼得出 URL。
+        清单 id 记在改动行上，推送时仍然拼得出 URL。这一行的**账面**（还没试过、没有下次
+        重试、没有错误）与入队那条 SQL 都在机制里（#82）——这里只递进去这一行自己的形状。
         """
         resolved_list = list_id or self._list_of(task_id)
         # 本地生效与入队同一个事务：不会出现「生效了但没进队列」这种下次刷新就丢的状态。
@@ -440,22 +446,17 @@ class Store:
             else:
                 self._apply_locally(task_id, payload)
 
-            cursor = self._db.execute(
-                """
-                INSERT INTO pending_changes
-                    (task_id, list_id, kind, payload, created_at,
-                     attempts, next_retry_at, last_error)
-                VALUES (?, ?, ?, ?, ?, 0, NULL, NULL)
-                """,
-                (
-                    task_id,
-                    resolved_list,
-                    kind.value,
-                    _dumps(payload),
-                    now.isoformat(),
-                ),
+            change = self._change_row(
+                self._task_queue.insert(
+                    owner=task_id,
+                    values={
+                        "list_id": resolved_list,
+                        "kind": kind.value,
+                        "payload": _dumps(payload),
+                    },
+                    now=now,
+                )
             )
-            change = self._change_row(int(cursor.lastrowid or 0))
         assert change is not None
         return change
 
@@ -489,18 +490,14 @@ class Store:
             self._remember_alias(local_id, target)
             if target != local_id:
                 self._db.execute("DELETE FROM tasks WHERE id = ?", (local_id,))
-                self._db.execute(
-                    "UPDATE pending_changes SET task_id = ? WHERE task_id = ?",
-                    (target, local_id),
-                )
+                self._task_queue.repoint(local_id, target)
 
     def pending(self) -> tuple[PendingChange, ...]:
         """还没推成功的改动，按发生顺序（t10 的重试队列按这个顺序挑）。
 
         「什么时候该重试」不在这里筛：判断「现在」要有钟，那是引擎的事。
         """
-        rows = self._db.execute("SELECT * FROM pending_changes ORDER BY id").fetchall()
-        return tuple(_change(row) for row in rows)
+        return tuple(_change(row) for row in self._task_queue.rows())
 
     def pending_count(self) -> int:
         """待推送数量；状态栏常驻显示这个数（ADR 0002 的豁免代价）。
@@ -516,11 +513,10 @@ class Store:
         **算不算由词表说了算**（#57 的检查 8）：:attr:`~dida.sync.lists.ListWriteKind.counts_as_pending`
         一处分类，加一种记录时不会在这里被默默归错类（默认是「算」，保守的那一侧）。
         """
-        counted = self._db.execute("SELECT COUNT(*) AS n FROM pending_changes").fetchone()
-        task_changes = int(counted["n"])
+        task_changes = len(self._task_queue.rows())
         list_changes = sum(
             1
-            for row in self._db.execute("SELECT kind FROM pending_list_changes")
+            for row in self._list_queue.rows()
             if ListWriteKind(row["kind"]).counts_as_pending
         )
         return task_changes + list_changes
@@ -537,19 +533,14 @@ class Store:
         退避怎么算（第几次、隔多久）是引擎的事；这一层只负责把结果存住。
         """
         with self._db:
-            self._db.execute(
-                """
-                UPDATE pending_changes
-                   SET attempts = attempts + 1, last_error = ?, next_retry_at = ?
-                 WHERE id = ?
-                """,
-                (error, next_retry_at.isoformat() if next_retry_at else None, change_id),
+            self._task_queue.record_attempt(
+                change_id, error=error, next_retry_at=next_retry_at
             )
 
     def resolve(self, change_id: int) -> None:
         """这条改动已经推到服务端了，出队。"""
         with self._db:
-            self._db.execute("DELETE FROM pending_changes WHERE id = ?", (change_id,))
+            self._task_queue.dequeue(change_id)
 
     # ---------------------------------------------------------------- 写：清单的乐观写（#42）
 
@@ -651,21 +642,20 @@ class Store:
 
         ``now`` 由调用方给：这一层没有时钟。本地生效与入队**同一个事务**：不会出现
         「生效了但没进队列」这种下次刷新就丢的状态（与 :meth:`enqueue` 同一条规矩）。
+        这一行的账面与入队那条 SQL 与任务队列共用机制（#82）——这里只递进去清单这一行的形状。
         """
         with self._db:
             if kind.local is ListLocalEffect.DROP:
                 self._db.execute("DELETE FROM lists WHERE id = ?", (list_id,))
             else:
                 self._write_list(dict(local if local is not None else payload))
-            cursor = self._db.execute(
-                """
-                INSERT INTO pending_list_changes
-                    (list_id, kind, payload, created_at, attempts, next_retry_at, last_error)
-                VALUES (?, ?, ?, ?, 0, NULL, NULL)
-                """,
-                (list_id, kind.value, _dumps(payload), now.isoformat()),
+            change = self._list_change_row(
+                self._list_queue.insert(
+                    owner=list_id,
+                    values={"kind": kind.value, "payload": _dumps(payload)},
+                    now=now,
+                )
             )
-            change = self._list_change_row(int(cursor.lastrowid or 0))
         assert change is not None
         return change
 
@@ -692,10 +682,7 @@ class Store:
             self._remember_alias(local_id, target)
             if target != local_id:
                 self._db.execute("DELETE FROM lists WHERE id = ?", (local_id,))
-                self._db.execute(
-                    "UPDATE pending_list_changes SET list_id = ? WHERE list_id = ?",
-                    (target, local_id),
-                )
+                self._list_queue.repoint(local_id, target)
 
     def amend_list_change(
         self,
@@ -763,15 +750,11 @@ class Store:
                 self._write_list(dict(row))
             self._remember_alias(local_id, real_id)
             self._db.execute("DELETE FROM lists WHERE id = ?", (local_id,))
-            self._db.execute(
-                "UPDATE pending_list_changes SET list_id = ? WHERE list_id = ?",
-                (real_id, local_id),
-            )
+            self._list_queue.repoint(local_id, real_id)
 
     def pending_lists(self) -> tuple[PendingListChange, ...]:
         """还没推成功的清单改动，按发生顺序（与 :meth:`pending` 同一条口径）。"""
-        rows = self._db.execute("SELECT * FROM pending_list_changes ORDER BY id").fetchall()
-        return tuple(_list_change(row) for row in rows)
+        return tuple(_list_change(row) for row in self._list_queue.rows())
 
     def record_list_attempt(
         self,
@@ -782,19 +765,14 @@ class Store:
     ) -> None:
         """记一次清单改动的推送失败（尝试次数 +1、最后一次错误、下次重试时刻）。"""
         with self._db:
-            self._db.execute(
-                """
-                UPDATE pending_list_changes
-                   SET attempts = attempts + 1, last_error = ?, next_retry_at = ?
-                 WHERE id = ?
-                """,
-                (error, next_retry_at.isoformat() if next_retry_at else None, change_id),
+            self._list_queue.record_attempt(
+                change_id, error=error, next_retry_at=next_retry_at
             )
 
     def resolve_list(self, change_id: int) -> None:
         """这条清单改动已经推到服务端了，出队。"""
         with self._db:
-            self._db.execute("DELETE FROM pending_list_changes WHERE id = ?", (change_id,))
+            self._list_queue.dequeue(change_id)
 
     # ---------------------------------------------------------------- 读 / 写：自定义视图（#36）
 
@@ -976,9 +954,7 @@ class Store:
         self._write_task(current)
 
     def _change_row(self, change_id: int) -> PendingChange | None:
-        row = self._db.execute(
-            "SELECT * FROM pending_changes WHERE id = ?", (change_id,)
-        ).fetchone()
+        row = self._task_queue.row(change_id)
         return None if row is None else _change(row)
 
     def _prune_lists(self, remote_ids: set[str]) -> int:
@@ -1071,9 +1047,7 @@ class Store:
         return row is not None
 
     def _list_change_row(self, change_id: int) -> PendingListChange | None:
-        row = self._db.execute(
-            "SELECT * FROM pending_list_changes WHERE id = ?", (change_id,)
-        ).fetchone()
+        row = self._list_queue.row(change_id)
         return None if row is None else _list_change(row)
 
     def _write_list(self, payload: Mapping[str, Any]) -> bool:
