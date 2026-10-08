@@ -1,18 +1,21 @@
 """假后端自己的契约。
 
-它是接缝一的地基，t12/t16/t17/t20 都要在上面按键，所以这里钉住两件事：
-它一直满足引擎接口（t11/t13 往 ``Engine`` 上加方法时要立刻发现），
-以及写操作真的被记下来了——**包括记下了什么**：一条记错的写会让上面那一层的测试静默断言
-成另一件事（#39 的教训：``create`` 原来把 ``list_name=收集箱`` 写死，于是「在 工作 里建，
-落在 工作」会安静地绿）。
+#80 之后它内部装的就是**真货**（真引擎 + 真本地库 + 假传输层），#86 又把没人读的账本与
+抄来的判断清掉了。所以这个文件只剩三件事：
+
+- 它一直满足引擎接口（往 ``Engine`` 上加方法时要立刻发现）；
+- 账本记的确实是**收到的调用**——记错一条，上面那一层的测试就会静默断言成另一件事
+  （#39 的教训：``create`` 原来把 ``list_name=收集箱`` 写死，于是「在 工作 里建、落在
+  工作」会安静地绿）；
+- 「摆数据 + 委托」这条路上，新建真的落在交给它的那个清单里、标签真的读得出来。
+
+「替身说得跟真货一样」那一类断言**不再需要**：替身不再自己说话，落点、字段与守卫都在
+真引擎与真库里发生。同一件事各自的证据在 ``tests/test_engine_writes.py``（真引擎那条接缝）。
 """
 
 from datetime import datetime, timedelta, timezone
 
-import pytest
-
 from dida.sync.engine import INBOX_ID, Engine
-from dida.sync.writes import UnclaimedListError
 from dida.testing import FakeBackend, ManualClock
 
 T0 = datetime(2026, 3, 14, 12, 3, tzinfo=timezone(timedelta(hours=8)))
@@ -33,10 +36,10 @@ async def test_fake_backend_records_the_write_calls_later_tickets_assert_on():
 
 
 def test_a_create_through_the_fake_lands_in_the_list_it_was_given():
-    """按清单新建（工单 #39 的验收标准 8）：假后端认得落点，并且**照它**摆进缓存。
+    """替身把 ``list_id`` 原样递给真引擎：新建落在交给它的那个清单里（#39 的验收标准 8）。
 
-    三条一起断：落点记在 ``created_tasks`` 上、缓存里那条任务的 ``list_id`` 是它、
-    那个清单的容器里真的看得见这条任务。
+    断的是**真读路径**（``tasks_in``）——真库写了什么、引擎读出来什么。原来这一条还兼着
+    「落点别被替身写死」；替身不再自己摆落点，那个风险随 #80 一起没了，剩下的是这条接线。
     """
     backend = FakeBackend(clock=ManualClock(T0))
     backend.add_list("收集箱", id=INBOX_ID, is_inbox=True)
@@ -44,17 +47,17 @@ def test_a_create_through_the_fake_lands_in_the_list_it_was_given():
 
     task_id = backend.create("写周报", list_id="work")
 
-    created = [task for task in backend.created_tasks if task.id == task_id]
-    assert len(backend.created_tasks) == 1, "新建记在那一条记录里"
-    assert [(task.title, task.list_id) for task in created] == [("写周报", "work")]
     assert [task.title for task in backend.tasks_in("work").items] == ["写周报"], (
         "落点是「工作」，任务就得在「工作」里看得见"
     )
     assert [task.title for task in backend.tasks_in(INBOX_ID).items] == [], "不是收集箱"
+    assert [(task.id, task.list_id) for task in backend.created_tasks] == [(task_id, "work")], (
+        "账本记下的落点与真库读出来的是同一个"
+    )
 
 
 def test_a_create_through_the_fake_records_the_tags_on_the_task():
-    """标签记下来也要**落到那条任务上**（#39 顺手修的替身 bug）。
+    """标签落到那条任务上、从读路径拿得到，账本也照旧记着（#39 顺手修的替身 bug）。
 
     原来它 ``created_tags.append(tuple(tags))`` 之后就不管了：请求那一侧记着、缓存里那条
     任务却没有标签，于是「新建带的标签会显示出来」这条断言无论生产代码对不对都绿。
@@ -62,24 +65,7 @@ def test_a_create_through_the_fake_records_the_tags_on_the_task():
     backend = FakeBackend(clock=ManualClock(T0))
     task_id = backend.create("写周报", list_id=INBOX_ID, tags=["周报", "工作"])
 
-    payload = backend.source.task_payload(task_id)
-    assert payload is not None
-    assert payload["tags"] == ["周报", "工作"], "标签要摆进这条任务的原文里"
+    detail = backend.task_detail(task_id)
+    assert detail is not None
+    assert detail.tags == ("周报", "工作"), "标签要落在那条任务上（不是只记在账本里）"
     assert backend.created_tags == [("周报", "工作")], "记下来的那一份也照旧"
-
-
-def test_the_fake_refuses_a_create_into_an_unclaimed_list_like_the_engine_does():
-    """替身与引擎说同一句话：名字服务端没见过的清单收不了任务（#39 / #53）。
-
-    真引擎拒绝这一笔（请求体里的 ``projectId`` 服务端没见过 → 404 → 那笔新建永远出不了队，
-    而屏幕上那条任务看着像建好了）；替身要是照收不误，接缝一上「在还没推出去的清单里建」
-    就会看起来是通的——那正是 #39 一开始踩的那个坑（替身说了假话，测试全绿）。
-    """
-    backend = FakeBackend(clock=ManualClock(T0))
-    backend.add_list("还没推出去的清单", id="local-list-1")
-
-    with pytest.raises(UnclaimedListError):
-        backend.create("写周报", list_id="local-list-1")
-
-    assert backend.created == [] and backend.created_tasks == [], "拒绝就是拒绝，一条都不记"
-
