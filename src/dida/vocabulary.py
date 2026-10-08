@@ -235,6 +235,16 @@ class WriteBehaviour:
     whole_row: bool = False
     """冲突裁决时**整条任务**豁免于服务端权威（删除就是这一种）。"""
 
+    converges: bool = False
+    """同值收敛：这次要盖上去的字段与本地那一份原文逐位相同时**什么都不做**（工单 #79）。
+
+    「什么都没改」不是每一种写都有的一档：**改字段**有（用户把原样交回来），完成 / 取消完成 /
+    删除**没有**——它们是不可逆的对外动作，再来一次就是再来一次，没有「省下这一笔」的道理
+    （spec 的已知例外，那个判断的判据是 :func:`dida.sync.writes.is_a_change`）。所以这一位是
+    **每一种写各自的事实**，与 :attr:`marks_completed` 同一个形状：写路径读它，不逐个成员写
+    ``if``。
+    """
+
 
 class WriteKind(Enum):
     """一次乐观写的种类。
@@ -301,10 +311,17 @@ class WriteKind(Enum):
         """整条任务豁不豁免于服务端权威（删除是唯一的一种）。"""
         return _WRITE_BEHAVIOUR[self].whole_row
 
+    @property
+    def converges(self) -> bool:
+        """同值收敛：盖上去的字段与本地那一份相同时什么都不写（只有改字段这一种）。"""
+        return _WRITE_BEHAVIOUR[self].converges
+
 
 _WRITE_BEHAVIOUR: dict[WriteKind, WriteBehaviour] = {
     WriteKind.CREATE: WriteBehaviour(local=LocalEffect.MERGE, wire=WireCall.CREATE_TASK),
-    WriteKind.UPDATE: WriteBehaviour(local=LocalEffect.MERGE, wire=WireCall.UPDATE_TASK),
+    WriteKind.UPDATE: WriteBehaviour(
+        local=LocalEffect.MERGE, wire=WireCall.UPDATE_TASK, converges=True
+    ),
     WriteKind.COMPLETE: WriteBehaviour(
         local=LocalEffect.MERGE, wire=WireCall.COMPLETE_TASK, marks_completed=True
     ),
@@ -552,6 +569,61 @@ class RefreshReport:
     pruned_tasks: int = 0
     overwritten: tuple[FieldOverride, ...] = ()
     suppressed: tuple[FieldOverride, ...] = ()
+
+
+# ---------------------------------------------------------------------------
+# 读本地那一份原文的口径：服务端字段名 → 本地那一份的值（#79）
+#
+# 本地库（``Store._snapshot``）与写路径（``dida.sync.writes.is_a_change``）都要把服务端原文
+# 的一格读成一个值，而**两边必须读成同一个值**——否则「这次到底改了没有」会在两个口径之间
+# 答错（写路径拿判据比一遍、本地库拿另一种读法看一遍）。这一族就是那份口径本身：谁读都用它，
+# 不再各写一遍（``tests/test_architecture.py`` 的「同名的函数体不许写两份」正盯着这件事）。
+# ---------------------------------------------------------------------------
+
+TEXT_FIELDS = frozenset({"title", "content", "desc"})
+"""本地原文里那几段**文字**：缺省读作空串（:func:`read_text`）。"""
+
+
+def read_time(value: Any) -> datetime | None:
+    """服务端给的一个日期字符串 → 那一刻；不是字符串、或者吃不下，就当**没有**。
+
+    文档的形状是 ``yyyy-MM-dd'T'HH:mm:ssZ``，实测里偏移既可能是 ``+0800`` 也可能是
+    ``+08:00``，还可能带毫秒。``fromisoformat``（3.11+）这几种都吃得下；吃不下就当作没有
+    截止时间，绝不让一条脏日期把整个刷新带崩。``None`` 与「这个字段不在原文里」是同一个
+    意思——**「缺省」与显式的 ``null`` 是同一件事**。
+    """
+    if not isinstance(value, str):
+        return None
+    try:
+        return datetime.fromisoformat(value)
+    except ValueError:
+        return None
+
+
+def read_text(value: Any) -> str:
+    """服务端给的一段文字 → 字符串；不是字符串就当没有。
+
+    「没有这个字段」与「写了一个空串」因此是同一个值——本地库与写路径都按这一条读。
+    """
+    return value if isinstance(value, str) else ""
+
+
+def read_priority(value: Any) -> int:
+    """服务端给的优先级 → 整数；缺省与脏值都是 ``0``（API 的「无」就是 ``0``）。"""
+    try:
+        return int(value or 0)  # type: ignore[call-overload]
+    except (TypeError, ValueError):
+        return 0
+
+
+def read_tags(value: Any) -> tuple[str, ...]:
+    """服务端给的标签数组 → 标签名元组；不是数组、或者混了别的东西，就跳过那一项。
+
+    顺序照服务端给的来（排序是服务端的事）；比「改了没有」的时候由调用方按**集合**比。
+    """
+    if not isinstance(value, (list, tuple)):
+        return ()
+    return tuple(item for item in value if isinstance(item, str) and item)
 
 
 # ---------------------------------------------------------------------------

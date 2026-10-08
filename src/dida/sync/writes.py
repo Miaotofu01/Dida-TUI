@@ -46,12 +46,17 @@ from dida.vocabulary import (
     LOCAL_TASK_PREFIX,
     LocalEffect,
     PendingChange,
+    TEXT_FIELDS,
     WireCall,
     WriteBehaviour,
     WriteKind,
     is_local_id,
     is_local_list_id,
     is_local_task_id,
+    read_priority,
+    read_tags,
+    read_text,
+    read_time,
 )
 
 __all__ = [
@@ -65,6 +70,7 @@ __all__ = [
     "WireCall",
     "WriteKind",
     "WriteTarget",
+    "is_a_change",
     "is_a_move",
     "is_addressable",
     "is_addressable_task",
@@ -73,6 +79,56 @@ __all__ = [
     "is_local_task_id",
     "project_in",
 ]
+
+TEXT_FIELDS = frozenset({"title", "content", "desc"})
+"""本地原文里那几段**文字**：缺省读作空串——定义在 :mod:`dida.vocabulary`（与本地库共用）。"""
+
+
+def is_a_change(
+    current: Mapping[str, Any] | None, changes: Mapping[str, Any] | None
+) -> bool:
+    """这次要盖上去的字段与**本地那一份原文**逐位比，有没有一位不同——**判据只此一处**（#79）。
+
+    这是六条写路径（改字段 / 搬运 / 改期 / 顺延 / 改清单 / 改视图）共用的那一个判据本体：
+    「这一次到底改了没有」只在这里回答一次，写的那一次把答案回报给调用方，界面不再各问一遍
+    （ADR-0008 第二节记的那一次空写就是漏了它）。比的是**本地那一份原文**（服务端字段名那一
+    层），不是界面上某一份缓存的显示值——界面手里的成品可能与原文差着归一化，拿它比会答错。
+
+    归一化口径与本地库读那一份时（``Store._snapshot`` 一族）一致，每一条都有理由：
+
+    - **文本**（``title`` / ``content`` / ``desc``）：缺省是空串，「没有这个字段」与
+      「写一个空串」是同一个意思；
+    - **``priority``**：缺省是 ``0``（API 的「无」就是 ``0``）；
+    - **``tags``**：比**集合**——挑中的那几个标签变没变，不是它们排在第几个；
+    - **``isAllDay``**：看**真假**；
+    - **``dueDate``**：「缺省」与「显式 ``null``」是同一件事（都是「没有截止时间」），
+      有值时比那一刻（同一时刻的两种写法不是改动）；
+    - **认不出的字段**：原样比（``timeZone`` 这种我们只负责带回服务端的东西，一个字都不能动）。
+
+    只比 ``changes`` 里提到的那几位：没提的字段这一次不盖，也就无所谓改没改。
+    """
+    if not changes:
+        return False
+    local: Mapping[str, Any] = current if isinstance(current, Mapping) else {}
+    for key, value in changes.items():
+        if key in TEXT_FIELDS:
+            if read_text(local.get(key)) != read_text(value):
+                return True
+        elif key == "priority":
+            if read_priority(local.get(key)) != read_priority(value):
+                return True
+        elif key == "tags":
+            if set(read_tags(local.get(key))) != set(read_tags(value)):
+                return True
+        elif key == "isAllDay":
+            if bool(local.get(key)) != bool(value):
+                return True
+        elif key == "dueDate":
+            if read_time(local.get(key)) != read_time(value):
+                return True
+        elif local.get(key) != value:
+            return True
+    return False
 
 
 @runtime_checkable
@@ -191,23 +247,17 @@ def is_a_move(current_list_id: str | None, target_list_id: str | None) -> bool:
 
     不算的两种：目标是空的（没挑清单，不成一次搬运），或者目标就是它**现在待的那个清单**
     （那不是一次改动；凭空入队一笔「同一个清单之间搬」只会让状态栏那个数多一个没有意义的
-    数，服务端那边也没人知道该怎么理解它）。
+    数，服务端那边也没人知道该怎么理解它）。比目标与当前值的是那**一个**判据本体
+    :func:`is_a_change`（本层）——这一处只是把两个 id 摆成它的形状，不自己再比一遍。
 
-    **两个时刻各问一次**，与 :func:`is_addressable_task` 同一个形状：
-
-    - 引擎在 :meth:`~dida.sync.push.PushMixin.move_task` 里问它，决定**写不写**（一次
-      真改动才乐观落库、才入队、才排推送）。这条判断长在引擎这一层，是因为 ``move_task``
-      是公开的写入口——谁都可能调它。
-    - 界面在 :meth:`~dida.tui.app.DidaApp._apply_pick` 里问它，决定**推不推**。那一问不是
-      多余：``move_task`` 的签名是 ``-> None``，回不了话，界面不问就会为一次根本没发生的
-      改动推一轮（``tests/test_picker_fields.py`` 钉着那句 ``pushes == 0``）。
-
-    以前这两处各写了一遍同一个比较，而界面那处的注释还写着「由引擎自己挡（``move_task``）」
-    ——注释说引擎管、代码下面又自己管了一遍，而且两份会漂。现在实现只有这一份。
+    引擎在 :meth:`~dida.sync.push.PushMixin.move_task` 里问它，决定**写不写**，并把答案
+    回报给调用方（#79：这条路径的签名从 ``-> None`` 变成 ``-> bool``）。界面**不再**问第二遍
+    ——它已经按回报值决定推不推了。在 #58 落地到 #79 之间，界面确实问过同一个函数（那时
+    ``move_task`` 回不了话）：判据一直只有一份，变的是**谁不再问**。
     """
     if not target_list_id:
         return False
-    return (current_list_id or "") != target_list_id
+    return is_a_change({"projectId": current_list_id or ""}, {"projectId": target_list_id})
 
 
 def project_in(payload: object) -> str | None:
