@@ -5,6 +5,10 @@
 翻页、剪枝为什么跟着落库走而不是边翻边剪——都是这一个变化原因。增量发生在本地
 （``apply_refresh`` 只写变化），不在这里。
 
+**``refresh`` 只有一个实现**（#84）：取数落库之后顺手认领「建好了、但服务端没回 id」的清单
+（#54），那一步并在这里、不再由清单那一片另写一份靠 ``super()`` 串起来——所以「谁先生效」不
+再取决于基类的排列顺序。
+
 :class:`RefreshMixin` 的方法挂在组装好的 :class:`~dida.sync.engine.SyncEngine` 上。
 """
 
@@ -113,6 +117,10 @@ class RefreshMixin:
         都不会留下半份刷新：要么整份落地，要么本地库一动不动——剪枝也跟着留在这最后一步，
         绝不会出现「索引只翻到一半，于是把第 201 个清单起当成远端已删」这种事。
         失败照旧是 :class:`~dida.api.errors.DidaError` 的结构化错误，不吞。
+
+        **落地之后还要认领**（#54）：建好了、但服务端没回 id 的那几条清单拿这一次刚写进来的
+        服务端清单集按名字对回来（``self._identify_created_lists()``）。认领只有这一处入口，
+        与取数落库同一个实现——清单那一片不再各写一份 ``refresh``（#84）。
         """
         target = self._refresh_target()
         reader = self._reader()
@@ -156,6 +164,13 @@ class RefreshMixin:
             last_refresh_at=now,
             logical_day=logical_day(now, self._day_end).label,
         )
+
+        # 刷新**之后**顺手认领新建的清单（#54）：那一次刷新刚把服务端的清单集写进本地库，认领要的
+        # 正是「服务端现在有哪些行」这件事实，所以它一个网络请求都不用多发。这一步原来住在清单那
+        # 一片的另一份 ``refresh`` 里、靠 ``super()`` 串起来（#84 之前有两个实现，谁生效由基类
+        # 顺序决定）；并进这唯一的实现之后清单那一片不再各写一份，「谁先生效」也不再是一句默契。
+        # 两次之间没有渲染，所以「服务端那行刚被写进来、又被认领摘掉」这件事用户看不见。
+        self._identify_created_lists()
         return report
 
     def _refresh_target(self) -> RefreshTarget:
