@@ -18,7 +18,7 @@ import pytest
 
 from dida.api.client import DidaApiClient
 from dida.storage.store import Store
-from dida.sync.engine import SyncEngine
+from dida.sync.engine import SyncEngine, WriteKind
 from dida.sync.lists import ListMixin
 from dida.sync.push import PushMixin
 from dida.sync.refresh import RefreshMixin
@@ -122,6 +122,11 @@ async def test_one_round_pushes_a_task_change_and_a_list_change(engine_class, st
 async def test_a_refresh_adopts_a_newly_created_list(engine_class, store):
     """新建的清单（201 空 body：建好了但没回 id）在下一次刷新时被**认领**。
 
+    断的是**那条认领记录出队了**（``pending_lists()`` 空）：认领那一步的证据在队列里，不在
+    本地那一行在不在——刷新自己的「写服务端索引 + 剪枝」也会把 ``local-list-1`` 换成 ``p1``
+    （服务端索引里没有临时那一行），所以只看本地行的话，把认领整个抽掉这条测试照样绿。
+    也**不能**看 ``pending_count()``：``AWAIT_ID`` 那一种本来就不算待推送（#54），它一直是 0。
+
     #84 之前这一条在「倒过来拼」那一台上是红的：``refresh`` 只跑取数落库那一份，认领那
     一步没接上——那一行永远停在本地临时 id 上，之后每一次改名与删除都打到一个服务端没
     见过的 id 上（#54 记的就是这一类安静错误）。
@@ -140,6 +145,7 @@ async def test_a_refresh_adopts_a_newly_created_list(engine_class, store):
     transport.enqueue(httpx.Response(200, json={"tasks": []}))
     await engine.refresh()
 
+    assert store.pending_lists() == (), "认领那一步真的跑了：等 id 的记录出队了"
     ids = {row.id for row in store.lists()}
     assert "p1" in ids, "认到服务端给的 id 上了"
     assert local_id not in ids, "本地临时那一行让位给真 id"
@@ -169,6 +175,39 @@ async def test_a_write_schedules_its_own_push_without_the_caller_asking(engine_c
 
     assert "https://api.dida365.com/open/v1/task/t1" in urls(transport), "任务那一笔自己出去了"
     assert "https://api.dida365.com/open/v1/project/work" in urls(transport), "清单那一笔也是"
+
+async def test_an_unaddressable_change_in_the_task_queue_is_not_a_failed_attempt(store):
+    """任务队列里一笔**打在一个服务端没见过的 id 上**的改动：泵跳过它，不算一次失败。
+
+    公开写路径已经拒绝入队这种改动（#53 的守卫），所以这一格只能由旧库遗留或者直接改库造出来
+    ——用 ``Store.enqueue`` 摆出那笔改动就是这件事。它是 #84 报备的那处**语义对齐**：旧代码在
+    ``_send`` 里抛 ``Unaddressable…``、由泵记一次失败（``attempts+1``、写下 ``last_error``、排
+    下次重试），新泵与清单那边一致地在挑候选时就跳过它、等认领。
+
+    用户看得见的差别只有一处：那行 ``last_error`` 会经 ``pending_error`` →
+    ``status().last_error`` 在状态栏说一句「保存失败」。所以这里既断「不发请求、不算失败」，
+    也断那句话说不出来。
+    """
+    transport = FakeTransport(json={})
+    engine = make_engine(SyncEngine, store, transport)
+    store.enqueue(
+        task_id="t1",
+        kind=WriteKind.UPDATE,
+        payload={"title": "写周报（改）"},
+        now=T0,
+        list_id="local-list-1",
+    )
+
+    assert await engine.push_pending() == 0
+    assert transport.requests == [], "发不出去的改动一个请求都不许发"
+
+    queued = store.pending()
+    assert len(queued) == 1, "它留在队列里等认领，不许被丢掉"
+    assert (queued[0].attempts, queued[0].next_retry_at, queued[0].last_error) == (0, None, None), (
+        "发不出去不是一次失败：不记尝试次数、不排下次重试、不写错误"
+    )
+    assert engine.status().last_error is None, "状态栏不许为它说一句「保存失败」"
+
 
 def test_push_pending_and_refresh_have_exactly_one_implementation_each():
     """``push_pending`` 与 ``refresh`` 各自**只有一个实现**（#84 的验收标准）。
