@@ -9,6 +9,14 @@ TUI 自己不 import 存储与 API 客户端，只拿 :class:`~dida.sync.engine.
 （真传输）→ ``SyncEngine``（``day_end`` / ``completed_window_hours`` / ``push_on_change``
 三项配置从这里进去）→ ``DidaApp``（``refresh_on_start`` 与周期泵从这里进去）。
 
+换绑（#92）在这条线上多了两处，都在这一层：
+
+- ``RebindService`` 握着与引擎**同一个** ``Store``，作为 :class:`~dida.sync.engine.AccountPort`
+  挂到引擎上（界面只调 ``engine.account``，不碰存储与配置）；
+- ``main`` 不再只 ``build_app().run()`` 一次，而是 :func:`run_startup_loop`：换绑交回
+  :class:`~dida.tui.app.RebindRestart` 就重读配置、**新造一个 app 实例**再 ``run()``
+  （ADR-0011 六：原地换 store / client 会留下半截状态）。
+
 首次运行（``needs_token``）走 :func:`paste_token`：请用户粘贴一次，拿它真的列一次清单，
 服务端认了才落盘——token 不进日志、不进屏幕、也不进这个仓库。
 """
