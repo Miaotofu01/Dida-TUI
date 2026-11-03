@@ -65,7 +65,7 @@ from dataclasses import dataclass
 from datetime import date, datetime
 from typing import TYPE_CHECKING, Protocol, Sequence, runtime_checkable
 
-from dida.api.errors import AuthError, DidaError
+from dida.api.errors import AuthError, DidaError, NetworkError
 from dida.api.guards import all_day_date
 from dida.clock import Clock
 from dida.logical_day import logical_day
@@ -186,6 +186,13 @@ __all__ = [
     "COMPLETION_CHOICES",
     "DUE_CHOICES",
     "INBOX_ID",
+    "AccountPort",
+    "NetworkError",
+    "RebindCloseError",
+    "RebindConfigError",
+    "RebindDeleteError",
+    "RebindError",
+    "RebindImpact",
     "LOCAL_LIST_PREFIX",
     "LOCAL_TASK_PREFIX",
     "NO_DUE_TEXT",
@@ -300,6 +307,89 @@ def pending_error(source: object) -> str | None:
 
 
 @dataclass(frozen=True)
+class RebindImpact:
+    """换绑会带走什么：确认页上那四个数（工单 #92、ADR-0011 四）。
+
+    口径在实现那一侧钉死（:class:`AccountPort.impact`）：**四个数各自**是本地副本里一类
+    会**随库一起消失**的东西（清单 / 任务 / 自定义视图 / 待推送）。界面上多一个或少一个都
+    必须断得出来，所以它们是四个独立的整数，不是一个加起来的总数。
+    """
+
+    lists: int
+    """清单行数（``lists`` 表，含收集箱那一行）。"""
+
+    tasks: int
+    """任务行数（``tasks`` 表，含已完成、含还有待推送改动的那几条）。"""
+
+    views: int
+    """自定义视图行数（``views`` 表）。"""
+
+    pending: int
+    """待推送改动笔数：任务队列 + 清单队列（与状态栏的 ``pending_count()`` 同口径）。"""
+
+
+class RebindError(DidaError):
+    """换绑**执行**失败（验证不归它：验证走 ``AuthError`` / ``NetworkError``）。
+
+    #93 拿这几个类型给两条失败路定屏幕原句；这一票只保证类型分得开、留下的东西说得出。
+    """
+
+
+class RebindCloseError(RebindError):
+    """关旧连接失败：``unlink`` 还没走到，配置与库**文件**都没动（ADR-0011 五）。
+
+    与 :class:`RebindDeleteError` 分开：那一步要是把没发生的 ``unlink`` 说成「删库失败」，
+    屏幕就说了假话。旧连接此刻的状态不可知，所以这个类型只承诺「文件与配置没动」，
+    不承诺「连接还开着」。
+    """
+
+
+class RebindDeleteError(RebindError):
+    """删库（``unlink``）失败：配置没动，旧库文件完好（ADR-0011 五）。"""
+
+
+class RebindConfigError(RebindError):
+    """写配置失败：库已经删了，配置仍是旧账号——三个失败点里唯一留下半截状态的那个。"""
+
+
+@runtime_checkable
+class AccountPort(Protocol):
+    """引擎公开面上的换绑端口（工单 #92）：界面只调这四件事。
+
+    实现在 ``dida/rebind.py``（住在 ``dida.tui`` 之外），由组合根注入；它握着**引擎正在用
+    的那一个** ``Store`` 实例，所以「删库」删的是同一个连接底下的那个文件，不是另开一份。
+
+    ``verify`` 与 ``execute`` 都**不该**把 token 放进异常消息：它会一路走到屏幕上、日志里
+    和终端回滚里（``Config.__repr__`` 守的是同一件事）。
+    """
+
+    def is_bound(self) -> bool:
+        """「已绑定 / 未绑定」的唯一事实来源（配置里有没有可用 token）。"""
+        ...
+
+    async def verify(self, token: str) -> None:
+        """只验一次 ``list_projects``，**一个字节都不落盘**。
+
+        失败沿用 API 那一层的分类：401/403 是 :class:`~dida.api.errors.AuthError`，连不上是
+        :class:`~dida.api.errors.NetworkError`——界面据此分开说（ADR-0003）。
+        """
+        ...
+
+    def impact(self) -> RebindImpact:
+        """现在清库会丢掉多少——必须在 :meth:`execute` **之前**读（那之后库就没了）。"""
+        ...
+
+    async def execute(self, token: str) -> None:
+        """执行换绑：关连接 → 删库 → 只换 token 写配置（ADR-0011 五）。
+
+        任何一步失败都抛 :class:`RebindError` 的子类，且**不假装做完了**：关连接失败时
+        ``unlink`` 还没走到，删库失败时配置与旧库文件都在，写配置失败时库已经没了——三个
+        失败点留下的东西不一样，界面必须说得出是哪一步。
+        """
+        ...
+
+
+@dataclass(frozen=True)
 class SyncStatus:
     """状态栏快照。"""
 
@@ -326,6 +416,15 @@ class SyncStatus:
 @runtime_checkable
 class Engine(Protocol):
     """TUI 眼里的引擎：它只用得到这几个。t11/t13/t14 的实现必须仍然满足它。"""
+
+    @property
+    def account(self) -> AccountPort | None:
+        """换绑端口（工单 #92）：个人主页上的「换绑」只调它，不自己碰文件、不自己发请求。
+
+        ``None`` 是**直接 new 一个引擎**时的那种状态（没接上组合根），不是生产的样子：
+        ``dida.bootstrap`` 总会注入一支。界面见到 ``None`` 就不提供入口——不假装能换绑。
+        """
+        ...
 
     def set_day_end(self, day_end: str) -> bool:
         """配置：换掉「一天结束的时刻」（工单 #46），真变了才返回 ``True``。
@@ -536,11 +635,15 @@ class SyncEngine(
         client: ProjectReader | TaskWriter | CompletedReader | TagReader | None = None,
         completed_window_hours: int = DEFAULT_COMPLETED_WINDOW_HOURS,
         push_on_change: bool = True,
+        account: AccountPort | None = None,
     ) -> None:
         self._clock = clock
         self._day_end = day_end
         self._source = source
         self._client = client
+        self._account = account
+        """换绑端口（工单 #92）。默认 ``None``：直接 new 一个引擎的测试不必为此准备存储与
+        配置文件；生产由组合根注入一支真的（``dida.bootstrap.build_engine``）。"""
         self._completed_window_hours = completed_window_hours
         # 标签列表：用户打开挑标签那一格时拉一次，只活在内存里（见 dida.sync.tags 的模块文档）。
         self._tags: tuple[str, ...] = ()
@@ -553,6 +656,15 @@ class SyncEngine(
         self._push_lock = asyncio.Lock()
         # 已在飞的推送轮次；wait_for_pushes() 等它们。
         self._inflight: set[asyncio.Task[int]] = set()
+
+    @property
+    def account(self) -> AccountPort | None:
+        """换绑端口（工单 #92）：个人主页上的换绑只调它。
+
+        它握着**这个引擎正在用的那个** ``Store``——所以「删库」删的是同一个连接底下的文件，
+        不是另开一个连接删一个还开着的库。
+        """
+        return self._account
 
     def set_day_end(self, day_end: str) -> bool:
         """换掉「一天结束的时刻」（工单 #46）；真变了才返回 ``True``。

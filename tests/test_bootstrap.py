@@ -99,6 +99,27 @@ def test_the_pump_interval_is_the_composition_roots_policy(tmp_path):
     assert PUSH_TICK_SECONDS > 0, "间隔得是个正数，否则泵根本不会被挂上"
 
 
+def test_the_binding_fact_comes_from_the_config_token(tmp_path):
+    """个人主页的「已绑定 / 未绑定」由组合根按配置里有没有 token 决定（工单 #91）。
+
+    界面不读配置文件（TUI 只 import ``dida.sync.engine`` 与 ``dida.tui``，见
+    ``tests/test_architecture.py``），所以这一位事实在装配线上算好、作为构造参数交给 app。
+    """
+    bound = build_app(
+        config=Config(token="tok-1234"),
+        transport=FakeTransport(),
+        db_path=tmp_path / "bound.sqlite3",
+    )
+    unbound = build_app(
+        config=Config(),
+        transport=FakeTransport(),
+        db_path=tmp_path / "unbound.sqlite3",
+    )
+
+    assert bound.account_bound is True, "配置里有 token，个人主页该说「已绑定」"
+    assert unbound.account_bound is False, "没有 token，个人主页该说「未绑定」"
+
+
 def test_console_script_points_at_an_importable_main():
     pyproject = tomllib.loads((ROOT / "pyproject.toml").read_text(encoding="utf-8"))
 

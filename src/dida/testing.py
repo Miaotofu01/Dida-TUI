@@ -29,8 +29,10 @@ from dida.storage.store import (
     RefreshReport,
 )
 from dida.sync.engine import (
+    AccountPort,
     CompletedReport,
     ListRow,
+    RebindImpact,
     SyncEngine,
     SyncStatus,
     TaskDetail,
@@ -397,12 +399,66 @@ class InMemorySource:
         return self.state
 
 
+class FakeAccount:
+    """换绑端口的假实现（工单 #92 的接缝一）：记录验证 / 影响面 / 执行，可配置抛错。
+
+    与 :class:`FakeBackend` 的 ``write_error`` 同一形状：``verify_error`` 一摆，下一次
+    ``verify`` 就抛它；``execute_error`` 一摆，``execute`` 就抛它。测试因此能只按外部行为
+    断言界面停在哪、说了什么，而不必为了「验证失败」那一刻去碰真配置文件与 SQLite。
+
+    影响面四个数由测试摆（``counts``）：这一层不去猜一份库里有多少行——那是真
+    :class:`~dida.rebind.RebindService` 的事，它有自己的接缝二测试。
+    """
+
+    def __init__(self, *, bound: bool = True) -> None:
+        self.bound = bound
+        """``is_bound()`` 的答案（#91 那一位事实的来源）。"""
+
+        self.counts = RebindImpact(lists=0, tasks=0, views=0, pending=0)
+        """``impact()`` 交回的那四个数。"""
+
+        self.verified: list[str] = []
+        """``verify(token)`` 收到的 token，按调用顺序。"""
+
+        self.verify_error: Exception | None = None
+        """摆一个异常进去，``verify`` 就抛它（试界面 401 / 断网时的反应）。"""
+
+        self.impact_calls = 0
+        """``impact()`` 被调用的次数（确认页显示之前必须先读过一次）。"""
+
+        self.executed: list[str] = []
+        """``execute(token)`` 收到的 token，按调用顺序。"""
+
+        self.execute_error: Exception | None = None
+        """摆一个异常进去，``execute`` 就抛它（试执行失败时的退出路径）。"""
+
+    def is_bound(self) -> bool:
+        return self.bound
+
+    async def verify(self, token: str) -> None:
+        self.verified.append(token)
+        if self.verify_error is not None:
+            raise self.verify_error
+
+    def impact(self) -> RebindImpact:
+        self.impact_calls += 1
+        return self.counts
+
+    async def execute(self, token: str) -> None:
+        self.executed.append(token)
+        if self.execute_error is not None:
+            raise self.execute_error
+
+
 class FakeBackend:
     """接缝一的假后端：内存缓存 + 真引擎的读路径，写操作只记录。
 
     读（``view()`` / ``status()``）委托给真 :class:`~dida.sync.engine.SyncEngine`，
     所以渲染测试跑的是真的读路径、排序与逻辑日判定；写（``refresh`` / ``complete`` /
     ``defer``）只把调用记下来，等对应工单落地后由它们决定要不要真的走一遍。
+
+    换绑端口（工单 #92）默认是一支 :class:`FakeAccount`：既有那 ~20 个
+    ``DidaApp(FakeBackend())`` 测试因此不必知道换绑存在，新测试直接摆布 ``backend.account``。
 
     用法::
 
@@ -414,6 +470,9 @@ class FakeBackend:
     def __init__(self, *, clock: Clock, day_end: str = "24:00") -> None:
         self.clock = clock
         self.source = InMemorySource()
+        self.account = FakeAccount()
+        """换绑端口（工单 #92）：默认「已绑定」、影响面全零、什么都不抛。"""
+
         self.refreshes = 0
         """``refresh()`` 被调用的次数。"""
 

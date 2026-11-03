@@ -9,6 +9,14 @@ TUI 自己不 import 存储与 API 客户端，只拿 :class:`~dida.sync.engine.
 （真传输）→ ``SyncEngine``（``day_end`` / ``completed_window_hours`` / ``push_on_change``
 三项配置从这里进去）→ ``DidaApp``（``refresh_on_start`` 与周期泵从这里进去）。
 
+换绑（#92）在这条线上多了两处，都在这一层：
+
+- ``RebindService`` 握着与引擎**同一个** ``Store``，作为 :class:`~dida.sync.engine.AccountPort`
+  挂到引擎上（界面只调 ``engine.account``，不碰存储与配置）；
+- ``main`` 不再只 ``build_app().run()`` 一次，而是 :func:`run_startup_loop`：换绑交回
+  :class:`~dida.tui.app.RebindRestart` 就重读配置、**新造一个 app 实例**再 ``run()``
+  （ADR-0011 六：原地换 store / client 会留下半截状态）。
+
 首次运行（``needs_token``）走 :func:`paste_token`：请用户粘贴一次，拿它真的列一次清单，
 服务端认了才落盘——token 不进日志、不进屏幕、也不进这个仓库。
 """
@@ -44,10 +52,12 @@ from dida.api.errors import NetworkError
 from dida.api.transport import HttpxTransport, Transport
 from dida.clock import Clock, SystemClock
 from dida.config import Config, Credentials, DayEndReader, config_path, load_config, needs_token
+from dida.rebind import RebindService
 from dida.storage.store import Store
 from dida.sync.engine import SyncEngine
-from dida.tui.app import DidaApp
+from dida.tui.app import DidaApp, RebindRestart
 from dida.tui.escape import open_in_browser
+from dida.tui.keys import LAYER_PROFILE
 
 STORE_FILENAME = "cache.sqlite3"
 """本地副本的文件名：与 ``config.toml`` 同一个目录（spec 只写死了配置的位置）。"""
@@ -129,9 +139,9 @@ def store_path() -> Path:
 def build_client(config: Config, transport: Transport | None = None) -> DidaApiClient:
     """按配置造客户端；``transport`` 省略就是真的 HTTP。
 
-    没有 token 时用空串：请求会被服务端按 401 拒绝，UI 因此给出「凭据失效，请重新粘贴
-    token」——比一个裸 ``RuntimeError`` 诚实得多（首次运行本该在 :func:`main` 里就补上
-    token，走到这里说明用户把配置文件里的 token 删了）。
+    没有 token 时用空串：请求会被服务端按 401 拒绝，UI 因此给出「凭据失效：按 A 进个人
+    主页，再按 b 换绑（会清空本地副本）」——比一个裸 ``RuntimeError`` 诚实得多（首次运行
+    本该在 :func:`main` 里就补上 token，走到这里说明用户把配置文件里的 token 删了）。
     """
     return DidaApiClient(
         token=config.token or "",
@@ -146,22 +156,41 @@ def build_engine(
     config: Config | None = None,
     transport: Transport | None = None,
     db_path: Path | None = None,
+    config_file: Path | None = None,
 ) -> SyncEngine:
-    """组装同步引擎：配置 → 本地副本 → 客户端 → 引擎。
+    """组装同步引擎：配置 → 本地副本 → 客户端 → 引擎，外加**换绑端口**（工单 #92）。
 
     配置里那三项都在这里落到引擎上：``day_end``（逻辑日边界）、``completed_window_hours``
     （已完成区的窗口）、``push_on_change``（改动要不要立刻推）。省略 ``config`` 就按
     ``~/.config/dida-tui/config.toml`` 来（缺文件时由 :func:`~dida.config.load_config`
     生成一份默认的，那份没有 token——首次运行的信号）。
+
+    ``config_file`` 是换绑端口要写的那一份配置文件：给了它，``execute`` 换 token 就落在
+    这个文件上（测试用 tmp 路径）；不给就是生产那个 ``config_path()``。**换绑会删掉
+    ``db_path`` 那个库**，所以测试走这条端口时必须把两个路径都给到 tmp 里。
+
+    端口握着的就是这里新开的那个 ``Store``（同一个实例），所以「关连接 → 删库」删的是
+    同一个连接底下的文件，不是另开一个连接删一个还开着的库。
     """
     config = load_config() if config is None else config
+    database = db_path if db_path is not None else store_path()
+    store = Store(database)
+    account = RebindService(
+        store=store,
+        config=config,
+        database=database,
+        path=config_file,
+        transport=transport,
+        transport_factory=default_transport,
+    )
     return SyncEngine(
         clock=clock if clock is not None else SystemClock(),
         day_end=config.day_end,
-        source=Store(db_path if db_path is not None else store_path()),
+        source=store,
         client=build_client(config, transport),
         completed_window_hours=config.completed_window_hours,
         push_on_change=config.push_on_change,
+        account=account,
     )
 
 
@@ -173,6 +202,9 @@ def build_app(
     db_path: Path | None = None,
     open_url: Callable[[str], bool] = open_in_browser,
     config_file: Path | None = None,
+    start_layer: str | None = None,
+    notice: str | None = None,
+    force_refresh: bool = False,
 ) -> DidaApp:
     """组装 app：引擎 + 三项启动策略（``refresh_on_start``、周期泵的间隔、**日界的重读**）。
 
@@ -182,16 +214,37 @@ def build_app(
     ``config_file`` 是**跟着走**的那个配置文件（工单 #46）：给了它，app 就会在心跳与 ``r``
     上重读里面的 ``day_end``，改完不必重启。不给就是「没有文件可跟」——测试直接递一个
     ``Config`` 进来时，不该被指到 ``~/.config/dida-tui/config.toml`` 上去（那份文件握着
-    用户的 token）；生产那条路（:func:`main`）永远把它给上。
+    用户的 token）；生产那条路（:func:`main`）永远把它给上。换绑端口写的那份也是它（#92）。
+
+    ``account_bound`` 也在这一层算（工单 #91）：个人主页只说「已绑定 / 未绑定」，而这件事
+    只有握着配置文件的组合根知道。**唯一的事实来源是引擎上那个换绑端口**
+    （``account.is_bound()``）——#92 之后界面与组合根都不再各读一遍配置算这件事。
+
+    ``start_layer`` / ``notice`` / ``force_refresh`` 是**同进程重启**那三个参数（#92，
+    与 #93 / #94 共用）：换绑成功后 ``main`` 用新配置重建 app，落在个人主页、用 ``notice``
+    说「已换绑到新账号」、``force_refresh`` 无条件重拉一次（#94）；失败时留在清单列表页，
+    用 ``notice`` 把失败原句带到新 app 的屏幕上（#93）。普通启动三个都是默认值，行为与以前
+    逐字节相同（不弹 notice、不无条件刷新）。
     """
     config = load_config() if config is None else config
     reader = None if config_file is None else DayEndReader(config_file)
+    engine = build_engine(
+        clock, config=config, transport=transport, db_path=db_path, config_file=config_file
+    )
+    account = engine.account
+    # ``build_engine`` 总会注入换绑端口（#92），所以这里没有「没有端口」那一条退路：
+    # 绑定事实只有 ``account.is_bound()`` 这一个出处（#91 定下的唯一事实来源）。
+    assert account is not None
     return DidaApp(
-        build_engine(clock, config=config, transport=transport, db_path=db_path),
+        engine,
         open_url=open_url,
         refresh_on_start=config.refresh_on_start,
         push_tick_seconds=PUSH_TICK_SECONDS,
         day_boundary=None if reader is None else reader.current,
+        account_bound=account.is_bound(),
+        start_layer=start_layer,
+        notice=notice,
+        force_refresh=force_refresh,
     )
 
 
@@ -234,6 +287,48 @@ async def _first_run(transport: Transport | None = None) -> Config:
         await transport.aclose()
 
 
+def run_startup_loop(
+    *,
+    build: Callable[..., DidaApp],
+    run: Callable[[DidaApp], object],
+    config: Config,
+    config_file: Path,
+) -> None:
+    """起 app、跑它；换绑的话重读配置、**新造一个**再跑，直到它不再要求重启（工单 #92）。
+
+    这是 ADR-0011 六那条「同一进程内重跑一遍启动序列」的落点：app 自己 ``exit()`` 之后由
+    这里接手，配置重新读一遍（换绑已经把新 token 写进去了），然后 **build 一个新的
+    ``DidaApp``**——旧实例的 ``_running``、screen stack、引擎、周期泵全都不可复用，原地换
+    store / client 会留下一个还开着旧库的半截进程（ADR-0011 二第 6 条）。
+
+    三项重启参数来自 :class:`~dida.tui.app.RebindRestart`，**每条纸条各算各的**：
+    ``land_on_profile`` 决定落在个人主页，``notice`` 是落地 toast，``force_refresh`` 让新
+    app 无条件跑一轮刷新（#94）。普通退出（``run`` 返回 ``None``）只 build 一次——启动行
+    为与这条循环之前逐字节相同。
+
+    ``build`` / ``run`` 是注入的：测试用假手断「重开几次、拿什么参数、配置什么时候重读」，
+    不必起真终端；``main`` 传的是 :func:`build_app` 与 ``app.run``。
+    """
+    start_layer: str | None = None
+    notice: str | None = None
+    force_refresh = False
+    while True:
+        app = build(
+            config=config,
+            config_file=config_file,
+            start_layer=start_layer,
+            notice=notice,
+            force_refresh=force_refresh,
+        )
+        result = run(app)
+        if not isinstance(result, RebindRestart):
+            return
+        start_layer = LAYER_PROFILE if result.land_on_profile else None
+        notice = result.notice
+        force_refresh = result.force_refresh
+        config = load_config(config_file)
+
+
 def main() -> None:
     """``dida`` 命令的入口：单进程，按 ``q`` 退出。
 
@@ -241,6 +336,9 @@ def main() -> None:
     全量刷新按 ``refresh_on_start`` 在后台跑（用户故事 3 + 4）。
 
     「连不上」与「token 被拒」分开报：前者是环境问题，说「重新粘贴」帮不上任何忙。
+
+    换绑之后的「退出再重开」由 :func:`run_startup_loop` 接手：这个进程不结束，只是换一个
+    新的 ``DidaApp`` 实例重新 ``run()``（工单 #92 / ADR-0011 六）。
     """
     config = load_config()
     if needs_token(config):
@@ -250,4 +348,9 @@ def main() -> None:
             raise SystemExit(_unreachable_message(exc)) from exc
         except Exception as exc:  # noqa: BLE001 - 首次运行只有这一条出口：说清楚再退
             raise SystemExit(f"凭据没验证通过：{exc}\n再运行一次 dida 重新粘贴。") from exc
-    build_app(config=config, config_file=config_path()).run()
+    run_startup_loop(
+        build=build_app,
+        run=lambda app: app.run(),
+        config=config,
+        config_file=config_path(),
+    )

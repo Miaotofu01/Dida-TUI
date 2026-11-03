@@ -11,15 +11,31 @@ from datetime import datetime, timedelta, timezone
 
 import pytest
 
-from dida.sync.engine import INBOX_ID, Engine
+from dida.sync.engine import INBOX_ID, AccountPort, Engine, RebindImpact
 from dida.sync.writes import UnclaimedListError
-from dida.testing import FakeBackend, ManualClock
+from dida.testing import FakeAccount, FakeBackend, ManualClock
 
 T0 = datetime(2026, 3, 14, 12, 3, tzinfo=timezone(timedelta(hours=8)))
 
 
 def test_fake_backend_satisfies_the_engine_interface():
     assert isinstance(FakeBackend(clock=ManualClock(T0)), Engine)
+
+
+def test_fake_backend_carries_a_rebind_port_by_default():
+    """既有的 ``DidaApp(FakeBackend())`` 测试不必知道换绑存在（工单 #92）。
+
+    默认那支端口说「已绑定」、影响面全零、什么都不抛；要试失败就摆 ``verify_error`` /
+    ``execute_error``（与 ``write_error`` 同一形状）。
+    """
+    backend = FakeBackend(clock=ManualClock(T0))
+
+    assert isinstance(backend.account, AccountPort)
+    assert backend.account.is_bound() is True
+    assert backend.account.counts == RebindImpact(lists=0, tasks=0, views=0, pending=0)
+    # 两个答案都钉住：只断 isinstance 是空转（bool 永远成立），断不出「绑了没有」。
+    assert FakeAccount(bound=True).is_bound() is True
+    assert FakeAccount(bound=False).is_bound() is False
 
 
 async def test_fake_backend_records_the_write_calls_later_tickets_assert_on():

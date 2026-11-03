@@ -32,6 +32,7 @@ from dida.tui.keys import (
     GLOBAL,
     LAYER_DETAIL,
     LAYER_INDEX,
+    LAYER_PROFILE,
     LAYER_TASKS,
     LAYER_TITLES,
     LAYERS,
@@ -129,10 +130,11 @@ def test_every_page_binds_its_own_layer_from_the_one_table():
     """每一层的真实绑定都是从表里取的那一份，页面里没有手写的第二条。
 
     ``BINDINGS`` 手抄一份的下场与帮助手抄一份一样，只是更难发现：按键真的会不通。
+    个人主页（#91）是第四种页面、不在导航路径上，但它同样按层取键，所以也在这张清单里。
     """
-    from dida.tui.pages import DetailPage, IndexPage, TasksPage
+    from dida.tui.pages import DetailPage, IndexPage, ProfilePage, TasksPage
 
-    for page in (IndexPage, TasksPage, DetailPage):
+    for page in (IndexPage, TasksPage, DetailPage, ProfilePage):
         assert page.LAYER in LAYERS, f"{page.__name__} 的层名不在表里"
         assert page.BINDINGS == bindings_for(page.LAYER), f"{page.__name__} 的绑定不是从表里来的"
 
@@ -149,9 +151,17 @@ def every_binding_the_app_installs() -> dict[str, set[str]]:
     """
     from dida.tui.app import DidaApp
     from dida.tui.overlays import ConfirmOverlay, MessageOverlay
-    from dida.tui.pages import DetailPage, IndexPage, TasksPage
+    from dida.tui.pages import DetailPage, IndexPage, ProfilePage, TasksPage
 
-    owners = (DidaApp, IndexPage, TasksPage, DetailPage, MessageOverlay, ConfirmOverlay)
+    owners = (
+        DidaApp,
+        IndexPage,
+        TasksPage,
+        DetailPage,
+        ProfilePage,
+        MessageOverlay,
+        ConfirmOverlay,
+    )
     installed: dict[str, set[str]] = {}
     for owner in owners:
         for binding in owner.BINDINGS:
@@ -232,10 +242,29 @@ async def open_help(pilot, app: DidaApp) -> str:
     return text
 
 
+async def walk_to(pilot, app: DidaApp, layer: str) -> None:
+    """走到某一层：先退回清单列表页，再按那一层的入口键。
+
+    三层走 ``→``；个人主页（#91）不在导航路径上，入口是清单列表页的 ``A``。
+    """
+    while app.layer != LAYER_INDEX:
+        await pilot.press("left")
+        await pilot.pause()
+    if layer == LAYER_TASKS:
+        await pilot.press("right")
+    elif layer == LAYER_DETAIL:
+        await pilot.press("right")
+        await pilot.pause()
+        await pilot.press("right")
+    elif layer == LAYER_PROFILE:
+        await pilot.press("A")
+    await pilot.pause()
+
+
 async def test_the_h_help_shows_only_the_keys_of_the_layer_you_are_on():
     """``h`` 只列**当前这一层**的键：别的层自己的键一个都不出现（用户故事 119）。
 
-    走的是外部行为：真的按键、真的看下一屏。抬头先说清这是哪一层，然后拿同一张表里那三层
+    走的是外部行为：真的按键、真的看下一屏。抬头先说清这是哪一层，然后拿同一张表里那几层
     的行对账——帮助跟着表走，「别的层自己的键」就是从表里减出来的那一份。第一层没有
     ``←`` 那一行（它无处可退，spec 的状态机里清单列表页只有 ``→`` 向下）。
     """
@@ -245,6 +274,7 @@ async def test_the_h_help_shows_only_the_keys_of_the_layer_you_are_on():
         await pilot.pause()
 
         for layer in LAYERS:
+            await walk_to(pilot, app, layer)
             screen = await open_help(pilot, app)
 
             assert LAYER_TITLES[layer] in screen, f"帮助的抬头不是「{LAYER_TITLES[layer]}」"
@@ -260,6 +290,11 @@ async def test_the_h_help_shows_only_the_keys_of_the_layer_you_are_on():
             others = set().union(
                 *({row.label for row in help_rows(other)} for other in LAYERS if other != layer)
             ) - mine
+            # 子串撞车不算「出现了别的层的键」：个人主页那一层整条说明就是「退回」，而
+            # 任务列表页/详细页那两条是「退回清单列表页」「退回任务列表页」——本层那一行
+            # 本来就含这三个字。别层**多出来的那一行**仍会被上面「本层每条说明都在」与
+            # 下面「本条说明不在别层」两条夹住（这张表是唯一来源，见 help_rows）。
+            others = {label for label in others if not any(label in own for own in mine)}
             for label in others:
                 assert label not in rows_text, f"{layer} 的帮助里出现了别的层的键：「{label}」"
 
@@ -267,9 +302,6 @@ async def test_the_h_help_shows_only_the_keys_of_the_layer_you_are_on():
                 assert "退回" not in rows_text, "第一层无处可退，帮助不该列一个退回键"
             else:
                 assert "退回" in rows_text, f"{layer} 得有一条退回上一层的键"
-            if layer != LAYER_DETAIL:
-                await pilot.press("right")  # 清单列表页 → 任务列表页 → 详细页
-                await pilot.pause()
 
 
 # ------------------------------------------------------------------ `h` 取代 `?`

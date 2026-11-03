@@ -15,6 +15,8 @@
 - :class:`Config` —— 上面五个键的数据类，字段名就是文件里的键名。
 - :class:`Credentials` —— 「先验证、后落盘」的入口：一次成功的「列清单」调用
   是 token 落盘的唯一途径。
+- :func:`verify_token` —— **只验证不落盘**的那一步（空返回 ``None``）；换绑端口与
+  :class:`Credentials` 共用这一处，各自把空 / 401 翻成自己那一层的话。
 - :func:`config_path` / :func:`load_config` / :func:`save_config` —— 位置、读、写。
 - :func:`needs_token` —— 首次运行的信号。
 - :class:`DayEndReader` —— 配置里那个「一天结束的时刻」，跟着文件走（工单 #46 的重读路径）。
@@ -27,7 +29,9 @@ from __future__ import annotations
 
 import os
 import re
+import tempfile
 import tomllib
+from collections.abc import Callable
 from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
@@ -35,7 +39,7 @@ import tomli_w
 
 from dida.api.client import DEFAULT_BASE_URL, DidaApiClient
 from dida.api.errors import AuthError, DidaError
-from dida.api.transport import Transport
+from dida.api.transport import HttpxTransport, Transport
 
 
 class ConfigError(Exception):
@@ -151,18 +155,35 @@ def needs_token(config: Config) -> bool:
 
 
 def save_config(config: Config, path: Path | None = None) -> None:
-    """落盘：0600，写入前先建父目录；``token`` 为 ``None`` 时不写这个键。
+    """落盘：**原子写**，0600；``token`` 为 ``None`` 时不写这个键。
 
-    权限显式设成 0600：``os.open`` 的 mode 会被 umask 削掉，而且对已经存在的文件
-    它根本不会改权限，所以覆盖写一个旧的宽松文件也要能收紧。
+    先算好要写的字节，再写进同目录的临时文件（0600），最后 ``os.replace`` 到目标。失败
+    （序列化、``ENOSPC``、``EIO``……）时目标文件一个字节都不动——这对换绑的「写配置失败」
+    那条路是承重的：库已经删了，配置若被截成空文件，重开就会看到「首次运行」而不是旧账号
+    （#93 的「配置仍是旧账号」）。临时文件在失败时清掉。
+
+    权限显式设成 0600：``mkstemp`` 建出来就是 0600，写入后再 ``chmod`` 一次，补回可能被
+    umask 削掉的位；替换之后目标文件因此也是 0600——覆盖一个旧的宽松文件同样会收紧。
     """
     path = config_path() if path is None else path
-    path.parent.mkdir(parents=True, exist_ok=True)
     data = {key: value for key, value in asdict(config).items() if value is not None}
-    handle = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(handle, "w", encoding="utf-8") as stream:
-        stream.write(tomli_w.dumps(data))
-    os.chmod(path, 0o600)
+    payload = tomli_w.dumps(data)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    handle, temporary_name = tempfile.mkstemp(
+        prefix=f".{path.name}.", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(handle, "w", encoding="utf-8") as stream:
+            stream.write(payload)
+        os.chmod(temporary, 0o600)
+        os.replace(temporary, path)
+    except BaseException:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
+        raise
 
 
 class DayEndReader:
@@ -198,6 +219,41 @@ class DayEndReader:
             return None
 
 
+async def verify_token(
+    token: str,
+    *,
+    transport: Transport | None = None,
+    transport_factory: Callable[[], Transport] | None = None,
+    base_url: str = DEFAULT_BASE_URL,
+) -> str | None:
+    """只验一枚 token：strip → 空就是 ``None`` → 一次 ``list_projects``；返回 strip 后的值。
+
+    **不落盘**（ADR-0003），也**不翻译错误**：凭据被拒时客户端抛 ``AuthError``，连不上抛
+    ``NetworkError``。空粘贴在本地就拦下（返回 ``None``，而且发生在建传输层之前），两个
+    调用方各自把它翻成自己那一层的话——:class:`Credentials` 说 ``CredentialsError``，换绑
+    端口说 ``AuthError``——两句话与从前逐字相同。
+
+    ``transport`` 是调用方给的（不关它）；省略时按 ``transport_factory`` 现造一个，并在
+    ``finally`` 里关掉——一次验证不必留下一个连接池。这两条正是一处「验证口径」：首次运行
+    与换绑验的是同一件事，只是各自怎么落盘、怎么措辞不同。
+    """
+    token = token.strip()
+    if not token:
+        return None
+    owned = transport is None
+    if owned:
+        transport = transport_factory() if transport_factory is not None else HttpxTransport()
+    try:
+        client = DidaApiClient(token=token, transport=transport, base_url=base_url)
+        await client.list_projects()
+    finally:
+        if owned:
+            close = getattr(transport, "aclose", None)
+            if close is not None:
+                await close()
+    return token
+
+
 class Credentials:
     """凭据的验证入口：一次成功的「列清单」调用是 token 落盘的唯一途径。
 
@@ -224,17 +280,17 @@ class Credentials:
 
     async def verify_and_store(self, token: str) -> Config:
         """验证 token 并落盘，返回写好的配置；失败抛错且磁盘不变。"""
-        token = token.strip()
-        if not token:  # 空粘贴本地就拦下，不浪费一次请求
-            raise CredentialsError(f"token 不能为空，请重新粘贴：{_PASTE_HINT}")
-        client = DidaApiClient(token=token, transport=self._transport, base_url=self._base_url)
         try:
-            await client.list_projects()
+            token = await verify_token(
+                token, transport=self._transport, base_url=self._base_url
+            )
         except AuthError as exc:
             raise CredentialsError(
                 f"凭据失效，请重新粘贴 token（HTTP {exc.status_code}）：{_PASTE_HINT}",
                 status_code=exc.status_code,
             ) from exc
+        if token is None:  # 空粘贴本地就拦下，不浪费一次请求
+            raise CredentialsError(f"token 不能为空，请重新粘贴：{_PASTE_HINT}")
         config = replace(load_config(self._path), token=token)
         save_config(config, self._path)
         return config

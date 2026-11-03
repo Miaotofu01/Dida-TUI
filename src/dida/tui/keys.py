@@ -2,7 +2,7 @@
 
 两个读者是：
 
-- 真实绑定：三张页面各自的 ``BINDINGS`` 与 app 的 ``BINDINGS`` 都从 :func:`bindings_for`
+- 真实绑定：每张页面各自的 ``BINDINGS`` 与 app 的 ``BINDINGS`` 都从 :func:`bindings_for`
   长出来，没有人在别处手写第二条绑定；
 - ``h`` 那张帮助：:func:`help_rows` 从同一张表里取当前这一层该看到的行。
 
@@ -13,7 +13,8 @@
 的大表）。``right`` 在清单列表页是「进入这个清单」、在任务列表页是「进入详细页」，
 ``left`` 在任务列表页与详细页是「退回上一层」——同一个键在不同层做不同的事，所以它必须
 跟着层走。**往里走 / 往回走各只有一个键**（ADR-0008 一）：``enter`` / ``esc`` 在这三个
-导航页上不再触发导航。
+导航页上不再触发导航。个人主页是第四种页面、不在导航路径上（ADR-0010），但它同样按层取键：
+那一层只有一条「退回」（``left`` / ``esc``）。
 
 **这是 #48 的接缝**（「键位守卫 + 分层帮助」）：那一张要在这张表上加一道守卫（键位只能用
 终端一定会传上来的那些），并把帮助做成分层的样子。:func:`help_rows` 就是它要读的口子。
@@ -42,6 +43,7 @@ __all__ = [
     "LAYERS",
     "LAYER_DETAIL",
     "LAYER_INDEX",
+    "LAYER_PROFILE",
     "LAYER_TITLES",
     "LAYER_TASKS",
     "QUIT_ACTION",
@@ -67,8 +69,19 @@ LAYER_TASKS = "tasks"
 LAYER_DETAIL = "detail"
 """层三，任务详细页（#43 接手扩展）。"""
 
-LAYERS: tuple[str, ...] = (LAYER_INDEX, LAYER_TASKS, LAYER_DETAIL)
-"""三层，按用户进入的顺序。``LAYERS`` 不含 :data:`GLOBAL`——那是每一层的附加项。"""
+LAYER_PROFILE = "profile"
+"""第四种页面，个人主页（#91、ADR-0010）：**不在导航路径上**。
+
+它从清单列表页旁路进入（``A``），``←`` / ``esc`` 回原处。所以它有自己的一层键位与帮助
+抬头，却不是 ``→`` / ``←`` 那条导航栈上的一层——平移轨道上没有它。
+"""
+
+LAYERS: tuple[str, ...] = (LAYER_INDEX, LAYER_TASKS, LAYER_DETAIL, LAYER_PROFILE)
+"""按层的键位表覆盖的所有页面。
+
+前三层是导航路径上的三页（按用户进入的顺序）；最后一层是路径之外的个人主页（#91）。
+``LAYERS`` 不含 :data:`GLOBAL`——那是每一页的附加项。
+"""
 
 QUIT_ACTION = "quit"
 """退出那个动作名——**只有这一个**（工单 #47）。
@@ -116,6 +129,7 @@ BINDINGS: dict[str, tuple[Key, ...]] = {
         Key(("n",), "new_list", "新建清单或视图"),
         Key(("e",), "edit_list", "改这一行（清单或视图）"),
         Key(("d",), "delete_list", "删除这一行（清单或视图）"),
+        Key(("A",), "open_profile", "个人主页"),
     ),
     LAYER_TASKS: (
         Key(("j", "down"), "cursor_down", "下一条"),
@@ -134,6 +148,10 @@ BINDINGS: dict[str, tuple[Key, ...]] = {
         Key(("enter",), "enter", "编辑这个字段"),
         Key(("left",), "back", "退回任务列表页"),
         Key(("escape",), "end_edit", "结束编辑（保存）"),
+    ),
+    LAYER_PROFILE: (
+        Key(("b",), "rebind", "换绑账号"),
+        Key(("left", "escape"), "back", "退回"),
     ),
 }
 
@@ -249,6 +267,7 @@ LAYER_TITLES: dict[str, str] = {
     LAYER_INDEX: "清单列表页",
     LAYER_TASKS: "任务列表页",
     LAYER_DETAIL: "任务详细页",
+    LAYER_PROFILE: "个人主页",
 }
 """``h`` 那张帮助的抬头：先说清「这是哪一层的键」。"""
 

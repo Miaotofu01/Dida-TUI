@@ -381,6 +381,9 @@ class IndexPage(CursorPage):
             self.row_id = row_id
             super().__init__()
 
+    class OpenProfile(Message):
+        """用户按了 ``A``：旁路进个人主页（不在导航路径上，ADR-0010）。"""
+
     def __init__(self, *, id: str | None = None) -> None:
         super().__init__(id=id)
         self._rows_by_id: dict[str, ListRow] = {}
@@ -450,3 +453,10 @@ class IndexPage(CursorPage):
         """``d``：删光标这一行（外层先问一句，这里只转发）。"""
         if self.selected_id is not None:
             self.post_message(self.DeleteList(self.selected_id))
+
+    def action_open_profile(self) -> None:
+        """``A``：旁路进个人主页（工单 #91）。
+
+        这一页只转发：主页不在导航栈上，进出的藏 / 显归 app 管（它才看得见 ``#stage``）。
+        """
+        self.post_message(self.OpenProfile())
