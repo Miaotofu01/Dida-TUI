@@ -1,17 +1,18 @@
-"""外壳：组装、三层页面的进出、状态栏、同步泵、退出流——**这是一个薄 app**。
+"""外壳：组装、三层导航页与个人主页的进出、状态栏、同步泵、退出流——**这是一个薄 app**。
 
 一栏、三层页面（ADR-0004）：启动落在清单列表页，``→`` 向下、``←`` 向上。三层各是
 一个控件（:mod:`dida.tui.pages`），这里管的是**它们之间的进出**：谁在屏上、焦点在哪、
-光标从哪来、``o`` 说的是哪条任务。
+光标从哪来、``o`` 说的是哪条任务。**第四种页面（个人主页，#91）在导航路径之外**：它与
+``#stage`` 并列挂在这里，用 ``display`` 藏 / 显，不进那条平移 / 压栈的路径（ADR-0010）。
 
 TUI 只通过 :class:`~dida.sync.engine.Engine` 读写；分组、计数、逾期判定、截止时间读法
 全部留在引擎里，页面只把引擎给的成品画出来。一启动就读本地缓存渲染——网络不是这一屏的
 前置条件（用户故事 3/4）。
 
 留在这里的是**组装与生命周期**：``__init__`` / ``compose`` / ``on_mount``、上下两行的
-分工（顶栏说「你在哪」、状态栏说「数据怎么样」）、同步泵（``r`` 与周期重试）、三层进出、
-以及退出流。按 wave-plan 的约定，#34 之后 #46（逻辑日立刻生效）与 #47（退出拦截）各自
-扩展的就是这一片。
+分工（顶栏说「你在哪」、状态栏说「数据怎么样」）、同步泵（``r`` 与周期重试）、三层进出
+与个人主页的旁路进出、以及退出流。按 wave-plan 的约定，#34 之后 #46（逻辑日立刻生效）与
+#47（退出拦截）各自扩展的就是这一片；#91 在这里加了第四种页面（它不在导航栈上）。
 
 **外观一行都不在这里**：颜色、字形、间距、动效时长全在 :mod:`dida.tui.theme`（工单 #51）。
 这里只决定**什么时候**动（换层平移、同步转圈、toast）。
@@ -60,13 +61,14 @@ from dida.tui.keys import (
     GLOBAL,
     LAYER_DETAIL,
     LAYER_INDEX,
+    LAYER_PROFILE,
     LAYER_TASKS,
     LAYER_TITLES,
     bindings_for,
     help_body,
 )
 from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay, multi_values
-from dida.tui.pages import DetailPage, IndexPage, TasksPage
+from dida.tui.pages import DetailPage, IndexPage, ProfilePage, TasksPage
 from dida.tui.pages.detail import LIST_FIELD, PRIORITY_FIELD, TAGS_FIELD, picker_spec
 from dida.tui.pages.index import (
     KIND_VIEW,
@@ -245,7 +247,7 @@ def save_line(status: SyncStatus) -> str:
 
 
 class DidaApp(App[None]):
-    """一栏 + 三层页面 + 状态栏。"""
+    """一栏 + 三层导航页 + 个人主页 + 状态栏。"""
 
     ENABLE_COMMAND_PALETTE = False  # 命令面板会抢键；键位帮助是 h
     BINDINGS = bindings_for(GLOBAL)
@@ -265,6 +267,7 @@ class DidaApp(App[None]):
         push_tick_seconds: float | None = None,
         animations: str | None = None,
         day_boundary: Callable[[], str | None] | None = None,
+        account_bound: bool = False,
     ) -> None:
         """``open_url`` 是**注入**的浏览器开手（工单 #19）。
 
@@ -289,9 +292,15 @@ class DidaApp(App[None]):
         ``animations`` 是 ``auto|on|off`` 开关（ADR-0007 三）。不给就走 ``DIDA_ANIM``，
         再不给就是 ``auto``：ssh 与低能力终端上自动关掉。这是**换层平移**的闸（ADR-0008
         四撤掉光标条之后，它是这一档动效唯一的用武之地）：关掉时换层不滑，屏幕一步到位。
+
+        ``account_bound`` 是**账号绑定**那一位事实（工单 #91）：组合根按配置里有没有 token
+        算出来交给界面，个人主页只把它画成「已绑定 / 未绑定」。它不归界面判断——TUI 读不到
+        配置文件，也不许读（``tests/test_architecture.py`` 的允许表）。
         """
         super().__init__(ansi_color=True)
         self.engine = engine
+        self.account_bound = account_bound
+        """个人主页要说的那一位事实（工单 #91）；来源是组合根，见 :func:`dida.bootstrap.build_app`。"""
         self._open_url = open_url
         self._refresh_on_start = refresh_on_start
         self._push_tick_seconds = push_tick_seconds
@@ -353,6 +362,11 @@ class DidaApp(App[None]):
             yield IndexPage(id=LAYER_INDEX)
             yield TasksPage(id=LAYER_TASKS)
             yield DetailPage(id=LAYER_DETAIL)
+        # 第四种页面（#91）：**与 #stage 并列**，不在平移轨道上——平移是导航栈的表达，
+        # 而个人主页不在那条栈上（ADR-0010）。平时藏着，按 A 时由 show_profile 显出来。
+        profile = ProfilePage(id=LAYER_PROFILE, account_bound=self.account_bound)
+        profile.display = False
+        yield profile
         yield StatusBar(id="status-bar")
 
     def on_mount(self) -> None:
@@ -401,13 +415,30 @@ class DidaApp(App[None]):
     def detail_page(self) -> DetailPage:
         return self.query_one(DetailPage)
 
+    def profile_page(self) -> ProfilePage:
+        """个人主页（第四种页面，不在导航路径上——#91 / ADR-0010）。"""
+        return self.query_one(ProfilePage)
+
     def _pages(self) -> dict[str, IndexPage | TasksPage | DetailPage]:
-        """三层各是哪个控件，按层名索引。"""
+        """导航路径上的三层各是哪个控件，按层名索引（个人主页不在这张表里）。"""
         return {
             LAYER_INDEX: self.index_page(),
             LAYER_TASKS: self.tasks_page(),
             LAYER_DETAIL: self.detail_page(),
         }
+
+    def show_profile(self) -> None:
+        """``A``：从清单列表页**旁路**进个人主页（工单 #91 / ADR-0010）。
+
+        它不在导航栈上，所以这里不压栈、也不平移：把舞台藏起来、把主页显出来，焦点交给它。
+        清单列表页整个留在 DOM 里（只是不可见），光标因此还是离开时那一行。
+        """
+        self._layer = LAYER_PROFILE
+        self._stage().display = False
+        page = self.profile_page()
+        page.display = True
+        self._write_top()
+        page.focus(scroll_visible=False)
 
     def _show(self, layer: str) -> None:
         """把这一层滑到眼前，并把焦点交给它（``j``/``k``/``→`` 立刻能用）。
@@ -415,11 +446,15 @@ class DidaApp(App[None]):
         三层**都在 DOM 里**、并排停在 :class:`Stage` 上：它们的行与光标因此原样留着，
         ``←`` 回去时用户看到的就是他离开时那一行（用户故事 20/62）。换层是横向平移——
         ``→`` 压栈、``←`` 出栈本来就是导航栈（ADR-0007 三）。
+
+        任何一层导航页上屏，都意味着个人主页又藏回去了：它不在那条栈上（#91）。
         """
         previous = self._layer
         self._layer = layer
         page = self._pages()[layer]
         self._write_top()
+        self.profile_page().display = False
+        self._stage().display = True
         self._stage().show(self._layer_index(layer), animate=self._motion and layer != previous)
         # ``scroll_visible=False``：#59 **之前**它是承重的——Textual 交焦点时默认会把那个控件
         # **立刻**滚进可见区，而这一页正好是整个舞台（平移就是把它滑过来），那一下会把动画
@@ -452,7 +487,7 @@ class DidaApp(App[None]):
         self._show(LAYER_DETAIL)
 
     def back_to_index(self) -> None:
-        """回层一（任务列表页上按 ``←``）——光标照旧停在他进来的那一行。"""
+        """回层一（任务列表页、或个人主页上按 ``←``）——光标照旧停在他进来的那一行。"""
         self._detail_task_id = None
         self._show(LAYER_INDEX)
 
@@ -571,9 +606,14 @@ class DidaApp(App[None]):
     def nav_path(self) -> tuple[str, ...]:
         """当前导航路径：清单列表页 → 任务列表页 → 任务详细页，最多三级。
 
-        第一段是**页面**（它只有三种），后面两段是走在那一页上的**东西**：容器名与任务名。
-        「你在哪」在详细页的答案就是「在哪条任务上」，所以最后一段写的是它。
+        第一段是**页面**（导航路径上的页面只有三种），后面两段是走在那一页上的**东西**：
+        容器名与任务名。「你在哪」在详细页的答案就是「在哪条任务上」，所以最后一段写的是它。
+
+        **个人主页不在任何一条路径上**（ADR-0010）：它单独一段，不是第四级——顶栏在这一页
+        只有「个人主页」四个字，硬画成路径就会出现「清单列表页 ▸ 个人主页」这种不存在的关系。
         """
+        if self._layer == LAYER_PROFILE:
+            return (LAYER_TITLES[LAYER_PROFILE],)
         index = LAYER_TITLES[LAYER_INDEX]
         if self._layer == LAYER_TASKS:
             return (index, self._container_title or LAYER_TITLES[LAYER_TASKS])
@@ -609,6 +649,14 @@ class DidaApp(App[None]):
     def on_index_page_refused(self, event: IndexPage.Refused) -> None:
         """按 ``→`` 进一个进不去的清单：如实说一句，不进下一层。"""
         self._write_status(event.message)
+
+    def on_index_page_open_profile(self, event: IndexPage.OpenProfile) -> None:
+        """清单列表页上按了 ``A``：旁路进个人主页（不在导航路径上）。"""
+        self.show_profile()
+
+    def on_profile_page_back(self, event: ProfilePage.Back) -> None:
+        """个人主页上按了 ``←`` / ``esc``：回清单列表页原处（不在导航栈上，没有可弹的层）。"""
+        self.back_to_index()
 
     def on_tasks_page_entered(self, event: TasksPage.Entered) -> None:
         """任务列表页上按了 ``→``：进这条任务的详细页。"""

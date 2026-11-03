@@ -183,6 +183,10 @@ def build_app(
     上重读里面的 ``day_end``，改完不必重启。不给就是「没有文件可跟」——测试直接递一个
     ``Config`` 进来时，不该被指到 ``~/.config/dida-tui/config.toml`` 上去（那份文件握着
     用户的 token）；生产那条路（:func:`main`）永远把它给上。
+
+    ``account_bound`` 也在这一层算（工单 #91）：个人主页只说「已绑定 / 未绑定」，而这件事
+    只有握着配置文件的组合根知道。有可用 token 就是已绑定（``needs_token`` 的否定）——
+    官方 API 没有「当前用户」端点，所以它说不清绑到了谁身上，界面也不许去读配置。
     """
     config = load_config() if config is None else config
     reader = None if config_file is None else DayEndReader(config_file)
@@ -192,6 +196,7 @@ def build_app(
         refresh_on_start=config.refresh_on_start,
         push_tick_seconds=PUSH_TICK_SECONDS,
         day_boundary=None if reader is None else reader.current,
+        account_bound=not needs_token(config),
     )
 
 
