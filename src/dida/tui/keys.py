@@ -149,7 +149,10 @@ BINDINGS: dict[str, tuple[Key, ...]] = {
         Key(("left",), "back", "退回任务列表页"),
         Key(("escape",), "end_edit", "结束编辑（保存）"),
     ),
-    LAYER_PROFILE: (Key(("left", "escape"), "back", "退回"),),
+    LAYER_PROFILE: (
+        Key(("b",), "rebind", "换绑账号"),
+        Key(("left", "escape"), "back", "退回"),
+    ),
 }
 
 KEY_NAMES: dict[str, str] = {

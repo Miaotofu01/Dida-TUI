@@ -30,6 +30,7 @@ TUI 只通过 :class:`~dida.sync.engine.Engine` 读写；分组、计数、逾�
 from __future__ import annotations
 
 import os
+from dataclasses import dataclass
 from datetime import date
 from functools import partial
 from typing import TYPE_CHECKING, Callable, Sequence
@@ -38,6 +39,7 @@ from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import HorizontalScroll
 from textual.widgets import Static
+from textual.worker import WorkerCancelled
 
 from dida.sync.engine import (
     DidaError,
@@ -45,6 +47,7 @@ from dida.sync.engine import (
     INBOX_ID,
     ListKind,
     ListRow,
+    RebindImpact,
     SyncStatus,
     TaskDetail,
     UnknownTaskError,
@@ -67,7 +70,7 @@ from dida.tui.keys import (
     bindings_for,
     help_body,
 )
-from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay, multi_values
+from dida.tui.overlays import ConfirmOverlay, FormField, FormOverlay, MessageOverlay, multi_values
 from dida.tui.pages import DetailPage, IndexPage, ProfilePage, TasksPage
 from dida.tui.pages.detail import LIST_FIELD, PRIORITY_FIELD, TAGS_FIELD, picker_spec
 from dida.tui.pages.index import (
@@ -91,6 +94,8 @@ if TYPE_CHECKING:  # 只为了标注周期泵那个句柄，运行时用不到
 __all__ = [
     "DidaApp",
     "PENDING_STYLE",
+    "REBIND_GROUP",
+    "RebindRestart",
     "Stage",
     "StatusBar",
     "TopBar",
@@ -101,6 +106,45 @@ __all__ = [
 
 SYNC_GROUP = "sync"
 """同步 worker 的组名：``exclusive=True`` 靠它保证同时只有一轮同步在跑。"""
+
+REBIND_GROUP = "rebind"
+"""换绑那几个异步步骤（验证 / 执行）的 worker 组名。
+
+与 :data:`SYNC_GROUP` 分开：换绑执行前要**取消同步组**并等它们结束（关库之前不能有人在飞），
+而正在跑换绑的那一个 worker 不能被自己取消掉。
+"""
+
+REBIND_TOKEN_FIELD = "token"
+"""换绑表单里 token 那一格的名字（表单交回来的 ``dict`` 用它作键）。"""
+
+REBIND_CONFIRM_FIELD = "yes"
+"""影响面确认那一格的名字：用户要打的字就是 ``yes``。"""
+
+
+@dataclass(frozen=True)
+class RebindRestart:
+    """换绑之后要**重开一个 app**的那张纸条（工单 #92 建，与 #93 / #94 共用）。
+
+    ``DidaApp.exit(RebindRestart(...))`` 把它交给 :meth:`textual.app.App.run` 的调用方
+    （``dida.bootstrap`` 的启动循环），那边重新读配置、**新造一个 app 实例**再 ``run()``
+    ——不是在原实例里换掉 ``store`` / ``client``（ADR-0011 六）。
+
+    为什么不原地换：引擎、周期泵、日界重读每一处都握着旧库 / 旧 client，漏一处就是静默
+    串号；而且旧连接还开着，删掉的只是一个还开着的 SQLite（ADR-0011 二第 6 条）。
+
+    ``land_on_profile`` 决定新 app 开屏落在哪：换绑成功落在个人主页（#92）；失败时留在
+    清单列表页，把那句话用 ``notice`` 说出来（#93）。``force_refresh`` 给 #94：换完绑库是
+    空的，不立刻重拉的话屏幕看起来像卡住了。
+    """
+
+    land_on_profile: bool
+    """新 app 一开屏就落在个人主页（成功那条路）。"""
+
+    notice: str | None = None
+    """新 app 落地时用 toast 说的一句话（失败那条路；``None`` = 什么都不说）。"""
+
+    force_refresh: bool = False
+    """不管 ``refresh_on_start`` 配的是什么，落地就立刻跑一轮全量刷新（#94）。"""
 
 PENDING_STYLE = theme.PENDING
 """待推送数量非零时的高亮（用户故事 100）。
@@ -246,8 +290,12 @@ def save_line(status: SyncStatus) -> str:
     return messages.saved_message()
 
 
-class DidaApp(App[None]):
-    """一栏 + 三层导航页 + 个人主页 + 状态栏。"""
+class DidaApp(App[RebindRestart | None]):
+    """一栏 + 三层导航页 + 个人主页 + 状态栏。
+
+    ``App[...]`` 的参数是 ``run()`` 的返回值（工单 #92）：普通退出是 ``None``，换绑之后是
+    一张 :class:`RebindRestart` 纸条，由组合根的启动循环接手重开一个新实例。
+    """
 
     ENABLE_COMMAND_PALETTE = False  # 命令面板会抢键；键位帮助是 h
     BINDINGS = bindings_for(GLOBAL)
@@ -268,6 +316,9 @@ class DidaApp(App[None]):
         animations: str | None = None,
         day_boundary: Callable[[], str | None] | None = None,
         account_bound: bool = False,
+        start_layer: str | None = None,
+        notice: str | None = None,
+        force_refresh: bool = False,
     ) -> None:
         """``open_url`` 是**注入**的浏览器开手（工单 #19）。
 
@@ -296,11 +347,29 @@ class DidaApp(App[None]):
         ``account_bound`` 是**账号绑定**那一位事实（工单 #91）：组合根按配置里有没有 token
         算出来交给界面，个人主页只把它画成「已绑定 / 未绑定」。它不归界面判断——TUI 读不到
         配置文件，也不许读（``tests/test_architecture.py`` 的允许表）。
+
+        ``start_layer`` / ``notice`` / ``force_refresh`` 是**同进程重启**那三个参数（工单 #92，
+        与 #93 / #94 共用）：换绑成功后 ``main`` 用新配置重开一个**新实例**，``start_layer``
+        让它落在个人主页；失败时 ``notice`` 把那句话带到新实例的屏幕上；``force_refresh``
+        让换完绑的那一次立刻重拉（#94）。默认值就是普通启动，行为与以前逐字节相同。
         """
         super().__init__(ansi_color=True)
         self.engine = engine
         self.account_bound = account_bound
         """个人主页要说的那一位事实（工单 #91）；来源是组合根，见 :func:`dida.bootstrap.build_app`。"""
+        self._start_layer = start_layer
+        """开屏落在哪一层（工单 #92）：``None`` / ``index`` 是普通启动，``profile`` 是换绑后重启。"""
+        self._notice = notice
+        """开屏时用 toast 说的一句话（#93 的失败话术；``None`` = 什么都不说）。"""
+        self._force_refresh = force_refresh
+        """落地就跑一轮全量刷新，压过 ``refresh_on_start``（#94 的换绑后重拉）。"""
+        self._rebinding = False
+        """换绑**执行中**（工单 #92）：旧库连接已经关掉，任何读引擎的动作都不许再发生。
+
+        第二道保险。第一道是执行前把同步 worker 全部取消并等到它们结束；这个闸挡的是那些
+        不归 worker 管的入口（周期泵、``r``、关窗时的状态栏重画）——关库之后读一次就会抛
+        ``sqlite3.ProgrammingError``，而它出现在屏幕上时已经离现场很远了。
+        """
         self._open_url = open_url
         self._refresh_on_start = refresh_on_start
         self._push_tick_seconds = push_tick_seconds
@@ -374,18 +443,33 @@ class DidaApp(App[None]):
 
         动效的开关只在这里定一次：``auto|on|off`` 落到**换层平移**这一个地方（ADR-0008 四
         撤掉光标条之后，页面自己不再有动效开关）。
+
+        换绑重启那三个参数也在这里落地（工单 #92）：先按 ``start_layer`` 落位（个人主页是
+        旁路页，要先画清单列表页再显出来——``_show`` 只认导航路径上的三层），再画行，再按
+        ``force_refresh or refresh_on_start`` 决定跑不跑启动刷新，最后把 ``notice`` 用 toast
+        说出来。普通启动这三个都是默认值，走的还是原来那一条路。
         """
         self._motion = theme.animations_enabled(self._animations)
         if not self._motion:
             self.animation_level = "none"
+        if self._start_layer not in (None, LAYER_INDEX, LAYER_PROFILE):
+            raise ValueError(
+                f"start_layer 只能是 None / {LAYER_INDEX!r} / {LAYER_PROFILE!r}，"
+                f"收到 {self._start_layer!r}"
+            )
         self._show(LAYER_INDEX)
+        if self._start_layer == LAYER_PROFILE:
+            # 个人主页不在平移轨道上（ADR-0010）：先让清单列表页上屏，再把它显出来。
+            self.show_profile()
         self.refresh_view()
-        if self._refresh_on_start:
+        if self._force_refresh or self._refresh_on_start:
             self.start_sync()
         if self._push_tick_seconds is not None:
             # 重试队列的泵（t21）：写失败时改动留在队列里，退避到点了得有谁来推它。
             # 句柄留着，关窗时好把它停掉（on_unmount）——泵的开关归这一层管。
             self._push_timer = self.set_interval(self._push_tick_seconds, self.push_tick)
+        if self._notice:
+            self.notify(self._notice, timeout=6)
 
     def on_unmount(self) -> None:
         """关窗：把周期泵停掉——app 都拆了，没有人再需要它问那句「到点了没有」。
@@ -539,7 +623,7 @@ class DidaApp(App[None]):
 
         屏幕已经拆掉时整体是空操作（关窗中，这一次回来晚了，见 :meth:`_write_status`）。
         """
-        if not self.is_running:
+        if self._rebinding or not self.is_running:
             return
         # 先记下「这一屏是哪一天的」，再画行：反过来的话，边界正好在这几句里跨过去时，会记下
         # 一个比行更新的日子，那一屏就永远没人认领了（心跳以为它是最新的，见
@@ -582,7 +666,13 @@ class DidaApp(App[None]):
         两处说的是两件事（ADR-0007 四）：状态栏说「数据怎么样」（已同步 / 待推送 / 逻辑日），
         详细页那一行说「你刚才那一下出去没有」。同一个 ``status()`` 读出来的两份读法，
         所以它们永远不会互相矛盾。
+
+        换绑执行中（:attr:`_rebinding`）整个丢掉：那一刻旧库连接已经关了，``status()`` 会抛
+        ``sqlite3.ProgrammingError``（工单 #92）。真正挡住跨 ``await`` 的那一路是执行前把
+        同步停干净，这一道是第二保险。
         """
+        if self._rebinding:
+            return
         status = self.engine.status()
         self._write_status(status_line(status, spinner=self._spinner()))
         self._write_save_line(save_line(status))
@@ -657,6 +747,10 @@ class DidaApp(App[None]):
     def on_profile_page_back(self, event: ProfilePage.Back) -> None:
         """个人主页上按了 ``←`` / ``esc``：回清单列表页原处（不在导航栈上，没有可弹的层）。"""
         self.back_to_index()
+
+    def on_profile_page_rebind(self, event: ProfilePage.Rebind) -> None:
+        """个人主页上按了 ``b``：开换绑流程（工单 #92）。"""
+        self._start_rebind()
 
     def on_tasks_page_entered(self, event: TasksPage.Entered) -> None:
         """任务列表页上按了 ``→``：进这条任务的详细页。"""
@@ -1250,6 +1344,166 @@ class DidaApp(App[None]):
         """``h``：当前这一层的键位帮助（跟着绑定表走，不是手抄一份）。"""
         self.push_screen(MessageOverlay(help_body(self._layer)))
 
+    # ---------------------------------------------------------------- 换绑（工单 #92）
+
+    def _start_rebind(self) -> None:
+        """``b``：开那张输入新 token 的表单（只从个人主页进来）。
+
+        没有换绑端口（直接 new 一个引擎的测试）时什么都不做——不假装能换绑。真正碰文件、
+        发请求、删库的活全在端口后面（:class:`~dida.sync.engine.AccountPort`），界面只调它。
+        """
+        if self._rebinding or self._layer != LAYER_PROFILE:
+            return
+        if self.engine.account is None:
+            return
+        self._open_rebind_token_form("")
+
+    def _open_rebind_token_form(self, token: str, notice: str | None = None) -> None:
+        """开 token 表单：``notice``（上一次失败的原因）写在底部提示的上面。
+
+        ``token`` 会**预填**回输入框（验证失败时「停在输入框」）：``Input(password=True)``
+        把它画成一串掩码点，明文只活在控件的 ``value`` 里——不进屏幕、不进状态栏、不进 toast。
+        """
+        hint = messages.REBIND_TOKEN_HINT
+        if notice is not None:
+            hint = f"{notice}\n{hint}"
+        self.push_screen(
+            FormOverlay(
+                title=messages.REBIND_TOKEN_TITLE,
+                fields=(
+                    FormField(
+                        name=REBIND_TOKEN_FIELD,
+                        label=messages.REBIND_TOKEN_LABEL,
+                        value=token,
+                        password=True,
+                    ),
+                ),
+                hint=hint,
+            ),
+            self._finish_rebind_token,
+        )
+
+    def _finish_rebind_token(self, values: dict[str, str] | None) -> None:
+        """token 表单交回来了：空的不算一次提交，其余排到事件循环上去验证。
+
+        ``Esc`` 与 ``Enter`` 在这张表单里是同一个结果（ADR-0008 二），所以「取消」不存在：
+        一个空值等于什么都没填，直接回到个人主页；填了字就当作要验证。
+        """
+        if not values:
+            return
+        token = values.get(REBIND_TOKEN_FIELD, "").strip()
+        if not token:
+            return
+        self.run_worker(
+            self._verify_rebind_token(token),
+            group=REBIND_GROUP,
+            exclusive=True,
+            description="验证新 token",
+        )
+
+    async def _verify_rebind_token(self, token: str) -> None:
+        """验一次新 token（**磁盘一动不动**）；过了就读影响面、开确认页。
+
+        失败分三种说法（:func:`dida.tui.messages.rebind_verify_failed_message`）：凭据被拒、
+        连不上、其它。前两种是这一票的判据，必须分开——它们的下一步完全不同（ADR-0003）。
+        验证失败回到**同一张表单**、带着刚才那枚 token，用户改一个字就能再试。
+        """
+        account = self.engine.account
+        if account is None:
+            return
+        try:
+            await account.verify(token)
+        except DidaError as exc:
+            if not self.is_running:
+                return
+            self._open_rebind_token_form(token, messages.rebind_verify_failed_message(exc))
+            return
+        if not self.is_running:
+            return
+        self._open_rebind_confirm(token, account.impact())
+
+    def _open_rebind_confirm(self, token: str, impact: RebindImpact) -> None:
+        """影响面确认页：四个数 + 要求输入 ``yes``（判据五 / 六）。
+
+        ``impact`` 是在删任何东西**之前**读的——这一屏说的就是「按下去会丢掉这些」。选
+        :class:`FormOverlay` 而不是 :class:`ConfirmOverlay`：要的是打出来的 ``yes``，不是
+        一个字母。表单的 ``Esc`` 也是提交，所以按错键等于交回一个不是 ``yes`` 的答案——
+        :meth:`_finish_rebind_confirm` 那边什么都不做（「不输入 yes 就什么都不发生」）。
+        """
+        self.push_screen(
+            FormOverlay(
+                title=messages.REBIND_CONFIRM_TITLE,
+                fields=(
+                    FormField(name=REBIND_CONFIRM_FIELD, label=messages.REBIND_CONFIRM_LABEL),
+                ),
+                hint=messages.rebind_impact_hint(impact),
+            ),
+            partial(self._finish_rebind_confirm, token),
+        )
+
+    def _finish_rebind_confirm(self, token: str, values: dict[str, str] | None) -> None:
+        """确认页交回来了：只有字面上的 ``yes`` 才执行，别的一律什么都不做（判据六）。"""
+        if not values:
+            return
+        if values.get(REBIND_CONFIRM_FIELD, "").strip() != "yes":
+            return
+        self.run_worker(
+            self._execute_rebind(token),
+            group=REBIND_GROUP,
+            exclusive=True,
+            description="换绑",
+        )
+
+    async def _execute_rebind(self, token: str) -> None:
+        """执行换绑：先停在飞的工作，再交给端口，最后把重启纸条交出去（ADR-0011 五）。
+
+        顺序是承重的：
+
+        1. 停周期泵与转圈——它们会自己醒来读引擎；
+        2. 取消同步组并**等到它们结束**——``Store`` 的连接是线程亲和的，关掉之后任何一次
+           读都会抛 ``ProgrammingError``，而一个跨过 ``await`` 的同步协程正好会撞上；
+        3. 才 ``await account.execute(token)``：关连接 → 删库 → 写配置；
+        4. 成功后 ``exit(RebindRestart(land_on_profile=True))``；失败也退出，把失败原句放进
+           ``notice``（#93 给新实例定屏幕话术）——不留在「库关了但界面还在」的半死状态。
+
+        ``execute`` 之后**一行都不读引擎**：``_rebinding`` 闸挡着状态栏 / 重画 / 周期泵，
+        所以这个协程剩下的只是 ``exit()``（同步的，不碰 DOM）。
+        """
+        self._rebinding = True
+        self._stop_rebind_background()
+        workers = self.workers.cancel_group(self, SYNC_GROUP)
+        # ``wait_for_complete([])`` 在 Textual 8.2.8 里等于「等**所有** worker」——包括正在跑
+        # 换绑的这一个自己，那会当场抛 ``DeadlockError``。所以没有同步在飞时根本不用等。
+        if workers:
+            try:
+                await self.workers.wait_for_complete(workers)
+            except WorkerCancelled:
+                # 我们自己取消的那几个 worker，``wait()`` 会抛这个（Wait 只吞 asyncio 的
+                # CancelledError）。等它们**停下来**正是这一行的目的；同步组有 exclusive=True，
+                # 同时最多一个，所以不会出现「抛了第一个、别的还在飞」。
+                pass
+        account = self.engine.account
+        if account is None:
+            self._rebinding = False
+            return
+        try:
+            await account.execute(token)
+        except DidaError as exc:
+            self.exit(RebindRestart(land_on_profile=False, notice=str(exc)))
+            return
+        self.exit(RebindRestart(land_on_profile=True))
+
+    def _stop_rebind_background(self) -> None:
+        """把周期泵与转圈停掉（换绑执行的第一个动作）。
+
+        泵的句柄与转圈的两个定时器都有人握着（:meth:`on_unmount` 里也停一次），这里停是
+        因为执行完到退出之间还有几个 ``await``——那一秒里定时器跳一次就会读一次已经关掉的库。
+        """
+        if self._push_timer is not None:
+            self._push_timer.stop()
+            self._push_timer = None
+        self._stop_spinner()
+
     # ---------------------------------------------------------------- 同步泵（t21）
 
     def action_refresh(self) -> None:
@@ -1263,7 +1517,12 @@ class DidaApp(App[None]):
         顺带问一次日界（工单 #46）：「现在再看一眼」这句话里，配置改过、钟自己走过了边界，都
         算在内——而且这是那条检查**唯一不依赖周期泵**的触发。它跑在这里、任何网络调用之前，
         所以这一轮同步成不成功都与它无关（``_sync()`` 里的重画在 ``else:`` 成功分支里）。
+
+        换绑执行中按 ``r`` 什么都不做：那一刻库已经关了（工单 #92）。表单正开着时 ``r`` 也
+        到不了这里（浮层截断绑定链），所以这只需要挡「确认页关掉到 app 退出」那几毫秒。
         """
+        if self._rebinding:
+            return
         self.reload_day_boundary()
         self.start_sync(announce=True, manual=True)
 
@@ -1441,7 +1700,12 @@ class DidaApp(App[None]):
 
         ``await`` 之后那一次状态栏重画走 :meth:`update_status` → :meth:`_write_status`：
         关窗时它整个丢掉，但**这一笔推送已经落下去了**——界面没了不代表用户那一下不算数。
+
+        换绑执行中直接返回（工单 #92）：泵在执行前就停了，这是第二道保险——那一秒里跳一次
+        就会读已经关掉的库。
         """
+        if self._rebinding:
+            return
         self.reload_day_boundary()
         await self.engine.push_pending()
         self.update_status()
@@ -1466,7 +1730,12 @@ class DidaApp(App[None]):
         ``App.exit()`` 也是同步的。真正的 ``await`` 在调用方（``_dispatch_action`` 的
         ``await invoke(...)``），那时这一帧已经做完了。:meth:`_finish_quit` 同理，见它自己的
         说明。
+
+        **换绑执行中按退出键不理**（工单 #92）：那一刻旧库连接已经关了，``engine.status()``
+        会抛；而换绑本身几毫秒后就会 ``exit()``，用户没什么可等的。
         """
+        if self._rebinding:
+            return
         pending = self.engine.status().pending_count
         if not pending:
             # 没有待推送改动就照旧直接退（``q`` 即结束，spec 的单进程规矩）。

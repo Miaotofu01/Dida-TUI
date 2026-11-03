@@ -10,7 +10,7 @@
 
 **这一页只说组合根交给它的那一位事实**（已绑定 / 未绑定）。官方 API 没有「当前用户」
 端点（GLOSSARY 的「账号绑定」），所以这一页说不出、也不画「绑到了谁身上」——没有用户名、
-邮箱、头像、token 片段。换绑入口与它背后的动作是 #92，这一票不预留任何东西。
+邮箱、头像、token 片段。换绑入口是它名下唯一的动作（#92）：键位 ``b``，``h`` 里说得出来。
 """
 
 from __future__ import annotations
@@ -24,6 +24,7 @@ from dida.tui.pages.base import EMPTY_STYLE, CursorPage, Row, rule_row
 __all__ = [
     "BINDING_LABEL",
     "BOUND_TEXT",
+    "REBIND_HINT",
     "UNBOUND_TEXT",
     "ProfilePage",
     "account_line",
@@ -38,15 +39,25 @@ BOUND_TEXT = "已绑定"
 UNBOUND_TEXT = "未绑定"
 """还没有 token（首次运行的信号）。"""
 
+REBIND_HINT = "b 换绑"
+"""账号绑定那一行末尾的入口提示（工单 #92）。
 
-def account_line(bound: bool) -> Text:
-    """「账号绑定」那一行：标签 + **这一位事实**，没有别的。
+写在这一行上而不是只放在 ``h`` 里：``h`` 是「我想知道这一层能按什么」时去查的地方，不是
+发现功能的地方。键位本身仍在 :mod:`dida.tui.keys` 的表里，这一句只是同一个事实的展示——
+``b`` 与 ``Key(("b",), "rebind", …)`` 对不上会由 ``h`` 那几条守卫当场抓出来。
+"""
+
+
+def account_line(bound: bool, *, rebind_hint: str = REBIND_HINT) -> Text:
+    """「账号绑定」那一行：标签 + **这一位事实** + 换绑入口，没有别的。
 
     值用暗色那一档（它是注解，不是光标行）：这一页没有可停光标的行，整页都不该有一行
-    看起来像「可以按进去」。
+    看起来像「可以按进去」。换绑入口也写暗色，它只是一个键位提示，不是一行可选的东西。
     """
     line = Text(f"{BINDING_LABEL}  ")
     line.append(BOUND_TEXT if bound else UNBOUND_TEXT, style=EMPTY_STYLE)
+    if rebind_hint:
+        line.append(f"   {rebind_hint}", style=EMPTY_STYLE)
     return line
 
 
@@ -58,6 +69,13 @@ class ProfilePage(CursorPage):
 
     class Back(Message):
         """用户按了 ``←`` / ``esc``：退回清单列表页（个人主页不在导航栈上，只回原处）。"""
+
+    class Rebind(Message):
+        """用户按了 ``b``：要换绑账号（工单 #92）。
+
+        这一页只**发消息**，不自己开浮层、不碰引擎：换绑那张表单与后面的验证 / 确认 / 执行
+        都在 app 那一层（它才握着引擎上的换绑端口）。与 :class:`Back` 同一种分工。
+        """
 
     def __init__(self, *, account_bound: bool = False, id: str | None = None) -> None:
         """``account_bound`` 是组合根交进来的**事实**，这一页不判断、也不去读配置。"""
@@ -71,10 +89,14 @@ class ProfilePage(CursorPage):
     def _build(self) -> tuple[Row, ...]:
         """顶上一条通栏细线（与另外几页同一个开头），下面是唯一的那一项。
 
-        ``id=None``：这一行**不可停光标**——页面上没有可做的事，光标标记与强调色在这里
-        只会让人以为按得进去。``#92`` 的换绑动作到了再决定它是不是一行可选的东西。
+        ``id=None``：这一行**不可停光标**——换绑是一个键（``b``），不是「按进这一行」。
+        光标标记与强调色在这里只会让人以为要用 ``→`` 进去。
         """
         return (rule_row(), Row(id=None, text=account_line(self.account_bound)))
+
+    def action_rebind(self) -> None:
+        """``b``：请求换绑（#92）。真正的流程在 app 那一层，这一页只递一句话。"""
+        self.post_message(self.Rebind())
 
     def action_back(self) -> None:
         """``←``（``left``）与 ``esc``：回清单列表页。
