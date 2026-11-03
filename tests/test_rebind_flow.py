@@ -17,7 +17,7 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from dida.api.errors import AuthError, NetworkError
-from dida.sync.engine import RebindConfigError, RebindImpact
+from dida.sync.engine import RebindConfigError, RebindDeleteError, RebindImpact
 from dida.testing import FakeBackend, ManualClock
 from dida.tui.app import REBIND_GROUP, DidaApp, RebindRestart
 from dida.tui.keys import LAYER_PROFILE, LAYER_TITLES
@@ -254,6 +254,31 @@ async def test_yes_executes_the_rebind_and_hands_back_a_restart_on_the_profile_p
     assert app.return_value == RebindRestart(land_on_profile=True), (
         f"换绑成功后要交回一张重开便条，实际是 {app.return_value!r}"
     )
+
+
+async def test_a_delete_failure_says_which_step_failed_and_what_was_left_alone():
+    """删库失败：屏幕原句说出哪一步、原因，以及配置与旧库都没动（工单 #93 判据一）。
+
+    这一条断的是交给下一个 app 的那句话；重启之后它真的出现在屏幕上、旧库也真的还能用，
+    在 ``tests/test_rebind_flow_real.py`` 里按真磁盘断。
+    """
+    fake = backend()
+    fake.account.execute_error = RebindDeleteError("database is busy")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_rebind(pilot)
+        await submit_token(pilot, app)
+        await answer_confirm(pilot, app, "yes")
+
+    result = app.return_value
+    assert isinstance(result, RebindRestart), f"执行失败也要重启，实际 {result!r}"
+    assert result.land_on_profile is False, "失败那条路不回个人主页"
+    notice = result.notice or ""
+    assert "删库失败" in notice, f"要说清是哪一步失败了：{notice}"
+    assert "database is busy" in notice, f"要带上失败原因：{notice}"
+    assert "配置" in notice and "旧库" in notice, f"要说清配置与旧库都没动：{notice}"
 
 
 async def test_a_failed_execute_still_restarts_but_carries_the_failure_notice():

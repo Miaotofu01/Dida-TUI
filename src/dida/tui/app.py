@@ -1489,7 +1489,12 @@ class DidaApp(App[RebindRestart | None]):
         try:
             await account.execute(token)
         except DidaError as exc:
-            self.exit(RebindRestart(land_on_profile=False, notice=str(exc)))
+            self.exit(
+                RebindRestart(
+                    land_on_profile=False,
+                    notice=messages.rebind_execute_failed_message(exc),
+                )
+            )
             return
         self.exit(RebindRestart(land_on_profile=True))
 
