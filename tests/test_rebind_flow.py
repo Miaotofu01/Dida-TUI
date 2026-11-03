@@ -239,7 +239,8 @@ async def test_anything_but_yes_executes_nothing(answer: str):
 async def test_yes_executes_the_rebind_and_hands_back_a_restart_on_the_profile_page():
     """``yes`` 之后：执行换绑，app 退出并把「落在个人主页」那张纸条交回去（判据七的界面半边）。
 
-    ``notice`` / ``force_refresh`` 是 #93 / #94 的，这一票成功后**只**置 ``land_on_profile``。
+    成功那张纸条带着 #94 的三项：落在个人主页、落地说「已换绑到新账号」、无条件刷新一次
+    （库是空的，不刷新就是一片空白）。失败那条路的 ``notice`` 是 #93 的，不在这条断言里。
     """
     fake = backend()
     app = DidaApp(fake)
@@ -251,9 +252,9 @@ async def test_yes_executes_the_rebind_and_hands_back_a_restart_on_the_profile_p
         await answer_confirm(pilot, app, "yes")
 
     assert fake.account.executed == [TOKEN], "yes 之后才真的执行"
-    assert app.return_value == RebindRestart(land_on_profile=True), (
-        f"换绑成功后要交回一张重开便条，实际是 {app.return_value!r}"
-    )
+    assert app.return_value == RebindRestart(
+        land_on_profile=True, notice="已换绑到新账号", force_refresh=True
+    ), f"换绑成功后要交回一张带回声与强制刷新的重开便条，实际是 {app.return_value!r}"
 
 
 async def test_a_failed_execute_still_restarts_but_carries_the_failure_notice():

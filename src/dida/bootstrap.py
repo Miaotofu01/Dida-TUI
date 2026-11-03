@@ -221,9 +221,10 @@ def build_app(
     （``account.is_bound()``）——#92 之后界面与组合根都不再各读一遍配置算这件事。
 
     ``start_layer`` / ``notice`` / ``force_refresh`` 是**同进程重启**那三个参数（#92，
-    与 #93 / #94 共用）：换绑成功后 ``main`` 用新配置重建 app，落在个人主页；失败时用
-    ``notice`` 把那句话带到新 app 的屏幕上。普通启动三个都是默认值，行为与以前逐字节相同
-    （不弹 notice、不无条件刷新）。
+    与 #93 / #94 共用）：换绑成功后 ``main`` 用新配置重建 app，落在个人主页、用 ``notice``
+    说「已换绑到新账号」、``force_refresh`` 无条件重拉一次（#94）；失败时留在清单列表页，
+    用 ``notice`` 把失败原句带到新 app 的屏幕上（#93）。普通启动三个都是默认值，行为与以前
+    逐字节相同（不弹 notice、不无条件刷新）。
     """
     config = load_config() if config is None else config
     reader = None if config_file is None else DayEndReader(config_file)

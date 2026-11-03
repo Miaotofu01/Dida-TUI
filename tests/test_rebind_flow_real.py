@@ -258,9 +258,9 @@ async def test_yes_writes_the_new_token_deletes_the_old_copy_and_restarts_on_the
         else:
             raise AssertionError("输入 yes 之后没有走到 exit()")
 
-    assert world.app.return_value == RebindRestart(land_on_profile=True), (
-        f"成功后要交回「落在个人主页」那张纸条，实际是 {world.app.return_value!r}"
-    )
+    assert world.app.return_value == RebindRestart(
+        land_on_profile=True, notice="已换绑到新账号", force_refresh=True
+    ), f"成功后要交回「落在个人主页 + 回声 + 强制刷新」那张纸条，实际是 {world.app.return_value!r}"
     assert not world.db_path.exists(), "旧库必须整个删掉（不是删表）"
     written = load_config(world.config_file)
     assert written.token == NEW_TOKEN, "配置里是新 token"

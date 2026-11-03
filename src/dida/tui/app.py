@@ -133,15 +133,16 @@ class RebindRestart:
     串号；而且旧连接还开着，删掉的只是一个还开着的 SQLite（ADR-0011 二第 6 条）。
 
     ``land_on_profile`` 决定新 app 开屏落在哪：换绑成功落在个人主页（#92）；失败时留在
-    清单列表页，把那句话用 ``notice`` 说出来（#93）。``force_refresh`` 给 #94：换完绑库是
-    空的，不立刻重拉的话屏幕看起来像卡住了。
+    清单列表页。``notice`` 是落地那一下的 toast：成功那条路是「已换绑到新账号」（#94），
+    失败那条路是失败原句（#93）。``force_refresh`` 也是成功那条路的（#94）：换完绑库是空的，
+    不立刻重拉的话屏幕看起来像卡住了。
     """
 
     land_on_profile: bool
     """新 app 一开屏就落在个人主页（成功那条路）。"""
 
     notice: str | None = None
-    """新 app 落地时用 toast 说的一句话（失败那条路；``None`` = 什么都不说）。"""
+    """新 app 落地时用 toast 说的一句话（成功的回声 / 失败的原句；``None`` = 什么都不说）。"""
 
     force_refresh: bool = False
     """不管 ``refresh_on_start`` 配的是什么，落地就立刻跑一轮全量刷新（#94）。"""
@@ -350,8 +351,9 @@ class DidaApp(App[RebindRestart | None]):
 
         ``start_layer`` / ``notice`` / ``force_refresh`` 是**同进程重启**那三个参数（工单 #92，
         与 #93 / #94 共用）：换绑成功后 ``main`` 用新配置重开一个**新实例**，``start_layer``
-        让它落在个人主页；失败时 ``notice`` 把那句话带到新实例的屏幕上；``force_refresh``
-        让换完绑的那一次立刻重拉（#94）。默认值就是普通启动，行为与以前逐字节相同。
+        让它落在个人主页、``notice`` 把「已换绑到新账号」带过去、``force_refresh`` 让新库立刻
+        重拉一次（#94）；失败时留在清单列表页，``notice`` 那句话说失败原句（#93）。默认值就是
+        普通启动，行为与以前逐字节相同。
         """
         super().__init__(ansi_color=True)
         self.engine = engine
@@ -360,7 +362,7 @@ class DidaApp(App[RebindRestart | None]):
         self._start_layer = start_layer
         """开屏落在哪一层（工单 #92）：``None`` / ``index`` 是普通启动，``profile`` 是换绑后重启。"""
         self._notice = notice
-        """开屏时用 toast 说的一句话（#93 的失败话术；``None`` = 什么都不说）。"""
+        """开屏时用 toast 说的一句话（成功是「已换绑到新账号」#94；失败是失败原句 #93）。"""
         self._force_refresh = force_refresh
         """落地就跑一轮全量刷新，压过 ``refresh_on_start``（#94 的换绑后重拉）。"""
         self._rebinding = False
@@ -1491,7 +1493,16 @@ class DidaApp(App[RebindRestart | None]):
         except DidaError as exc:
             self.exit(RebindRestart(land_on_profile=False, notice=str(exc)))
             return
-        self.exit(RebindRestart(land_on_profile=True))
+        # 成功那条路（工单 #94）：落在个人主页、屏幕上有回声、**无条件**跑一轮全量刷新
+        # ——库刚被清空，不刷新就是一片空白（ADR-0011 二第 7 条）。刷新压过
+        # ``refresh_on_start``，由 ``on_mount`` 的 ``force_refresh or refresh_on_start`` 兑现。
+        self.exit(
+            RebindRestart(
+                land_on_profile=True,
+                notice=messages.REBIND_SUCCESS_NOTICE,
+                force_refresh=True,
+            )
+        )
 
     def _stop_rebind_background(self) -> None:
         """把周期泵与转圈停掉（换绑执行的第一个动作）。
