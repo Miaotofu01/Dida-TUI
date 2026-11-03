@@ -21,6 +21,7 @@ from dida.sync.engine import (
     AuthError,
     DidaError,
     NetworkError,
+    RebindConfigError,
     RebindDeleteError,
     RebindImpact,
     UnclaimedListError,
@@ -640,5 +641,10 @@ def rebind_execute_failed_message(error: DidaError) -> str:
         return (
             "删库失败：配置文件一个字都没改，旧库和里面的清单、任务都还在"
             f"（原因：{reason}）。可以再试一次。"
+        )
+    if isinstance(error, RebindConfigError):
+        return (
+            "库已删、配置仍是旧账号"
+            f"（原因：{reason}）。重新打开是旧账号 + 空库。"
         )
     return f"换绑失败：{error}"
