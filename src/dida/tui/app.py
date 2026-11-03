@@ -363,7 +363,7 @@ class DidaApp(App[None]):
             yield TasksPage(id=LAYER_TASKS)
             yield DetailPage(id=LAYER_DETAIL)
         # 第四种页面（#91）：**与 #stage 并列**，不在平移轨道上——平移是导航栈的表达，
-        # 而个人主页不在那条栈上（ADR-0010）。平时藏着，按 A 时由 _show_profile 显出来。
+        # 而个人主页不在那条栈上（ADR-0010）。平时藏着，按 A 时由 show_profile 显出来。
         profile = ProfilePage(id=LAYER_PROFILE, account_bound=self.account_bound)
         profile.display = False
         yield profile
@@ -606,8 +606,8 @@ class DidaApp(App[None]):
     def nav_path(self) -> tuple[str, ...]:
         """当前导航路径：清单列表页 → 任务列表页 → 任务详细页，最多三级。
 
-        第一段是**页面**（它只有三种），后面两段是走在那一页上的**东西**：容器名与任务名。
-        「你在哪」在详细页的答案就是「在哪条任务上」，所以最后一段写的是它。
+        第一段是**页面**（导航路径上的页面只有三种），后面两段是走在那一页上的**东西**：
+        容器名与任务名。「你在哪」在详细页的答案就是「在哪条任务上」，所以最后一段写的是它。
 
         **个人主页不在任何一条路径上**（ADR-0010）：它单独一段，不是第四级——顶栏在这一页
         只有「个人主页」四个字，硬画成路径就会出现「清单列表页 ▸ 个人主页」这种不存在的关系。
