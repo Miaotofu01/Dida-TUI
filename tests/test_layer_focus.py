@@ -24,7 +24,7 @@ from textual.widgets import Input
 
 from dida.testing import FakeBackend, ManualClock
 from dida.tui.app import DidaApp, Stage
-from dida.tui.keys import LAYER_DETAIL, LAYER_INDEX, LAYER_TASKS
+from dida.tui.keys import LAYER_DETAIL, LAYER_INDEX, LAYER_PROFILE, LAYER_TASKS
 from support import screen_text
 
 TZ = timezone(timedelta(hours=8))
@@ -60,9 +60,12 @@ async def go_to_layer(pilot, app: DidaApp, layer: int) -> None:
 
 
 def page_of(app: DidaApp, layer: str):
-    return {LAYER_INDEX: app.index_page(), LAYER_TASKS: app.tasks_page(), LAYER_DETAIL: app.detail_page()}[
-        layer
-    ]
+    return {
+        LAYER_INDEX: app.index_page(),
+        LAYER_TASKS: app.tasks_page(),
+        LAYER_DETAIL: app.detail_page(),
+        LAYER_PROFILE: app.profile_page(),
+    }[layer]
 
 
 CURRENT = {0: LAYER_INDEX, 1: LAYER_TASKS, 2: LAYER_DETAIL}
@@ -122,11 +125,16 @@ async def test_only_the_page_on_screen_can_be_focused(layer: int):
             "焦点链里不只有当前这一页——屏外的页面又能被聚焦了："
             f"{[repr(widget) for widget in app.screen.focus_chain]}"
         )
+        assert app.profile_page() not in app.screen.focus_chain, (
+            "个人主页不在屏上（display: none），却进了焦点链"
+        )
         assert current.focusable, "当前这一页必须能被聚焦（换层就是靠它接住键盘）"
         assert not app.query_one("#stage", Stage).focusable, (
             "平移轨道被当成焦点目标了：它自己没有键位，tab 不该停在它上面"
         )
-        for other_layer in (LAYER_INDEX, LAYER_TASKS, LAYER_DETAIL):
+        # 个人主页（#91）是第四种页面、不在平移轨道上，但它同样是「不在屏上的那一页」：
+        # ``allow_focus`` 那一条对它的答案必须也是「不可聚焦」，否则 tab 会走进看不见的它。
+        for other_layer in (LAYER_INDEX, LAYER_TASKS, LAYER_DETAIL, LAYER_PROFILE):
             if other_layer == CURRENT[layer]:
                 continue
             assert not page_of(app, other_layer).focusable, (
@@ -192,3 +200,40 @@ async def test_the_editor_that_is_actually_on_screen_is_still_focusable():
         assert isinstance(field, Input), f"编辑那一格没拿到焦点：{field!r}"
         assert field.focusable, "亮出来的编辑器是在屏上的，它必须能聚焦"
         assert page.focusable, "当前这一页自己也要一直能聚焦（退出编辑要回到它身上）"
+
+
+async def test_tab_leaves_focus_on_the_profile_page_when_it_is_up():
+    """个人主页（#91）是**新的焦点目标**：``tab`` / ``shift+tab`` 同样不许把焦点交给屏外那三页。
+
+    它不在平移轨道上（与 ``#stage`` 并列，用 ``display`` 藏 / 显），可那三页还在 DOM 里——
+    「屏外」这件事与页面挂在哪里无关，所以 #60 的那句判据对它同样是现算的：焦点链里只该有
+    它自己，三个导航页一个都不可聚焦。两个方向各按三次，每一次屏幕都要逐字节不变。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("A")  # 清单列表页 → 个人主页（旁路，不压栈）
+        await pilot.pause()
+        page = app.profile_page()
+        assert app.layer == LAYER_PROFILE
+        assert app.focused is page, f"进个人主页之后焦点应当在它身上，实际是 {app.focused!r}"
+        assert app.screen.focus_chain == [page], (
+            "焦点链里不只有个人主页——屏外的东西又能被聚焦了："
+            f"{[repr(widget) for widget in app.screen.focus_chain]}"
+        )
+        for other_layer in (LAYER_INDEX, LAYER_TASKS, LAYER_DETAIL):
+            assert not page_of(app, other_layer).focusable, (
+                f"个人主页在屏上时，屏外的 {other_layer} 那一页又能被聚焦了"
+            )
+
+        for key in ("tab", "tab", "tab", "shift+tab", "shift+tab", "shift+tab"):
+            before = screen_text(app)
+            await pilot.press(key)
+            await pilot.pause()
+
+            assert app.focused is page, (
+                f"个人主页上按 {key}：焦点跑到 {app.focused!r} 上去了，"
+                f"而用户看着的是 {page!r}——接下来按的键会落在看不见的那一页"
+            )
+            assert screen_text(app) == before, f"个人主页上按 {key}，屏幕不该有任何变化"

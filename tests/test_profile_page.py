@@ -173,3 +173,67 @@ async def test_the_page_shows_no_account_identifier():
 
     for marker in ("token", "Bearer", "@", "用户名", "邮箱", "头像", "账户", "账号名"):
         assert marker not in body, f"个人主页的正文里出现了账号标识「{marker}」：\n{body}"
+
+
+async def test_h_on_the_profile_page_lists_that_pages_keys():
+    """``h`` 在这一页抬头是「个人主页」，至少列出「退回」（ADR-0010 一、用户故事 119）。"""
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_profile(pilot, app)
+        await pilot.press("h")
+        await pilot.pause()
+        opened = screen_text(app)
+        await pilot.press("escape")
+        await pilot.pause()
+
+    assert LAYER_TITLES[LAYER_PROFILE] in opened, "帮助的抬头不是「个人主页」"
+    assert "退回" in opened, "个人主页的帮助里少了唯一的那个键「退回」"
+    assert LAYER_TITLES[LAYER_INDEX] not in opened, "这一页的帮助里出现了清单列表页的键"
+
+
+async def test_the_profile_page_has_no_statistics_area_or_its_placeholder():
+    """页面上没有统计区，也没有它的占位：细线下面只有「账号绑定」这一行（工单 #91）。
+
+    统计与热力图是 #90，这一票**不预留**位置——空标题、空区块、分隔线都不行。断法是
+    屏幕正文里只有两条非空行（页面细线 + 账号绑定），并且一个统计词都没有。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_profile(pilot, app)
+        body = lines(screen_text(app))[1:-1]
+
+    content = [line for line in body if line.strip()]
+    assert len(content) == 2, (
+        f"个人主页的正文只该有细线与「账号绑定」两行，实际多出/少了：{[line for line in content]!r}"
+    )
+    assert "账号绑定" in content[1], f"细线下面那一行不是账号绑定：{content[1]!r}"
+
+    text = "\n".join(body)
+    for marker in ("统计", "热力图", "已完成", "完成数", "逾期", "本周", "本月", "日 / 周"):
+        assert marker not in text, f"个人主页上出现了统计区或它的占位：「{marker}」"
+
+
+async def test_entering_and_leaving_the_profile_page_sends_no_network_request():
+    """进出这一页一个网络请求都不发（验收标准；统计是 #90，这一页只画本地事实）。
+
+    这一页说的是组合根交进来的一位事实，引擎的读形状都不必问。所以进、出、再进、再出
+    之后，三个网络计数器都还是 0——它不靠「刷新一下」才画得出来。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        before = (fake.refreshes, fake.pushes, fake.completed_pulls)
+        for key in ("A", "left", "A", "escape"):
+            await pilot.press(key)
+            await pilot.pause()
+        after = (fake.refreshes, fake.pushes, fake.completed_pulls)
+
+    assert before == (0, 0, 0), f"还没进主页就有网络请求了：{before}"
+    assert after == before, f"进出个人主页发了网络请求：{before} → {after}"
+
