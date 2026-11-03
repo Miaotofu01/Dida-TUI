@@ -14,6 +14,7 @@ from pathlib import Path
 import httpx
 import pytest
 
+import dida.config
 from dida.api.errors import NetworkError, ServerRejectionError
 from dida.config import (
     Config,
@@ -107,6 +108,56 @@ def test_a_pasted_token_round_trips_through_the_file(tmp_path):
     save_config(Config(token="tok-2", day_end="04:00"), path)
 
     assert load_config(path) == Config(token="tok-2", day_end="04:00")
+
+
+def test_a_failed_replace_leaves_the_old_bytes_and_the_old_token_intact(tmp_path, monkeypatch):
+    """落盘是原子写：替换那一下失败，旧文件一个字节都不许变（#93 的「配置仍是旧账号」）。
+
+    非原子写的坏处不是「写了一半」而是「写成了空文件」：``O_TRUNC`` 之后失败，重开时
+    ``needs_token`` 为真，用户会看到首次运行——旧账号在一瞬间变成了不存在。
+    """
+    path = tmp_path / "config.toml"
+    save_config(Config(token="old-token", day_end="04:00"), path)
+    before = path.read_bytes()
+
+    def fail_replace(source, target):
+        raise OSError("ENOSPC")
+
+    monkeypatch.setattr(dida.config.os, "replace", fail_replace)
+
+    with pytest.raises(OSError):
+        save_config(Config(token="new-token"), path)
+
+    assert path.read_bytes() == before, "替换失败时旧配置一个字节都不许变"
+    assert load_config(path).token == "old-token", "旧 token 还在（不是首次运行）"
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["config.toml"], (
+        "失败之后不许留下临时文件"
+    )
+
+
+def test_a_failed_serialisation_leaves_the_old_bytes_and_the_old_token_intact(tmp_path, monkeypatch):
+    """序列化失败发生在碰目标文件之前：旧配置原样留着。
+
+    这一条挡的是「先打开 / 截断目标文件、再算要写的内容」那种顺序——单看正常路径看不出来，
+    只在序列化抛错时把文件清成空的。
+    """
+    path = tmp_path / "config.toml"
+    save_config(Config(token="old-token"), path)
+    before = path.read_bytes()
+
+    def fail_dumps(data):
+        raise TypeError("can't serialise")
+
+    monkeypatch.setattr(dida.config.tomli_w, "dumps", fail_dumps)
+
+    with pytest.raises(TypeError):
+        save_config(Config(token="new-token"), path)
+
+    assert path.read_bytes() == before, "没写成的时候旧配置一个字节都不许变"
+    assert load_config(path).token == "old-token", "旧 token 还在（不是首次运行）"
+    assert sorted(entry.name for entry in tmp_path.iterdir()) == ["config.toml"], (
+        "失败之后不许留下临时文件"
+    )
 
 
 @pytest.mark.parametrize("pasted", ["tok-1", "  tok-1", "tok-1\n", "\ttok-1  "])

@@ -78,6 +78,7 @@ MODULE_WHITELIST = [
     "dida.storage.store",  # 本地存储
     "dida.sync.engine",  # 同步引擎
     "dida.logical_day",  # 逻辑日
+    "dida.rebind",  # 换绑服务（#92 的第七个深模块）
     "dida.tui.app",  # TUI
 ]
 """深模块的**白名单**：每一个都得能 import（``test_module_is_importable``）。

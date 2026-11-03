@@ -435,7 +435,11 @@ class DidaApp(App[RebindRestart | None]):
             yield DetailPage(id=LAYER_DETAIL)
         # 第四种页面（#91）：**与 #stage 并列**，不在平移轨道上——平移是导航栈的表达，
         # 而个人主页不在那条栈上（ADR-0010）。平时藏着，按 A 时由 show_profile 显出来。
-        profile = ProfilePage(id=LAYER_PROFILE, account_bound=self.account_bound)
+        profile = ProfilePage(
+            id=LAYER_PROFILE,
+            account_bound=self.account_bound,
+            can_rebind=self.engine.account is not None,
+        )
         profile.display = False
         yield profile
         yield StatusBar(id="status-bar")
@@ -1351,12 +1355,14 @@ class DidaApp(App[RebindRestart | None]):
     def _start_rebind(self) -> None:
         """``b``：开那张输入新 token 的表单（只从个人主页进来）。
 
-        没有换绑端口（直接 new 一个引擎的测试）时什么都不做——不假装能换绑。真正碰文件、
+        没有换绑端口（直接 new 一个引擎的测试）时不开表单、也不假装能换绑：那一页本来就不再
+        写「b 换绑」这个入口，而键位表还在，所以真按下去要在状态栏说一句实话。真正碰文件、
         发请求、删库的活全在端口后面（:class:`~dida.sync.engine.AccountPort`），界面只调它。
         """
         if self._rebinding or self._layer != LAYER_PROFILE:
             return
         if self.engine.account is None:
+            self._write_status(messages.REBIND_UNAVAILABLE)
             return
         self._open_rebind_token_form("")
 
@@ -1465,38 +1471,53 @@ class DidaApp(App[RebindRestart | None]):
         2. 取消同步组并**等到它们结束**——``Store`` 的连接是线程亲和的，关掉之后任何一次
            读都会抛 ``ProgrammingError``，而一个跨过 ``await`` 的同步协程正好会撞上；
         3. 才 ``await account.execute(token)``：关连接 → 删库 → 写配置；
-        4. 成功后 ``exit(RebindRestart(land_on_profile=True))``；失败也退出，把失败原句放进
-           ``notice``（#93 给新实例定屏幕话术）——不留在「库关了但界面还在」的半死状态。
+        4. 成功后 ``exit(RebindRestart(land_on_profile=True))``。
+
+        **进入执行路之后，任何失败都换一张重开纸条**（#93）：两条已知失败按类型给原句；
+        其它任何异常（包括等待在飞 worker 时冒出来的）给一句**通用**的话——不带 token、
+        不带 traceback。绝不把进程留在 ``_rebinding`` 永远为真、库却可能已经关掉的半死状态里
+        （ADR-0011 二第 6 条）。
 
         ``execute`` 之后**一行都不读引擎**：``_rebinding`` 闸挡着状态栏 / 重画 / 周期泵，
         所以这个协程剩下的只是 ``exit()``（同步的，不碰 DOM）。
         """
         self._rebinding = True
-        self._stop_rebind_background()
-        workers = self.workers.cancel_group(self, SYNC_GROUP)
-        # ``wait_for_complete([])`` 在 Textual 8.2.8 里等于「等**所有** worker」——包括正在跑
-        # 换绑的这一个自己，那会当场抛 ``DeadlockError``。所以没有同步在飞时根本不用等。
-        if workers:
-            try:
-                await self.workers.wait_for_complete(workers)
-            except WorkerCancelled:
-                # 我们自己取消的那几个 worker，``wait()`` 会抛这个（Wait 只吞 asyncio 的
-                # CancelledError）。等它们**停下来**正是这一行的目的；同步组有 exclusive=True，
-                # 同时最多一个，所以不会出现「抛了第一个、别的还在飞」。
-                pass
-        account = self.engine.account
-        if account is None:
-            self._rebinding = False
-            return
+        failure: RebindRestart | None = None
         try:
-            await account.execute(token)
-        except DidaError as exc:
-            self.exit(
-                RebindRestart(
+            self._stop_rebind_background()
+            workers = self.workers.cancel_group(self, SYNC_GROUP)
+            # ``wait_for_complete([])`` 在 Textual 8.2.8 里等于「等**所有** worker」——包括
+            # 正在跑换绑的这一个自己，那会当场抛 ``DeadlockError``。所以没有同步在飞时不用等。
+            if workers:
+                try:
+                    await self.workers.wait_for_complete(workers)
+                except WorkerCancelled:
+                    # 我们自己取消的那几个 worker，``wait()`` 会抛这个（Wait 只吞 asyncio 的
+                    # CancelledError）。等它们**停下来**正是这一行的目的；同步组有 exclusive=True，
+                    # 同时最多一个，所以不会出现「抛了第一个、别的还在飞」。
+                    pass
+            account = self.engine.account
+            if account is None:
+                # 生产不会走到这里（组合根总会注入一支，`_start_rebind` 也会先挡住入口）。
+                # 真走到了就按「意外」收尾，不假装换绑没发生过。
+                failure = RebindRestart(
                     land_on_profile=False,
-                    notice=messages.rebind_execute_failed_message(exc),
+                    notice=messages.REBIND_UNEXPECTED_FAILURE_NOTICE,
                 )
+            else:
+                await account.execute(token)
+        except DidaError as exc:
+            failure = RebindRestart(
+                land_on_profile=False,
+                notice=messages.rebind_execute_failed_message(exc),
             )
+        except Exception:  # noqa: BLE001 - 执行路之后的任何异常都只能以重开收尾
+            failure = RebindRestart(
+                land_on_profile=False,
+                notice=messages.REBIND_UNEXPECTED_FAILURE_NOTICE,
+            )
+        if failure is not None:
+            self.exit(failure)
             return
         # 成功那条路（工单 #94）：落在个人主页、屏幕上有回声、**无条件**跑一轮全量刷新
         # ——库刚被清空，不刷新就是一片空白（ADR-0011 二第 7 条）。刷新压过

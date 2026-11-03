@@ -33,7 +33,8 @@ def test_fake_backend_carries_a_rebind_port_by_default():
     assert isinstance(backend.account, AccountPort)
     assert backend.account.is_bound() is True
     assert backend.account.counts == RebindImpact(lists=0, tasks=0, views=0, pending=0)
-    assert isinstance(FakeAccount(bound=False).is_bound(), bool)
+    # 两个答案都钉住：只断 isinstance 是空转（bool 永远成立），断不出「绑了没有」。
+    assert FakeAccount(bound=True).is_bound() is True
     assert FakeAccount(bound=False).is_bound() is False
 
 

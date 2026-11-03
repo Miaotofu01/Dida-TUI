@@ -27,6 +27,7 @@ from dida.rebind import RebindService
 from dida.storage.store import ChangeKind, Store
 from dida.sync.engine import (
     AccountPort,
+    RebindCloseError,
     RebindConfigError,
     RebindDeleteError,
     RebindImpact,
@@ -292,6 +293,39 @@ async def test_execute_closes_the_old_connection_then_deletes_the_database_then_
     assert written.completed_window_hours == 24
     assert OLD_TOKEN not in world.config_file.read_text(encoding="utf-8"), "旧 token 不许留在文件里"
     assert world.service.is_bound() is True
+
+
+async def test_a_close_failure_names_the_close_step_and_leaves_the_file_alone(world, monkeypatch):
+    """关连接失败：说的是「关连接」而不是「删库」——库文件一个字节都没动（工单 #93 的诚实口径）。
+
+    失败点注入在 ``Store.close``：``unlink`` 根本没走到，所以把这一步说成「删库失败」就是在
+    说一件没发生的事。旧连接此刻是什么状态不可知，句子因此只承诺文件与配置没动，不承诺
+    「连接还开着」。
+    """
+    config_before = world.config_file.read_bytes()
+    rows_before = world.rows()
+
+    def close() -> None:
+        raise sqlite3.ProgrammingError("Cannot operate on a closed database")
+
+    monkeypatch.setattr(world.store, "close", close)
+
+    with pytest.raises(RebindCloseError) as caught:
+        await world.service.execute(NEW_TOKEN)
+
+    message = str(caught.value)
+    assert "关连接失败" in message, "要说清失败的是关连接这一步"
+    assert "删库" not in message, "关连接失败不许把没发生的那一步说成失败"
+    assert NEW_TOKEN not in message
+    assert world.config_file.read_bytes() == config_before, "关连接失败时配置一动不动"
+    assert world.db_path.exists(), "库文件还在（unlink 根本没走到）"
+    monkeypatch.undo()
+    reopened = Store(world.db_path)
+    try:
+        assert reopened.lists() == rows_before[0], "旧库的内容一条都没少"
+        assert reopened.tasks() == rows_before[1]
+    finally:
+        reopened.close()
 
 
 async def test_a_delete_failure_leaves_the_old_database_and_config_alone(world, monkeypatch):

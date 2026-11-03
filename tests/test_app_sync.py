@@ -20,7 +20,7 @@ from pathlib import Path
 import httpx
 
 from dida.api.client import DidaApiClient
-from dida.api.errors import NetworkError
+from dida.api.errors import AuthError, NetworkError
 from dida.config import Config
 from dida.storage.store import Store
 from dida.sync.engine import SyncEngine
@@ -264,6 +264,32 @@ async def test_offline_still_reads_the_cache_and_says_the_sync_failed(tmp_path):
 
     assert "同步失败" in text, "刷新失败要如实说，不许装成刷过了"
     assert "收集箱" in text, "缓存那一份还在"
+
+
+async def test_a_rejected_token_points_at_the_rebind_route_and_its_cost(tmp_path):
+    """凭据失效：指出应用内**唯一**的换 token 出口，并说出那条路的代价（ADR-0011 四）。
+
+    「重新粘贴 token」在今天已经不是一个能照着做的动作：首次运行的 ``getpass`` 只在启动前
+    出现，应用里换 token 的唯一入口是 ``A`` → 个人主页 → ``b`` 换绑——而那条路按 ADR-0011
+    会清空本地副本。这句话必须三样都在，且短到能待在状态栏那一行。
+    """
+    store = open_store(tmp_path)
+    seed(store, task(id="t1", title="写周报", project_id="inbox"), lists=[inbox()])
+    server = Server(error=AuthError("unauthorized", status_code=401))
+    app = make_app(store, server)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await pilot.press("r")
+        await settle(app, pilot)
+        text = screen_text(app)
+
+    assert "凭据失效" in text, "凭据问题要如实说，不许冒充网络失败"
+    assert "按 A 进个人主页" in text and "b 换绑" in text, (
+        f"要指出应用内换 token 的那条路（A → 个人主页 → b）：\n{text}"
+    )
+    assert "清空本地副本" in text, f"要说出那条路的代价，用户才不是被吓一跳：\n{text}"
+    assert "重新粘贴 token" not in text, "应用里已经没有「重新粘贴」这条可照做的路了"
 
 
 # ------------------------------------------------------------------ 覆盖告知

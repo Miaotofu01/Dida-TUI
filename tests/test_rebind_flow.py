@@ -17,7 +17,12 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from dida.api.errors import AuthError, NetworkError
-from dida.sync.engine import RebindConfigError, RebindDeleteError, RebindImpact
+from dida.sync.engine import (
+    RebindCloseError,
+    RebindConfigError,
+    RebindDeleteError,
+    RebindImpact,
+)
 from dida.testing import FakeBackend, ManualClock
 from dida.tui.app import REBIND_GROUP, DidaApp, RebindRestart
 from dida.tui.keys import LAYER_PROFILE, LAYER_TITLES
@@ -277,10 +282,10 @@ async def test_a_delete_failure_says_which_step_failed_and_what_was_left_alone()
     result = app.return_value
     assert isinstance(result, RebindRestart), f"执行失败也要重启，实际 {result!r}"
     assert result.land_on_profile is False, "失败那条路不回个人主页"
-    notice = result.notice or ""
-    assert "删库失败" in notice, f"要说清是哪一步失败了：{notice}"
-    assert "database is busy" in notice, f"要带上失败原因：{notice}"
-    assert "配置" in notice and "旧库" in notice, f"要说清配置与旧库都没动：{notice}"
+    assert result.notice == (
+        "删库失败：配置文件一个字都没改，旧库和里面的清单、任务都还在"
+        "（原因：database is busy）。可以再试一次。"
+    ), f"删库失败那一句要整句对上（含「可以再试一次」与留下的东西）：{result.notice!r}"
 
 
 async def test_a_config_write_failure_says_the_database_is_gone_and_the_config_still_holds_the_old_account():
@@ -306,6 +311,78 @@ async def test_a_config_write_failure_says_the_database_is_gone_and_the_config_s
     assert "库已删、配置仍是旧账号" in notice, f"那句话必须原样说出来：{notice}"
     assert "read-only file system" in notice, f"要带上失败原因：{notice}"
     assert TOKEN not in notice, "token 不许进屏幕原句"
+
+
+def chained(error_type: type[Exception], reason: str) -> Exception:
+    """像 ``RebindService.execute`` 那样把原始异常链在后面：屏幕话术取的是链上那一句。"""
+    try:
+        try:
+            raise OSError(reason)
+        except OSError as cause:
+            raise error_type("换绑失败") from cause
+    except error_type as error:
+        return error
+
+
+@pytest.mark.parametrize(
+    ("failed", "expected"),
+    [
+        pytest.param(
+            chained(RebindCloseError, "EPIPE"),
+            "关连接失败：配置文件一个字都没改，旧库文件还在"
+            "（原因：EPIPE）。可以重开再试一次。",
+            id="close",
+        ),
+        pytest.param(
+            chained(RebindDeleteError, "EBUSY"),
+            "删库失败：配置文件一个字都没改，旧库和里面的清单、任务都还在"
+            "（原因：EBUSY）。可以再试一次。",
+            id="delete",
+        ),
+        pytest.param(
+            chained(RebindConfigError, "EACCES"),
+            "库已删、配置仍是旧账号（原因：EACCES）。重新打开是旧账号 + 空库。",
+            id="config",
+        ),
+    ],
+)
+def test_the_execution_failure_sentences_are_exactly_these(failed, expected):
+    """#93 的三句屏幕原句**逐字**钉死（判据一 / 三）。
+
+    断子串会让「可以再试一次」「旧库和里面的清单、任务都还在」「重新打开是旧账号 + 空库」
+    这些承诺被静默删掉还全绿——每一句都是用户据以决定下一步的那半句，所以这里对整句。
+    关连接与删库分开，是因为那一步究竟有没有发生必须说对。
+    """
+    assert rebind_execute_failed_message(failed) == expected
+
+
+async def test_an_unexpected_execute_failure_still_ends_in_a_restart_paper():
+    """不是两条已知失败的任何一条，也必须落在重开纸条上（工单 #93 判据二）。
+
+    执行路径已经走过了「停泵 / 取消在飞的同步」那几步，之后**任何**异常都不能把进程留在一个
+    ``_rebinding`` 永远为真、库却可能已经关掉的半死状态里（ADR-0011 二第 6 条）。未知异常
+    说的是一句**通用的**话：不带 token、不带异常原文、也不带 traceback。
+    """
+    fake = backend()
+    fake.account.execute_error = RuntimeError(f"boom {TOKEN}")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_rebind(pilot)
+        await submit_token(pilot, app)
+        await answer_confirm(pilot, app, "yes")
+
+    result = app.return_value
+    assert isinstance(result, RebindRestart), f"意外失败也要交回重开纸条，实际 {result!r}"
+    assert result.land_on_profile is False, "失败那条路不回个人主页"
+    notice = result.notice or ""
+    assert notice == (
+        "换绑中断：出现了意外错误，没能确认账号状态——已重新打开，请检查个人主页与本地副本。"
+    ), f"意外失败要给一句通用的话，实际是：{notice}"
+    assert TOKEN not in notice, "token 不许进屏幕原句"
+    assert "boom" not in notice, "异常原文不进屏幕"
+    assert "Traceback" not in notice, "traceback 不进屏幕"
 
 
 # ------------------------------------------------------------------ 在飞的同步先停

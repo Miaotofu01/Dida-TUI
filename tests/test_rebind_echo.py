@@ -213,11 +213,14 @@ async def test_the_forced_refresh_shows_the_existing_sync_spinner_while_it_runs(
     async with app.run_test(size=WIDE, notifications=True) as pilot:
         await pilot.pause()  # 落地那一帧：个人主页 + 回声
         await backend.started.wait()
-        # 阈值那一步不真等：先停掉还没到点的定时器，再走 app 自己的「到点了」回调。
-        if app._spin_delay_timer is not None:
-            app._spin_delay_timer.stop()
-        if not app._spinning:
-            app._maybe_spin()
+        # 同步开始时必须**真排上**那个阈值定时器：没有它，转圈永远不会出现，下面这一步就是
+        # 测试自己造出来的（把 ``_arm_spinner`` 删掉也照样绿）。
+        assert app._spin_delay_timer is not None, (
+            "强制刷新开始时没有排上「阈值到了再看一眼」的定时器——_arm_spinner 那一步没了"
+        )
+        # 阈值那一步不真等：停掉还没到点的定时器，再走 app 自己的「到点了」回调。
+        app._spin_delay_timer.stop()
+        app._maybe_spin()
         await pilot.pause()  # 让状态栏那一帧上屏
 
         during = screen_text(app)

@@ -343,7 +343,8 @@ async def test_a_delete_failure_leaves_both_files_alone_and_the_restarted_app_ca
 
     def unlink(self: Path, missing_ok: bool = False) -> None:
         if failure["enabled"] and self == world.db_path:
-            raise OSError("database is busy")
+            # 原因用不含空格的 errno 名：它要跟着 toast 折行到屏幕上，空格会被折行切开。
+            raise OSError("EBUSY")
         real_unlink(self, missing_ok=missing_ok)
 
     monkeypatch.setattr(Path, "unlink", unlink)
@@ -358,7 +359,7 @@ async def test_a_delete_failure_leaves_both_files_alone_and_the_restarted_app_ca
     assert result.land_on_profile is False
     notice = result.notice or ""
     assert "删库失败" in notice, f"屏幕原句要说出是哪一步：{notice}"
-    assert "database is busy" in notice, f"屏幕原句要带上原因：{notice}"
+    assert "EBUSY" in notice, f"屏幕原句要带上原因：{notice}"
     assert world.config_file.read_bytes() == config_before, "删库失败时配置一个字节都不许变"
     assert content(world.db_path) == rows_before, (
         "旧库里的清单、任务、自定义视图、待推送改动一条都不许少"
@@ -371,6 +372,8 @@ async def test_a_delete_failure_leaves_both_files_alone_and_the_restarted_app_ca
         await pilot.pause()
         text = screen_text(restarted)
         assert "删库失败" in text, f"重启后的屏幕没说出失败原因：\n{text}"
+        # 原因也要落到屏幕上——只有「删库失败」四个字不算说清了失败点（#93 判据一）。
+        assert "EBUSY" in text, f"重启后的屏幕没带上失败原因：\n{text}"
         assert "工作" in text, f"重启后旧清单不在了：\n{text}"
         assert "高优先级" in text and "家里的事" in text, f"重启后旧自定义视图不在了：\n{text}"
         # 旧库可读：收集箱那一行（光标默认停在它上面）里还躺着旧任务。

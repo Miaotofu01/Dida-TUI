@@ -65,6 +65,11 @@ async def test_a_on_the_index_opens_the_profile_page_off_the_nav_path():
         text = screen_text(app)
 
         assert app.layer == LAYER_PROFILE, f"按 A 之后应当落在个人主页，实际在 {app.layer!r}"
+        # 「不出现路径分隔符」指的是**没有第二段**：词标后面那一个 `▸` 是词标与当前页的分隔，
+        # 不是「清单列表页 ▸ 个人主页」那种并不存在的层级（ADR-0010 一）。
+        assert app.nav_path() == (LAYER_TITLES[LAYER_PROFILE],), (
+            f"个人主页不在导航路径上，路径该只有它自己一段，实际是 {app.nav_path()!r}"
+        )
 
         top = lines(text)[0]
         assert LAYER_TITLES[LAYER_PROFILE] in top, f"顶栏没写「个人主页」：{top!r}"
@@ -163,21 +168,47 @@ async def test_the_page_states_the_binding_fact_it_was_handed(
     assert hidden not in text, f"屏幕上同时出现了「{hidden}」，绑定状态不该有两个答案"
 
 
+async def test_without_a_rebind_port_the_page_does_not_offer_the_entry_and_says_so():
+    """引擎上没有换绑端口时：个人主页不写「b 换绑」，按 ``b`` 也有一句实话（#91 / #92）。
+
+    端口是组合根注入的（生产总有），只有直接 new 一个引擎的测试会没有。入口那时不能出现
+    ——#91 明确不要「按下去没反应」的入口；而键位表还在，所以真按了也要说一句，不能静默。
+    """
+    fake = backend()
+    fake.account = None
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_profile(pilot, app)
+        before = screen_text(app)
+        assert "账号绑定" in before, "页面本身还在"
+        assert "换绑" not in before, f"没有换绑端口时不该写「b 换绑」这个入口：\n{before}"
+
+        await pilot.press("b")
+        await pilot.pause()
+        after = screen_text(app)
+
+    assert app.layer == LAYER_PROFILE, "按 b 不该离开个人主页"
+    assert "换绑不可用" in after, f"没有端口时按 b 要如实说一句，不能静默：\n{after}"
+
+
 async def test_the_page_shows_no_account_identifier():
     """这一页**说不清自己绑到了谁**：屏幕上不出现任何账号标识（GLOSSARY「账号绑定」）。
 
     官方 API 没有「当前用户」端点，所以用户名 / 邮箱 / 头像 / token 片段一个都不该有。
-    这一页只许说「已绑定 / 未绑定」——这一条在屏幕文本上逐词对账。
+    这一页只许说「已绑定 / 未绑定」——这一条在**整块屏幕**上逐词对账：验收标准说的是
+    「屏幕上」，不是「状态栏以上」。
     """
     app = DidaApp(backend(), account_bound=True)
 
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
         await open_profile(pilot, app)
-        body = "\n".join(lines(screen_text(app))[1:-1])
+        body = screen_text(app)
 
     for marker in ("token", "Bearer", "@", "用户名", "邮箱", "头像", "账户", "账号名"):
-        assert marker not in body, f"个人主页的正文里出现了账号标识「{marker}」：\n{body}"
+        assert marker not in body, f"屏幕上出现了账号标识「{marker}」：\n{body}"
 
 
 async def test_h_on_the_profile_page_lists_that_pages_keys():
