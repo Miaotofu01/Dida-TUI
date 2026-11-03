@@ -266,6 +266,7 @@ class DidaApp(App[None]):
         push_tick_seconds: float | None = None,
         animations: str | None = None,
         day_boundary: Callable[[], str | None] | None = None,
+        account_bound: bool = False,
     ) -> None:
         """``open_url`` 是**注入**的浏览器开手（工单 #19）。
 
@@ -290,9 +291,15 @@ class DidaApp(App[None]):
         ``animations`` 是 ``auto|on|off`` 开关（ADR-0007 三）。不给就走 ``DIDA_ANIM``，
         再不给就是 ``auto``：ssh 与低能力终端上自动关掉。这是**换层平移**的闸（ADR-0008
         四撤掉光标条之后，它是这一档动效唯一的用武之地）：关掉时换层不滑，屏幕一步到位。
+
+        ``account_bound`` 是**账号绑定**那一位事实（工单 #91）：组合根按配置里有没有 token
+        算出来交给界面，个人主页只把它画成「已绑定 / 未绑定」。它不归界面判断——TUI 读不到
+        配置文件，也不许读（``tests/test_architecture.py`` 的允许表）。
         """
         super().__init__(ansi_color=True)
         self.engine = engine
+        self.account_bound = account_bound
+        """个人主页要说的那一位事实（工单 #91）；来源是组合根，见 :func:`dida.bootstrap.build_app`。"""
         self._open_url = open_url
         self._refresh_on_start = refresh_on_start
         self._push_tick_seconds = push_tick_seconds
@@ -356,7 +363,7 @@ class DidaApp(App[None]):
             yield DetailPage(id=LAYER_DETAIL)
         # 第四种页面（#91）：**与 #stage 并列**，不在平移轨道上——平移是导航栈的表达，
         # 而个人主页不在那条栈上（ADR-0010）。平时藏着，按 A 时由 _show_profile 显出来。
-        profile = ProfilePage(id=LAYER_PROFILE)
+        profile = ProfilePage(id=LAYER_PROFILE, account_bound=self.account_bound)
         profile.display = False
         yield profile
         yield StatusBar(id="status-bar")

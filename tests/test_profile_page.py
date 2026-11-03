@@ -105,3 +105,71 @@ async def test_the_way_back_lands_on_the_row_you_left_from(key: str):
         assert after == before, f"回来后屏幕不一样了——光标该还在「学习」那一行：\n{after}"
         study = next(line for line in lines(after) if "学习" in line)
         assert study.startswith(theme.CURSOR_MARK), f"光标被挪走了：{study!r}"
+
+
+@pytest.mark.parametrize("layer", [LAYER_TASKS, LAYER_DETAIL])
+async def test_a_does_nothing_on_the_task_list_and_detail_pages(layer: str):
+    """``A`` 只在清单列表页有入口：任务列表页与详细页上它什么都不做（层不变、屏幕不变）。
+
+    这两个页面上压根没有 ``A`` 的绑定（它只挂在清单列表页那一层），所以断的是「按下去
+    什么都不发生」——不是「它报了句错」。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await move_to_row(pilot, app, "work")
+        await pilot.press("right")  # 清单列表页 → 任务列表页
+        await pilot.pause()
+        if layer == LAYER_DETAIL:
+            await pilot.press("right")  # 任务列表页 → 详细页
+            await pilot.pause()
+        assert app.layer == layer
+
+        before = screen_text(app)
+        await pilot.press("A")
+        await pilot.pause()
+
+        assert app.layer == layer, f"{layer} 上按 A 把人带走了（在 {app.layer!r}）"
+        assert screen_text(app) == before, f"{layer} 上按 A 不该动屏幕"
+
+
+@pytest.mark.parametrize(
+    ("account_bound", "shown", "hidden"),
+    [(True, "已绑定", "未绑定"), (False, "未绑定", "已绑定")],
+)
+async def test_the_page_states_the_binding_fact_it_was_handed(
+    account_bound: bool, shown: str, hidden: str
+):
+    """绑定状态是**组合根交给界面**的那一位事实：交给它什么，它就说「已绑定 / 未绑定」。
+
+    页面自己不判断绑没绑（它读不到配置文件，也不许读——TUI 只 import ``dida.sync.engine``
+    与 ``dida.tui``）。所以这里从 app 的构造参数注入，断的是屏幕上那句话。
+    """
+    app = DidaApp(backend(), account_bound=account_bound)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_profile(pilot, app)
+        text = screen_text(app)
+
+    assert "账号绑定" in text, "个人主页上少了「账号绑定」那一项"
+    assert shown in text, f"交进来的是 account_bound={account_bound}，屏幕上该写「{shown}」"
+    assert hidden not in text, f"屏幕上同时出现了「{hidden}」，绑定状态不该有两个答案"
+
+
+async def test_the_page_shows_no_account_identifier():
+    """这一页**说不清自己绑到了谁**：屏幕上不出现任何账号标识（GLOSSARY「账号绑定」）。
+
+    官方 API 没有「当前用户」端点，所以用户名 / 邮箱 / 头像 / token 片段一个都不该有。
+    这一页只许说「已绑定 / 未绑定」——这一条在屏幕文本上逐词对账。
+    """
+    app = DidaApp(backend(), account_bound=True)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_profile(pilot, app)
+        body = "\n".join(lines(screen_text(app))[1:-1])
+
+    for marker in ("token", "Bearer", "@", "用户名", "邮箱", "头像", "账户", "账号名"):
+        assert marker not in body, f"个人主页的正文里出现了账号标识「{marker}」：\n{body}"
