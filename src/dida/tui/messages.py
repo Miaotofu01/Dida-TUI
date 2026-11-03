@@ -571,6 +571,14 @@ REBIND_CONFIRM_TITLE = "换绑：确认清空本地副本"
 REBIND_CONFIRM_LABEL = "输入 yes 继续"
 """确认那一格的名字就是要求的那句话：要用户**打出来**，不是按一个字母。"""
 
+REBIND_SUCCESS_NOTICE = "已换绑到新账号"
+"""换绑成功后落在个人主页时说的那一句（工单 #94、ADR-0011 二第 7 条）。
+
+只说「换了」，**不点名具体账号**：官方 API 没有「当前用户」端点，这个 app 说不清绑到了谁
+身上（GLOSSARY「账号绑定」）。它走 toast（这个仓库里「刚刚那一下」的回声就是 toast），
+不写状态栏——状态栏那一行只属于同步状态。
+"""
+
 
 def rebind_verify_failed_message(error: DidaError) -> str:
     """新 token 验证失败时，回到输入框要说的那句话（工单 #92、判据三 / 四）。

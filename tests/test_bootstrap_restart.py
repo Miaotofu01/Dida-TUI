@@ -66,7 +66,7 @@ def test_a_restart_builds_a_second_app_on_the_profile_page_and_rereads_the_confi
     assert built[0]["start_layer"] is None, "第一次装配是普通启动"
     assert built[1]["start_layer"] == LAYER_PROFILE, "换绑成功后新 app 落在个人主页"
     assert built[1]["notice"] is None and built[1]["force_refresh"] is False, (
-        "成功那条路只置 land_on_profile；notice / force_refresh 是 #93 / #94 的"
+        "纸条里没写的两项按默认值传过去——#94 的成功路会写上它们，循环自己不添油加醋"
     )
     assert built[1]["config"].token == "new-token", "第二次装配必须用重读过的配置"
 
