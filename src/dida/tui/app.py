@@ -1491,7 +1491,12 @@ class DidaApp(App[RebindRestart | None]):
         try:
             await account.execute(token)
         except DidaError as exc:
-            self.exit(RebindRestart(land_on_profile=False, notice=str(exc)))
+            self.exit(
+                RebindRestart(
+                    land_on_profile=False,
+                    notice=messages.rebind_execute_failed_message(exc),
+                )
+            )
             return
         # 成功那条路（工单 #94）：落在个人主页、屏幕上有回声、**无条件**跑一轮全量刷新
         # ——库刚被清空，不刷新就是一片空白（ADR-0011 二第 7 条）。刷新压过

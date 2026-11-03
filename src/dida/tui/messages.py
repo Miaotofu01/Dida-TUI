@@ -21,6 +21,8 @@ from dida.sync.engine import (
     AuthError,
     DidaError,
     NetworkError,
+    RebindConfigError,
+    RebindDeleteError,
     RebindImpact,
     UnclaimedListError,
     UnclaimedTaskError,
@@ -617,3 +619,40 @@ def rebind_impact_hint(impact: RebindImpact) -> str:
         f"{impact.views} 个自定义视图 / {impact.pending} 笔待推送\n"
         "输入 yes 继续；别的答案什么都不做（Enter 或 Esc 提交）"
     )
+
+
+def _rebind_failure_reason(error: DidaError) -> str:
+    """失败原因原句：优先取服务链上的原始异常，退回异常自己的那句话。
+
+    :class:`~dida.rebind.RebindService` 两处都是 ``raise Rebind…Error(…) from exc``：被链上
+    的那个 ``OSError`` / ``ConfigError`` 才是「原因」，这一层不重复它自己的整句。测试里的
+    假端口直接抛一个带原因的 TypedError（没有链），那就用它自己的话。
+    """
+    cause = error.__cause__
+    return str(cause) if cause is not None else str(error)
+
+
+def rebind_execute_failed_message(error: DidaError) -> str:
+    """换绑执行失败时，新 app 落地要说的那句话（工单 #93 的两条原句）。
+
+    两种失败留下的东西不一样，所以句子的前半句是**不同的**（ADR-0011 五）：
+
+    - 删库失败：配置没动、旧库完好——说清哪一步失败、原因，以及什么都没丢，可以再来一次；
+    - 写配置失败：库已经删了，配置仍是旧账号——这句必须原样说出来，用户才知道重开是
+      「旧账号 + 空库」。
+
+    哪一步失败由服务抛的**类型**决定（:class:`RebindDeleteError` /
+    :class:`RebindConfigError`）；原因取链上的原始异常。token 一个字都不进这句话。
+    """
+    reason = _rebind_failure_reason(error)
+    if isinstance(error, RebindDeleteError):
+        return (
+            "删库失败：配置文件一个字都没改，旧库和里面的清单、任务都还在"
+            f"（原因：{reason}）。可以再试一次。"
+        )
+    if isinstance(error, RebindConfigError):
+        return (
+            "库已删、配置仍是旧账号"
+            f"（原因：{reason}）。重新打开是旧账号 + 空库。"
+        )
+    return f"换绑失败：{error}"

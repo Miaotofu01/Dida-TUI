@@ -17,10 +17,11 @@ from datetime import datetime, timedelta, timezone
 import pytest
 
 from dida.api.errors import AuthError, NetworkError
-from dida.sync.engine import RebindConfigError, RebindImpact
+from dida.sync.engine import RebindConfigError, RebindDeleteError, RebindImpact
 from dida.testing import FakeBackend, ManualClock
 from dida.tui.app import REBIND_GROUP, DidaApp, RebindRestart
 from dida.tui.keys import LAYER_PROFILE, LAYER_TITLES
+from dida.tui.messages import rebind_execute_failed_message
 from support import screen_text
 
 TZ = timezone(timedelta(hours=8))
@@ -257,12 +258,39 @@ async def test_yes_executes_the_rebind_and_hands_back_a_restart_on_the_profile_p
     ), f"换绑成功后要交回一张带回声与强制刷新的重开便条，实际是 {app.return_value!r}"
 
 
-async def test_a_failed_execute_still_restarts_but_carries_the_failure_notice():
-    """执行失败：不留在半死状态，退出并把失败那句话交给下一个 app（#92 的失败形状；#93 定原句）。"""
+async def test_a_delete_failure_says_which_step_failed_and_what_was_left_alone():
+    """删库失败：屏幕原句说出哪一步、原因，以及配置与旧库都没动（工单 #93 判据一）。
+
+    这一条断的是交给下一个 app 的那句话；重启之后它真的出现在屏幕上、旧库也真的还能用，
+    在 ``tests/test_rebind_flow_real.py`` 里按真磁盘断。
+    """
     fake = backend()
-    fake.account.execute_error = RebindConfigError(
-        "库已经删了，但写配置失败——配置里仍是旧账号，重开是旧账号 + 空库"
-    )
+    fake.account.execute_error = RebindDeleteError("database is busy")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_rebind(pilot)
+        await submit_token(pilot, app)
+        await answer_confirm(pilot, app, "yes")
+
+    result = app.return_value
+    assert isinstance(result, RebindRestart), f"执行失败也要重启，实际 {result!r}"
+    assert result.land_on_profile is False, "失败那条路不回个人主页"
+    notice = result.notice or ""
+    assert "删库失败" in notice, f"要说清是哪一步失败了：{notice}"
+    assert "database is busy" in notice, f"要带上失败原因：{notice}"
+    assert "配置" in notice and "旧库" in notice, f"要说清配置与旧库都没动：{notice}"
+
+
+async def test_a_config_write_failure_says_the_database_is_gone_and_the_config_still_holds_the_old_account():
+    """写配置失败：屏幕原句必须含「库已删、配置仍是旧账号」+ 原因（工单 #93 判据三）。
+
+    这是三条失败路里唯一留下半截状态的：库已经没了，配置还是旧账号。句子不是「换绑失败」
+    四个字——用户必须一眼看出重开之后会是什么样子（旧账号 + 空库）。
+    """
+    fake = backend()
+    fake.account.execute_error = RebindConfigError("read-only file system")
     app = DidaApp(fake)
 
     async with app.run_test(size=WIDE) as pilot:
@@ -274,7 +302,10 @@ async def test_a_failed_execute_still_restarts_but_carries_the_failure_notice():
     result = app.return_value
     assert isinstance(result, RebindRestart), f"执行失败也要重启，实际 {result!r}"
     assert result.land_on_profile is False
-    assert result.notice is not None and "库已经删了" in result.notice
+    notice = result.notice or ""
+    assert "库已删、配置仍是旧账号" in notice, f"那句话必须原样说出来：{notice}"
+    assert "read-only file system" in notice, f"要带上失败原因：{notice}"
+    assert TOKEN not in notice, "token 不许进屏幕原句"
 
 
 # ------------------------------------------------------------------ 在飞的同步先停
@@ -339,12 +370,19 @@ async def test_a_restarted_app_lands_on_the_profile_page():
 
 
 async def test_a_restarted_app_shows_its_notice_at_mount():
-    """``notice`` 在落地时用 toast 说出来（#93 的失败话术就搭这一条）。"""
-    app = DidaApp(backend(), notice="库已经删了，但配置仍是旧账号")
+    """``notice`` 在落地时用 toast 说出来：失败原句真的到得了重启后的屏幕（#93 判据三）。
+
+    第一段 app 在失败那一刻就退出了，所以「屏幕说出那句话」只能靠新实例落地时这一跳。
+    """
+    notice = rebind_execute_failed_message(RebindConfigError("EACCES"))
+    app = DidaApp(backend(), notice=notice)
 
     async with app.run_test(size=WIDE, notifications=True) as pilot:
         await pilot.pause()
-        assert "库已经删了" in screen_text(app)
+        text = screen_text(app)
+        assert "库已删、配置仍是旧账号" in text, f"重启后的屏幕没说出那句话：\n{text}"
+        # 原因那一截也要到屏幕上（这一条用不含空格的 errno 名，toast 折行不会把它切开）。
+        assert "EACCES" in text, f"重启后的屏幕没说出原因：\n{text}"
 
 
 async def test_force_refresh_refreshes_even_when_the_config_says_not_to():
