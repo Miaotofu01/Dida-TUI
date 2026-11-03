@@ -13,7 +13,7 @@ import pytest
 
 from dida.testing import FakeBackend, ManualClock
 from dida.tui import theme
-from dida.tui.app import DidaApp
+from dida.tui.app import DidaApp, Stage
 from dida.tui.keys import LAYER_DETAIL, LAYER_INDEX, LAYER_PROFILE, LAYER_TASKS, LAYER_TITLES
 from support import screen_text
 
@@ -78,6 +78,11 @@ async def test_a_on_the_index_opens_the_profile_page_off_the_nav_path():
         assert bottom.startswith("已同步"), f"状态栏那一行不见了：{bottom!r}"
         for part in ("待推送", "逻辑日"):
             assert part in bottom, f"状态栏少了「{part}」：{bottom!r}"
+
+        # 它不在平移轨道上：舞台仍停在清单列表页，只是被藏起来了（ADR-0010）。
+        assert app.query_one("#stage", Stage).scroll_offset.x == 0, (
+            "进个人主页不该推动平移轨道——它不在导航栈上"
+        )
 
 
 @pytest.mark.parametrize("key", ["left", "escape"])
