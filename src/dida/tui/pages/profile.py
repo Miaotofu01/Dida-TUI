@@ -53,6 +53,9 @@ def account_line(bound: bool, *, rebind_hint: str = REBIND_HINT) -> Text:
 
     值用暗色那一档（它是注解，不是光标行）：这一页没有可停光标的行，整页都不该有一行
     看起来像「可以按进去」。换绑入口也写暗色，它只是一个键位提示，不是一行可选的东西。
+
+    ``rebind_hint=""`` 就是**不写入口**：引擎上没有换绑端口时（直接 new 一个引擎的测试）
+    这一页不该放一个按下去没反应的入口（#91 的注意、#92 的契约）。
     """
     line = Text(f"{BINDING_LABEL}  ")
     line.append(BOUND_TEXT if bound else UNBOUND_TEXT, style=EMPTY_STYLE)
@@ -77,10 +80,21 @@ class ProfilePage(CursorPage):
         都在 app 那一层（它才握着引擎上的换绑端口）。与 :class:`Back` 同一种分工。
         """
 
-    def __init__(self, *, account_bound: bool = False, id: str | None = None) -> None:
-        """``account_bound`` 是组合根交进来的**事实**，这一页不判断、也不去读配置。"""
+    def __init__(
+        self,
+        *,
+        account_bound: bool = False,
+        can_rebind: bool = True,
+        id: str | None = None,
+    ) -> None:
+        """``account_bound`` 是组合根交进来的**事实**，这一页不判断、也不去读配置。
+
+        ``can_rebind`` 也一样是注入的：引擎上没有换绑端口时它说 ``False``，这一行就不再写
+        「b 换绑」这个入口（入口不能是一个按下去没反应的东西——#91 / #92）。
+        """
         super().__init__(id=id)
         self.account_bound = account_bound
+        self.can_rebind = can_rebind
 
     def on_mount(self) -> None:
         """把这一页的内容铺上屏（它不随刷新变，所以只铺一次）。"""
@@ -92,7 +106,8 @@ class ProfilePage(CursorPage):
         ``id=None``：这一行**不可停光标**——换绑是一个键（``b``），不是「按进这一行」。
         光标标记与强调色在这里只会让人以为要用 ``→`` 进去。
         """
-        return (rule_row(), Row(id=None, text=account_line(self.account_bound)))
+        hint = REBIND_HINT if self.can_rebind else ""
+        return (rule_row(), Row(id=None, text=account_line(self.account_bound, rebind_hint=hint)))
 
     def action_rebind(self) -> None:
         """``b``：请求换绑（#92）。真正的流程在 app 那一层，这一页只递一句话。"""

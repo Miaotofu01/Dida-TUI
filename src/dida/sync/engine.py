@@ -188,6 +188,7 @@ __all__ = [
     "INBOX_ID",
     "AccountPort",
     "NetworkError",
+    "RebindCloseError",
     "RebindConfigError",
     "RebindDeleteError",
     "RebindError",
@@ -309,9 +310,9 @@ def pending_error(source: object) -> str | None:
 class RebindImpact:
     """换绑会带走什么：确认页上那四个数（工单 #92、ADR-0011 四）。
 
-    口径在实现那一侧钉死（:class:`AccountPort.impact`）：两个数各自是本地副本里一类**会
-    随库一起消失**的东西。界面上多一个或少一个都必须断得出来，所以它们是四个独立的整数，
-    不是一个加起来的总数。
+    口径在实现那一侧钉死（:class:`AccountPort.impact`）：**四个数各自**是本地副本里一类
+    会**随库一起消失**的东西（清单 / 任务 / 自定义视图 / 待推送）。界面上多一个或少一个都
+    必须断得出来，所以它们是四个独立的整数，不是一个加起来的总数。
     """
 
     lists: int
@@ -334,8 +335,17 @@ class RebindError(DidaError):
     """
 
 
+class RebindCloseError(RebindError):
+    """关旧连接失败：``unlink`` 还没走到，配置与库**文件**都没动（ADR-0011 五）。
+
+    与 :class:`RebindDeleteError` 分开：那一步要是把没发生的 ``unlink`` 说成「删库失败」，
+    屏幕就说了假话。旧连接此刻的状态不可知，所以这个类型只承诺「文件与配置没动」，
+    不承诺「连接还开着」。
+    """
+
+
 class RebindDeleteError(RebindError):
-    """关连接或删库失败：配置没动，旧库完好（ADR-0011 五）。"""
+    """删库（``unlink``）失败：配置没动，旧库文件完好（ADR-0011 五）。"""
 
 
 class RebindConfigError(RebindError):
@@ -372,8 +382,9 @@ class AccountPort(Protocol):
     async def execute(self, token: str) -> None:
         """执行换绑：关连接 → 删库 → 只换 token 写配置（ADR-0011 五）。
 
-        任何一步失败都抛 :class:`RebindError` 的子类，且**不假装做完了**：删库失败时配置与
-        旧库都在，写配置失败时库已经没了——两个失败点留下的东西不一样，界面必须说得出。
+        任何一步失败都抛 :class:`RebindError` 的子类，且**不假装做完了**：关连接失败时
+        ``unlink`` 还没走到，删库失败时配置与旧库文件都在，写配置失败时库已经没了——三个
+        失败点留下的东西不一样，界面必须说得出是哪一步。
         """
         ...
 

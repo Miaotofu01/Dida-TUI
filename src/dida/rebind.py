@@ -14,9 +14,10 @@ SQLite」那种半截状态。
 
 ``execute`` 的顺序不是随便排的：先关连接，是因为删一个还开着的 SQLite 只会解链一个 inode，
 旧连接照样能写；先删库后写配置，是因为写配置失败是三个失败点里唯一会留下「旧账号 + 空库」
-的那个——把它排在最后，失败时要说的话只有这一种。失败抛
-:class:`~dida.sync.engine.RebindDeleteError` / :class:`~dida.sync.engine.RebindConfigError`，
-两者留下的东西不同，界面分得开（#93 定屏幕原句）。
+的那个——把它排在最后，失败时要说的话只有这一种。关连接与删库**分开**抛
+:class:`~dida.sync.engine.RebindCloseError` / :class:`~dida.sync.engine.RebindDeleteError`
+（``unlink`` 根本没走到时不能把「删库失败」说成发生过），写配置失败是
+:class:`~dida.sync.engine.RebindConfigError`。三者留下的东西不同，界面分得开（#93 定屏幕原句）。
 
 **token 的三条禁令**（与 ``Config.__repr__`` 同一条）：不进日志、不进屏幕、不进异常消息。
 所以这里的每一条失败消息都只描述「哪一步失败了、留下了什么」，不带凭据。
@@ -29,12 +30,24 @@ from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
-from dida.api.client import DEFAULT_BASE_URL, DidaApiClient
+from dida.api.client import DEFAULT_BASE_URL
 from dida.api.errors import AuthError
-from dida.api.transport import HttpxTransport, Transport
-from dida.config import Config, ConfigError, load_config, needs_token, save_config
+from dida.api.transport import Transport
+from dida.config import (
+    Config,
+    ConfigError,
+    load_config,
+    needs_token,
+    save_config,
+    verify_token,
+)
 from dida.storage.store import Store
-from dida.sync.engine import RebindConfigError, RebindDeleteError, RebindImpact
+from dida.sync.engine import (
+    RebindCloseError,
+    RebindConfigError,
+    RebindDeleteError,
+    RebindImpact,
+)
 
 __all__ = ["RebindService"]
 
@@ -85,26 +98,19 @@ class RebindService:
     async def verify(self, token: str) -> None:
         """只验一次 ``list_projects``：**不关库、不删库、不写配置**（ADR-0003）。
 
-        校验口径与首次运行那条路一致：401/403 由客户端抛
-        :class:`~dida.api.errors.AuthError`，连不上抛 :class:`~dida.api.errors.NetworkError`，
-        两者**不互相冒充**。空粘贴在本地就拦下，不浪费一次请求。
+        校验口径与首次运行那条路一致（同一个 :func:`dida.config.verify_token`）：401/403 由
+        客户端抛 :class:`~dida.api.errors.AuthError`，连不上抛
+        :class:`~dida.api.errors.NetworkError`，两者**不互相冒充**。空粘贴在本地就拦下
+        （建传输层之前），不浪费一次请求。
         """
-        token = token.strip()
-        if not token:
+        stripped = await verify_token(
+            token,
+            transport=self._transport,
+            transport_factory=self._transport_factory,
+            base_url=self._base_url,
+        )
+        if stripped is None:
             raise AuthError("token 不能为空，请重新粘贴")
-        transport = self._transport
-        owned = False
-        if transport is None:
-            transport = self._transport_factory() if self._transport_factory else HttpxTransport()
-            owned = True
-        try:
-            client = DidaApiClient(token=token, transport=transport, base_url=self._base_url)
-            await client.list_projects()
-        finally:
-            if owned:
-                close = getattr(transport, "aclose", None)
-                if close is not None:
-                    await close()
 
     # ---------------------------------------------------------------- 端口：会丢多少
 
@@ -137,18 +143,25 @@ class RebindService:
 
         失败留下什么：
 
-        - 关连接 / 删库失败 → :class:`RebindDeleteError`：配置没动，旧库完好；
+        - 关连接失败 → :class:`RebindCloseError`：``unlink`` 还没走到，配置与库**文件**都没动；
+        - 删库（``unlink``）失败 → :class:`RebindDeleteError`：配置没动，旧库文件完好；
         - 写配置失败 → :class:`RebindConfigError`：库已经删了，配置仍是旧账号。
 
-        两条消息里都没有 token。
+        两条消息里都没有 token。关连接与删库**分开**捕获：把没有发生的 ``unlink`` 说成
+        「删库失败」就是在屏幕上说一件假的步骤（#93 的判据是「说出是哪一步」）。
         """
         token = token.strip()
         if not token:
             raise AuthError("token 不能为空，请重新粘贴")
         try:
             self._store.close()
-            self._remove_database()
         except (OSError, sqlite3.Error) as exc:
+            raise RebindCloseError(
+                f"关连接失败，配置与旧库文件都没动（可以重开再试一次）：{exc}"
+            ) from exc
+        try:
+            self._remove_database()
+        except OSError as exc:
             raise RebindDeleteError(
                 f"删库失败，配置与旧库都没动（可以再来一次）：{exc}"
             ) from exc

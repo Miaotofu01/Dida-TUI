@@ -21,6 +21,7 @@ from dida.sync.engine import (
     AuthError,
     DidaError,
     NetworkError,
+    RebindCloseError,
     RebindConfigError,
     RebindDeleteError,
     RebindImpact,
@@ -451,11 +452,14 @@ def overwritten_message(count: int) -> str:
 def refresh_failed_message(error: DidaError) -> str:
     """同步失败时状态栏里的话：凭据失效与其它失败分开说（工单 #21，用户故事 6）。
 
-    「凭据失效」必须直接引导重新粘贴 token：说成笼统的网络失败，用户会去查网络，
-    而问题在他那把过期或被吊销的 token 上（t03 的 ``Credentials`` 提供了那条重新粘贴的路）。
+    「凭据失效」这一支必须指出**应用里**换 token 的那条出口：``A`` 进个人主页、再按 ``b``
+    换绑（#92）。首次运行的 ``getpass`` 只在启动前出现，所以「重新粘贴 token」在今天不是
+    一个能照着做的动作。同时要说出那条路的代价——它会清空本地副本（ADR-0011 四）——但不能
+    长到待不下状态栏那一行。说成笼统的网络失败也不行：用户会去查网络，而问题在他那把过期
+    或被吊销的 token 上（ADR-0003）。
     """
     if isinstance(error, AuthError):
-        return f"凭据失效，请重新粘贴 token：{error}"
+        return f"凭据失效：按 A 进个人主页，再按 b 换绑（会清空本地副本）：{error}"
     return f"同步失败：{error}"
 
 
@@ -581,6 +585,25 @@ REBIND_SUCCESS_NOTICE = "已换绑到新账号"
 不写状态栏——状态栏那一行只属于同步状态。
 """
 
+REBIND_UNAVAILABLE = "换绑不可用：这次启动没有接上账号配置，重开 dida 再试"
+"""引擎上没有换绑端口时，按 ``b`` 得到的那句实话（工单 #92 / #91 的「不放入口」）。
+
+生产不会走到这里（组合根总会注入一支），只有直接 new 一个引擎的测试会。个人主页那时
+**不写**「b 换绑」这个入口（:func:`dida.tui.pages.profile.account_line`），而键位表还在，
+所以真按下去也得说一句，不能静默。
+"""
+
+REBIND_UNEXPECTED_FAILURE_NOTICE = (
+    "换绑中断：出现了意外错误，没能确认账号状态——已重新打开，请检查个人主页与本地副本。"
+)
+"""换绑执行路上**两条已知失败之外**的异常，落地时说的那句通用话（工单 #93、ADR-0011 二第 6 条）。
+
+它是一句**通用**的话：不带 token、不带异常原文、也不带 traceback。执行路径已经走过了
+「停周期泵 / 取消在飞的同步」，任何异常都不能把进程留在一个 ``_rebinding`` 永远为真、
+库却可能已经关掉的半死状态里——所以未知异常也换一张重开纸条，由这一句交代发生了什么级别的
+事、用户该看哪里。
+"""
+
 
 def rebind_verify_failed_message(error: DidaError) -> str:
     """新 token 验证失败时，回到输入框要说的那句话（工单 #92、判据三 / 四）。
@@ -624,7 +647,7 @@ def rebind_impact_hint(impact: RebindImpact) -> str:
 def _rebind_failure_reason(error: DidaError) -> str:
     """失败原因原句：优先取服务链上的原始异常，退回异常自己的那句话。
 
-    :class:`~dida.rebind.RebindService` 两处都是 ``raise Rebind…Error(…) from exc``：被链上
+    :class:`~dida.rebind.RebindService` 三处都是 ``raise Rebind…Error(…) from exc``：被链上
     的那个 ``OSError`` / ``ConfigError`` 才是「原因」，这一层不重复它自己的整句。测试里的
     假端口直接抛一个带原因的 TypedError（没有链），那就用它自己的话。
     """
@@ -633,18 +656,25 @@ def _rebind_failure_reason(error: DidaError) -> str:
 
 
 def rebind_execute_failed_message(error: DidaError) -> str:
-    """换绑执行失败时，新 app 落地要说的那句话（工单 #93 的两条原句）。
+    """换绑执行失败时，新 app 落地要说的那句话（工单 #93 的屏幕原句）。
 
-    两种失败留下的东西不一样，所以句子的前半句是**不同的**（ADR-0011 五）：
+    三种失败留下的东西不一样，所以句子的前半句是**不同的**（ADR-0011 五）：
 
+    - 关连接失败：``unlink`` 还没走到——说清是关连接这一步失败，文件与配置都没动；
     - 删库失败：配置没动、旧库完好——说清哪一步失败、原因，以及什么都没丢，可以再来一次；
     - 写配置失败：库已经删了，配置仍是旧账号——这句必须原样说出来，用户才知道重开是
       「旧账号 + 空库」。
 
-    哪一步失败由服务抛的**类型**决定（:class:`RebindDeleteError` /
-    :class:`RebindConfigError`）；原因取链上的原始异常。token 一个字都不进这句话。
+    哪一步失败由服务抛的**类型**决定（:class:`RebindCloseError` /
+    :class:`RebindDeleteError` / :class:`RebindConfigError`）；原因取链上的原始异常。
+    token 一个字都不进这句话。
     """
     reason = _rebind_failure_reason(error)
+    if isinstance(error, RebindCloseError):
+        return (
+            "关连接失败：配置文件一个字都没改，旧库文件还在"
+            f"（原因：{reason}）。可以重开再试一次。"
+        )
     if isinstance(error, RebindDeleteError):
         return (
             "删库失败：配置文件一个字都没改，旧库和里面的清单、任务都还在"
