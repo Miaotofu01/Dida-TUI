@@ -22,6 +22,7 @@
 from dida.tui.pages.base import CURSOR_MARK, CursorPage, Row
 from dida.tui.pages.detail import DetailPage
 from dida.tui.pages.index import IndexPage
+from dida.tui.pages.profile import ProfilePage
 from dida.tui.pages.tasks import TasksPage
 
 __all__ = [
@@ -29,6 +30,7 @@ __all__ = [
     "CursorPage",
     "DetailPage",
     "IndexPage",
+    "ProfilePage",
     "Row",
     "TasksPage",
 ]

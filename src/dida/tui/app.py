@@ -60,13 +60,14 @@ from dida.tui.keys import (
     GLOBAL,
     LAYER_DETAIL,
     LAYER_INDEX,
+    LAYER_PROFILE,
     LAYER_TASKS,
     LAYER_TITLES,
     bindings_for,
     help_body,
 )
 from dida.tui.overlays import ConfirmOverlay, FormOverlay, MessageOverlay, multi_values
-from dida.tui.pages import DetailPage, IndexPage, TasksPage
+from dida.tui.pages import DetailPage, IndexPage, ProfilePage, TasksPage
 from dida.tui.pages.detail import LIST_FIELD, PRIORITY_FIELD, TAGS_FIELD, picker_spec
 from dida.tui.pages.index import (
     KIND_VIEW,
@@ -353,6 +354,11 @@ class DidaApp(App[None]):
             yield IndexPage(id=LAYER_INDEX)
             yield TasksPage(id=LAYER_TASKS)
             yield DetailPage(id=LAYER_DETAIL)
+        # 第四种页面（#91）：**与 #stage 并列**，不在平移轨道上——平移是导航栈的表达，
+        # 而个人主页不在那条栈上（ADR-0010）。平时藏着，按 A 时由 _show_profile 显出来。
+        profile = ProfilePage(id=LAYER_PROFILE)
+        profile.display = False
+        yield profile
         yield StatusBar(id="status-bar")
 
     def on_mount(self) -> None:
@@ -401,13 +407,30 @@ class DidaApp(App[None]):
     def detail_page(self) -> DetailPage:
         return self.query_one(DetailPage)
 
+    def profile_page(self) -> ProfilePage:
+        """个人主页（第四种页面，不在导航路径上——#91 / ADR-0010）。"""
+        return self.query_one(ProfilePage)
+
     def _pages(self) -> dict[str, IndexPage | TasksPage | DetailPage]:
-        """三层各是哪个控件，按层名索引。"""
+        """导航路径上的三层各是哪个控件，按层名索引（个人主页不在这张表里）。"""
         return {
             LAYER_INDEX: self.index_page(),
             LAYER_TASKS: self.tasks_page(),
             LAYER_DETAIL: self.detail_page(),
         }
+
+    def show_profile(self) -> None:
+        """``A``：从清单列表页**旁路**进个人主页（工单 #91 / ADR-0010）。
+
+        它不在导航栈上，所以这里不压栈、也不平移：把舞台藏起来、把主页显出来，焦点交给它。
+        清单列表页整个留在 DOM 里（只是不可见），光标因此还是离开时那一行。
+        """
+        self._layer = LAYER_PROFILE
+        self._stage().display = False
+        page = self.profile_page()
+        page.display = True
+        self._write_top()
+        page.focus(scroll_visible=False)
 
     def _show(self, layer: str) -> None:
         """把这一层滑到眼前，并把焦点交给它（``j``/``k``/``→`` 立刻能用）。
@@ -415,11 +438,15 @@ class DidaApp(App[None]):
         三层**都在 DOM 里**、并排停在 :class:`Stage` 上：它们的行与光标因此原样留着，
         ``←`` 回去时用户看到的就是他离开时那一行（用户故事 20/62）。换层是横向平移——
         ``→`` 压栈、``←`` 出栈本来就是导航栈（ADR-0007 三）。
+
+        任何一层导航页上屏，都意味着个人主页又藏回去了：它不在那条栈上（#91）。
         """
         previous = self._layer
         self._layer = layer
         page = self._pages()[layer]
         self._write_top()
+        self.profile_page().display = False
+        self._stage().display = True
         self._stage().show(self._layer_index(layer), animate=self._motion and layer != previous)
         # ``scroll_visible=False``：#59 **之前**它是承重的——Textual 交焦点时默认会把那个控件
         # **立刻**滚进可见区，而这一页正好是整个舞台（平移就是把它滑过来），那一下会把动画
@@ -452,7 +479,7 @@ class DidaApp(App[None]):
         self._show(LAYER_DETAIL)
 
     def back_to_index(self) -> None:
-        """回层一（任务列表页上按 ``←``）——光标照旧停在他进来的那一行。"""
+        """回层一（任务列表页、或个人主页上按 ``←``）——光标照旧停在他进来的那一行。"""
         self._detail_task_id = None
         self._show(LAYER_INDEX)
 
@@ -573,7 +600,12 @@ class DidaApp(App[None]):
 
         第一段是**页面**（它只有三种），后面两段是走在那一页上的**东西**：容器名与任务名。
         「你在哪」在详细页的答案就是「在哪条任务上」，所以最后一段写的是它。
+
+        **个人主页不在任何一条路径上**（ADR-0010）：它单独一段，不是第四级——顶栏在这一页
+        只有「个人主页」四个字，硬画成路径就会出现「清单列表页 ▸ 个人主页」这种不存在的关系。
         """
+        if self._layer == LAYER_PROFILE:
+            return (LAYER_TITLES[LAYER_PROFILE],)
         index = LAYER_TITLES[LAYER_INDEX]
         if self._layer == LAYER_TASKS:
             return (index, self._container_title or LAYER_TITLES[LAYER_TASKS])
@@ -609,6 +641,14 @@ class DidaApp(App[None]):
     def on_index_page_refused(self, event: IndexPage.Refused) -> None:
         """按 ``→`` 进一个进不去的清单：如实说一句，不进下一层。"""
         self._write_status(event.message)
+
+    def on_index_page_open_profile(self, event: IndexPage.OpenProfile) -> None:
+        """清单列表页上按了 ``A``：旁路进个人主页（不在导航路径上）。"""
+        self.show_profile()
+
+    def on_profile_page_back(self, event: ProfilePage.Back) -> None:
+        """个人主页上按了 ``←`` / ``esc``：回清单列表页原处（不在导航栈上，没有可弹的层）。"""
+        self.back_to_index()
 
     def on_tasks_page_entered(self, event: TasksPage.Entered) -> None:
         """任务列表页上按了 ``→``：进这条任务的详细页。"""
