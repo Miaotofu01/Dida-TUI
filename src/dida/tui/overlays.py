@@ -142,6 +142,16 @@ class FormField:
     那几格要的也是它。
     """
 
+    password: bool = False
+    """这一格是**掩码**输入（工单 #92 的换绑）：画成 ``••••``，明文不进屏幕。
+
+    这是**字段级**的一个开关，不是一种新控件——换绑那张表单里只有这一格，其余表单一个字段
+    都不变。Textual 的 ``Input(password=True)`` 只改**显示**：``Input.value`` 仍是明文，所以
+    ``FormOverlay.values()`` 不用改，「掩码」这件事只发生在屏幕上。反过来也成立：拿到那份
+    ``dict`` 的人不许把值写进状态栏 / toast / 日志 / 异常消息（换绑那边由
+    :class:`~dida.rebind.RebindService` 与 :mod:`dida.tui.messages` 的话术守着）。
+    """
+
     @property
     def is_choice(self) -> bool:
         """这一格是不是选择框。"""
@@ -392,7 +402,7 @@ class FormOverlay(ModalScreen[dict[str, str] | None]):
                 elif field.is_choice:
                     yield ChoiceField(field)
                 else:
-                    yield Input(value=field.value, id=f"field-{field.name}")
+                    yield Input(value=field.value, id=f"field-{field.name}", password=field.password)
             yield Static(self._hint, classes="overlay-hint")
 
     def values(self) -> dict[str, str]:

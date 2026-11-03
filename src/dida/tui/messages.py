@@ -20,6 +20,8 @@ from __future__ import annotations
 from dida.sync.engine import (
     AuthError,
     DidaError,
+    NetworkError,
+    RebindImpact,
     UnclaimedListError,
     UnclaimedTaskError,
     UnknownListError,
@@ -545,3 +547,65 @@ def delete_failed_message(error: DidaError) -> str:
     if isinstance(error, UnknownTaskError):
         return UNKNOWN_DELETE_MESSAGE
     return f"没有删：{error}"
+
+
+# ------------------------------------------------------------------ 换绑（工单 #92）
+
+REBIND_TOKEN_TITLE = "换绑账号"
+"""换绑那张表单的边框标题：这一步换的是**这一个 app 连着哪个账号**（GLOSSARY「换绑」）。"""
+
+REBIND_TOKEN_LABEL = "新 token"
+"""输入那一格的名字。用了 token 这个词：网页版「设置 > 账户 > API Token」里就叫它。"""
+
+REBIND_TOKEN_HINT = "Enter 或 Esc 提交验证 / Ctrl+C 退出"
+"""换绑表单底部那行提示：与 :data:`~dida.tui.overlays.FORM_HINT` 同一口径。
+
+表单里 ``Esc`` 就是提交（ADR-0008 二），所以这里不写一个不存在的「取消」。**验证失败时**
+这一行上面会多一行原因（:func:`rebind_verify_failed_message`）——表单的 ``hint`` 是一块
+静态文本，两行拼在一起正好。
+"""
+
+REBIND_CONFIRM_TITLE = "换绑：确认清空本地副本"
+"""影响面确认页的边框标题。**不可恢复**这四个字必须出现，这是这一屏存在的理由。"""
+
+REBIND_CONFIRM_LABEL = "输入 yes 继续"
+"""确认那一格的名字就是要求的那句话：要用户**打出来**，不是按一个字母。"""
+
+
+def rebind_verify_failed_message(error: DidaError) -> str:
+    """新 token 验证失败时，回到输入框要说的那句话（工单 #92、判据三 / 四）。
+
+    三种失败分开说，因为它们让用户做的事完全不同：
+
+    - 凭据被拒（401/403）：这枚 token 不能用，重新粘一个；
+    - 连不上：这台机器发不出请求，**不是 token 的问题**——再粘一次也一样（ADR-0003）；
+    - 其它服务端拒绝／响应形状不对：如实说验证失败，既不冒充凭据问题也不冒充断网。
+
+    token **一个字都不进这句话**（屏幕、日志、回滚都看得见它）。
+    """
+    if isinstance(error, AuthError):
+        status = f"HTTP {error.status_code}" if error.status_code else "HTTP 401/403"
+        return f"凭据被拒绝（{status}），这个 token 不能用——重新粘贴一个。"
+    if isinstance(error, NetworkError):
+        return f"连不上服务端，这不是 token 的问题：{error}"
+    return f"验证失败：{error}"
+
+
+def rebind_impact_hint(impact: RebindImpact) -> str:
+    """确认页底部那段话：四个数 + 「输入 yes 继续」（工单 #92、判据五 / 六）。
+
+    四个数各自是本地副本里**会随库一起消失**的东西（口径在 ``RebindService.impact``）：
+    清单 / 任务 / 自定义视图 / 待推送。所以这一屏说「会丢什么」而不是「会换什么」——换绑
+    之后旧副本没有备份（ADR-0011 三），用户要在按下去之前看见代价。
+
+    「别的答案什么都不做」是**承诺**：不是取消，也不是重问；用户得自己打 ``yes``。
+
+    分隔符用 ASCII 的 ``/``：这块浮层是 ``width: auto``，``·`` 那类东亚歧义宽度会把右边框
+    挤掉（#48 立的那条规矩）。
+    """
+    return (
+        "这次换绑会清空本地副本，不可恢复：\n"
+        f"{impact.lists} 个清单 / {impact.tasks} 条任务 / "
+        f"{impact.views} 个自定义视图 / {impact.pending} 笔待推送\n"
+        "输入 yes 继续；别的答案什么都不做（Enter 或 Esc 提交）"
+    )
