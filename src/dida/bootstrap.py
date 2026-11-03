@@ -139,9 +139,9 @@ def store_path() -> Path:
 def build_client(config: Config, transport: Transport | None = None) -> DidaApiClient:
     """按配置造客户端；``transport`` 省略就是真的 HTTP。
 
-    没有 token 时用空串：请求会被服务端按 401 拒绝，UI 因此给出「凭据失效，请重新粘贴
-    token」——比一个裸 ``RuntimeError`` 诚实得多（首次运行本该在 :func:`main` 里就补上
-    token，走到这里说明用户把配置文件里的 token 删了）。
+    没有 token 时用空串：请求会被服务端按 401 拒绝，UI 因此给出「凭据失效：按 A 进个人
+    主页，再按 b 换绑（会清空本地副本）」——比一个裸 ``RuntimeError`` 诚实得多（首次运行
+    本该在 :func:`main` 里就补上 token，走到这里说明用户把配置文件里的 token 删了）。
     """
     return DidaApiClient(
         token=config.token or "",
@@ -232,13 +232,16 @@ def build_app(
         clock, config=config, transport=transport, db_path=db_path, config_file=config_file
     )
     account = engine.account
+    # ``build_engine`` 总会注入换绑端口（#92），所以这里没有「没有端口」那一条退路：
+    # 绑定事实只有 ``account.is_bound()`` 这一个出处（#91 定下的唯一事实来源）。
+    assert account is not None
     return DidaApp(
         engine,
         open_url=open_url,
         refresh_on_start=config.refresh_on_start,
         push_tick_seconds=PUSH_TICK_SECONDS,
         day_boundary=None if reader is None else reader.current,
-        account_bound=account.is_bound() if account is not None else not needs_token(config),
+        account_bound=account.is_bound(),
         start_layer=start_layer,
         notice=notice,
         force_refresh=force_refresh,
