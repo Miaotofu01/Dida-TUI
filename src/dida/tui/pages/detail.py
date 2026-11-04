@@ -50,6 +50,7 @@ from dida.tui.keys import LAYER_DETAIL, bindings_for
 from dida.tui.overlays import FORM_HINT, MULTI_SEPARATOR, FormField, FormOption
 from dida.tui.pages import due
 from dida.tui.pages.base import EMPTY_STYLE, CursorPage, Row, empty_row, rule_row
+from dida.tui.pages.tasks import TasksPage
 
 __all__ = [
     "DetailPage",
@@ -1110,6 +1111,18 @@ class DetailPage(CursorPage):
         所以这一页绑的 ``left`` 抢不到它。
         """
         self.post_message(self.Back())
+
+    def action_delete(self) -> None:
+        """``d``：删这一条任务——**先问一句**，问与写都归 app（工单 #56）。
+
+        发出去的是 :class:`~dida.tui.pages.tasks.TasksPage.Delete`——**同一个消息**，所以
+        接住它的还是 app 里 ``#40`` 那条已有的删除路径（确认文案、真正的那一次写、失败的
+        措辞都只有一处），详细页不另开一条。这一页只把「哪条任务」说出去；编辑中这个键属于
+        输入框（焦点在 ``Input`` 上，可打印字符先被它吃掉），所以正文里的字母 ``d`` 不会被
+        当成删除。
+        """
+        if self._task_id is not None:
+            self.post_message(TasksPage.Delete(self._task_id))
 
     def action_end_edit(self) -> None:
         """``esc``：结束这次编辑，**改动已经生效**（验收标准 4 + 5）。它不再是「退回」。

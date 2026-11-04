@@ -968,6 +968,9 @@ class DidaApp(WriteFlow, App[RebindRestart | None]):
     def on_tasks_page_delete(self, event: TasksPage.Delete) -> None:
         """``d``：删光标那条任务——**先如实问一句**，``y`` 才真的删（验收标准 1、3）。
 
+        详细页的 ``d`` 发的是**同一个** :class:`~dida.tui.pages.tasks.TasksPage.Delete`
+        （工单 #56），所以两个入口都落在这里，确认文案与真正的那一次写只有这一条路。
+
         确认文案在 :func:`dida.tui.messages.delete_prompt`：整份官方文档里没有回收站、没有
         undelete、也没有「已删除」列表（``api-shapes.md`` §A6），所以那一句话不许承诺任何恢复
         ——这次确认就是全部的防线。删掉的那条任务本地当场摘掉、推送走 ``DELETE``。
@@ -985,12 +988,24 @@ class DidaApp(WriteFlow, App[RebindRestart | None]):
 
         删失败（引擎当场拒绝、断网、服务端拒绝）那句话怎么说在
         :mod:`dida.tui.write_flow`——删除在服务端不可逆，所以那一句说的是「**没**删成」。
+
+        从**详细页**删掉的是这一页正在说的那条任务时，删完回任务列表页（工单 #56 验收标准 3）：
+        那一页没有东西可看了，而清单列表页也不该是落点——光标留在同一个清单里，由
+        ``refresh_view`` 按行 id 认回它删掉之后让出来的那一条。失败时本地那一份还在，
+        人留在详细页把话看完。
         """
         if not confirmed:
             return
         await self.finish_write(
             Write(perform=lambda: self.engine.delete(task_id), reply=TASK_DELETE)
         )
+        if self._detail_task_id != task_id:
+            return
+        if self.engine.task_detail(task_id) is not None:
+            return
+        self._detail_task_id = None
+        if self.layer == LAYER_DETAIL:
+            self.back_to_tasks()
 
     async def on_tasks_page_defer(self, event: TasksPage.Defer) -> None:
         """``g`` / ``G``：顺延 ``days`` 个逻辑日，**截止时间以外的字段一个都不动**（验收标准 4–7）。

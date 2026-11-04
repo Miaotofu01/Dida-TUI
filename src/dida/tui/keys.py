@@ -147,6 +147,7 @@ BINDINGS: dict[str, tuple[Key, ...]] = {
         Key(("k", "up"), "cursor_up", "上一个字段"),
         Key(("enter",), "enter", "编辑这个字段"),
         Key(("left",), "back", "退回任务列表页"),
+        Key(("d",), "delete", "删除这条任务"),
         Key(("escape",), "end_edit", "结束编辑（保存）"),
     ),
     LAYER_PROFILE: (

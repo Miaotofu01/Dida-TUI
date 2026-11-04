@@ -245,7 +245,11 @@ class TasksPage(CursorPage):
             super().__init__()
 
     class Delete(Message):
-        """用户按了 ``d``：删光标下这一条（问一句与真的删都归 app）。"""
+        """用户按了 ``d``：删这一条任务（问一句与真的删都归 app）。
+
+        两个入口发的是**同一个**消息：任务列表页的光标行，以及详细页正在说的那条任务
+        （工单 #56）——所以确认文案、真正的那一次写、失败的措辞都只有一处。
+        """
 
         def __init__(self, task_id: str) -> None:
             self.task_id = task_id
