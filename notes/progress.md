@@ -962,3 +962,15 @@ merger 做了 2×2 实测：**闸开着**时 `scroll_visible=True` 照样有动�
 - 凭据失效的状态栏句子现在指向 `A` → 个人主页 → `b` 换绑（并说明会清本地副本）。
 - 一笔教训：全量变异验证在「`show_profile` 不藏 `#stage`」那处**跑挂了 1 小时**（pytest 在
   `ep_poll` 空转）；后来用 `timeout -s KILL` 复跑才拿到红。以后变异验证一律带硬超时。
+
+## 收深八项进 main + 详细页删除（#77–#87、#56）— 2026-11-04
+
+- **#77–#87**（收深八项）：`feat/deepening-77` 经 PR #96 合入 `main`（合并提交 `2b3fc0a`，树 `da3ebdb`）。
+  与个人主页/换绑在 `sync/engine.py`、`tui/app.py`、`testing.py` 上有真实冲突，按两边意图逐处合过：
+  换绑端口 `AccountPort`/`RebindRestart` 与读模型/写机器/替身结构并存。全量 **1050 passed**。
+  - 合并那一刻 GitHub 的 `Closes` 处理被一次 502 吞掉（11 张票仍开着），已补关；机制本身没问题。
+- **#56**（详细页 `d`）：PR #97 合入 `main`（`c18f017`），`Closes #56` 正常自动关闭——新口径第一次真跑通。
+  删除复用列表页那条 `_confirm_delete_task` / `Write(TASK_DELETE)`，确认浮层原文逐字同源（`ConfirmOverlay.prompt`）。
+  全量 **1058 passed**。
+- 地雷：`gh pr merge` 走 GraphQL，这台机器上偶发 502/GraphQL 报错；改用
+  `gh api --method PUT repos/<o>/<r>/pulls/<n>/merge -f merge_method=merge …` 一次成功。
