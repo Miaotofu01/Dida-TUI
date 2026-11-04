@@ -5,6 +5,8 @@ TUI 读写一切只能走本模块；排序、逾期判定、视图求值、冲�
 
 - ``status() -> SyncStatus`` —— 读：状态栏所需的全部信息。
 - ``logical_day() -> date`` —— 读：现在是哪个逻辑日（工单 #46 的心跳）。
+- ``read_model() -> ReadModel | None`` —— 读：从当下这一份本地副本**一次装配**出整份读模型
+  （#81，没有缓存）；下面三种读形状都是它的投影。
 - **三种读形状**（#33）：``list_index() -> tuple[ListRow, ...]``（清单索引）、
   ``tasks_in(container_id) -> TaskList``（某个容器的任务列表）、
   ``task_detail(task_id) -> TaskDetail | None``（单条任务的详情）。
@@ -18,9 +20,12 @@ TUI 读写一切只能走本模块；排序、逾期判定、视图求值、冲�
 - ``create(title, ...)`` —— 写：新建，落在收集箱（:mod:`dida.sync.create`）。
 - ``create_list(name, color=)`` / ``update_list(id, name=, color=)`` / ``delete_list(id)`` ——
   写：清单的建 / 改 / 删，乐观写 + 立即推送 + 失败进重试队列（:mod:`dida.sync.lists`，#42）。
-- ``cycle_priority(task_id)`` —— 写：优先级推进一档（:mod:`dida.sync.priority`）。
-- ``subtasks(task_id)`` —— 读：子任务那几行（只读，:mod:`dida.sync.subtasks`；spec 的
-  「子任务只看不勾」）。
+
+**#85 退场的那两个没有调用者的成员**：``cycle_priority(task_id)``（``p`` 推进一档）与
+``subtasks(task_id)``（引擎那一层的子任务读）。优先级从 #45 起走详细页的挑选器
+（``write(changes={"priority": …})``，线上编码那套词汇留在 :mod:`dida.sync.view`），子任务行由
+``task_detail().subtasks`` 给——两条路都还在，只是「引擎上多挂一个入口」这一层没人用了。
+接口只留有人用的部分（工单 #85 的验收标准 4）。
 
 **v1 那条读路径在 #58 里删掉了**：``view() -> TodayView`` 与它硬编码的三个分区、左栏的
 ``ListSummary`` 徽标、``/`` 的模糊过滤、以及子任务的勾选写路径（``toggle_subtask``）都只
@@ -39,8 +44,7 @@ v2 的全部读面。
 :mod:`dida.sync.completed`      已完成流的窗口与游标（t12）
 :mod:`dida.sync.schedule`       顺延与改期：截止时间怎么挪（t13 / t14 / #40 / #44）
 :mod:`dida.sync.create`         新建一条任务要发什么（t15 / #39）
-:mod:`dida.sync.priority`       优先级推进一档（t17 / #45）
-:mod:`dida.sync.subtasks`       子任务的先读后写（t20）
+:mod:`dida.sync.capabilities`   构造那一处问清「谁会做什么」（#85）
 ============================  ==========================================
 
 各片的方法挂在同一个 ``SyncEngine`` 上（它们用 ``self._clock`` / ``self._source`` / 彼此的
@@ -63,12 +67,13 @@ from __future__ import annotations
 import asyncio
 from dataclasses import dataclass
 from datetime import date, datetime
-from typing import TYPE_CHECKING, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import AuthError, DidaError, NetworkError
 from dida.api.guards import all_day_date
 from dida.clock import Clock
 from dida.logical_day import logical_day
+from dida.sync.capabilities import Capabilities, MissingCapability
 from dida.sync.completed import (
     DEFAULT_COMPLETED_WINDOW_HOURS,
     CompletedReader,
@@ -86,27 +91,28 @@ from dida.sync.lists import (
     UnknownListError,
     is_list_edit,
 )
-from dida.sync.priority import PriorityMixin
+from dida.sync.pump import PumpMixin
 from dida.sync.push import PushMixin, TaskWriter, backoff_delay
 from dida.sync.read import (
     ListKind,
     ListRow,
     PayloadReader,
+    ReadModel,
     TaskDetail,
     TaskList,
     ViewReader,
     ViewRow,
+    assemble_read_model,
     builtin_view_rows,
-    container_tasks,
     custom_view_rows,
+    detail_of,
     is_inbox_id,
-    list_index,
+    list_rows,
     resolve_lists,
     task_detail,
 )
 from dida.sync.refresh import ProjectReader, RefreshMixin, RefreshTarget
 from dida.sync.schedule import ScheduleMixin
-from dida.sync.subtasks import SubtaskMixin
 from dida.sync.tags import TagMixin, TagReader
 from dida.sync.view import (
     INBOX_ID,
@@ -123,7 +129,6 @@ from dida.sync.view import (
     ViewSource,
     completed_section,
     format_due,
-    list_names,
     next_priority,
     priority_mark,
     subtask_items,
@@ -138,6 +143,7 @@ from dida.sync.writes import (
     WireCall,
     WriteKind,
     WriteTarget,
+    is_a_change,
     is_a_move,
     is_local_id,
     is_local_list_id,
@@ -176,9 +182,7 @@ from dida.sync.views import (
     view_from_payload,
     view_payload,
 )
-
-if TYPE_CHECKING:  # 只为了标注：storage 反过来 import dida.sync.view，运行时不能在这里 import
-    from dida.storage.store import RefreshReport
+from dida.vocabulary import RefreshReport
 
 __all__ = [
     "ANY_VALUE",
@@ -223,8 +227,10 @@ __all__ = [
     "ListWriteKind",
     "ListWriteTarget",
     "LocalEffect",
+    "MissingCapability",
     "PayloadReader",
     "ProjectReader",
+    "ReadModel",
     "RefreshTarget",
     "SUBTASK_COMPLETED_STATUS",
     "SubtaskItem",
@@ -258,19 +264,18 @@ __all__ = [
     "builtin_view_definitions",
     "builtin_view_rows",
     "completed_section",
-    "container_tasks",
     "custom_view_rows",
     "due_window_of",
     "evaluate_view",
     "format_due",
     "implied_due_for",
+    "is_a_change",
     "is_a_move",
     "is_inbox_id",
     "is_list_edit",
     "is_local_id",
     "is_local_list_id",
     "is_view_edit",
-    "list_index",
     "logical_day",
     "next_priority",
     "order_key",
@@ -289,20 +294,21 @@ DEFAULT_DAY_END = "00:00"
 """配置注入之前的默认日界：零偏移，逻辑日等于自然日（规范形式见 ADR 0003）。"""
 
 
-def pending_error(source: object) -> str | None:
-    """本地队列里最后一条推不出去的改动报的错（源上没有队列就是 ``None``）。
+def pending_error(queue: WriteTarget | None) -> str | None:
+    """本地队列里最后一条推不出去的改动报的错（这份副本没有队列就是 ``None``）。
 
     读的是一条**已经记下来的事实**：``Store.record_attempt`` 把失败原因写在那一行上
     （``last_error``），这里只是把它带到 :class:`SyncStatus` 上，让它到得了界面（用户故事
     81：保存失败要说具体原因）。
 
-    只读替身（``InMemorySource`` 那种）没有队列，于是没有这个信息——与写路径上那几个
-    ``isinstance`` 门同一条口径：不知道就说不知道，不猜一个。
+    参数是**构造时定下来的那一格**（工单 #85 的 :attr:`Capabilities.writes`），不是一个还没
+    问过的源：只读替身（``InMemorySource`` 那种）没有队列，于是没有这个信息——「不知道就说
+    不知道」这件事在构造那一处就定了，业务路径不再临场探一次。真的 ``Store`` 本身就满足
+    ``WriteTarget``，所以照旧可以直接把它递进来。
     """
-    pending = getattr(source, "pending", None)
-    if not callable(pending):
+    if queue is None:
         return None
-    errors = [str(change.last_error) for change in pending() if getattr(change, "last_error", None)]
+    errors = [str(change.last_error) for change in queue.pending() if change.last_error]
     return errors[-1] if errors else None
 
 
@@ -448,6 +454,14 @@ class Engine(Protocol):
         """
         ...
 
+    def read_model(self) -> ReadModel | None:
+        """读：从**当下这一份**本地副本一次装配出整份读模型（#81）。
+
+        界面一次重画调它一次，三种读形状（清单索引 / 某个容器的任务 / 单条任务详情）都是
+        它的投影——读一次只算一遍。没有本地副本时给 ``None``（降级态）。
+        """
+        ...
+
     def list_index(self) -> tuple[ListRow, ...]:
         """读：清单索引（内置视图、自定义视图、真实清单三种行）。"""
         ...
@@ -501,8 +515,12 @@ class Engine(Protocol):
         *,
         changes: Mapping[str, Any] | None = None,
         kind: WriteKind = WriteKind.UPDATE,
-    ) -> None:
+    ) -> bool:
         """写：把 ``changes`` 里那几个字段盖上去（本地当场生效 + 立刻推送）。
+
+        **回报这次到底改了没有**（工单 #79）：改了回 ``True``；一位都没变时什么都不写（不入队、
+        不排推送、不动本地那一份）回 ``False``。完成 / 删除那几条预置写没有这一档，照旧回
+        ``True``（它们的对外动作是不可逆的，再来一次就是再来一次）。
 
         改一个字段（详细页 #43 的标题 / 描述 / 备注）与完成、删除走的是同一条乐观写路径；
         本地没有这条任务的底稿时当场抛 :class:`~dida.sync.writes.UnknownTaskError`——界面
@@ -522,23 +540,32 @@ class Engine(Protocol):
         """
         ...
 
-    def defer(self, task_id: str, *, days: int = 1) -> None:
-        """写：顺延 ``days`` 个逻辑日（``g`` 是 1 天、``G`` 是 7 天）。"""
+    def defer(self, task_id: str, *, days: int = 1) -> bool:
+        """写：顺延 ``days`` 个逻辑日（``g`` 是 1 天、``G`` 是 7 天）。
+
+        回报这次到底挪了没有（#79）：落点与本地那一份相同时回 ``False``（什么都不写）。
+        """
         ...
 
     def delete(self, task_id: str) -> None:
         """写：删除一条任务（服务端没有撤销，t16）。"""
         ...
 
-    def move_task(self, task_id: str, *, to_list_id: str) -> None:
-        """写：把这条任务搬到另一个清单——走**搬运端点**，不是普通字段更新（#45）。"""
+    def move_task(self, task_id: str, *, to_list_id: str) -> bool:
+        """写：把这条任务搬到另一个清单——走**搬运端点**，不是普通字段更新（#45）。
+
+        回报这次到底搬了没有（#79）：搬到它已经在的那个清单回 ``False``（什么都不写）。
+        """
         ...
 
-    def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> None:
+    def reschedule(self, task_id: str, *, due: datetime | None, all_day: bool = False) -> bool:
         """写：改期——把截止时间换成 ``due``，只动 ``dueDate`` 与 ``isAllDay``。
 
         ``due=None`` 是**清除**（详细页 #44 的「把任务变回没有日期」）：写显式的
         ``dueDate: null``，让服务端知道这一格空了，而不是「别动它」。
+
+        回报这次到底改了没有（#79）：那一刻与本地那一份相同（同一个时刻的两种写法也算相同）
+        回 ``False``——详细页「一个字都没改就提交」那一次空写走的就是这里。
         """
         ...
 
@@ -564,8 +591,11 @@ class Engine(Protocol):
 
     def update_list(
         self, list_id: str, *, name: str | None = None, color: str | None = None
-    ) -> None:
-        """写：改清单的名字与颜色（``e``）——没给的字段不动（#42）。"""
+    ) -> bool:
+        """写：改清单的名字与颜色（``e``）——没给的字段不动（#42）。
+
+        回报这次到底改了没有（#79）：给的字段都与本地那一行相同时回 ``False``。
+        """
         ...
 
     def delete_list(self, list_id: str) -> None:
@@ -580,9 +610,12 @@ class Engine(Protocol):
         """
         ...
 
-    def update_view(self, definition: ViewDefinition) -> None:
+    def update_view(self, definition: ViewDefinition) -> bool:
         """写：改一个自定义视图的条件与名字（``e``）；本地没有这一行时抛
-        :class:`~dida.sync.views.UnknownViewError`（#36）。"""
+        :class:`~dida.sync.views.UnknownViewError`（#36）。
+
+        回报这次到底改了没有（#79）：交回来的那份与本地那一行一样时回 ``False``。
+        """
         ...
 
     def delete_view(self, view_id: str) -> None:
@@ -593,20 +626,9 @@ class Engine(Protocol):
         """读：一个自定义视图的定义；本地没有就是 ``None``（``e`` 的表单要拿它填当前值）。"""
         ...
 
-    def cycle_priority(self, task_id: str) -> None:
-        """写：优先级推进一档（``p``）——无 → 低 → 中 → 高 → 无。"""
-        ...
-
-    def subtasks(self, task_id: str) -> tuple[SubtaskItem, ...]:
-        """读：这条任务的子任务行（详情页的只读那一段），标题与完成状态都已经是可以直接画的成品。
-
-        **只读**：spec 的「子任务只看不勾（也不能增删改）」，所以没有对应的写入口（#58 把
-        v1 的 ``toggle_subtask`` 删掉了）。
-        """
-        ...
-
 
 class SyncEngine(
+    PumpMixin,
     ListMixin,
     ViewMixin,
     RefreshMixin,
@@ -614,16 +636,17 @@ class SyncEngine(
     CompletedStreamMixin,
     ScheduleMixin,
     CreateMixin,
-    PriorityMixin,
-    SubtaskMixin,
     TagMixin,
 ):
     """通用客户端的数据与写入入口（组装各片；读路径在本模块）。
 
-    :class:`~dida.sync.lists.ListMixin` 排在第一位，所以引擎的 ``push_pending()`` 是它那一份
-    （先推清单改动，再把任务那一份交给 :class:`~dida.sync.push.PushMixin`）；其余方法照旧
-    按名字解析，各自的 ``self._…`` 都落在同一个实例上。:class:`~dida.sync.views.ViewMixin`
-    在它们后面：自定义视图的建 / 改 / 删**只在本地落库**，与推送那几片没有交集。
+    ``push_pending()`` 是 :class:`~dida.sync.pump.PumpMixin` 那**一台**泵（它按 :class:`~dida.sync.pump.PushQueue`
+    把清单与任务两本账各抽一遍），``refresh()`` 是 :class:`~dida.sync.refresh.RefreshMixin`
+    那**一个**实现（取数落库之后顺手认领新建的清单）——这两个方法各自只有一个家，所以「谁先生效」
+    **不再由这里的基类排列顺序决定**（#84 之前是两个实现靠 ``super()`` 串起来，顺序一换清单改动
+    就悄悄不再推送）。其余方法照旧按名字解析，各自的 ``self._…`` 都落在同一个实例上。
+    :class:`~dida.sync.views.ViewMixin` 在中间：自定义视图的建 / 改 / 删**只在本地落库**，与推送
+    那几片没有交集。
     """
 
     def __init__(
@@ -644,6 +667,10 @@ class SyncEngine(
         self._account = account
         """换绑端口（工单 #92）。默认 ``None``：直接 new 一个引擎的测试不必为此准备存储与
         配置文件；生产由组合根注入一支真的（``dida.bootstrap.build_engine``）。"""
+        # 「这份本地副本 / 这个客户端会不会做某件事」**在构造这一处问清**（工单 #85）：
+        # 从前它被拆成 13 处运行时探测散在业务路径上，而「做不到」有四种说法。答案存在这张
+        # 表里，业务路径只读它；缺哪一件由 Capabilities 那一个地方说（MissingCapability）。
+        self._caps = Capabilities.of(source, client)
         self._completed_window_hours = completed_window_hours
         # 标签列表：用户打开挑标签那一格时拉一次，只活在内存里（见 dida.sync.tags 的模块文档）。
         self._tags: tuple[str, ...] = ()
@@ -689,7 +716,7 @@ class SyncEngine(
             pending_count=state.pending_count,
             last_refresh_at=state.last_refresh_at,
             logical_day=logical_day(now, self._day_end).label,
-            last_error=pending_error(self._source),
+            last_error=pending_error(self._caps.writes),
         )
 
     def logical_day(self) -> date:
@@ -701,43 +728,54 @@ class SyncEngine(
         """
         return logical_day(self._clock.now(), self._day_end).label
 
+    def read_model(self) -> ReadModel | None:
+        """读：从**当下这一份**本地副本一次装配出整份读模型（#81）。
+
+        界面一次重画调它一次，三种读形状都是它的投影：找一个容器不再把**视图**重新求值一遍
+        （视图在这一次装配里各算一次），同一个视图的条数与进去看到的成员也来自同一次求值。
+        **没有缓存**——每一次重画都从当下这一份本地副本重新装配，所以旧值不会留下来，也就
+        没有过期问题。
+
+        没有本地副本（``SyncEngine(source=None)`` 那种降级态）时给 ``None``：读不出东西是
+        「没有」，不是「空缓存」——空缓存照样有收集箱与三个内置视图那几行。
+        """
+        source = self._source
+        if source is None:
+            return None
+        tasks = tuple(source.tasks())
+        return assemble_read_model(
+            tuple(source.lists()),
+            tasks,
+            self._view_definitions(),
+            now=self._clock.now(),
+            day_end=self._day_end,
+            window_hours=self._completed_window_hours,
+            resolve_id=source.resolve_id,
+            payload_of=self._payload_of,
+        )
+
     def list_index(self) -> tuple[ListRow, ...]:
         """读：清单索引——收集箱置顶，然后内置视图、自定义视图、真实清单（#33）。
 
-        缓存不在就是空索引，不是错误（空缓存给空行，而不是抛）。
+        它是 :meth:`read_model` 那一份读模型的投影（#81）。缓存不在就是空索引，不是错误
+        （空缓存给空行，而不是抛）。
         """
-        if self._source is None:
-            return ()
-        tasks = tuple(self._source.tasks())
-        return list_index(
-            tuple(self._source.lists()),
-            tasks,
-            now=self._clock.now(),
-            day_end=self._day_end,
-            views=self._view_rows(tasks),
-        )
+        model = self.read_model()
+        return () if model is None else model.list_index()
 
     def tasks_in(self, container_id: str) -> TaskList:
         """读：某个容器的任务列表——它的**全部**未完成任务（未来的也在）+ 已完成的那部分。
 
-        认不出来的容器给空列表（清单被删了、光标停在一条已经不在了的行上）。
+        认不出来的容器给空列表（清单被删了、光标停在一条已经不在的行上）。
 
         ``container_id`` 可能是**认领换名之前**的那个清单 id（人正站在一个刚建好的清单里，
-        工单 #75）：先解析成它现在的名字，不然这一屏会是空的（读法见 ``ViewSource.resolve_id``）。
+        工单 #75）：读模型那一层先解析成它现在的名字，不然这一屏会是空的（读法见
+        ``ViewSource.resolve_id``）。
         """
-        if self._source is None:
+        model = self.read_model()
+        if model is None:
             return TaskList(container_id=container_id)
-        container_id = self._source.resolve_id(container_id)
-        tasks = tuple(self._source.tasks())
-        return container_tasks(
-            container_id,
-            tuple(self._source.lists()),
-            tasks,
-            now=self._clock.now(),
-            day_end=self._day_end,
-            window_hours=self._completed_window_hours,
-            views=self._view_rows(tasks),
-        )
+        return model.tasks_in(container_id)
 
     def task_detail(self, task_id: str) -> TaskDetail | None:
         """读：单条任务的详情（重复规则、提醒、子任务、原文里的未知字段都在这）。
@@ -745,21 +783,23 @@ class SyncEngine(
         ``task_id`` 可能是**认领换名之前**的那个临时 id（屏幕上那一行就是旧的，工单 #75）：
         先解析成它现在的名字，不然这一页会说「这条任务已经不在本地缓存里了」——而那正是用户
         报上来的那句话。
+
+        **不走** :meth:`read_model` 那一份整装配：详情形状不要视图成员，为它把所有视图求值
+        一遍是白付的（实测 500 条任务 / 8 个视图：0.11ms → 31ms）。它读的仍是当下这一份本地
+        副本，用的是同一条 :func:`~dida.sync.read.detail_of`——少装配一样东西，不是另一份实现。
         """
-        if self._source is None:
+        source = self._source
+        if source is None:
             return None
-        task_id = self._source.resolve_id(task_id)
-        tasks = tuple(self._source.tasks())
-        snapshot = next((item for item in tasks if item.id == task_id), None)
-        if snapshot is None:
-            return None
-        names = list_names(resolve_lists(tuple(self._source.lists()), tasks))
-        return task_detail(
-            snapshot,
-            self._payload_of(task_id),
-            names,
+        tasks = tuple(source.tasks())
+        return detail_of(
+            resolve_lists(tuple(source.lists()), tasks),
+            tasks,
+            task_id,
             now=self._clock.now(),
             day_end=self._day_end,
+            resolve_id=source.resolve_id,
+            payload_of=self._payload_of,
         )
 
     def move_targets(self) -> tuple[ListRow, ...]:
@@ -774,11 +814,19 @@ class SyncEngine(
           （``local-list-N``），拿它当 ``toProjectId`` 会 404，而那条改动**永远推不出去**
           ——状态栏那个数从此一直非零（#53/#54 是同一类）。判据是队列里还有没有这一行的
           ``CREATE``，不是 id 长什么样。
+
+        **不装配视图**（#81）：挑清单只要真实清单那几行（:func:`~dida.sync.read.list_rows`
+        那一份，与清单索引同一处组装），而视图成员是这一格里用不到的东西。
         """
+        source = self._source
+        if source is None:
+            return ()
         unseen = self._unseen_list_ids()
+        tasks = tuple(source.tasks())
+        rows = list_rows(resolve_lists(tuple(source.lists()), tasks), tasks)
         return tuple(
             row
-            for row in self.list_index()
+            for row in rows
             if row.kind is ListKind.LIST and row.enterable and row.id not in unseen
         )
 
@@ -786,41 +834,31 @@ class SyncEngine(
         """服务端还没见过的清单 id（本地还有一笔没推成功的 ``CREATE``）。
 
         读的是一条**已经记下来的事实**（``Store.pending_lists`` 那张队列表），不是 id 的
-        形状。只读替身没有队列，于是没有这个信息——与写路径上那几个 ``isinstance`` 门
-        同一条口径：不知道就说不知道，不猜一个。
+        形状。只读替身没有队列，于是没有这个信息——「不知道就说不知道」在构造那一处就定了
+        （工单 #85 的 :attr:`Capabilities.list_writes`），这里只是照它答。
         """
-        source = self._source
-        if not isinstance(source, ListWriteTarget):
-            return frozenset()
-        return frozenset(
-            change.list_id
-            for change in source.pending_lists()
-            if change.kind is ListWriteKind.CREATE
-        )
+        return self._caps.unseen_list_ids()
 
-    def _view_rows(self, tasks: Sequence[TaskSnapshot]) -> tuple[ViewRow, ...]:
-        """本地库里那些自定义视图的行：**在这里求值**（#36）。
+    def _view_definitions(self) -> tuple[ViewDefinition, ...]:
+        """本地库里那些自定义视图的**定义**（#36）；装配读模型时交给那一层去求值。
 
         本地副本只给**定义**（它手上没有逻辑日，不读时钟），求值走
         :func:`~dida.sync.read.custom_view_rows`——与内置视图那三个是同一个
-        ``evaluate_view``。源上没有这个能力就是「没有自定义视图」，不是错误——与写路径上
-        那几个 ``isinstance`` 门同一条口径。
+        ``evaluate_view``。源上没有这个能力就是「没有自定义视图」，不是错误——这一格在构造
+        那一处就定了（工单 #85 的 :attr:`Capabilities.views`）。
         """
-        source = self._source
-        if not isinstance(source, ViewReader):
-            return ()
-        return custom_view_rows(
-            tuple(source.view_definitions()),
-            tasks,
-            now=self._clock.now(),
-            day_end=self._day_end,
-        )
+        return self._caps.view_definitions()
 
     def _write_target(self) -> WriteTarget:
         """写路径要写的那个本地副本。没接上就大声报错——绝不假装写成功了。"""
-        if not isinstance(self._source, WriteTarget):
-            raise RuntimeError(
-                "写路径需要本地存储：SyncEngine(source=Store(...))；"
-                "只读的 ViewSource 存不下待推送改动"
-            )
-        return self._source
+        return self._caps.task_write_target()
+
+    def _payload_of(self, task_id: str) -> Mapping[str, Any] | None:
+        """本地那份任务原文；源读不出原文时当作「没有这条任务」。
+
+        要的是**读**的能力（``PayloadReader``），不是写的能力：详情形状（含只读的子任务行）
+        只读它，只读的替身存得下原文就该读得到。这一格在构造那一处就定了（工单 #85 的
+        :attr:`Capabilities.payload`）。#85 之前它挂在 ``SubtaskMixin`` 上——那个 mixin 的
+        另一个成员（``subtasks()``）没有调用者，退场了，这一件留下（有人用）。
+        """
+        return self._caps.payload_of(task_id)

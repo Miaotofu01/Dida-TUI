@@ -154,7 +154,7 @@ def test_the_cache_lives_at_the_path_the_composition_root_was_given(tmp_path):
     seeded(db, inbox_task(id="t1", title="写周报"))
     app = make_app(db, Server(), push_on_change=False, refresh_on_start=False)
 
-    app.engine.cycle_priority("t1")
+    app.engine.write("t1", changes={"priority": 1})
 
     assert db.exists()
     with Store(db) as reopened:
@@ -182,7 +182,7 @@ async def test_push_on_change_false_from_the_config_queues_instead_of_pushing(tm
     server = Server()
     app = make_app(db, server, push_on_change=False, refresh_on_start=False)
 
-    app.engine.cycle_priority("t1")
+    app.engine.write("t1", changes={"priority": 1})
     await app.engine.wait_for_pushes()
 
     assert server.requests == [], "配置关掉了「改动立即推送」"

@@ -75,8 +75,11 @@ CSS 里 ``cyan`` 是 ``#00FFFF``（真彩色）。同一个词两个意思——
 MODULE_WHITELIST = [
     "dida.config",  # 配置与凭据
     "dida.api.client",  # 滴答 API 客户端
+    "dida.vocabulary",  # 共用词汇（同步与本地副本的共同下界）
     "dida.storage.store",  # 本地存储
+    "dida.storage.queue",  # 队列表的记账机制（#82；本地存储那一支里的账本，只依赖 stdlib）
     "dida.sync.engine",  # 同步引擎
+    "dida.sync.capabilities",  # 构造那一处问清「谁会做什么」（#85）
     "dida.logical_day",  # 逻辑日
     "dida.rebind",  # 换绑服务（#92 的第七个深模块）
     "dida.tui.app",  # TUI
@@ -587,8 +590,26 @@ def test_the_duplicate_body_guard_catches_a_second_copy():
     )
 
 
+def _is_the_local_value(node: ast.AST) -> bool:
+    """这一边是不是「**界面自己那份值**」：裸名字 / 下标 / 调用 / 字面量。
+
+    ``values[LIST_FIELD]``（下标）、``int(picked)``（调用）、``value``（裸名字）都是界面手里
+    那一份。**属性不是**——属性说的是「另一个对象手里的那一份」，两边都是属性就是两个对象之间
+    的比较（挑选项回填那种：``option.value == detail.list_id``，见
+    :func:`_equality_against_a_bare_name` 的同一条口径）。
+    """
+    return isinstance(node, (ast.Name, ast.Subscript, ast.Call, ast.Constant))
+
+
 def _equality_with_attribute(source: str, attribute: str) -> list[int]:
-    """源码里 ``… .attribute == …`` 这种**相等比较**的行号。"""
+    """源码里 ``<引擎那一份 .attribute> == <界面自己那份值>`` 这种**相等比较**的行号。
+
+    两件事同时才算：有一边是那个引擎属性（``detail.list_id`` / ``detail.priority`` /
+    ``detail.tags``），**而且**另一边是界面自己手里的值（见 :func:`_is_the_local_value`）。
+    两边都是属性不算（``option.value == detail.list_id``：那是在问「当前这个值在不在这一份
+    选项里」，是回填不是判改动，``pages/detail.py`` 的 ``list_picker`` 正是这么用的；
+    ``mine.list_id == other.list_id`` 同理，那是两个对象之间的比较）。
+    """
     found: list[int] = []
     for node in ast.walk(ast.parse(source)):
         if not isinstance(node, ast.Compare):
@@ -596,36 +617,579 @@ def _equality_with_attribute(source: str, attribute: str) -> list[int]:
         if not any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
             continue
         operands = [node.left, *node.comparators]
-        if any(isinstance(item, ast.Attribute) and item.attr == attribute for item in operands):
+        engines = [
+            item
+            for item in operands
+            if isinstance(item, ast.Attribute) and item.attr == attribute
+        ]
+        if not engines:
+            continue
+        others = [item for item in operands if all(item is not engine for engine in engines)]
+        if any(_is_the_local_value(item) for item in others):
             found.append(node.lineno)
     return found
 
 
-def test_the_same_list_judgement_is_asked_of_the_engine_not_written_twice():
-    """「搬到它已经在的那个清单 = 没改」只实现一次，界面**问引擎**（工单 #58 的 T6）。
+def _equality_against_a_bare_name(source: str, attribute: str) -> list[int]:
+    """源码里 ``<某个裸名字> == … .attribute``（或反过来）这种比较的行号。
 
-    判据本体是 :func:`dida.sync.writes.is_a_move`，两个时刻各问一次（与
-    ``is_addressable_task`` 同一个形状）：引擎在 ``move_task`` 里问它决定**写不写**，
-    界面在 ``_apply_pick`` 里问它决定**推不推**。
-
-    界面那一问非有不可：``move_task`` 回不了话（它的签名是 ``-> None``），不问就会为一次
-    根本没发生的改动推一轮——``tests/test_picker_fields.py`` 钉着那句 ``pushes == 0``。
-    但**判据**只有一处，所以这里扫两件事：界面确实问了引擎，而且没有自己再比一遍。
+    与 :func:`_equality_with_attribute` 的差别在**另一边**：这里要求另一边是一个**裸名字**
+    （界面自己手里那份值），所以只抓「拿我这边那份值与引擎给的那一份比」这种形状；
+    ``option.value == field.value``（两边都是属性，挑选项回填那种正当比较）不算。
     """
-    source = (ROOT / "src" / "dida" / "tui" / "app.py").read_text(encoding="utf-8")
+    found: list[int] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Compare):
+            continue
+        if not any(isinstance(op, (ast.Eq, ast.NotEq)) for op in node.ops):
+            continue
+        operands = [node.left, *node.comparators]
+        named = any(isinstance(item, ast.Name) for item in operands)
+        valued = any(
+            isinstance(item, ast.Attribute) and item.attr == attribute for item in operands
+        )
+        if named and valued:
+            found.append(node.lineno)
+    return found
 
-    assert "is_a_move(" in source, "界面没有问引擎那条判据：它是不是又自己比了一遍？"
-    assert _equality_with_attribute(source, "list_id") == [], (
-        "界面自己判了「同一个清单」——这条判断归引擎（dida.sync.writes.is_a_move）"
+
+JUDGEMENT_NAMES = frozenset({"is_a_change", "is_a_move", "is_list_edit", "is_view_edit"})
+"""「这一次到底改了没有」那几个判据的名字（**本体只有一个**，其余是同一族的适配）。
+
+从 #79 起写的那一次自己回话（回报布尔），所以界面一处都不许再问、也不许再自己比一遍。
+"""
+
+
+def _judgements_in(source: str) -> list[str]:
+    """这份源码里用到那几个判据的地方，写成 ``行号: 名字``（空元组 = 干净）。
+
+    两种形状都算：``from … import is_a_move`` 进来的那个名字（``ast.alias``），以及直接用它
+    （``ast.Name`` / ``ast.Attribute``，后者兜住 ``import dida.sync.writes as w; w.is_a_move``）。
+    """
+    found: set[tuple[int, str]] = set()
+    for node in ast.walk(ast.parse(source)):
+        if isinstance(node, ast.Name) and node.id in JUDGEMENT_NAMES:
+            found.add((node.lineno, node.id))
+        elif isinstance(node, ast.Attribute) and node.attr in JUDGEMENT_NAMES:
+            found.add((node.lineno, node.attr))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            for alias in node.names:
+                if alias.name in JUDGEMENT_NAMES:
+                    found.add((node.lineno, alias.name))
+    return [f"{lineno}: {name}" for lineno, name in sorted(found)]
+
+
+def test_the_interface_never_judges_whether_something_changed():
+    """界面里 **0 处**自己判「改了没有」（工单 #79）。
+
+    判据本体是 :func:`dida.sync.writes.is_a_change`（写词汇那一层，比的是本地那一份原文），
+    六条写路径各自回报布尔；界面只按回报值决定推不推、说不说。所以 ``tui/`` 里一处都不许
+    出现那几个判据的名字——包括「再 import 进来问一遍」这条退路。
+
+    在 #79 之前这里恰好相反：``#58`` 的守卫要求界面 import ``is_a_move``（那时写入口回不了
+    话，只能各问一遍），于是同一个判断在六个地方各写一遍、第七处漏掉（ADR-0008 第二节记的
+    那次空写）。这条守卫守的是**那个方向**：判据只有一个主语。
+    """
+    sources = {
+        str(path.relative_to(ROOT)): path.read_text(encoding="utf-8")
+        for path in sorted((ROOT / "src" / "dida" / "tui").rglob("*.py"))
+    }
+
+    offenders = [
+        f"{name}:{where}" for name, source in sources.items() for where in _judgements_in(source)
+    ]
+
+    assert offenders == [], (
+        "界面自己判了「改了没有」——这条判断归引擎（dida.sync.writes.is_a_change），"
+        "写的那一次回报布尔，界面只按回报值走：\n" + "\n".join(offenders)
     )
 
 
-def test_the_same_list_guard_catches_an_inlined_comparison():
-    """上一条守卫自己也要有人守（工单 #58 的 T6）：再写一遍那个比较当场红。"""
+def test_the_interface_does_not_inline_the_comparisons_it_used_to_make():
+    """界面里**任何一处**都不许把那个比较**手写**回来（工单 #79）：import 与内联两种形状都要拦。
+
+    **覆盖整个 ``tui/``，不是只扫 ``app.py``**（工单 #83）：这几处曾经逐处写在 ``app.py`` 里、
+    比的是屏幕上那一份（而不是引擎手里的本地原文）。#83 把挑选型字段那一格搬进了
+    ``dida/tui/write_flow.py``——搬走的代码照样是界面，只认文件名的写法从那一刻起就没有覆盖，
+    所以这里扫的是 ``rglob("*.py")``：以后再往 ``tui/`` 里添模块，它一并被守着。
+
+    拦的是两组：
+
+    - 挑选型字段那几格（清单 / 优先级 / 标签）的属性比较（``values[LIST_FIELD] == detail.list_id``）；
+    - ``pages/detail.py`` 自由文本框退出时「编辑器里那段文字与 ``Field.value`` 相等」那一下
+      （形状是**裸名字 vs 属性**：``value == field.value``）。
+    """
+    sources = {
+        str(path.relative_to(ROOT)): path.read_text(encoding="utf-8")
+        for path in sorted((ROOT / "src" / "dida" / "tui").rglob("*.py"))
+    }
+
+    inlined = [
+        f"{name}:{attribute}:{lineno}"
+        for name, source in sources.items()
+        for attribute in ("list_id", "priority", "tags")
+        for lineno in _equality_with_attribute(source, attribute)
+    ]
+    assert inlined == [], (
+        "界面又自己比了一遍「改了没有」（比的是屏幕上那一份）：这条判断归引擎\n" + repr(inlined)
+    )
+
+    against_a_bare_name = [
+        f"{name}:{lineno}"
+        for name, source in sources.items()
+        for lineno in _equality_against_a_bare_name(source, "value")
+    ]
+    assert against_a_bare_name == [], (
+        "详细页又自己比了一遍「编辑器里那段文字与字段当前值相等」——这条判断归引擎"
+        "（dida.sync.writes.is_a_change），写的那一次回报布尔\n" + repr(against_a_bare_name)
+    )
+
+
+def test_the_interface_judgement_guard_catches_both_shapes():
+    """上两条守卫自己也要有人守（工单 #79）：import 与内联两种写法逐条钉住。"""
+    assert _judgements_in("from dida.sync.engine import is_a_move\n") == ["1: is_a_move"]
+    assert _judgements_in("if not is_a_move(a, b):\n    return False\n") == ["1: is_a_move"]
+    assert _judgements_in("import dida.sync.writes as w\n\nw.is_a_change(a, b)\n") == [
+        "3: is_a_change"
+    ], "换个写法绕过去也要拦得住"
+    assert _judgements_in("from dida.sync.engine import WriteKind, move_targets\n") == [], (
+        "不是那几个名字的 import 不算"
+    )
+    assert _judgements_in("self.engine.move_task(task_id, to_list_id=x)\n") == [], (
+        "把 id 当参数交出去不是「自己判」"
+    )
+
+
+def test_the_inlined_comparison_guard_catches_a_second_copy():
+    """内联那一条的守卫自己也要有人守：再写一遍那个比较当场红。
+
+    「两边都是属性」那一档是**故意**不算的（工单 #83 扩覆盖时定下来的口径）：它说的是两个
+    对象之间的比较，而 ``pages/detail.py`` 的 ``list_picker`` 真的在用它问「当前这个值在不在
+    这一份选项里」。#79 的判据形状永远是「**界面自己那份值** vs 引擎那份原文」——那一侧是
+    下标 / 调用 / 裸名字。
+    """
     inlined = "if field == LIST_FIELD:\n    if values[LIST_FIELD] == detail.list_id:\n        return False\n"
 
     assert _equality_with_attribute(inlined, "list_id") == [2]
     assert _equality_with_attribute("self.engine.move_task(task_id, to_list_id=x)\n", "list_id") == [], (
         "把 id 当参数传出去不是「自己判」"
     )
-    assert _equality_with_attribute("if other.list_id == mine.list_id:\n    pass\n", "list_id") == [1]
+    assert _equality_with_attribute("if int(picked) == detail.priority:\n    pass\n", "priority") == [1], (
+        "调用那一侧（``int(picked)``）也是界面自己那份值"
+    )
+    assert _equality_with_attribute(
+        "if any(option.value == detail.list_id for option in options):\n    pass\n", "list_id"
+    ) == [], "两边都是属性：挑选项回填那种正当比较（list_picker 正是这么用的）"
+    assert _equality_with_attribute("if other.list_id == mine.list_id:\n    pass\n", "list_id") == [], (
+        "同上：两个对象之间的比较不是「拿我这份值比对引擎那份原文」"
+    )
+
+    free_text = "value = self._editor_value()\nif value == field.value:\n    return\n"
+    assert _equality_against_a_bare_name(free_text, "value") == [2]
+    assert _equality_against_a_bare_name("if option.value == field.value:\n    pass\n", "value") == [], (
+        "两边都是属性的正当比较（挑选项回填）不算「自己判」"
+    )
+    assert _equality_against_a_bare_name(
+        'if event.input.id == "due-date" and event.value != self._due_prefill:\n    pass\n', "value"
+    ) == [], "「这一格被用户动过没有」不是「改了没有」"
+
+
+# ---------------------------------------------------------------------------
+# 写链只有一个家：接住 DidaError 与「叫一次写」不许长在同一个函数里（工单 #83）
+#
+# 在 #83 之前，十一个处理函数各自走完那十二行——接住失败 → 挑一句话 → 推一轮 → 重画，
+# 其中三处逐字相同。收进 dida/tui/write_flow.py 之后这条守卫盯着它不会被搬回来：处理函数
+# 只声明「写了什么」（叫一次写），失败怎么说、落在哪只有 WriteFlow.finish_write 一处。
+#
+# 别把这条读成「不许接 DidaError」：拉标签（on_detail_page_pick_requested）、同步收尾
+# （_pull_completed / _sync）接它是正当的——它们没有写。所以规矩是**两件事同时出现**才算。
+# ---------------------------------------------------------------------------
+
+ENGINE_WRITES = frozenset(
+    {
+        "write",
+        "move_task",
+        "reschedule",
+        "defer",
+        "create",
+        "delete",
+        "complete",
+        "uncomplete",
+        "create_list",
+        "update_list",
+        "delete_list",
+        "create_view",
+        "update_view",
+        "delete_view",
+    }
+)
+"""引擎那几条**写**路径（``self.engine.write(...)`` 那一族）。接住 ``DidaError`` 又调它们，
+就是在那一处手写了一遍「写的后半段」。"""
+
+DECLARED_WRITE = "perform"
+"""``Write.perform``——那个唯一的家把「写了什么」执行掉的那一下（``<那次写>.perform()``）。
+
+``perform`` 也算「叫了一次写」，为的是让 :data:`WRITE_CHAIN_HOME` **真的**撞上这条规矩：
+豁免是活的（今天它正是靠 perform 走到引擎的），不是一句摆设。
+"""
+
+WRITE_CHAIN_HOME = "WriteFlow.finish_write"
+"""那个唯一的家：唯一允许同时「接住 ``DidaError``」与「叫一次写」的函数。"""
+
+
+def _qualified_names(tree: ast.AST, prefix: str = "") -> dict[int, str]:
+    """每个函数/方法的名字：模块级就是函数名，类里写成 ``类.方法``（这条守卫要指名那个家）。"""
+    names: dict[int, str] = {}
+    for child in ast.iter_child_nodes(tree):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            name = f"{prefix}{child.name}"
+            names[id(child)] = name
+            names.update(_qualified_names(child, f"{name}."))
+        elif isinstance(child, ast.ClassDef):
+            names.update(_qualified_names(child, f"{prefix}{child.name}."))
+    return names
+
+
+def _own_parts(node: ast.AST) -> Iterator[ast.AST]:
+    """这个函数**自己**的那几段（不进嵌套函数——闭包算它自己的那一份）。"""
+    stack = list(ast.iter_child_nodes(node))
+    while stack:
+        item = stack.pop()
+        yield item
+        if isinstance(item, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            continue
+        stack.extend(ast.iter_child_nodes(item))
+
+
+def _catches_dida_error(node: ast.Try) -> bool:
+    """这个 ``try`` 接住 ``DidaError`` 吗（``except DidaError`` / ``except (A, DidaError)``）。"""
+    for handler in node.handlers:
+        caught = handler.type
+        if isinstance(caught, ast.Name) and caught.id == "DidaError":
+            return True
+        if isinstance(caught, ast.Tuple) and any(
+            isinstance(item, ast.Name) and item.id == "DidaError" for item in caught.elts
+        ):
+            return True
+    return False
+
+
+def _calls_a_write(node: ast.AST) -> str | None:
+    """这个调用是不是「一次写」：``self.engine.write(...)`` 那一族，或者 ``<那次写>.perform()``。"""
+    if not isinstance(node, ast.Call):
+        return None
+    func = node.func
+    if not isinstance(func, ast.Attribute):
+        return None
+    if func.attr == DECLARED_WRITE:
+        return func.attr
+    if func.attr not in ENGINE_WRITES:
+        return None
+    receiver = func.value
+    grounded = (isinstance(receiver, ast.Attribute) and receiver.attr == "engine") or (
+        isinstance(receiver, ast.Name) and receiver.id == "engine"
+    )
+    return func.attr if grounded else None
+
+
+def _write_chain_offenders(source: str) -> list[str]:
+    """这份源码里「自己写了一遍一次写的后半段」的函数，写成 ``函数: 接住…写…``（空 = 干净）。
+
+    唯一的例外是 :data:`WRITE_CHAIN_HOME` 本人——它是那个家。
+    """
+    tree = ast.parse(source)
+    names = _qualified_names(tree)
+    offenders: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        where = names.get(id(node), node.name)
+        if where == WRITE_CHAIN_HOME:
+            continue
+        parts = list(_own_parts(node))
+        catches = [
+            item.lineno for item in parts if isinstance(item, ast.Try) and _catches_dida_error(item)
+        ]
+        writes = [
+            f"{item.lineno}: {called}"
+            for item in parts
+            if (called := _calls_a_write(item)) is not None
+        ]
+        if catches and writes:
+            offenders.append(f"{where}: 接住 DidaError @{catches}，又写 @[{', '.join(writes)}]")
+    return offenders
+
+
+def test_the_write_chain_has_exactly_one_home():
+    """一次写的后半段**只有一个家**：``dida/tui/write_flow.py`` 的 ``WriteFlow.finish_write``（#83）。
+
+    十一个处理函数只声明「写了什么」（叫一次引擎写）与「成功那句说什么」；接住失败、挑话、
+    推一轮、重画都在那个家里。所以 ``tui/`` 里**任何函数**都不许同时出现「接住 ``DidaError``」
+    与「叫一次写」——那种组合就是一份手写的后半段。
+
+    这条守的是**搬家之后不会搬回来**（#83 之前它正是十一个地方各写一遍的样子），不是
+    「不许接 ``DidaError``」：那两处正当的（拉标签、同步收尾）都没有写。
+    """
+    offenders = [
+        f"{path.relative_to(ROOT)}:{where}"
+        for path in sorted((ROOT / "src" / "dida" / "tui").rglob("*.py"))
+        for where in _write_chain_offenders(path.read_text(encoding="utf-8"))
+    ]
+
+    assert offenders == [], (
+        "这一处在自己写一遍「写的后半段」（接住失败 → 挑话 → 推 → 重画）——它归 "
+        f"dida/tui/write_flow.py 的 {WRITE_CHAIN_HOME}，处理函数只声明「写了什么」：\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_the_write_chain_guard_catches_a_second_copy():
+    """上一条守卫自己也要有人守（仓库惯例）：抄一份当场红，那个家与两种「只有一半」都不算。"""
+    second_copy = (
+        "class TasksPage:\n"
+        "    async def save_the_title(self, task_id, title):\n"
+        "        try:\n"
+        "            self.engine.write(task_id, changes={'title': title})\n"
+        "        except DidaError as exc:\n"
+        "            self._write_status(str(exc))\n"
+    )
+    assert _write_chain_offenders(second_copy) != [], "别处再写一遍后半段要红"
+
+    home = (
+        "class WriteFlow:\n"
+        "    async def finish_write(self, write):\n"
+        "        try:\n"
+        "            write.perform()\n"
+        "        except DidaError as error:\n"
+        "            self._fail(error)\n"
+    )
+    assert _write_chain_offenders(home) == [], "那个唯一的家是允许的（豁免的对象正是它）"
+    assert _write_chain_offenders(home.replace("finish_write", "finish_write_again")) != [], (
+        "换个名字把它抄一份就不是那个家了"
+    )
+    assert _write_chain_offenders(
+        "async def load():\n    try:\n        await self.engine.load_tags()\n    except DidaError:\n        return\n"
+    ) == [], "接住 DidaError 但没写的不算（拉标签、同步收尾那几处正是这样）"
+    assert _write_chain_offenders(
+        "async def save():\n    await self.engine.write('t1', changes={})\n"
+    ) == [], "只声明「写了什么」、不接错的不算"
+    assert _write_chain_offenders(
+        "async def pump():\n    try:\n        await self.engine.push_pending()\n    except DidaError:\n        return\n"
+    ) == [], "推不是写（推送有多个正当调用点）"
+    assert _write_chain_offenders(
+        "class Inner:\n"
+        "    async def close(self):\n"
+        "        try:\n"
+        "            self.engine.delete('t1')\n"
+        "        except DidaError:\n"
+        "            return\n"
+        "    def outer(self):\n"
+        "        pass\n"
+    ) != [], "藏在类里的那一份，别指望它溜过去"
+
+
+# ---------------------------------------------------------------------------
+# 依赖方向：sync 与 storage 都只指向 dida.vocabulary（工单 #78）
+#
+# 在共用词汇独立成模块之前，sync 为了用本地库那几个类型，撑了 9 处补丁：6 处只在
+# ``if TYPE_CHECKING:`` 里 import、3 处把 import 写进函数体。三种形状都得拦——它们都能让
+# 「新加一个共用类型得先猜放哪边」这件事回来。零容忍：sync 里一处都不许出现。
+# ---------------------------------------------------------------------------
+
+SYNC_PACKAGE = "dida.sync"
+
+
+def _is_storage(name: str) -> bool:
+    """这是不是本地存储那一支（``dida.storage`` 或它的子模块）。"""
+    return name == "dida.storage" or name.startswith("dida.storage.")
+
+
+def _names_type_checking(test: ast.expr) -> bool:
+    """这个 ``if`` 的条件里出现了 ``TYPE_CHECKING`` 吗。"""
+    return any(isinstance(node, ast.Name) and node.id == "TYPE_CHECKING" for node in ast.walk(test))
+
+
+def _import_place(node: ast.AST, parents: dict[int, ast.AST]) -> str:
+    """这处 import 在哪儿：模块顶层 / 只在类型检查时 / 函数体内（可叠加）。"""
+    places: list[str] = []
+    parent = parents.get(id(node))
+    while parent is not None:
+        if isinstance(parent, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            places.append("函数体内")
+        elif isinstance(parent, ast.If) and _names_type_checking(parent.test):
+            places.append("只在类型检查时")
+        parent = parents.get(id(parent))
+    return " + ".join(reversed(places)) or "模块顶层"
+
+
+def _storage_imports(source: str, *, package: str) -> tuple[str, ...]:
+    """这份源码里每一处 import 本地库的位置，写成 ``行号: 在哪``（空元组 = 干净）。"""
+    tree = ast.parse(source)
+    parents: dict[int, ast.AST] = {}
+    for parent in ast.walk(tree):
+        for child in ast.iter_child_nodes(parent):
+            parents[id(child)] = parent
+
+    found: list[str] = []
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.Import, ast.ImportFrom)):
+            continue
+        names: set[str] = set()
+        if isinstance(node, ast.Import):
+            names.update(alias.name for alias in node.names)
+        else:
+            base = _absolute_module(node, package=package)
+            if base:
+                names.add(base)
+                names.update(f"{base}.{alias.name}" for alias in node.names)
+        if any(_is_storage(name) for name in names):
+            found.append(f"{node.lineno}: {_import_place(node, parents)}")
+    return tuple(found)
+
+
+def test_sync_never_reaches_back_into_the_local_store():
+    """``sync`` 只许依赖 :mod:`dida.vocabulary`，一处本地库 import 都不许有（工单 #78）。
+
+    这条守的是**方向**，不是「现在这几处对不对」：顶层、``if TYPE_CHECKING:``、函数体内
+    三种形状一视同仁——补丁当初正是靠后两种绕开那个环的。
+    """
+    offenders = [
+        f"{path.relative_to(ROOT)}:{where}"
+        for path in sorted((ROOT / "src" / "dida" / "sync").rglob("*.py"))
+        for where in _storage_imports(path.read_text(encoding="utf-8"), package=_package_of(path))
+    ]
+
+    assert offenders == [], (
+        "sync 只许依赖 dida.vocabulary（工单 #78）：本地库那一支一处都不许 import，"
+        "函数内 import 与 TYPE_CHECKING 后门同样不行：\n" + "\n".join(offenders)
+    )
+
+
+@pytest.mark.parametrize(
+    "source, expected",
+    [
+        ("from dida.storage.store import Store\n", ("1: 模块顶层",)),
+        ("import dida.storage\n", ("1: 模块顶层",)),
+        ("from ..storage import store\n", ("1: 模块顶层",)),
+        (
+            "if TYPE_CHECKING:\n    from dida.storage.store import RefreshReport\n",
+            ("2: 只在类型检查时",),
+        ),
+        (
+            "def f():\n    from dida.storage.store import COMPLETED_STATUS\n"
+            "    return COMPLETED_STATUS\n",
+            ("2: 函数体内",),
+        ),
+    ],
+)
+def test_the_storage_backdoor_guard_catches_every_shape(source, expected):
+    """这条守卫自己也要有人守（工单 #78）：补丁的三种形状逐条钉住（不然它只是好看）。"""
+    assert _storage_imports(source, package=SYNC_PACKAGE) == expected
+
+
+def test_the_storage_backdoor_guard_lets_the_shared_vocabulary_through():
+    """共用词汇与自己的兄弟模块照旧放行——守卫拦的是**本地库那一支**。"""
+    source = (
+        "from dida.vocabulary import PendingChange, WriteKind\n"
+        "from dida.sync.view import ListSnapshot\n"
+        "from dida.sync.engine import SyncEngine\n"
+    )
+
+    assert _storage_imports(source, package=SYNC_PACKAGE) == ()
+
+
+# ---------------------------------------------------------------------------
+# 能力在构造那一处定下来：业务路径一处运行时探测都不许有（工单 #85）
+#
+# 在 #85 之前，「这份副本会不会做某件事」被拆成 13 处运行时探测散在业务路径上
+# （``isinstance(…, 某个 Protocol)`` / ``getattr`` + ``callable``），而「做不到」有四种说法。
+# 现在只有一个地方问：``Capabilities.of``（引擎构造那一处）。这条守卫盯着它不会被写回来——
+# 形状是「谁再临场探一次就当场红」，而不是「现在这几处对不对」。
+# ---------------------------------------------------------------------------
+
+CAPABILITY_PROTOCOLS = frozenset(
+    {
+        "ViewSource",
+        "WriteTarget",
+        "ListWriteTarget",
+        "RefreshTarget",
+        "ViewStore",
+        "ViewReader",
+        "PayloadReader",
+        "ProjectReader",
+        "TaskWriter",
+        "ProjectWriter",
+        "TagReader",
+        "CompletedReader",
+        "PushQueue",
+    }
+)
+"""「这份副本 / 这个客户端会不会做某件事」那几个能力协议（工单 #85）。
+
+``isinstance(…, 这里的一个名字)`` 就是一次临场探测。``isinstance(payload, Mapping)`` 那种
+**形状**检查不算——它问的不是「谁会做什么」，是「这份数据长什么样」。
+"""
+
+CAPABILITY_HOME = "src/dida/sync/capabilities.py"
+"""唯一允许问「谁会做什么」的地方（工单 #85）：构造那一处的那一张表。"""
+
+
+def _is_a_capability(node: ast.AST) -> bool:
+    """``isinstance`` 的第二个参数是不是一个能力协议（裸名字，或者元组里的一个）。"""
+    if isinstance(node, ast.Name):
+        return node.id in CAPABILITY_PROTOCOLS
+    if isinstance(node, ast.Tuple):
+        return any(_is_a_capability(item) for item in node.elts)
+    return False
+
+
+def _capability_probes(source: str) -> list[str]:
+    """这份源码里的临场能力探测，写成 ``行号: 形状``（空 = 干净）。"""
+    found: list[str] = []
+    for node in ast.walk(ast.parse(source)):
+        if not isinstance(node, ast.Call):
+            continue
+        name = getattr(node.func, "id", None)
+        if name == "isinstance" and len(node.args) >= 2 and _is_a_capability(node.args[1]):
+            found.append(f"{node.lineno}: isinstance")
+        elif name == "callable":
+            found.append(f"{node.lineno}: callable")
+    return found
+
+
+def test_the_capability_is_decided_in_exactly_one_place():
+    """业务路径上**一处**运行时能力探测都没有——只有构造那一处问一次（工单 #85）。
+
+    两种形状都拦：``isinstance(source, ListWriteTarget)`` 与 ``getattr`` + ``callable``
+    （``pending_error`` 原来那种「装作没这回事」的写法）。业务路径读
+    :attr:`~dida.sync.engine.SyncEngine._caps` 里已经定下来的那一格。
+    """
+    offenders = [
+        f"{path.relative_to(ROOT)}:{where}"
+        for path in sorted((ROOT / "src" / "dida" / "sync").rglob("*.py"))
+        if str(path.relative_to(ROOT)) != CAPABILITY_HOME
+        for where in _capability_probes(path.read_text(encoding="utf-8"))
+    ]
+
+    assert offenders == [], (
+        "「谁会做什么」只许在构造那一处问一次（dida/sync/capabilities.py）：\n"
+        + "\n".join(offenders)
+    )
+
+
+def test_the_capability_probe_guard_catches_a_second_copy():
+    """上一条守卫自己也要有人守（仓库惯例）：两种形状逐条钉住，形状检查不算。"""
+    assert _capability_probes("if isinstance(source, ListWriteTarget):\n    return ()\n") == [
+        "1: isinstance"
+    ]
+    assert _capability_probes(
+        "pending = getattr(source, 'pending', None)\nif not callable(pending):\n    return None\n"
+    ) == ["2: callable"], "``getattr`` + ``callable`` 那种写法也要拦得住"
+    assert _capability_probes(
+        "if isinstance(source, (WriteTarget, ListWriteTarget)):\n    pass\n"
+    ) == ["1: isinstance"], "元组里的一个也算"
+    assert _capability_probes("if isinstance(payload, Mapping):\n    pass\n") == [], (
+        "形状检查不是「谁会做什么」"
+    )
+    assert _capability_probes("if isinstance(created, Mapping) or not created.get('id'):\n    pass\n") == []
+

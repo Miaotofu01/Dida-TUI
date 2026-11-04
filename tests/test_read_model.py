@@ -17,7 +17,7 @@ from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
 
-from dida.sync.engine import ListKind
+from dida.sync.engine import DueWindow, ListKind
 from dida.testing import FakeBackend, ManualClock
 
 TZ = timezone(timedelta(hours=8))
@@ -285,6 +285,44 @@ def test_the_detail_reads_repeat_reminders_subtasks_and_unknown_fields():
 def test_a_task_that_is_not_in_the_cache_has_no_detail():
     """本地没有这条任务（光标停在一条已经不在的行上）时给 ``None``，不是错误。"""
     assert make_backend().task_detail("没有这条任务") is None
+
+
+# ---------------------------------------------------------------- 一次装配：三种看法（#81）
+
+
+def test_the_three_read_shapes_are_projections_of_one_read_model():
+    """三个读形状来自**同一份读模型**（#81）：条数、顺序、隐含日期、逾期位都对得上。
+
+    期望值来自 spec，不是照抄实现：「今天」= 逾期 ∪ 今天到期、逾期置顶、同一个截止窗口的
+    自建视图隐含同一个逻辑日、条数数的是成员里未完成的那些。这条测试**只断内容**——
+    「求值了几遍」归探针管，调用次数不进测试（那会变成假红）。
+    """
+    backend = make_backend()
+    backend.add_list("工作", id="work")
+    backend.add_task("昨天到期", list_name="work", due=T0 - timedelta(days=1))
+    backend.add_task("今天到期", list_name="work", due=T0.replace(hour=18))
+    backend.add_task("下个月", list_name="work", due=T0 + timedelta(days=30))
+    backend.add_view("和今天一样", id="v1", due=DueWindow(first=None, last=0))
+
+    model = backend.read_model()
+    rows = {row.id: row for row in model.list_index()}
+
+    assert rows["today"].unfinished == 2, "逾期 ∪ 今天到期"
+    assert rows["v1"].unfinished == 2, "自建视图与内置「今天」同一个窗口"
+    assert rows["work"].unfinished == 3, "真实清单数的是这个清单里的全部未完成"
+
+    today = model.tasks_in("today")
+    assert [item.task_id for item in today.items] == ["t1", "t2"], "逾期置顶"
+    assert [item.overdue for item in today.items] == [True, False], "逾期位由逻辑日判定"
+    assert len(today.items) == rows["today"].unfinished, "条数与成员来自同一次求值"
+    assert len(model.tasks_in("v1").items) == rows["v1"].unfinished
+    assert model.tasks_in("v1").implied_due == today.implied_due, "同一个窗口隐含同一天"
+
+    detail = model.task_detail("t1")
+    assert detail is not None
+    assert (detail.task_id, detail.title, detail.list_name) == ("t1", "昨天到期", "工作")
+    assert detail.due_text == "昨天 12:03"
+    assert model.task_detail("没有这条任务") is None
 
 
 
