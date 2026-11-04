@@ -5,8 +5,9 @@
 
 两组类型：
 
-- 输入（缓存 → 引擎）：:class:`ListSnapshot` / :class:`TaskSnapshot` / :class:`SyncState`，
-  :class:`ViewSource` 是它们的只读入口，t08 的 ``Store`` 实现它。
+- 输入（缓存 → 引擎）：:class:`ListSnapshot` / :class:`TaskSnapshot` / :class:`SyncState`
+  （#78 起它们住在 :mod:`dida.vocabulary`，这里只转出——本地库也要用它们，而两边不许
+  import 对方），:class:`ViewSource` 是它们的只读入口，t08 的 ``Store`` 实现它。
 - 输出（引擎 → TUI）：:class:`TaskItem` / :class:`CompletedItem` / :class:`CompletedSection`
   / :class:`SubtaskItem`——三种读形状（清单索引 / 某个容器的任务列表 / 单条任务的详情）
   的行在 :mod:`dida.sync.read` 里组装，这里只提供这一行的字段与它们各自的读法。
@@ -30,6 +31,7 @@ from typing import Any, Mapping, Protocol, Sequence
 
 from dida.logical_day import logical_day
 from dida.sync.rows import completed_window_start, row_order_tail, row_sort_key
+from dida.vocabulary import INBOX_ID, INBOX_NAME, ListSnapshot, SyncState, TaskSnapshot
 
 NO_DUE_TEXT = "-"
 """没有截止时间的读法；与「今天」一眼可分。
@@ -38,84 +40,6 @@ NO_DUE_TEXT = "-"
 2 格，一旦它进了对齐列（截止时间那一列）整列就歪。换成 ASCII 的连字符：任何 locale 下
 都是 1 格，形状仍然是「一道短横」。
 """
-
-INBOX_ID = "inbox"
-"""收集箱在 API 里的 projectId 别名。"""
-
-INBOX_NAME = "收集箱"
-
-
-@dataclass(frozen=True)
-class ListSnapshot:
-    """缓存里的一条清单（API 叫 project）：只有事实，没有判断。
-
-    ``color`` / ``group_id`` / ``kind`` / ``permission`` 是服务端 ``Project`` 上的字段
-    （``kind`` 是 ``TASK`` / ``NOTE``，``permission`` 是 ``write`` / ``read`` / ``comment``），
-    清单索引页要用它们标出「装不了任务的」「改不动的」那些行（用户故事 23 / 24）。
-    ``is_inbox`` 是客户端认出来的收集箱那一行——服务端的清单索引里没有它（实测）。
-    """
-
-    id: str
-    name: str
-    color: str | None = None
-    group_id: str | None = None
-    kind: str | None = None
-    permission: str | None = None
-    is_inbox: bool = False
-
-
-@dataclass(frozen=True)
-class TaskSnapshot:
-    """缓存里的一条任务快照：只有事实，没有判断。"""
-
-    id: str
-    title: str
-    list_id: str
-    due: datetime | None = None
-    """截止时刻（带时区）；``all_day=True`` 时它是个**日期标记**，按 ``.date()`` 读
-    （写出去的正常形状是那一天的 UTC 午夜，#73；修好之前的历史数据可能是本地午夜）。"""
-
-    all_day: bool = False
-    priority: int = 0
-    """``0`` / ``1`` / ``3`` / ``5``（无 / 低 / 中 / 高），与 API 一致。"""
-
-    completed: bool = False
-
-    completed_at: datetime | None = None
-    """完成时刻（服务端的 ``completedTime``）；本地刚完成、服务端还没认过的那些是 ``None``。"""
-
-    desc: str = ""
-    """服务端的 ``desc``：GLOSSARY 里它是**备注**（详情页「备注」那一行画的就是它）。"""
-
-    content: str = ""
-    """服务端的 ``content``：GLOSSARY 里它是**描述**。
-
-    ``desc`` 与 ``content`` 是两个字面不同的字段，这里不合并、也不互相兜底——详情页两行
-    各画各的，改一个不会覆盖另一个。**v1 把这两个标反了**（描述当成 ``desc``），这份
-    spec 纠正它：描述 = ``content``、备注 = ``desc``（``GLOSSARY.md`` 的「任务」一节，
-    翻转的落点在 :func:`dida.tui.pages.detail.fields_of`）。
-    """
-
-    tags: tuple[str, ...] = ()
-    """服务端的 ``tags``：标签名，按服务端给的顺序。"""
-
-    repeat_flag: str = ""
-    """服务端的 ``repeatFlag``（重复规则原文，如 ``RRULE:FREQ=WEEKLY``）。
-
-    任务行只需要「是不是重复任务」（空串 = 不是），规则原文照旧原样留着——它只读，而且
-    回写时一个字都不许动（spec 的「改期绝不触碰重复规则」）。
-    """
-
-    reminders: tuple[str, ...] = ()
-    """服务端的 ``reminders``（提醒触发器原文）：行里只读「有没有提醒」，不改。"""
-
-
-@dataclass(frozen=True)
-class SyncState:
-    """缓存里的同步状态。"""
-
-    last_refresh_at: datetime | None = None
-    pending_count: int = 0
 
 
 class ViewSource(Protocol):

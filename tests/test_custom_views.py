@@ -57,7 +57,7 @@ from dida.sync.views import (
     ViewFormProblem,
     due_window_of,
 )
-from dida.testing import FakeBackend, FakeTransport, ManualClock
+from dida.testing import FakeBackend, FakeTransport, InMemorySource, ManualClock
 
 TZ = timezone(timedelta(hours=8))
 T0 = datetime(2026, 3, 14, 12, 3, tzinfo=TZ)
@@ -554,6 +554,18 @@ def test_the_store_is_where_custom_views_live(store):
     from dida.sync.engine import ViewStore
 
     assert isinstance(store, ViewStore)
+
+
+def test_the_read_only_double_also_satisfies_the_view_store():
+    """只读替身（``InMemorySource``）同样满足 ``ViewStore``——这是**协议面**，不是零调用者的新代码。
+
+    它那五个方法（``view_definitions`` / ``view_definition`` / ``save_view`` / ``drop_view`` /
+    ``new_view_id``）在测试里不都被直接调过，但 :class:`~dida.sync.views.ViewStore` 的文档与
+    ``tests/test_local_copy_interface.py`` 的「只读替身存得下视图」都指着这份表面（#86）。
+    """
+    from dida.sync.engine import ViewStore
+
+    assert isinstance(InMemorySource(), ViewStore)
 
 
 def test_a_created_view_lands_in_the_local_store_and_comes_back_as_a_definition(store):

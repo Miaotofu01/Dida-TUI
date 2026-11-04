@@ -107,7 +107,7 @@ def all_day_date(day: date) -> datetime:
     """全天任务的日期标记：``day`` 那一天的 **UTC 午夜**（全 app 一条口径，#73）。
 
     形状永远是 ``YYYY-MM-DDT00:00:00+0000``。这不是「哪一刻」：读侧按 UTC 取日期
-    （``storage/store.py`` 的 ``_parse_time`` 保留 ``+0000``，``sync/view.py`` 的
+    （``dida.vocabulary.read_time`` 保留 ``+0000``，``sync/view.py`` 的
     ``due_day(all_day=True)`` 取 ``.date()``），而服务端与官方客户端存的也是这一形状
     （实测：官方客户端写 ``2026-10-06T00:00:00.000+0000``）。
 

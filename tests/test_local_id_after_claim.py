@@ -330,7 +330,7 @@ async def test_standing_in_a_just_created_list_shows_its_name_not_the_local_id(t
 
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
-        app._finish_list_form({"name": "新清单", "color": ""})
+        await app._finish_list_form({"name": "新清单", "color": ""})
         await pilot.pause()
 
         index = app.index_page()
@@ -395,7 +395,7 @@ async def test_editing_a_just_created_list_from_the_index_page(tmp_path):
 
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
-        app._finish_list_form({"name": "新清单", "color": ""})
+        await app._finish_list_form({"name": "新清单", "color": ""})
         await pilot.pause()
         await app.engine.wait_for_pushes()
         await pilot.pause()

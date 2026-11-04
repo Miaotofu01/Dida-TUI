@@ -47,9 +47,23 @@ def test_lists_land_and_are_readable(store):
     store.apply_refresh(lists=[project(name="工作"), project(id="p2", name="生活")], tasks=[])
 
     assert [(item.id, item.name) for item in store.lists()] == [("p1", "工作"), ("p2", "生活")]
-    assert store.list_records()[0].color == "#ff0000"
-    assert store.list_records()[0].sort_order == 7
-    assert store.list_records()[0].group_id == "g1"
+    rows = {item.id: item for item in store.lists()}
+    assert rows["p1"].color == "#ff0000"
+    assert rows["p1"].group_id == "g1"
+
+
+def test_lists_come_back_in_the_servers_sort_order(store):
+    """清单按服务端的 ``sortOrder`` 排（#85 之后 ``sort_order`` 只从这个行为上读得到）。
+
+    ``list_records()`` 退场之后，「排序值落库了没有」不再靠读一个字段来断，而是断**顺序**——
+    那正是这个字段的用处。
+    """
+    store.apply_refresh(
+        lists=[project(id="p1", name="工作", sortOrder=7), project(id="p2", name="生活", sortOrder=1)],
+        tasks=[],
+    )
+
+    assert [item.id for item in store.lists()] == ["p2", "p1"], "sortOrder 小的在前"
 
 
 def test_list_rows_carry_the_project_kind_and_permission(store):
@@ -66,7 +80,6 @@ def test_list_rows_carry_the_project_kind_and_permission(store):
 
     assert (rows["p1"].kind, rows["p1"].permission) == ("NOTE", "read")
     assert (rows["p2"].kind, rows["p2"].permission) == (None, None), "服务端没给就是不知道"
-    assert (store.list_records()[0].kind, store.list_records()[0].permission) == ("NOTE", "read")
 
 
 def test_an_older_cache_gets_the_new_list_columns(tmp_path):
@@ -458,10 +471,10 @@ def test_the_inbox_is_flagged_as_the_inbox(store):
     """收集箱在 API 里是 ``"inbox"`` 这个别名，界面上它是独立一栏（spec 的清单 schema）。"""
     store.apply_refresh(lists=[project(), project(id="inbox", name="收集箱")])
 
-    inbox = {item.id: item for item in store.list_records()}["inbox"]
+    inbox = {item.id: item for item in store.lists()}["inbox"]
 
     assert inbox.is_inbox is True
-    assert {item.id: item for item in store.list_records()}["p1"].is_inbox is False
+    assert {item.id: item for item in store.lists()}["p1"].is_inbox is False
 
 
 def test_a_malformed_due_date_does_not_break_the_refresh(store):

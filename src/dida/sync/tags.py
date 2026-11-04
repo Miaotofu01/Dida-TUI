@@ -87,6 +87,4 @@ class TagMixin:
 
     def _tag_reader(self) -> TagReader:
         """拉标签列表要的那个客户端。没接上就大声报错——绝不假装拉过了。"""
-        if not isinstance(self._client, TagReader):
-            raise RuntimeError("标签列表需要 API 客户端：SyncEngine(client=DidaApiClient(...))")
-        return self._client
+        return self._caps.tag_reader()

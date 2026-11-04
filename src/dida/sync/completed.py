@@ -12,14 +12,12 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import TYPE_CHECKING, Any, Mapping, Protocol, Sequence, runtime_checkable
+from typing import Any, Mapping, Protocol, Sequence, runtime_checkable
 
 from dida.api.errors import MalformedResponseError
 from dida.api.guards import api_date
 from dida.sync.rows import completed_window_start, task_is_completed
-
-if TYPE_CHECKING:  # storage 反过来 import dida.sync.view，运行时不能在这里 import
-    from dida.storage.store import StoredSyncState
+from dida.vocabulary import StoredSyncState
 
 
 DEFAULT_COMPLETED_WINDOW_HOURS = 168
@@ -160,11 +158,7 @@ class CompletedStreamMixin:
 
     def _completed_reader(self) -> CompletedReader:
         """已完成流要的那个客户端。没接上就大声报错——绝不假装拉过了。"""
-        if not isinstance(self._client, CompletedReader):
-            raise RuntimeError(
-                "已完成流需要 API 客户端：SyncEngine(client=DidaApiClient(...))"
-            )
-        return self._client
+        return self._caps.completed_reader()
 
 
 def _completed_tasks(payload: Any) -> list[Mapping[str, Any]]:

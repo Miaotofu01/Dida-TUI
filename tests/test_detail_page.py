@@ -20,7 +20,7 @@ from textual._xterm_parser import XTermParser
 
 from dida.api.client import DidaApiClient
 from dida.storage.store import Store
-from dida.sync.engine import NO_DUE_TEXT, DidaError, UnknownTaskError
+from dida.sync.engine import NO_DUE_TEXT, UnknownTaskError
 from dida.sync.engine import SyncEngine
 
 from rich.cells import cell_len
@@ -954,24 +954,30 @@ async def test_a_refused_save_says_which_refusal_it_was():
 
 
 async def test_a_save_failure_that_is_not_the_known_one_still_names_the_reason():
-    """别的写失败也带上具体那一句（验收标准 9）：前缀之后是原因，不是一个句号。"""
-    fake = backend()
-    fake.write_error = DidaError("服务端说这个字段不行")
+    """别的写失败也带上具体那一句（验收标准 9）：前缀之后是原因，不是一个句号。
+
+    这一格用**真货**的那一句来试：任务还在等认领（本地 id，服务端还没给它 id）时引擎当场
+    拒绝（``UnclaimedTaskError``，工单 #53）。它不属于「本地没有这一条」那一类（本地明明
+    有），所以走的是**带上原因**的那一支——原来这里靠替身摆一个 ``write_error``，那不是这个
+    错误真正的来源。
+    """
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_task("还没同步完的", list_name="work", id="local-task-1")
     app = DidaApp(fake)
 
     async with app.run_test(size=WIDE) as pilot:
         await pilot.pause()
         await enter_detail(pilot, app)
         await pilot.press("enter")
-        await pilot.press(*clear(len(TITLE)))
+        await pilot.press(*clear(len("还没同步完的")))
         await pilot.press(*"新标题")
         await pilot.press("escape")
         await pilot.pause()
         text = screen_text(app)
 
-    assert messages.field_save_failed_message("服务端说这个字段不行") in text, (
-        f"保存失败没有带上具体原因：\n{text}"
-    )
+    assert "这条任务还在等同步" in text, f"保存失败没有带上具体原因：\n{text}"
+    assert "local-task-1" in text, f"原因里没说清是哪一条：\n{text}"
 
 
 # ------------------------------------------------------------------ 截止时间（#44）
@@ -1053,6 +1059,99 @@ async def test_typing_a_date_and_a_time_reschedules_the_task_to_that_moment():
     # 那一格的读法是引擎给的成品（「明天 09:30」），不是把用户敲的串原样抄上去——TUI 不自己
     # 拼日期（架构规则：日期判断与读法都在引擎里）。
     assert "明天 09:30" in field_row(text, "截止"), f"改完那一格没跟着变：\n{text}"
+
+
+SGR = re.compile(r"\x1b\[[0-9;]*m")
+"""ANSI 的 SGR 序列：屏幕文本里的样式就长这样。"""
+
+
+def status_style(screen: str, text: str) -> str:
+    """带样式的一屏里 ``text`` 那一段用的样式（原样，不去解读它是哪个颜色）。"""
+    for line in screen.splitlines():
+        if text not in SGR.sub("", line):
+            continue
+        runs: list[tuple[str, str]] = []
+        style, pos = "", 0
+        for match in SGR.finditer(line):
+            if line[pos : match.start()]:
+                runs.append((style, line[pos : match.start()]))
+            style = "" if match.group() == "\x1b[0m" else match.group()
+            pos = match.end()
+        if line[pos:]:
+            runs.append((style, line[pos:]))
+        for run_style, chunk in runs:
+            if text in chunk:
+                return run_style
+    raise AssertionError(f"屏幕上没有「{text}」这一段：\n{screen}")
+
+
+async def test_submitting_the_due_editor_without_changing_anything_writes_nothing(tmp_path):
+    """详细页把光标走到「截止」上、一个字都没改就提交：**空操作不入队、不推、不亮**（#79）。
+
+    ADR-0008 第二节记下的那次实测就是它的前身：在详细页把光标走到「截止」上连按三次
+    ``enter``（进编辑器 → 日期步 → 时刻步提交），引擎收到的是 ``rescheduled == ["t1"]``——
+    一笔什么都没改的写真的入队、真的推了一轮、状态栏的「待推送」就亮了一格。第七处漏掉是
+    因为写的那一次只回一个「什么都没有」；#79 让它自己回话，这一条就断在**传输层**上：
+    一个请求都没有（不是「替身没记账」，是网络上真的没东西出去）。
+
+    接缝二：真引擎 + 真库 + 打给假服务端的真客户端——与
+    ``test_a_change_that_cannot_be_pushed_says_why`` 同一套。什么都没改时界面也**不出声**：
+    不新增「没有改动」这类提示（措辞一个字不变）。
+    """
+    transport = Recording()
+    app = real_app(tmp_path, transport)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await walk_to_the_due_field(pilot, app)
+        await pilot.press("enter")  # 进截止编辑器（日期那一格，回填着当前那一刻）
+        await pilot.pause()
+        await pilot.press("enter")  # 日期这一格提交 → 轮到时刻
+        await pilot.pause()
+        await pilot.press("enter")  # 时刻这一格提交 → 「这一次改动」出去
+        await pilot.pause()
+        text = screen_text(app)
+        styled = screen_styled_text(app)
+        pending = app.engine.status().pending_count
+
+    assert transport.requests == [], (
+        "一个字都没改，却发了一个请求："
+        + repr([str(request.url) for request in transport.requests])
+    )
+    assert pending == 0, "空操作不许入队（状态栏那个数就是它）"
+    assert status_style(styled, "待推送 0") == status_style(styled, "已同步"), (
+        "空操作不许把状态栏那一段点亮：\n" + styled
+    )
+    assert "没有改动" not in text and "未改变" not in text, "什么都没改时界面不出声，不新增提示"
+    assert "今天" in field_row(text, "截止"), field_row(text, "截止")
+
+
+async def test_finishing_a_text_box_without_changing_anything_writes_nothing(tmp_path):
+    """详细页自由文本框原样退出：**一个请求都不发**（#79 删掉的那处界面自问的替补）。
+
+    这一格里界面以前自己比 ``value == field.value``（屏幕上那一份），#79 之后比的是引擎手里
+    的本地原文——写的那一次自己回话。这里走真引擎 + 假传输，所以「一笔都没有」在网络上看得见。
+    """
+    transport = Recording()
+    app = real_app(tmp_path, transport)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        await pilot.press("enter")  # 改标题：编辑器开着，一个字都不敲
+        await pilot.pause()
+        await pilot.press("escape")  # 结束编辑 = 保存
+        await pilot.pause()
+        text = screen_text(app)
+        pending = app.engine.status().pending_count
+
+    assert transport.requests == [], (
+        "标题一个字都没改，却发了一个请求："
+        + repr([str(request.url) for request in transport.requests])
+    )
+    assert pending == 0, "空操作不许入队"
+    assert TITLE in field_row(text, "标题"), f"原来的标题照旧在：\n{text}"
 
 
 async def test_the_all_day_switch_flips_between_a_time_and_a_date_only():
@@ -1190,7 +1289,7 @@ async def test_deleting_the_date_that_was_there_is_a_clear_and_not_a_mistake():
     """把**已有的**日期删掉再提交 = 清除（与上一条成对）。
 
     同一个空值，两种意思：上一条是「还没填」（没动过那一格），这一条是「要清除」（用户把
-    里面的日期删了）。这就是 ``_due_date_touched`` 存在的理由。
+    里面的日期删了）。这就是 ``DueEditor.date_touched`` 存在的理由（#87 之前叫 ``_due_date_touched``）。
     """
     fake = backend()
     app = DidaApp(fake)
@@ -1313,7 +1412,7 @@ async def test_esc_on_an_empty_untouched_date_ends_the_edit_and_says_why():
     「没有取消」不等于「必须写一笔」：用户什么都没改过，于是没有改动可生效。编辑器照规矩
     收起、回到字段列表（编辑器里 ``esc`` 的唯一含义就是这个），而下面那一行说明为什么——
     不能把这一下当成**清除**：「还没填」与「要清除」在请求体里是同一个空值，而清除要求
-    用户真的动过那一格（``_due_date_touched``）。旧行为是悄悄收起：既没写、也没说。
+    用户真的动过那一格（``DueEditor.date_touched``，旧名 ``_due_date_touched``）。旧行为是悄悄收起：既没写、也没说。
     """
     fake = backend()
     fake.add_task("没有日期的任务", list_name="work", id="t2")
@@ -1456,6 +1555,73 @@ async def test_the_due_editor_writes_out_an_explicit_null_shape(tmp_path):
     assert body["isAllDay"] is False, body
     assert body["timeZone"] == "Asia/Shanghai", "时区字段原样回写（验收标准 7）"
     assert body["focusSummaries"] == [{"pomoCount": 1}], "服务端给的陌生字段一起回去（验收标准 8）"
+
+
+def repaint_answer(text: str, header: str, draft: str) -> tuple[bool, bool, bool]:
+    """重画之后屏幕上的答案：编辑器开着、草稿还在、字段列表没有回来（工单 #87）。
+
+    第三件按「优先级」那一行认，不按「标题」：编辑标题时屏幕上本来就有「编辑标题」这几个
+    字，拿「标题」当凭据会把编辑器那一行标题误当成字段列表回来了。
+    """
+    return (header in text, draft in text, "优先级" not in text)
+
+
+async def test_a_repaint_answers_the_same_for_the_text_editor_and_the_due_editor():
+    """重画对两种编辑器给出**同一个答案**（工单 #87）。
+
+    这一页「有没有编辑器开着」以前是两个开关、三种拼法，其中重画那一处只问了文本框那一个：
+    开着自由文本框时重画不动，开着截止编辑器时照样按字段列表去滚一遍光标。收成一个值之后
+    两种编辑器问的是同一句——用户手里那段文字（或者他正在改的那个日期）是他的，后台刷新与
+    窗口变化都不许把它换掉、也不许把字段列表翻上来。
+
+    断的是屏幕：两种编辑器各做一遍「进编辑 → 敲点东西 → 后台刷新 → 窗口变小」，重画之后
+    屏幕上那三件事必须一样——编辑器那一行标题还在、敲进去的草稿还在、字段列表没有回来。
+    （当初那两种答案在屏幕上并没有差别：编辑那一块是 ``1fr``，重画时这一页没有可滚的东西。
+    这一条守的是「两种编辑器从此问同一句」——编辑器被重画收掉、草稿被换掉这一类改动它当场红。）
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await enter_detail(pilot, app)
+        refreshed = False
+
+        async def repaint() -> str:
+            """重画的两条路都走一遍：后台刷新送回来的那一趟，以及窗口变小那一下。"""
+            nonlocal refreshed
+            if not refreshed:
+                fake.add_task("刷新带回来的", list_name="work", id="t9", due=T0.replace(hour=9))
+                refreshed = True
+            app.refresh_view()
+            await pilot.pause()
+            await pilot.resize_terminal(WIDE[0] - 1, WIDE[1] - 1)
+            await pilot.pause()
+            return screen_text(app)
+
+        await pilot.press("enter")  # 标题：自由文本框
+        await pilot.press(*clear(len(TITLE)))
+        await pilot.press(*"还没交的标题")
+        await pilot.pause()
+        text_screen = await repaint()
+        text_answer = repaint_answer(text_screen, "编辑标题", "还没交的标题")
+        await pilot.press("escape")
+        await pilot.pause()
+
+        await walk_to_the_due_field(pilot, app)
+        await pilot.press("enter")  # 截止：结构化编辑器（先日期、再时刻）
+        await pilot.press(*clear(10))
+        await pilot.press(*"2026-04-01")
+        await pilot.pause()
+        due_screen = await repaint()
+        due_answer = repaint_answer(due_screen, "改截止", "2026-04-01")
+
+    assert text_answer == (True, True, True), f"重画把文本框换掉了：\n{text_screen}"
+    assert due_answer == (True, True, True), f"重画把截止编辑器换掉了：\n{due_screen}"
+    assert text_answer == due_answer, (
+        "重画对两种编辑器给了不同的答案——「有没有东西开着」只该有一个值：\n"
+        f"自由文本框：{text_answer}\n截止时间：{due_answer}"
+    )
 
 
 async def test_the_due_editor_emits_no_truecolor():
