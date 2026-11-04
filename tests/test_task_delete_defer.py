@@ -155,6 +155,7 @@ async def test_d_asks_once_and_only_y_deletes_the_task():
         await pilot.press("d")
         await pilot.pause()
         asked = screen_text(app)
+        assert app.screen.prompt == delete_prompt("写周报"), "浮层里的原文必须逐字来自那一处"
 
         await pilot.press("n")
         await pilot.pause()
@@ -459,6 +460,7 @@ async def test_d_on_the_detail_page_asks_the_same_question_as_the_task_list():
         await pilot.pause()
         asked_detail = screen_text(app)
         assert prompt_visible(asked_detail, "写周报"), "详细页问的必须是同一句确认"
+        assert app.screen.prompt == delete_prompt("写周报"), "详细页浮层里的原文必须逐字来自那一处"
 
         await pilot.press("n")
         await pilot.pause()
@@ -471,6 +473,7 @@ async def test_d_on_the_detail_page_asks_the_same_question_as_the_task_list():
         await pilot.pause()
         asked_list = screen_text(app)
         assert prompt_visible(asked_list, "写周报"), "列表页那条也必须是同一句确认"
+        assert app.screen.prompt == delete_prompt("写周报"), "列表页浮层里的原文也必须逐字来自那一处"
 
         await pilot.press("n")
         await pilot.pause()

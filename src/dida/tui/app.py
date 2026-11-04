@@ -993,6 +993,12 @@ class DidaApp(WriteFlow, App[RebindRestart | None]):
         那一页没有东西可看了，而清单列表页也不该是落点——光标留在同一个清单里，由
         ``refresh_view`` 按行 id 认回它删掉之后让出来的那一条。失败时本地那一份还在，
         人留在详细页把话看完。
+
+        ``is_running`` 那一问**今天是防御性的**：:data:`TASK_DELETE` 的落点是状态栏，
+        ``finish_write`` 这一条路上没有会让出事件循环的 ``await``，所以眼下它走不到「假」
+        那一支。留着它是给将来改落点（比如挪到详细页底部、要先 ``push_pending``）留的——
+        那时这下面就会真的跨 ``await``，而「关窗之后再去问引擎 / 动页面」正是本模块开头
+        那条规矩要挡的窗口。
         """
         if not confirmed:
             return
