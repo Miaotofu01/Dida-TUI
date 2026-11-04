@@ -28,6 +28,7 @@ from dida.storage.store import Store
 from dida.sync.engine import SyncEngine, UnknownTaskError
 from dida.testing import FakeBackend, FakeTransport, ManualClock
 from dida.tui.app import DidaApp
+from dida.tui.keys import LAYER_DETAIL, LAYER_TASKS
 from dida.tui.messages import UNKNOWN_DELETE_MESSAGE, delete_prompt
 from support import screen_text
 
@@ -46,6 +47,15 @@ def drawn_width(text: str) -> int:
         2 if unicodedata.east_asian_width(char) in ("A", "W", "F") else cell_len(char)
         for char in text
     )
+
+
+def prompt_visible(screen: str, title: str) -> bool:
+    """确认文案的每一行都在屏幕上（浮层的边框与留白把整段隔开了）。
+
+    用的是 :func:`dida.tui.messages.delete_prompt` **自己**的输出：两个入口问的必须是同一份，
+    测试不另抄一句来对账。
+    """
+    return all(line in screen for line in delete_prompt(title).splitlines())
 
 
 def at(day: int, hour: int = 0, minute: int = 0) -> datetime:
@@ -117,6 +127,14 @@ async def open_work(app: DidaApp, pilot) -> None:
     await pilot.pause()
 
 
+async def open_detail(app: DidaApp, pilot) -> None:
+    """从清单列表页走进「工作」清单，再进光标下那条任务的详细页（层三）。"""
+    await open_work(app, pilot)
+    await pilot.press("right")
+    await pilot.pause()
+    assert app.layer == LAYER_DETAIL, "没能走进任务详细页"
+
+
 # ------------------------------------------------------------------ d：删任务
 
 
@@ -137,6 +155,7 @@ async def test_d_asks_once_and_only_y_deletes_the_task():
         await pilot.press("d")
         await pilot.pause()
         asked = screen_text(app)
+        assert app.screen.prompt == delete_prompt("写周报"), "浮层里的原文必须逐字来自那一处"
 
         await pilot.press("n")
         await pilot.pause()
@@ -412,3 +431,248 @@ async def test_cancelling_the_delete_repaints_nothing_at_all():
     assert "探针" not in after, "取消触发了重画——它该什么都没做"
     assert after == before, "屏幕逐字符与操作前相同"
     assert fake.deleted == []
+
+
+# ------------------------------------------------------------------ 详细页的 d（工单 #56）
+#
+# 详细页与任务列表页共用**同一条**删除路径：确认文案、`_finish_delete_task`、失败措辞都只有
+# 一处。这里断的是外部行为——按 `d` 出现哪一句话、按 `y` / `n` / `Esc` 之后屏幕上是什么、
+# 真库里那条任务还在不在。详细页的 `d` 是 #40 正文里那句承诺，落地时曾被漏掉。
+
+
+async def test_d_on_the_detail_page_asks_the_same_question_as_the_task_list():
+    """详细页按 ``d`` 弹出的确认与列表页**逐字相同**，``n`` 取消后仍留在详细页。
+
+    确认文案从 :func:`dida.tui.messages.delete_prompt` 来（测试里也 import 它）：两页都要
+    出现同一份输出，而不是各自抄一句。``n`` 是「没做」——一条都不删，人也不被弹走。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_work(app, pilot)
+        await pilot.press("right")
+        await pilot.pause()
+        assert app.layer == LAYER_DETAIL
+
+        await pilot.press("d")
+        await pilot.pause()
+        asked_detail = screen_text(app)
+        assert prompt_visible(asked_detail, "写周报"), "详细页问的必须是同一句确认"
+        assert app.screen.prompt == delete_prompt("写周报"), "详细页浮层里的原文必须逐字来自那一处"
+
+        await pilot.press("n")
+        await pilot.pause()
+        assert app.layer == LAYER_DETAIL, "取消之后仍在详细页"
+        assert "写周报" in screen_text(app)
+
+        await pilot.press("left")
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+        asked_list = screen_text(app)
+        assert prompt_visible(asked_list, "写周报"), "列表页那条也必须是同一句确认"
+        assert app.screen.prompt == delete_prompt("写周报"), "列表页浮层里的原文也必须逐字来自那一处"
+
+        await pilot.press("n")
+        await pilot.pause()
+
+    assert fake.deleted == [], "两次都只是问了一句，一条都没删"
+
+
+async def test_confirming_the_detail_delete_really_deletes_and_returns_to_the_same_list(store):
+    """详细页 ``d`` → ``y``：真库里那条没了，人回到**同一个清单**的任务列表页（验收标准 1、3）。
+
+    接缝二（真 ``Store`` + 真引擎 + 假传输）：``FakeBackend`` 那一侧只能证明「引擎被叫去删
+    哪一条」，这里证明**本地那一份真的摘掉了**、``DELETE`` 真的发出去了。
+
+    删的是第二条（``t2``），所以「光标落在删掉那一条让出来的位置」与「光标被重置到第一行」
+    在屏幕上是两件事：前者是 ``t3``，后者是 ``t1``。
+    """
+    seed(
+        store,
+        task(id="t1", title="写周报", dueDate="2026-03-14T09:00:00+0800"),
+        task(id="t2", title="交水费", dueDate="2026-03-14T10:00:00+0800"),
+        task(id="t3", title="倒垃圾", dueDate="2026-03-14T11:00:00+0800"),
+    )
+    transport = FakeTransport(json={})
+    engine = make_engine(store, transport)
+    app = DidaApp(engine)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_work(app, pilot)
+        await pilot.press("j")
+        await pilot.pause()
+        assert app.tasks_page().selected_id == "t2", "光标走到要删的那一条上"
+
+        await pilot.press("right")
+        await pilot.pause()
+        assert app.layer == LAYER_DETAIL
+        await pilot.press("d")
+        await pilot.pause()
+        assert prompt_visible(screen_text(app), "交水费")
+
+        await pilot.press("y")
+        await pilot.pause()
+        await engine.wait_for_pushes()
+        after = screen_text(app)
+        layer = app.layer
+        selected = app.tasks_page().selected_id
+        container = app.tasks_page().container_name
+
+    assert len(transport.requests) == 1, "一次删除只发一个请求"
+    assert transport.requests[0].method == "DELETE"
+    assert str(transport.requests[0].url) == "https://api.dida365.com/open/v1/project/work/task/t2"
+    assert store.task_payload("t2") is None, "真库里那条真的没了"
+    assert store.task_payload("t1") is not None and store.task_payload("t3") is not None
+    assert layer == LAYER_TASKS, "删完回到任务列表页，不是清单列表页"
+    assert container == "工作", "还在同一条清单里"
+    assert selected == "t3", "光标落在删掉那一条让出来的位置，没被重置到第一行"
+    assert "交水费" not in after, "那一行没了"
+    assert "写周报" in after and "倒垃圾" in after, "同一个清单里别的任务照旧"
+
+
+@pytest.mark.parametrize("cancel", ["n", "escape"])
+async def test_cancelling_the_detail_delete_writes_nothing(store, monkeypatch, cancel):
+    """详细页确认框里 ``n`` / ``Esc``：引擎连删除都没被叫过，一个字节都没写（验收标准 2）。
+
+    删除在服务端不可逆，所以「没做」要有独立证据：引擎的 ``delete`` 没被调用、队列空、
+    传输上零请求，再主动推一轮也推不出东西；本地快照逐字段与操作前相同。
+    """
+    seed(store, task(id="t1", title="写周报", dueDate="2026-03-14T18:00:00+0800"))
+    transport = FakeTransport(json={})
+    engine = make_engine(store, transport)
+    app = DidaApp(engine)
+    calls: list[str] = []
+    original = engine.delete
+
+    def spy(task_id: str) -> None:
+        calls.append(task_id)
+        original(task_id)
+
+    monkeypatch.setattr(engine, "delete", spy)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_work(app, pilot)
+        before = dict(store.task_payload("t1"))
+        await pilot.press("right")
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+        assert prompt_visible(screen_text(app), "写周报"), "先确认问的是那一句"
+
+        await pilot.press(cancel)
+        await pilot.pause()
+        after = screen_text(app)
+        layer = app.layer
+
+    assert calls == [], "取消时引擎连删除都没被叫过"
+    assert store.pending() == (), "队列里一条改动都没有"
+    assert await engine.push_pending() == 0, "主动推一轮也推不出东西"
+    assert transport.requests == [], "一个请求都没发"
+    assert dict(store.task_payload("t1")) == before, "本地快照逐字段没变"
+    assert layer == LAYER_DETAIL, "取消之后留在详细页"
+    assert "写周报" in after, "那一条还在"
+    assert "删掉就找不回来了" not in after, "确认框收掉了"
+
+
+async def test_the_detail_page_help_lists_the_delete_key():
+    """详细层的 ``h`` 帮助里列着 ``d``（验收标准 4）。
+
+    帮助跟着 ``keys.py`` 那张表走，所以这一条同时钉住「表里加了」与「这一层真的看得到」。
+    """
+    app = DidaApp(backend())
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_detail(app, pilot)
+        await pilot.press("h")
+        await pilot.pause()
+        text = screen_text(app)
+
+    rows = [line.strip(" |") for line in text.splitlines()]
+    assert any(
+        line.startswith("d") and "删除这条任务" in line for line in rows
+    ), f"详细层帮助里没有 d / 删除这条任务：\n{text}"
+
+
+async def test_d_typed_into_a_field_editor_is_just_a_letter():
+    """编辑中的 ``d`` 属于输入框，不许被页面抢去当删除键。
+
+    详细页的绑定长在页面上，而编辑时焦点在 :class:`~textual.widgets.Input` 里：一个字母
+    ``d`` 该被写进正文，而不是弹出一个删除确认。这一条是那件事的守卫——它挡住的是「加一个
+    页面级单键动作」最容易踩的那一脚。
+    """
+    fake = backend()
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_detail(app, pilot)
+        await pilot.press("enter")  # 光标在「标题」上：进编辑
+        await pilot.pause()
+        await pilot.press("end")  # 输入框聚焦时会全选回填值；先把光标挪到末尾
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert "写周报d" in text, "d 该写进标题输入框"
+    assert "删掉就找不回来了" not in text, "编辑中按 d 不该弹删除确认"
+    assert fake.deleted == [], "一个删除都没发生"
+
+
+async def test_a_delete_the_engine_refuses_from_the_detail_page_says_so():
+    """详细页上引擎当场拒绝（本地没有这条底稿）时，如实说「**没**删」并留在原地。
+
+    走的是与任务列表页同一条拒绝路径（``UnknownTaskError`` → :data:`UNKNOWN_DELETE_MESSAGE`）：
+    删除不可逆，这句话说的是没删成；本地那条还在，所以人也不被带走。
+    """
+    fake = backend()
+    fake.delete_error = UnknownTaskError("t1")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_detail(app, pilot)
+        await pilot.press("d")
+        await pilot.pause()
+        await pilot.press("y")
+        await pilot.pause()
+        after = screen_text(app)
+        layer = app.layer
+
+    assert UNKNOWN_DELETE_MESSAGE in after, "拒绝时要说出「没删」，不能假装删了"
+    assert layer == LAYER_DETAIL, "本地那条还在，人留在详细页把话看完"
+    assert "写周报" in after, "那条任务还在"
+
+
+async def test_d_typed_into_the_multiline_editor_is_just_a_letter():
+    """多行框（描述 / 备注）里的 ``d`` 同样属于输入框。
+
+    与单行框是同一件事的另一半：页面级的 ``d`` 只在字段列表上有效，编辑器亮着时焦点在
+    ``TextArea`` 上，字母该写进正文。
+    """
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_task("写周报", list_name="work", id="t1", content="先问一下财务再发")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_detail(app, pilot)
+        await pilot.press("j")  # 光标从「标题」走到「描述」
+        await pilot.pause()
+        assert app.detail_page().selected_id == "content"
+        await pilot.press("enter")  # 进多行编辑
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert "先问一下财务再发d" in text, "d 该写进描述输入框"
+    assert "删掉就找不回来了" not in text, "编辑中按 d 不该弹删除确认"
+    assert fake.deleted == [], "一个删除都没发生"
