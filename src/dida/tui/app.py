@@ -999,6 +999,9 @@ class DidaApp(WriteFlow, App[RebindRestart | None]):
         await self.finish_write(
             Write(perform=lambda: self.engine.delete(task_id), reply=TASK_DELETE)
         )
+        if not self.is_running:
+            # ``await`` 之后可能已经关窗了：那时既不该再问引擎「它还在不在」，也不该动页面。
+            return
         if self._detail_task_id != task_id:
             return
         if self.engine.task_detail(task_id) is not None:
