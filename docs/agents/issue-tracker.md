@@ -9,7 +9,8 @@ Issues and specs for this repo live as GitHub issues in `Miaotofu01/Dida-TUI`. U
 - **List issues**: `gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'` with appropriate `--label` and `--state` filters.
 - **Comment on an issue**: `gh issue comment <number> --body "..."`
 - **Apply / remove labels**: `gh issue edit <number> --add-label "..."` / `--remove-label "..."`
-- **Close**: `gh issue close <number> --comment "..."`
+- **Close**: `gh issue close <number> --comment "..."` — **except for work delivered by a PR** (see next bullet).
+- **PRs close issues (repo convention)**: a PR body must carry `Closes #<n>` for every ticket the PR resolves (plus the spec/parent issue when it completes it). Merging the PR is the close; do not also run `gh issue close` on those tickets. Put the keywords in the body **before** merging — editing after merge does not retroactively close. A ticket resolved by a later PR stays open until that PR.
 
 Infer the repo from `git remote -v`; `gh` does this automatically when run inside a clone.
 

@@ -72,14 +72,15 @@ uv run pytest tests/test_architecture.py -q
 git push origin feat/v2-terminal-client
 ```
 
-Then leave a **comment (never a close)** on the ticket, with the commit range and a one-line summary of
-what landed:
+Then leave a **comment** on the ticket, with the commit range and a one-line summary of what landed:
 
 ```
-gh issue comment <NN> --body "落到集成分支 \`feat/v2-terminal-client\`：<merge-sha>（分支 <branch>）。<一句话说清这张工单实现了什么>。集成分支未进 main 之前不关这张工单。"
+gh issue comment <NN> --body "落到集成分支 \`feat/v2-terminal-client\`：<merge-sha>（分支 <branch>）。<一句话说清这张工单实现了什么>。合入 main 的 PR 会以 Closes #<NN> 自动关闭这张工单。"
 ```
 
-Per the user's decision: **tickets get comments, not closes.** Never run `gh issue close`.
+Per the user's decision (2026-11-04): **merging the final PR closes the tickets** — its body must carry
+`Closes #<NN>` for every resolved ticket. **Never run `gh issue close` by hand**; if the PR body is missing
+the keyword, report it to the orchestrator so it is added before the merge. Comments are the trail, not the close.
 
 ## Reporting back (≤25 lines)
 

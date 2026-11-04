@@ -40,6 +40,8 @@
 
 4. **派活时把基线 commit 写死在 prompt 里**（`git -C <worktree> rev-parse HEAD`）。
 
+5. **合 PR 自动关票。** 一张 PR 解决的每张票，PR 正文里都要有 `Closes #<NN>`（完成 spec 时连 spec 父票一起）；**合并 PR 就是关闭动作**，GitHub 会关掉它们。不手工 `gh issue close`，也不留「等用户关」的旧规矩。还没被这张 PR 解决的票（后续票 / 仍在挡别的票的父票）**不要**写 `Closes`。关键字必须在合并前就在正文里——合并后再改不会补关。
+
 ## Agent skills
 
 ### Issue tracker

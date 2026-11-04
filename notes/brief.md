@@ -84,9 +84,12 @@ accept `@file`; that needs `-F`.
    one-column three-layer app before 13 more tickets build on it.
 2. **Delivery is a draft PR** `feat/v2-terminal-client` → `main`, opened after the first merge into the
    integration branch, marked ready for review at the end.
-3. **Tickets get a comment, not a close.** Each landed ticket gets a `gh issue comment` pointing at the
-   commits that resolved it. **Nobody closes an issue** until the integration branch actually reaches
-   `main` — the user closes them himself.
+3. **合 PR 自动关票（2026-11-04 用户改的口径）.** The PR body must carry `Closes #<NN>` for **every ticket
+   that PR resolves** (and the spec parent when it completes the spec). **Merging the PR is the close** —
+   GitHub closes the referenced issues; nobody runs `gh issue close` by hand and nobody waits for the user.
+   A ticket a later PR resolves stays open until that PR. The merger still leaves a `gh issue comment`
+   pointing at the integration commit — that is the trail, not the close. Closing keywords must be in the
+   PR body **before** merging; editing it afterwards does not retroactively close.
 
 ## ⚠ Network: the SSH proxy is broken — every `git push` needs a bypass
 
