@@ -645,3 +645,31 @@ async def test_a_delete_the_engine_refuses_from_the_detail_page_says_so():
     assert UNKNOWN_DELETE_MESSAGE in after, "拒绝时要说出「没删」，不能假装删了"
     assert layer == LAYER_DETAIL, "本地那条还在，人留在详细页把话看完"
     assert "写周报" in after, "那条任务还在"
+
+
+async def test_d_typed_into_the_multiline_editor_is_just_a_letter():
+    """多行框（描述 / 备注）里的 ``d`` 同样属于输入框。
+
+    与单行框是同一件事的另一半：页面级的 ``d`` 只在字段列表上有效，编辑器亮着时焦点在
+    ``TextArea`` 上，字母该写进正文。
+    """
+    fake = FakeBackend(clock=ManualClock(T0))
+    fake.add_list("工作", id="work")
+    fake.add_task("写周报", list_name="work", id="t1", content="先问一下财务再发")
+    app = DidaApp(fake)
+
+    async with app.run_test(size=WIDE) as pilot:
+        await pilot.pause()
+        await open_detail(app, pilot)
+        await pilot.press("j")  # 光标从「标题」走到「描述」
+        await pilot.pause()
+        assert app.detail_page().selected_id == "content"
+        await pilot.press("enter")  # 进多行编辑
+        await pilot.pause()
+        await pilot.press("d")
+        await pilot.pause()
+        text = screen_text(app)
+
+    assert "先问一下财务再发d" in text, "d 该写进描述输入框"
+    assert "删掉就找不回来了" not in text, "编辑中按 d 不该弹删除确认"
+    assert fake.deleted == [], "一个删除都没发生"
